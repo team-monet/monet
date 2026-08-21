@@ -54,7 +54,7 @@ monet doctor --dir ~/.monet --json  # machine-readable result; diagnostics stay 
 
 ### When the server will not start at all
 
-A host that cannot start the server reports only that the connection closed — the transport does not exist until every fallible startup step has already succeeded, so there is no protocol channel left to explain a failure. The cause is written beside the store instead, at `startup-failure.json` next to `monet.db`: the step it died in, the error and its code, the time, and the pid. `doctor` prints that record on stderr before anything else, including when the store itself is too damaged to inspect.
+A host that cannot start the server reports only that the connection closed — the transport does not exist until every fallible startup step has already succeeded, so there is no protocol channel left to explain a failure. The cause is written beside the store instead, at `monet.db.startup-failure.json`: the step it died in, the error and its code, the time, and the pid. The record is a sidecar of one database, named after it, so a directory holding more than one store never mixes their diagnoses. `doctor` prints that record on stderr before anything else, including when the store itself is too damaged to inspect.
 
 The record holds only the most recent failure, and a later successful start does not clear it — hosts retry, so fail → fail → succeed is ordinary, and clearing on success would erase the evidence of the attempts that failed. Read the timestamp before acting on it.
 

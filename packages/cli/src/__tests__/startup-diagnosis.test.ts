@@ -21,8 +21,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   HashingEmbeddingProvider,
-  STARTUP_FAILURE_FILENAME,
+  STARTUP_FAILURE_SUFFIX,
   markStartupPhase,
+  startupFailurePath,
   startupPhaseOf,
   type StartupFailureRecord,
 } from "@team-monet/core";
@@ -31,6 +32,7 @@ import { openServedCore } from "../bootstrap";
 import { getStartupFailurePath } from "../db/index";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
+const CORE_ROOT = resolve(REPO_ROOT, "../core");
 const CLI_ENTRY = "src/cli.ts";
 const STDIO_ENTRY = "src/index.ts";
 /** A spawned `monet start` never returns on its own; an immediately-closed stdin is the supported
@@ -45,40 +47,42 @@ function storeDir(): string {
   return dir;
 }
 
+/** The store `monet start` serves out of `dir`, and the record that belongs to it. */
+const dbIn = (dir: string): string => join(dir, "monet.db");
+const recordIn = (dir: string): string => startupFailurePath(dbIn(dir));
+
 interface Run {
   status: number | null;
   stdout: string;
   stderr: string;
 }
 
-function runServer(entry: string, dir: string, extraEnv: Record<string, string> = {}): Run {
-  const result = spawnSync(process.execPath, ["--import", "tsx", entry], {
-    cwd: REPO_ROOT,
-    input: IMMEDIATE_EOF,
+function spawnNode(args: string[], cwd: string, env: Record<string, string>, input = IMMEDIATE_EOF): Run {
+  const result = spawnSync(process.execPath, ["--import", "tsx", ...args], {
+    cwd,
+    input,
     encoding: "utf8",
-    env: { ...process.env, MONET_STORAGE_DIR: dir, MONET_EMBEDDER: "hashing", ...extraEnv },
+    env: { ...process.env, MONET_EMBEDDER: "hashing", ...env },
   });
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
-function runStart(dir: string, extraEnv: Record<string, string> = {}): Run {
-  const result = spawnSync(process.execPath, ["--import", "tsx", CLI_ENTRY, "start"], {
-    cwd: REPO_ROOT,
-    input: IMMEDIATE_EOF,
-    encoding: "utf8",
-    env: { ...process.env, MONET_STORAGE_DIR: dir, MONET_EMBEDDER: "hashing", ...extraEnv },
-  });
-  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
-}
+const runStart = (dir: string, extra: string[] = [], env: Record<string, string> = {}): Run =>
+  spawnNode([CLI_ENTRY, "start", ...extra], REPO_ROOT, { MONET_STORAGE_DIR: dir, ...env });
+
+const runStdioEntry = (dir: string): Run => spawnNode([STDIO_ENTRY], REPO_ROOT, { MONET_STORAGE_DIR: dir });
+
+const runDoctor = (dir: string, extra: string[] = []): Run =>
+  spawnNode([CLI_ENTRY, "doctor", "--dir", dir, ...extra], REPO_ROOT, {});
 
 function readRecord(dir: string): StartupFailureRecord {
-  return JSON.parse(readFileSync(join(dir, STARTUP_FAILURE_FILENAME), "utf8")) as StartupFailureRecord;
+  return JSON.parse(readFileSync(recordIn(dir), "utf8")) as StartupFailureRecord;
 }
 
 /** The bytes that made `file is not a database` the reproduction of choice: deterministic, offline,
  *  and it fails in the store open rather than anywhere earlier. */
-function corruptStore(dir: string): void {
-  writeFileSync(join(dir, "monet.db"), "this is not a sqlite database at all, not even close\n");
+function corruptStore(dir: string, name = "monet.db"): void {
+  writeFileSync(join(dir, name), "this is not a sqlite database at all, not even close\n");
 }
 
 afterEach(() => {
@@ -96,18 +100,18 @@ describe("a startup that dies leaves a findable cause", () => {
     // existed. What is new is that the cause is now somewhere a reader can reach.
     expect(run.status).toBe(1);
     expect(run.stdout).toBe("");
-    expect(existsSync(join(dir, STARTUP_FAILURE_FILENAME))).toBe(true);
+    expect(existsSync(recordIn(dir))).toBe(true);
 
     const record = readRecord(dir);
     expect(record.phase).toBe("store-open");
     expect(record.error.message).toContain("file is not a database");
     expect(record.error.code).toBe("SQLITE_NOTADB");
-    expect(record.store).toBe(join(dir, "monet.db"));
+    expect(record.store).toBe(dbIn(dir));
     expect(record.pid).toBeGreaterThan(0);
     // The stderr line points AT the file, so an operator watching the stream is not left to guess
     // that a record was written or where.
     expect(run.stderr).toContain(`startup failed in phase 'store-open'`);
-    expect(run.stderr).toContain(join(dir, STARTUP_FAILURE_FILENAME));
+    expect(run.stderr).toContain(recordIn(dir));
   }, 30000);
 
   it("the bare stdio entry point — the SAME server, second launch path — writes the same record", () => {
@@ -117,12 +121,12 @@ describe("a startup that dies leaves a findable cause", () => {
     const dir = storeDir();
     corruptStore(dir);
 
-    const run = runServer(STDIO_ENTRY, dir);
+    const run = runStdioEntry(dir);
 
     expect(run.status).toBe(1);
     expect(run.stdout).toBe("");
     expect(readRecord(dir).phase).toBe("store-open");
-    expect(run.stderr).toContain(join(dir, STARTUP_FAILURE_FILENAME));
+    expect(run.stderr).toContain(recordIn(dir));
   }, 30000);
 
   it("a clean start writes no record at all — silence is the healthy state", () => {
@@ -133,7 +137,7 @@ describe("a startup that dies leaves a findable cause", () => {
     expect(run.status).toBe(0);
     expect(run.stdout).toBe("");
     expect(run.stderr).toContain("Monet started");
-    expect(existsSync(join(dir, STARTUP_FAILURE_FILENAME))).toBe(false);
+    expect(existsSync(recordIn(dir))).toBe(false);
   }, 30000);
 
   it("a later successful start does NOT delete an earlier failure's record", () => {
@@ -146,12 +150,67 @@ describe("a startup that dies leaves a findable cause", () => {
     expect(runStart(dir).status).toBe(1);
     const failed = readRecord(dir);
 
-    rmSync(join(dir, "monet.db")); // the operator fixes the store
+    rmSync(dbIn(dir)); // the operator fixes the store
     expect(runStart(dir).status).toBe(0);
 
-    expect(existsSync(join(dir, STARTUP_FAILURE_FILENAME))).toBe(true);
-    expect(readRecord(dir).at).toBe(failed.at); // byte-identical: the success neither cleared nor rewrote it
+    expect(existsSync(recordIn(dir))).toBe(true);
+    expect(readRecord(dir).at).toBe(failed.at); // the success neither cleared nor rewrote it
   }, 45000);
+});
+
+// ── ROUND 1 REVIEW (PR #79) ──────────────────────────────────────────────────────────────────────
+
+describe("a storage path that cannot be created is a startup failure like any other", () => {
+  it("`monet start --dir <uncreatable>` reports, instead of dying with a bare errno and nothing else", () => {
+    // THE DEFECT THIS FIXES: `ensureMonetDir` ran ABOVE the try, so the one failure class #13 names
+    // outright — an unusable storage path — produced no record AND no word about the record, while
+    // the very same failure through the stdio entry point (whose whole `main` sits inside its
+    // handler) reported it properly. One server, two launch paths, two behaviours.
+    //
+    // The record itself cannot be written here — the directory it would live in is the directory
+    // that could not be created — so what must not be silent is THAT. A reader who checks the
+    // expected path, finds nothing, and is told nothing concludes no startup ever failed.
+    const dir = storeDir();
+    writeFileSync(join(dir, "blocker"), "a regular file, so nothing can be created beneath it");
+    const target = join(dir, "blocker", "nested", ".monet");
+
+    const run = runStart(dir, ["--dir", target], { MONET_STORAGE_DIR: "" });
+
+    expect(run.status).toBe(1);
+    expect(run.stdout).toBe("");
+    expect(run.stderr).toContain("ENOTDIR"); // the original cause still reaches stderr, unchanged
+    expect(run.stderr).toContain("monet: startup failed in phase 'unknown'");
+    expect(run.stderr).toContain("could not write the diagnosis to");
+    expect(run.stderr).toContain(join(target, `monet.db${STARTUP_FAILURE_SUFFIX}`));
+  }, 30000);
+});
+
+describe("a record is never attributed to the wrong database", () => {
+  it("core's dev server failing on monet-core.db leaves `monet doctor` on the healthy monet.db saying nothing", () => {
+    // THE DEFECT THIS FIXES, end to end: one `.monet` directory holds BOTH databases — the shipped
+    // CLI's `monet.db` and `packages/core/scripts/mcp-cli.ts`'s `monet-core.db`. With one record per
+    // directory, the dev server's `file is not a database` was read back by `doctor` as the
+    // shipped store's own startup failure. A diagnostic confidently naming the wrong store's fault
+    // is worse than one that says nothing.
+    const dir = storeDir();
+    // A healthy monet.db, and a corrupt monet-core.db beside it.
+    expect(spawnNode([CLI_ENTRY, "status"], REPO_ROOT, { MONET_STORAGE_DIR: dir }).status).toBe(0);
+    corruptStore(dir, "monet-core.db");
+
+    const dev = spawnNode(["scripts/mcp-cli.ts"], CORE_ROOT, { MONET_STORAGE_DIR: dir });
+    expect(dev.status).toBe(1);
+    // The dev server's own record exists, under ITS store's name.
+    const devRecord = startupFailurePath(join(dir, "monet-core.db"));
+    expect(existsSync(devRecord)).toBe(true);
+    expect((JSON.parse(readFileSync(devRecord, "utf8")) as StartupFailureRecord).store).toBe(join(dir, "monet-core.db"));
+
+    // And the healthy store is untouched by it, on both of doctor's surfaces.
+    expect(existsSync(recordIn(dir))).toBe(false);
+    const doctor = runDoctor(dir);
+    expect(doctor.stderr).not.toContain("last recorded startup failure");
+    const json = JSON.parse(runDoctor(dir, ["--json"]).stdout) as { startupFailure: { status: string } };
+    expect(json.startupFailure).toEqual({ status: "none" });
+  }, 60000);
 });
 
 describe("`monet doctor` is where a reader finds it", () => {
@@ -163,41 +222,38 @@ describe("`monet doctor` is where a reader finds it", () => {
     corruptStore(dir);
     expect(runStart(dir).status).toBe(1);
 
-    const doctor = spawnSync(process.execPath, ["--import", "tsx", CLI_ENTRY, "doctor", "--dir", dir], {
-      cwd: REPO_ROOT,
-      encoding: "utf8",
-      env: { ...process.env, MONET_EMBEDDER: "hashing" },
-    });
+    const doctor = runDoctor(dir);
 
     expect(doctor.stderr).toContain("startup: last recorded startup failure");
     expect(doctor.stderr).toContain("phase 'store-open'");
     expect(doctor.stderr).toContain("file is not a database");
-    expect(doctor.stderr).toContain(join(dir, STARTUP_FAILURE_FILENAME)); // it names the file, not just the fact
+    expect(doctor.stderr).toContain(recordIn(dir)); // it names the file, not just the fact
     // The record never enters stdout — `doctor --json` consumers parse that stream.
     expect(doctor.stdout).not.toContain("last recorded startup failure");
   }, 45000);
 
   it("says nothing about startup when no record exists", () => {
-    const dir = storeDir();
-    const doctor = spawnSync(process.execPath, ["--import", "tsx", CLI_ENTRY, "doctor", "--dir", dir], {
-      cwd: REPO_ROOT,
-      encoding: "utf8",
-      env: { ...process.env, MONET_EMBEDDER: "hashing" },
-    });
-    expect(doctor.stderr).not.toContain("startup:");
+    expect(runDoctor(storeDir()).stderr).not.toContain("startup:");
   }, 30000);
 
-  it("reports a record it cannot parse as its own state, never as 'no failure'", () => {
+  it("a record it cannot fully vouch for is reported as unreadable, naming the field — never as a verdict", () => {
+    // A fragment used to come back as `found`, and doctor printed `pid undefined, phase
+    // 'undefined': undefined: undefined`. Both surfaces must now say they could not read it.
     const dir = storeDir();
-    writeFileSync(join(dir, STARTUP_FAILURE_FILENAME), "{ truncated mid-writ");
+    writeFileSync(recordIn(dir), JSON.stringify({ v: 1, at: "2026-08-21T00:00:00.000Z", error: {} }));
 
-    const doctor = spawnSync(process.execPath, ["--import", "tsx", CLI_ENTRY, "doctor", "--dir", dir], {
-      cwd: REPO_ROOT,
-      encoding: "utf8",
-      env: { ...process.env, MONET_EMBEDDER: "hashing" },
-    });
+    const doctor = runDoctor(dir);
+    expect(doctor.stderr).toContain("could not be read (record is missing or malformed: pid)");
+    expect(doctor.stderr).not.toContain("undefined");
 
-    expect(doctor.stderr).toContain("could not be read (not valid JSON)");
+    const json = JSON.parse(runDoctor(dir, ["--json"]).stdout) as { startupFailure: { status: string } };
+    expect(json.startupFailure.status).toBe("unreadable");
+  }, 45000);
+
+  it("reports a truncated record as unreadable rather than absent", () => {
+    const dir = storeDir();
+    writeFileSync(recordIn(dir), "{ truncated mid-writ");
+    expect(runDoctor(dir).stderr).toContain("could not be read (not valid JSON)");
   }, 30000);
 });
 
@@ -209,7 +265,7 @@ describe("openServedCore separates its two fallible steps", () => {
 
     let selectionError: unknown;
     try {
-      await openServedCore(join(dir, "monet.db"), { scopeContext: dir, defaultCircle: "c" }, async () => {
+      await openServedCore(dbIn(dir), { scopeContext: dir, defaultCircle: "c" }, async () => {
         throw new Error("model cache is poisoned");
       });
     } catch (error) {
@@ -220,11 +276,7 @@ describe("openServedCore separates its two fallible steps", () => {
     corruptStore(dir);
     let openError: unknown;
     try {
-      await openServedCore(
-        join(dir, "monet.db"),
-        { scopeContext: dir, defaultCircle: "c" },
-        async () => new HashingEmbeddingProvider(),
-      );
+      await openServedCore(dbIn(dir), { scopeContext: dir, defaultCircle: "c" }, async () => new HashingEmbeddingProvider());
     } catch (error) {
       openError = error;
     }
@@ -235,20 +287,20 @@ describe("openServedCore separates its two fallible steps", () => {
     const dir = storeDir();
     const original = new Error("model cache is poisoned");
     await expect(
-      openServedCore(join(dir, "monet.db"), { scopeContext: dir, defaultCircle: "c" }, async () => {
+      openServedCore(dbIn(dir), { scopeContext: dir, defaultCircle: "c" }, async () => {
         throw original;
       }),
     ).rejects.toBe(original); // the SAME object — cli.ts/index.ts branch on `instanceof`
   });
 });
 
-describe("source regression guards: both entry points actually report, and know which side of connect they are on", () => {
+describe("source regression guards: both entry points report, and know which side of connect they are on", () => {
   it("`monet start` and the stdio entry both call reportStartupFailure with a transportConnected flag set AFTER the factory", () => {
     // A source-text check in this file's established style (see bootstrap.test.ts's own guards):
     // the behavioural tests above prove the mechanism, this proves the two REAL entry points are
     // wired into it — and specifically that the flag is raised after createMonetCoreMcpServer
     // rather than before, which is what makes a post-connect death distinguishable at all.
-    for (const entry of ["src/cli.ts", "src/index.ts"]) {
+    for (const entry of [CLI_ENTRY, STDIO_ENTRY]) {
       const source = readFileSync(join(REPO_ROOT, entry), "utf8");
       expect(source).toContain("reportStartupFailure(error, { projectDir, transportConnected })");
       const factoryAt = source.indexOf("await createMonetCoreMcpServer(core);");
@@ -258,10 +310,19 @@ describe("source regression guards: both entry points actually report, and know 
     }
   });
 
-  it("the record's filename has ONE spelling, and resolves through the same chain the store does", () => {
-    // getStartupFailurePath takes its filename from core rather than restating it — two spellings
-    // is how a writer and a reader stop meeting — and resolves through getMonetDir, so the record
-    // always lands beside the store the failing process actually opened.
+  it("`monet start`'s try opens ABOVE ensureMonetDir, so a storage-path failure is inside it", () => {
+    // The behavioural test above proves the reporting; this pins the ORDER that makes it reachable,
+    // which is the whole of the round-1 finding and the easiest thing to undo by accident.
+    const source = readFileSync(join(REPO_ROOT, CLI_ENTRY), "utf8");
+    const tryAt = source.indexOf("    let transportConnected = false;\n    try {");
+    const ensureAt = source.indexOf("ensureMonetDir(projectDir);");
+    expect(tryAt).toBeGreaterThan(-1);
+    expect(ensureAt).toBeGreaterThan(tryAt);
+  });
+
+  it("the record's path has ONE derivation, shared by the writer and every reader", () => {
+    // getStartupFailurePath composes getDbPath with core's own startupFailurePath, so the client
+    // cannot spell the sidecar differently from the package that writes it.
     const dir = storeDir();
     const saved = process.env.MONET_STORAGE_DIR;
     // MONET_STORAGE_DIR is getMonetDir's first rung, and the most direct lever to pin the
@@ -269,16 +330,15 @@ describe("source regression guards: both entry points actually report, and know 
     // same reason: a value inherited from the invoking shell must not decide this assertion.
     process.env.MONET_STORAGE_DIR = dir;
     try {
-      expect(getStartupFailurePath(dir)).toBe(join(dir, STARTUP_FAILURE_FILENAME));
+      expect(getStartupFailurePath(dir)).toBe(join(dir, `monet.db${STARTUP_FAILURE_SUFFIX}`));
     } finally {
       if (saved !== undefined) process.env.MONET_STORAGE_DIR = saved;
       else delete process.env.MONET_STORAGE_DIR;
     }
-    expect(readFileSync(join(REPO_ROOT, "src/db/index.ts"), "utf8")).toContain("STARTUP_FAILURE_FILENAME");
+    expect(readFileSync(join(REPO_ROOT, "src/db/index.ts"), "utf8")).toContain("startupFailurePath(getDbPath(baseDir))");
   });
 
   it("markStartupPhase is re-exported to the client, so an entry point can tag without reaching into core internals", () => {
-    const error = markStartupPhase(new Error("x"), "post-connect");
-    expect(startupPhaseOf(error)).toBe("post-connect");
+    expect(startupPhaseOf(markStartupPhase(new Error("x"), "post-connect"))).toBe("post-connect");
   });
 });

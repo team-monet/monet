@@ -73,15 +73,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.error(e);
     // #13: stderr is at the host's discretion — leave the cause beside the store too. Same record,
     // same filename, same directory as the shipped entry points write, so one reader finds either.
+    // Keyed on the store, which for THIS script is `monet-core.db` — a different database from the
+    // shipped CLI's `monet.db`, routinely in the same directory. That is why the record's path is
+    // derived from the store rather than its directory (see startup-diagnosis.ts).
     const written = startedDbPath === null
       ? null
       : recordStartupFailure({
-          dir: path.dirname(startedDbPath),
           store: startedDbPath,
           error: e,
           fallbackPhase: transportConnected ? "post-connect" : "unknown",
         });
-    if (written !== null) console.error(`monet-core: full startup diagnosis written to ${written}`);
+    if (written !== null) console.error(`monet-core: the full startup diagnosis is at ${written}`);
     process.exit(1);
   });
 }

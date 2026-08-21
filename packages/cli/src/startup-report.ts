@@ -1,6 +1,6 @@
 import path from "node:path";
 import { recordStartupFailure, startupPhaseOf, type StartupPhase } from "@team-monet/core";
-import { getDbPath, getMonetDir, getStartupFailurePath } from "./db/index.js";
+import { getDbPath, getStartupFailurePath } from "./db/index.js";
 
 /**
  * What every entry point does with a startup failure (#13).
@@ -38,11 +38,9 @@ export interface StartupFailureContext {
  * Never throws: recordStartupFailure is total, and everything else here is path arithmetic.
  */
 export function reportStartupFailure(error: unknown, context: StartupFailureContext): void {
-  const dir = getMonetDir(context.projectDir);
   const fallbackPhase: StartupPhase = context.transportConnected ? "post-connect" : "unknown";
   const phase = startupPhaseOf(error) ?? fallbackPhase;
   const written = recordStartupFailure({
-    dir,
     store: path.resolve(getDbPath(context.projectDir)),
     error,
     fallbackPhase,
@@ -58,5 +56,10 @@ export function reportStartupFailure(error: unknown, context: StartupFailureCont
     );
     return;
   }
-  console.error(`monet: startup failed in phase '${phase}'; full diagnosis written to ${written}`);
+  // "IS AT", not "written to". recordStartupFailure declines to publish over a record that is
+  // already NEWER than this one (a second server failing against the same store at the same
+  // instant), and returns the path anyway because the file still holds the most recent startup
+  // diagnosis — which is what the line is directing the reader to. Claiming authorship of it would
+  // be false in exactly that case.
+  console.error(`monet: startup failed in phase '${phase}'; the full startup diagnosis is at ${written}`);
 }

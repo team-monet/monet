@@ -257,8 +257,8 @@ export { deriveCircle } from "./circle";
  *  the writers are the ENTRY POINTS, which live in the CLI package, and the reader is `monet
  *  doctor`, which lives there too. */
 export {
-  STARTUP_FAILURE_FILENAME,
   STARTUP_FAILURE_FORMAT,
+  STARTUP_FAILURE_SUFFIX,
   inStartupPhase,
   markStartupPhase,
   readStartupFailure,

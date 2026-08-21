@@ -1,6 +1,6 @@
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 /**
  * The startup failure record — so a server that died before it had a protocol channel can still
@@ -41,8 +41,28 @@ import { join } from "node:path";
  * takes for its markers and moment-spool.ts for its appends).
  */
 
-/** Beside `monet.db`, `gate-mirror.json` and `moments.jsonl` — see this module's header. */
-export const STARTUP_FAILURE_FILENAME = "startup-failure.json";
+/**
+ * The record is a SIDECAR OF ONE DATABASE, named after it — `monet.db.startup-failure.json` beside
+ * `monet.db` — not one shared file per directory (Codex round 1, PR #79).
+ *
+ * WHY, and this was a live defect rather than a hypothetical: one `.monet` directory routinely holds
+ * TWO databases. The shipped CLI serves `monet.db`; `packages/core/scripts/mcp-cli.ts` serves
+ * `monet-core.db` out of the SAME directory, resolved by the same `MONET_STORAGE_DIR` rung. A
+ * per-directory filename gave them one record between them, so the dev server's failure overwrote
+ * the shipped server's — and `monet doctor`, which reads by directory, then reported a perfectly
+ * healthy `monet.db` as having failed to start with the OTHER file's error. A diagnostic that
+ * confidently attributes one store's fault to another is worse than one that says nothing.
+ *
+ * KEYING THE PATH ON THE STORE, rather than checking a `store` field on read, is what fixes BOTH
+ * halves. A mismatch check would keep the readers honest but leave the two writers still sharing one
+ * file — the older record simply destroyed instead of misread — and it would need a fourth read
+ * state ("a record, but for something else") that no writer can produce once the paths differ.
+ * Distinct paths make the collision unrepresentable, and leave the read a plain lookup.
+ *
+ * The `.db`-suffixed shape follows SQLite's own sidecar convention beside the store (`-wal`, `-shm`)
+ * so the file sorts next to the database it describes.
+ */
+export const STARTUP_FAILURE_SUFFIX = ".startup-failure.json";
 
 /** Bumped only when a reader would misread an older record; readers reject what they don't know. */
 export const STARTUP_FAILURE_FORMAT = 1;
@@ -171,8 +191,14 @@ export type StartupFailureRead =
 const STACK_MAX_CHARS = 4000;
 const MESSAGE_MAX_CHARS = 4000;
 
-export function startupFailurePath(dir: string): string {
-  return join(dir, STARTUP_FAILURE_FILENAME);
+/**
+ * Where the record for THIS store lives. Takes the store path, never a directory: one directory can
+ * hold several databases, and the writer and the reader must not be able to disagree about which
+ * one a record describes (see STARTUP_FAILURE_SUFFIX).
+ */
+export function startupFailurePath(storePath: string): string {
+  const resolved = resolve(storePath);
+  return join(dirname(resolved), `${basename(resolved)}${STARTUP_FAILURE_SUFFIX}`);
 }
 
 function truncate(value: string, max: number): string {
@@ -193,9 +219,10 @@ function describe(error: unknown): StartupFailureRecord["error"] & { stack: stri
 }
 
 export interface RecordStartupFailureOptions {
-  /** Where to write — the store's own directory, resolved by the caller that opened it. */
-  dir: string;
-  /** The store this startup was serving, for a reader holding the file but not the invocation. */
+  /**
+   * The store this startup was serving. It decides BOTH where the record goes and what the record
+   * says it is about — one input, so the two can never disagree (see STARTUP_FAILURE_SUFFIX).
+   */
   store: string;
   error: unknown;
   /**
@@ -204,45 +231,97 @@ export interface RecordStartupFailureOptions {
    * is a materially different fact from one before it. Defaults to "unknown" — never guessed.
    */
   fallbackPhase?: StartupPhase;
+  /** Injectable clock, for tests that need two records with a known ordering between them. */
+  now?: () => Date;
 }
 
 /**
- * Write the most recent startup failure beside the store. Returns the path written, or null if
- * nothing could be written.
+ * Write one full record's worth of bytes, or throw.
+ *
+ * `fs.writeSync` DOES NOT LOOP (Codex round 1, PR #79 — measured: asked for 1 MiB against a bounded
+ * pipe, it returned 8192). It issues one `write(2)` and hands back whatever the kernel took, so a
+ * caller that ignores the count publishes whatever fraction happened to land. On a regular file the
+ * realistic short write is a filling disk — which is also a perfectly good reason for the startup
+ * that is being recorded to have failed, so this is not a case the record can afford to fumble.
+ *
+ * Throwing on a stalled write (0 bytes taken with bytes still owing) rather than spinning: the outer
+ * catch turns that into `null`, which leaves the PREVIOUS record intact and tells the caller
+ * plainly that nothing was written. A truncated record renamed into place would destroy a good one
+ * and report success.
+ */
+function writeFully(fd: number, payload: Buffer): void {
+  let written = 0;
+  while (written < payload.length) {
+    const n = writeSync(fd, payload, written, payload.length - written);
+    if (n <= 0) throw new Error(`startup record write stalled after ${written}/${payload.length} bytes`);
+    written += n;
+  }
+}
+
+/**
+ * Write the most recent startup failure beside the store. Returns the path holding the diagnosis,
+ * or null if nothing could be written.
  *
  * TEMP + RENAME, matching gates.ts's sidecar and install-cli.ts's atomic write: a reader that
  * arrives mid-write must see the previous record or the new one, never half of either. `wx` on the
  * temp file so two servers failing at the same instant cannot land in one buffer.
  *
- * TOTAL, NEVER THROWING — see this module's header. The caller is already reporting a failure; this
- * must not become a second one.
+ * TOTAL, NEVER THROWING — see this module's header. EVERYTHING is inside the try, including reading
+ * the error's own fields: `describe` touches `.name`, `.message`, `.code` and `.stack`, any of which
+ * can be an accessor, and `String(x)` throws outright for a null-prototype object. Those reads sat
+ * outside the try until Codex round 1 on PR #79 showed both escaping — which meant this function
+ * could replace the startup fault it was called to record with a TypeError about a property nobody
+ * asked for, in the one code path whose whole purpose is to not lose the original error.
  */
 export function recordStartupFailure(options: RecordStartupFailureOptions): string | null {
-  const path = startupFailurePath(options.dir);
-  const { stack, ...error } = describe(options.error);
-  const record: StartupFailureRecord = {
-    v: STARTUP_FAILURE_FORMAT,
-    at: new Date().toISOString(),
-    pid: process.pid,
-    phase: startupPhaseOf(options.error) ?? options.fallbackPhase ?? "unknown",
-    store: options.store,
-    error,
-    stack,
-  };
-  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  let tmp: string | null = null;
   try {
-    mkdirSync(options.dir, { recursive: true });
+    const path = startupFailurePath(options.store);
+    const { stack, ...error } = describe(options.error);
+    const record: StartupFailureRecord = {
+      v: STARTUP_FAILURE_FORMAT,
+      at: (options.now?.() ?? new Date()).toISOString(),
+      pid: process.pid,
+      phase: startupPhaseOf(options.error) ?? options.fallbackPhase ?? "unknown",
+      store: resolve(options.store),
+      error,
+      stack,
+    };
+    tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    mkdirSync(dirname(path), { recursive: true });
     const fd = openSync(tmp, "wx", 0o600);
     try {
-      writeSync(fd, `${JSON.stringify(record, null, 2)}\n`);
+      writeFully(fd, Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8"));
     } finally {
       closeSync(fd);
+    }
+    // DO NOT PUBLISH OVER SOMETHING NEWER (Codex round 1, PR #79). `renameSync` replaces whatever is
+    // at the destination, so two servers failing against one shared store — the ordinary shape when
+    // the store is contended, since contention means a second process — can publish out of order:
+    // the slower writer's OLDER record lands last and buries the newer one, in exactly the
+    // host-retry scenario the record exists to explain.
+    //
+    // ONLY A RECORD THAT IS BOTH READABLE AND STRICTLY NEWER BLOCKS. An absent or unparseable
+    // destination is not evidence of a newer diagnosis, and treating it as one would let a single
+    // corrupt file wedge the mechanism permanently.
+    //
+    // WHAT THIS DOES NOT CLOSE, stated rather than implied: check-then-rename is not atomic, so a
+    // record published in the microseconds between the two still loses. That window is bounded by
+    // two syscalls instead of by the whole open/write/close, and closing it properly needs either a
+    // lock or per-writer files with a reader that merges them — machinery out of proportion to a
+    // race between two diagnoses of the same moment.
+    const existing = readStartupFailure(options.store);
+    if (existing.status === "found" && existing.record.at > record.at) {
+      unlinkSync(tmp);
+      return path; // the destination already holds a more recent diagnosis — which is the contract
     }
     renameSync(tmp, path);
     return path;
   } catch {
     try {
-      unlinkSync(tmp);
+      // `tmp` is null when the failure happened before a temp path existed at all — describing the
+      // error, or resolving where the record would go.
+      if (tmp !== null) unlinkSync(tmp);
     } catch {
       // Nothing to clean up, or nothing we may clean up. Either way this path reports by returning
       // null; it never speaks for itself.
@@ -251,11 +330,43 @@ export function recordStartupFailure(options: RecordStartupFailureOptions): stri
   }
 }
 
-/** Read the record beside a store. Total: a diagnostic that throws while diagnosing is useless. */
-export function readStartupFailure(dir: string): StartupFailureRead {
+/**
+ * Names the first field that is missing or of the wrong type, or null when the record is whole.
+ *
+ * EVERY FIELD THE TYPE PROMISES IS CHECKED, not a representative sample (Codex round 1, PR #79). The
+ * reader used to accept anything carrying `v` and `at`, so `{"v":1,"at":"…","error":{}}` came back
+ * `found` and `doctor` printed `pid undefined, phase 'undefined': undefined: undefined` — a partial
+ * record presented with the full confidence of a verdict, which is the exact conflation the
+ * three-state result exists to prevent. A record this function cannot vouch for entirely is
+ * `unreadable`, and says which field made it so.
+ */
+function missingRecordField(candidate: Partial<StartupFailureRecord>): string | null {
+  if (typeof candidate.at !== "string") return "at";
+  if (typeof candidate.pid !== "number") return "pid";
+  if (typeof candidate.phase !== "string" || !(STARTUP_PHASES as readonly string[]).includes(candidate.phase)) {
+    return "phase";
+  }
+  if (typeof candidate.store !== "string") return "store";
+  if (candidate.stack !== null && typeof candidate.stack !== "string") return "stack";
+  const error = candidate.error;
+  if (typeof error !== "object" || error === null) return "error";
+  if (typeof error.name !== "string") return "error.name";
+  if (typeof error.message !== "string") return "error.message";
+  // `code` is genuinely optional — plenty of errors carry none — but a present one must be a string
+  // rather than whatever else ended up there.
+  if (error.code !== undefined && typeof error.code !== "string") return "error.code";
+  return null;
+}
+
+/**
+ * Read the record for a store. Takes the STORE path, not a directory — see startupFailurePath.
+ *
+ * Total: a diagnostic that throws while diagnosing is useless.
+ */
+export function readStartupFailure(storePath: string): StartupFailureRead {
   let raw: string;
   try {
-    raw = readFileSync(startupFailurePath(dir), "utf8");
+    raw = readFileSync(startupFailurePath(storePath), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "none" };
     return { status: "unreadable", reason: error instanceof Error ? error.message : String(error) };
@@ -271,8 +382,7 @@ export function readStartupFailure(dir: string): StartupFailureRead {
   if (candidate.v !== STARTUP_FAILURE_FORMAT) {
     return { status: "unreadable", reason: `unsupported record format ${String(candidate.v)}` };
   }
-  if (typeof candidate.at !== "string" || typeof candidate.error !== "object" || candidate.error === null) {
-    return { status: "unreadable", reason: "record is missing required fields" };
-  }
+  const missing = missingRecordField(candidate);
+  if (missing !== null) return { status: "unreadable", reason: `record is missing or malformed: ${missing}` };
   return { status: "found", record: candidate as StartupFailureRecord };
 }

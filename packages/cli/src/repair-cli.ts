@@ -387,10 +387,10 @@ function printProvider(provider: ProviderResult): void {
  * that exists and cannot be parsed — that is reported as its own state, because a reader who is
  * told nothing concludes no startup ever failed.
  */
-function printStartupFailure(read: StartupFailureRead, storeDir: string): void {
+function printStartupFailure(read: StartupFailureRead, dbPath: string): void {
   if (read.status === "none") return;
   if (read.status === "unreadable") {
-    console.error(`startup: ${startupFailurePath(storeDir)} exists but could not be read (${read.reason}).`);
+    console.error(`startup: ${startupFailurePath(dbPath)} exists but could not be read (${read.reason}).`);
     return;
   }
   const record = read.record;
@@ -402,7 +402,7 @@ function printStartupFailure(read: StartupFailureRead, storeDir: string): void {
   // it would destroy the evidence of the attempts that failed), so the timestamp is what decides
   // whether this is the current problem. Say that here rather than letting a reader assume freshness.
   console.error(
-    `startup: full record at ${startupFailurePath(storeDir)}; it is not cleared by a later ` +
+    `startup: full record at ${startupFailurePath(dbPath)}; it is not cleared by a later ` +
       `successful start, so check the timestamp above before acting on it.`,
   );
 }
@@ -469,10 +469,13 @@ function inspectOrThrow(dbPath: string, dependencies: RecoveryCliDependencies): 
 async function runDoctor(options: DoctorOptions, dependencies: RecoveryCliDependencies): Promise<void> {
   const dbPath = path.resolve(dependencies.dbPath(options.dir));
   console.error(`store: ${dbPath}`);
-  // Read from the directory of the store being examined, NOT from a re-resolved project dir: with
-  // `--dir` in play those are different stores, and a record from the wrong one is worse than none.
-  const startupFailure = readStartupFailure(path.dirname(dbPath));
-  printStartupFailure(startupFailure, path.dirname(dbPath));
+  // Keyed on the store being examined — this exact `dbPath`, not its directory and not a
+  // re-resolved project dir. `--dir` makes those different stores, and the directory alone made
+  // them the SAME record: core's dev server keeps `monet-core.db` in this very directory, and
+  // reading by directory reported its failure as this store's (Codex round 1, PR #79). A record
+  // from the wrong database is worse than no record at all.
+  const startupFailure = readStartupFailure(dbPath);
+  printStartupFailure(startupFailure, dbPath);
   try {
     const inspection = inspectOrThrow(dbPath, dependencies);
     let provider: ProviderResult = { loadStatus: "not-checked" };
