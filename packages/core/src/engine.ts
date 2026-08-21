@@ -905,10 +905,15 @@ export interface IngestResult {
    * too: the caller named a live-looking circle and still landed in the attic.
    *
    * ANSWERED ON EVERY PATH THAT RETURNS A RESULT, `false` included — the write asked, under the
-   * reservation, and both answers are verdicts. An idempotency REPLAY rebuilds it from the concept's
-   * own circle (see getOperationResult) rather than storing a second copy, the same way
-   * `resolutionMode` is: a retry must be indistinguishable from the original call, and "not asked"
-   * on the retry of a call that was asked would be exactly the distinction receipts exist to erase.
+   * reservation, and both answers are verdicts.
+   *
+   * STORED ON THE RECEIPT, so an idempotency REPLAY returns the verdict the write recorded rather
+   * than a fresh reading of the circle (`ingest_operations.landed_in_archived_circle`; Codex round 1
+   * on #55). Archive state is mutable — unlike the immutable resolution event `resolutionMode` is
+   * safely rebuilt from — so re-deriving it flipped a retry's answer whenever the circle was
+   * archived or unarchived in between, breaking the "a repeated write returns its original result"
+   * contract. ABSENT, never `false`, on a receipt written before that column existed: no verdict was
+   * recorded there, and "not known" must not be answered with the reassuring one.
    */
   landedInArchivedCircle?: boolean;
 }
@@ -3435,6 +3440,26 @@ export class MonetCore {
         if (!message.includes("duplicate column name")) throw error;
       }
     }
+    // WAS THE DESTINATION ARCHIVED WHEN THIS WRITE LANDED (Codex round 1 on #55, finding 1) — the
+    // same PRODUCED-value lesson `rule_circle` records two blocks up, on the one axis where it bites
+    // hardest: archive state is MUTABLE, so re-deriving this at replay time from `circle_aliases`
+    // reported the circle's state NOW rather than the verdict the write recorded. Measured: store
+    // into a live circle, archive it, replay the same operationId — the flag flipped false→true, and
+    // unarchiving flipped it back. `resolutionMode` may be rebuilt from the substrate because a
+    // resolution event is immutable once written; this is not that kind of fact.
+    //
+    // NULLABLE ON PURPOSE, and read back as ABSENT rather than `false` (getOperationResult): a
+    // receipt written before this column existed recorded no verdict, and "not known" is not the
+    // same answer as "the destination was fine" — the one distinction this whole field exists to
+    // preserve. Same guarded-ALTER, same write site, same replay-read shape as the four columns above.
+    if (!operationCols.some((c) => c.name === "landed_in_archived_circle")) {
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN landed_in_archived_circle INTEGER`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
+    }
     // aliases: slugs/ids a concept ANSWERS TO after absorbing another on merge — so an asserted
     // reference to a merged-away slug (`supports: #old-slug`) still resolves to the survivor.
     const conceptCols = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
@@ -4704,12 +4729,20 @@ export class MonetCore {
       const returnScore = opts.resolution === "forceNew" ? (liveMatches[0]?.score ?? 0)
         : opts.attachTo ? cosine(emb, jsonToEmb(row.embedding))
         : autoScore;
+      // THE DISCLOSURE, FROZEN BY THE SAME RESERVATION AS THE WRITE (#55) — see IngestResult's own
+      // field for why it is asked here and not before the embed above, nor at the MCP layer after
+      // the call returns. Asked on EVERY resolution branch because all three land somewhere: an
+      // attach, a fork and a creation are equally invisible to store-wide recall in an archived
+      // circle, and a disclosure that fired on only one of them would be silent exactly where the
+      // caller had least reason to check. Computed BEFORE the receipt insert below, because the
+      // receipt has to record the verdict rather than let a replay re-derive it (Codex round 1).
+      const landedInArchivedCircle = this.isArchivedCircle(circle);
       if (opts.operationId) {
         this.db
           .prepare(
             `INSERT INTO ingest_operations
-               (operation_id, concept_id, observation_id, writer_domain, source_concept_id, action, score, near_match_id, near_match_score, contradiction_id, rule_previous_severity, rule_previous_circle, rule_circle, rule_severity)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (operation_id, concept_id, observation_id, writer_domain, source_concept_id, action, score, near_match_id, near_match_score, contradiction_id, rule_previous_severity, rule_previous_circle, rule_circle, rule_severity, landed_in_archived_circle)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             opts.operationId, row.id, obsId, receiptExpectation.domain,
@@ -4726,17 +4759,15 @@ export class MonetCore {
             // reports it directly), just never threaded into the receipt until now. Same
             // optional-chain-to-null shape as the three fields above it.
             ruleBindingChange?.severity ?? null,
+            // THE VERDICT THIS WRITE RECORDED, stored rather than re-derived at replay: archive
+            // state moves, so the only place this answer survives a later archive/unarchive is here.
+            // Written as 0/1 — a stored `0` is the verdict "the destination was live", which a NULL
+            // (no verdict recorded) must never be confused with.
+            landedInArchivedCircle ? 1 : 0,
           );
       }
 
       const proofToken = this.captureEmbeddingWidthProof(emb.length);
-      // THE DISCLOSURE, FROZEN BY THE SAME RESERVATION AS THE WRITE (#55) — see IngestResult's own
-      // field for why it is asked here and not before the embed above, nor at the MCP layer after
-      // the call returns. Asked on EVERY resolution branch because all three land somewhere: an
-      // attach, a fork and a creation are equally invisible to store-wide recall in an archived
-      // circle, and a disclosure that fired on only one of them would be silent exactly where the
-      // caller had least reason to check.
-      const landedInArchivedCircle = this.isArchivedCircle(circle);
       return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate, landedInArchivedCircle, proofToken };
     })();
 
@@ -17296,6 +17327,10 @@ export class MonetCore {
     const resolution = this.db
       .prepare(`SELECT mode FROM resolution_events WHERE observation_id = ?`)
       .get(operation.observation_id) as { mode: ResolutionMode } | undefined;
+    // Same cast-at-the-read shape `replayRuleOutcome` uses for its own migrated columns: the row
+    // type predates them, and a receipt from an older schema simply has nothing here.
+    const operationArchivedVerdict =
+      (operation as { landed_in_archived_circle?: number | null }).landed_in_archived_circle ?? null;
     return {
       action: operation.action,
       conceptId: operation.concept_id,
@@ -17307,14 +17342,18 @@ export class MonetCore {
         ? { nearMatchId: operation.near_match_id, nearMatchScore: operation.near_match_score ?? 0 }
         : {}),
       ...(resolution ? { resolutionMode: resolution.mode } : {}),
-      // REHYDRATED, NOT STORED — the same discipline `resolutionMode` follows just above, and for
-      // the same contract: a retry must be indistinguishable from the original call, so a caller
-      // branching on this field cannot be told "not asked" on the second call and `false` on the
-      // first. Read off the concept's own live circle rather than a second copy in the receipt,
-      // because that IS the question — where this memory sits now, and whether recall reaches it.
-      // No write reservation is owed here: a replay mutates nothing, so there is no instant of
-      // mutation for the answer to be frozen against.
-      landedInArchivedCircle: this.isArchivedCircle(row.circle),
+      // THE STORED VERDICT, NOT A FRESH READING OF THE CIRCLE (Codex round 1 on #55, finding 1).
+      // This is where `resolutionMode`'s rebuild-from-the-substrate discipline stops applying: a
+      // resolution event is immutable once written, so rebuilding it reproduces the original answer
+      // by construction, while archive state is a flag anyone can flip afterwards. Re-deriving this
+      // one made a retry report the circle's state NOW — measured flipping false→true across an
+      // `archiveCircle`, and back across an `unarchiveCircle` — which is precisely the "a repeated
+      // write returns its original result" contract receipts exist to hold.
+      //
+      // NULL IS "NO VERDICT RECORDED", NOT `false`: receipts written before this column existed
+      // never asked the question, and answering for them would invent the reassuring answer — the
+      // one direction this disclosure must never fail in.
+      ...(operationArchivedVerdict !== null ? { landedInArchivedCircle: operationArchivedVerdict === 1 } : {}),
       ...this.replayRuleOutcome(operation),
     };
   }

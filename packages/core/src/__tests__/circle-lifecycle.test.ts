@@ -606,6 +606,106 @@ describe("archiveCircle / unarchiveCircle", () => {
   });
 
   /**
+   * THE VERDICT SURVIVES A LATER ARCHIVE — BOTH DIRECTIONS (Codex round 1 on #55, finding 1). The
+   * first cut rebuilt this at replay time from `circle_aliases`, on the theory that `resolutionMode`
+   * is rebuilt the same way. The analogy breaks on mutability: a resolution event is immutable once
+   * written, so rebuilding it reproduces the original answer by construction, while archive state is
+   * a flag anyone can flip afterwards — so the retry answered "is this circle archived NOW" while
+   * the first call had answered "was it archived when the write landed". Measured before the fix:
+   * false→true across an archiveCircle, true→false across an unarchiveCircle.
+   */
+  it("keeps the WRITE-TIME verdict on a retry, across a later archive and a later unarchive", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+
+    // Written into a LIVE circle, archived afterwards: the retry must still say the destination was
+    // live, because that is what this operation did.
+    const live = await core.store("The invoice job runs on Sundays.", { circle: "proj", operationId: "op-A" });
+    expect(live.landedInArchivedCircle).toBe(false);
+    core.archiveCircle("proj");
+    const retryAfterArchive = await core.store("a completely different body", { circle: "proj", operationId: "op-A" });
+    expect(retryAfterArchive.landedInArchivedCircle).toBe(false);
+    expect(retryAfterArchive).toEqual(live);
+
+    // And the inverse, which is the direction that would have gone QUIET about a real disclosure.
+    core.archiveCircle("shelf");
+    const shelved = await core.store("Quarterly close checklist.", { circle: "shelf", operationId: "op-B" });
+    expect(shelved.landedInArchivedCircle).toBe(true);
+    core.unarchiveCircle("shelf");
+    const retryAfterUnarchive = await core.store("something else entirely", { circle: "shelf", operationId: "op-B" });
+    expect(retryAfterUnarchive.landedInArchivedCircle).toBe(true);
+    expect(retryAfterUnarchive).toEqual(shelved);
+
+    core.close();
+  });
+
+  /**
+   * A RECEIPT FROM BEFORE THE COLUMN RECORDED NO VERDICT, and must say so by staying absent. `false`
+   * would be the reassuring answer — "your write went somewhere recallable" — invented for a write
+   * nobody asked the question about, which is the one direction this disclosure must never fail in.
+   */
+  it("reports no verdict at all — not `false` — replaying a receipt that predates the stored column", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    core.archiveCircle("shelf");
+    const first = await core.store("Retention policy draft.", { circle: "shelf", operationId: "op-old" });
+    expect(first.landedInArchivedCircle).toBe(true);
+
+    // Exactly the row shape an older build would have left behind: every other receipt column
+    // present, this one never written.
+    const db = (core as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
+    db.prepare(`UPDATE ingest_operations SET landed_in_archived_circle = NULL WHERE operation_id = ?`).run("op-old");
+
+    const replay = await core.store("anything at all", { circle: "shelf", operationId: "op-old" });
+    expect(replay.conceptId).toBe(first.conceptId);
+    expect(replay).not.toHaveProperty("landedInArchivedCircle");
+
+    core.close();
+  });
+
+  /**
+   * THE ACKNOWLEDGEMENT NAMES THE CIRCLE THE WRITE REACHED (Codex round 1 on #55, finding 2). The
+   * envelope used to re-resolve the caller's own circle argument through LIVE alias state, so a
+   * rename committed between the write's commit and the envelope's construction renamed the circle
+   * out from under the sentence. It is sharpest here because renaming an archived circle also clears
+   * its archived flag: the old code printed "ARCHIVED CIRCLE: 'proj-renamed' is archived" about a
+   * circle that was, at that very moment, not archived at all — a frozen verdict wearing a live
+   * name. The boolean and the name it speaks of have to come from one instant.
+   */
+  it("names the circle the write reached, not a rename committed while the write was in flight", async () => {
+    const dbPath = tmpDbPath();
+    const a = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const b = new MonetCore(dbPath); // the competing writer: its own connection to the same file
+    await a.store("Deployment runbook for the billing service.", { circle: "proj" });
+    a.archiveCircle("proj");
+
+    type Storer = { store(content: string, opts: Record<string, unknown>): Promise<{ concept: { circle: string } }> };
+    const original = (Object.getPrototypeOf(a) as Storer).store;
+    let raced = false;
+    const spy = vi.spyOn(a as unknown as Storer, "store").mockImplementation(async (content, opts) => {
+      const result = await original.call(a as unknown as Storer, content, opts);
+      if (!raced) {
+        raced = true;
+        b.renameCircle("proj", "proj-renamed"); // a real commit, after the write, before the envelope
+      }
+      return result;
+    });
+
+    const { client, cleanup } = await makeMcpPair(a);
+    try {
+      const ack = await storeOverMcp(client, { content: "Runbook step two for billing.", circle: "proj" });
+      expect(raced).toBe(true);
+      // Frozen: the write landed in 'proj'. `scope('proj')` would now answer 'proj-renamed'.
+      expect(a.resolveCircleName("proj")).toBe("proj-renamed");
+      expect(ack.circle).toBe("proj");
+      expect(ack.guidance).toContain("'proj'");
+      expect(ack.guidance).not.toContain("proj-renamed");
+    } finally {
+      spy.mockRestore();
+      await cleanup();
+      b.close();
+    }
+  });
+
+  /**
    * THE WIRE. The engine flag exists to reach the storing agent on the turn it stores, so the
    * acknowledgement is where the fix is actually delivered — and it stays absent on the ordinary
    * write, because a key repeating "not archived" forever is payload with no reader.

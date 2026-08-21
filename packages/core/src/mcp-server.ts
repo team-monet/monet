@@ -1101,8 +1101,17 @@ export function registerMonetCoreTools(
         });
         const anomalousResolution = r.resolutionMode !== undefined &&
           ANOMALOUS_STORE_RESOLUTION_MODES.has(r.resolutionMode);
+        // THE DESTINATION THIS WRITE ACTUALLY REACHED, read off the result instead of re-resolving
+        // the caller's argument here (Codex round 1 on #55, finding 2). `scope()` consults live
+        // alias state, so a rename committed by a second connection between core.store()'s commit
+        // and this line — one .monet file shared by the MCP server and a monet CLI call is a
+        // supported topology, storage.ts — made the acknowledgement name the rename's target while
+        // the write had landed in the old circle. That mattered most in the disclosure below, where
+        // the sentence would have attached a frozen verdict to a circle it was never about: the
+        // boolean and the name it speaks of have to come from the same instant.
+        const landedCircle = r.concept.circle;
         const envelope = {
-          circle: scope(circle), // the circle these ids live in — pass it to id-based tools if it isn't your session default
+          circle: landedCircle, // the circle these ids live in — pass it to id-based tools if it isn't your session default
           action: r.action,
           conceptId: r.conceptId,
           ...(anomalousResolution
@@ -1140,7 +1149,7 @@ export function registerMonetCoreTools(
           ...(r.landedInArchivedCircle
             ? {
               guidance:
-                `ARCHIVED CIRCLE: '${scope(circle)}' is archived. This memory is stored and can be ` +
+                `ARCHIVED CIRCLE: '${landedCircle}' is archived. This memory is stored and can be ` +
                 `read back by naming that circle, but it stays out of store-wide recall, the ` +
                 `overview and the default circle list. Unarchive the circle with ` +
                 `memory_circle_manage to put it back in default recall.`,
