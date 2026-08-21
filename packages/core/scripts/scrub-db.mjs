@@ -931,6 +931,62 @@ function scrubConceptsAndObservations(db) {
   });
   scrubObsTx(obsRows);
 
+  /*
+   * ROUND 6, K1: governed_moments.action_rendering.
+   *
+   * WHAT THIS COLUMN HOLDS, so nobody later reads this as an over-cautious scrub of an innocent
+   * field: it is a bounded rendering of the REAL COMMAND LINE an agent was about to run, captured by
+   * the gate hook at the instant of interception. On a developer's machine that is routinely an
+   * absolute home path, a repository path, a branch name, a hostname, or whatever else happened to
+   * be on the command line — the closure test's own fixture value is
+   * `cd /Users/dev/code/monet-core && git push --force  # jane.doe@example.com`, and it tripped both
+   * the /Users/-path and the email pattern classes at once. This is the most privacy-sensitive
+   * column in the governed-moment tables and the reason it is here is empirical, not precautionary.
+   *
+   * SCRUBBED, NOT EXCLUDED, and the difference is the whole point. Dropping these tables from the
+   * walk — or deleting their rows — would make the closure test green again without making the file
+   * safe, which is the same unfalsifiable green this clause exists to end, relocated one table over.
+   * The rows stay, the identity stays (action_sha256 is a digest and carries no text), and only the
+   * rendered text is put through the same scrubString every other free-text column goes through.
+   *
+   * NOT DELETED WHOLESALE the way observation_segments is, because these rows are not a derived
+   * index: each one is the only record that a governed moment happened, and the sequence they carry
+   * is what proves the record is complete. Deleting them would destroy evidence rather than an
+   * index that can be rebuilt.
+   *
+   * GUARDED, like the two DELETEs above: scrubSizeDb copies a file and opens it directly without
+   * running MonetCore.init(), so a snapshot taken before the governed-moment tables existed has
+   * neither, and an unconditional UPDATE would abort the whole scrub. Older corpora must stay
+   * scrubbable.
+   *
+   * The OTHER moment tables carry no free text a scrub can act on — moment_runs holds a writer role
+   * and a timestamp, moment_losses holds sequence coordinates and digests, moment_fold_cursor holds
+   * one integer, and moment_reads holds two sequence coordinates plus two id columns (a moment id,
+   * which is a UUID this system minted, and a stage id, which is a registry key) — so there is
+   * nothing in them a scrub pattern can match.
+   * That is an observation about today's schema, not a standing exemption: the closure test walks
+   * every TEXT column of every table at runtime and will say so if that ever stops being true.
+   */
+  let actionRenderingHits = 0;
+  let momentRowCount = 0;
+  if (hasTable("governed_moments")) {
+    const momentRows = db.prepare(`SELECT moment_id, action_rendering FROM governed_moments ORDER BY moment_id`).all();
+    momentRowCount = momentRows.length;
+    const updateMoment = db.prepare(`UPDATE governed_moments SET action_rendering = ? WHERE moment_id = ?`);
+    const scrubMomentsTx = db.transaction((rows) => {
+      for (const row of rows) {
+        // NULL is a value here — it means the interceptor never observed an action (an ungoverned
+        // moment, a store-side call) — and it must survive as NULL rather than becoming a string.
+        if (row.action_rendering === null) continue;
+        const scrubbed = scrubString(row.action_rendering);
+        if (scrubbed !== row.action_rendering) actionRenderingHits += 1;
+        updateMoment.run(scrubbed, row.moment_id);
+      }
+    });
+    scrubMomentsTx(momentRows);
+  }
+
+
   return {
     conceptCount: conceptRows.length,
     observationCount: obsRows.length,
@@ -942,6 +998,12 @@ function scrubConceptsAndObservations(db) {
     conceptRefsHits,
     obsRefsHits,
     agentIdHits,
+    // REPORTED, NOT MERELY COUNTED. An operator who cannot see whether any moment rows were
+    // present — or whether any needed scrubbing — gets the same unfalsifiable green the
+    // comment above this scrub warns about: silence that means "clean" and silence that
+    // means "never looked" are indistinguishable without a number.
+    momentRowCount,
+    actionRenderingHits,
   };
 }
 
@@ -2142,6 +2204,7 @@ function main() {
         `aliasesCleared=${stats.aliases.aliasesCleared} ` +
         `observations=${stats.concepts.observationCount} ` +
         `(content:${stats.concepts.contentHits} kind:${stats.concepts.obsKindHits} source_refs:${stats.concepts.obsRefsHits} agentId:${stats.concepts.agentIdHits}) ` +
+        `governedMoments=${stats.concepts.momentRowCount} (actionRendering:${stats.concepts.actionRenderingHits}) ` +
         `contradictions=${stats.contradictions.contradictionCount} (detail:${stats.contradictions.detailHits} ` +
         `resolvedBy:${stats.futureProofed.resolvedByHits}) ` +
         `entities=${stats.entities.entityCount} (surface:${stats.entities.surfaceHits} key:${stats.entities.keyHits} ` +

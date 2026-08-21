@@ -108,21 +108,31 @@ describe("overview composition + invariants", () => {
 
   it("keeps gate aggregates and emits actionable exceptions only when present", async () => {
     const c = core({ runtimeModelTag: "current" });
-    const clean = c.overview("default").gateStats as Record<string, unknown>;
+    const clean = c.overview("default").gate as unknown as Record<string, unknown>;
+    // The counts, the four conformance states, and what the record knows it is missing — and
+    // nothing else until there is something actionable to say.
     expect(Object.keys(clean).sort()).toEqual([
-      "delivered", "fires", "overflows", "silences", "total", "windowDays", "windowTotal",
+      "conformance", "delivered", "fires", "losses", "silences", "total", "unattributed",
+      "ungoverned", "unopened",
     ].sort());
+    // `unopened` is its own key BY DESIGN (F3): debris is excluded from every rate, and excluding
+    // it must not make it invisible — a swallowed interception is a real loss.
+    // `ungoverned` is NOT a rename of `overflows`: it is wider, and it is its own number precisely
+    // so a moment nothing evaluated cannot be read as a silence.
+    expect(clean).not.toHaveProperty("overflows");
     expect(clean).not.toHaveProperty("byStage");
-    expect(clean).not.toHaveProperty("byMatcher");
     expect(clean).not.toHaveProperty("unverifiedPatterns");
-    expect(clean).not.toHaveProperty("malformedPatterns");
+    // The two pending states are separate keys and are never summed into one.
+    const conformance = clean.conformance as Record<string, unknown>;
+    expect(conformance).toHaveProperty("unanswered");
+    expect(conformance).toHaveProperty("notAsked");
 
     await c.store("Retire this old-model rule.", {
       kind: "rule", resolution: "forceNew",
       rule: { stage: "old stage", scope: "agent", modelTag: "old" },
     });
-    expect(c.overview("default").gateStats.retirementCandidates).toHaveLength(1);
-    expect(c.overview("default").gateStats).not.toHaveProperty("unexplainedDenies");
+    expect(c.overview("default").gate.retirementCandidates).toHaveLength(1);
+    expect(c.overview("default").gate).not.toHaveProperty("unexplainedDenies");
     c.close();
   });
 
@@ -187,9 +197,9 @@ describe("overview composition + invariants", () => {
       });
     }
     const overview = c.overview("default");
-    expect(overview.gateStats.retirementCandidates).toHaveLength(OVERVIEW_EXCEPTION_LIMIT);
-    expect(overview.gateStats.retirementCandidatesOmitted).toBe(3);
-    expect(c.gateStats("default").retirementCandidates).toHaveLength(OVERVIEW_EXCEPTION_LIMIT + 3);
+    expect(overview.gate.retirementCandidates).toHaveLength(OVERVIEW_EXCEPTION_LIMIT);
+    expect(overview.gate.retirementCandidatesOmitted).toBe(3);
+    expect(c.gateCoverage("default").retirementCandidates).toHaveLength(OVERVIEW_EXCEPTION_LIMIT + 3);
     c.close();
   });
 

@@ -1,0 +1,843 @@
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, fstatSync, mkdirSync, openSync, readSync, writeSync } from "node:fs";
+import { dirname } from "node:path";
+
+/**
+ * The moment spool — the append-only side of the governed-moment record.
+ *
+ * THE UNIT IS A GOVERNED MOMENT: an instant where an agent is about to act and the gate has
+ * jurisdiction over that act. One moment, one id, one row that accumulates its life. Everything in
+ * this file exists to get that life onto disk without ever putting the store on the critical path
+ * of the act being recorded.
+ *
+ * WHY A FILE AND NOT THE DATABASE. The busiest writer is a standalone host hook that runs before
+ * any decision to open a store, and holding a database handle and waiting on the process that holds
+ * one cost the same. An append to a file is the only sink that never blocks, depends on no other
+ * process being alive, and cannot silently drop. This is a boundary, not a preference: do not
+ * "improve" the append into an IPC call, a queue, or a store write.
+ *
+ * WHY EVERY WRITE FAILURE IS SWALLOWED, AND WHY THAT IS SAFE HERE. Recording is a duty this process
+ * owes the record, never one it owes the user's action — instrumentation must not fail a tool call.
+ * The old gate journal swallowed exactly the same way and left no trace at all, which is the defect
+ * this module closes: every append carries a per-run sequence number, so a swallowed write becomes a
+ * HOLE the fold can name later ("run R is missing seq 41-43") rather than a file that is merely
+ * shorter than the truth. The sequence is what buys the right to keep swallowing.
+ *
+ * THE LIMIT OF THAT GUARANTEE, STATED SO NOBODY ASSUMES IT IS TOTAL. Sequencing proves completeness
+ * WITHIN a run. It cannot detect a run whose records vanished entirely — nothing outside the spool
+ * declares that a run existed, so a run that never landed a single byte is indistinguishable from a
+ * run that never started. Closing that would need a second, independently-written witness of run
+ * starts, which is a different mechanism with its own failure modes. It is not built, and the gap
+ * report must never be read as "these are all the records that were lost".
+ *
+ * ORDER ON DISK IS NOT SEMANTIC. The fold keys on `momentId` and on (run, seq); nothing reads the
+ * file's line order. That is what makes re-folding any range harmless, and what lets an attachment
+ * be folded before the interception it belongs to. It is a property to preserve rather than an
+ * accident.
+ *
+ * NEVER SYNCED, NEVER SEARCHED, NEVER DELIVERED. Local instrumentation, for the same reason
+ * `gate_events` is excluded from sync (`sync-types.ts`): replicating a local action stream merges
+ * two machines' timelines and makes every rate computed from it a lie.
+ */
+
+/**
+ * Which writer produced a run. A closed roster rather than a free string, so the ledger's
+ * `writer_role` column has a vocabulary two writers cannot spell differently — the same discipline
+ * `GateJournalMouth` holds. A new writer adds a member here; it does not invent a name at the call
+ * site.
+ *
+ * Note that the roster is descriptive, not load-bearing for completeness: sequence holes are found
+ * per `runId`, which is unique per process lifetime regardless of role.
+ */
+export type MomentWriterRole =
+  /** The generated host hook. Runs on every intercepted tool call, opens no store. */
+  | "host-hook"
+  /** The `monet gate` command, invoked by a host that shells out rather than hooking in. */
+  | "gate-cli"
+  /** In-process interception inside core itself (calls into the store, and the MCP surface). */
+  | "core";
+
+/**
+ * What the gate did with the moment.
+ *
+ * `ungoverned` is the one that is easy to omit and must not be: a surface that cannot be
+ * intercepted is recorded as ungoverned, never left out. An absent record and an uninterceptable
+ * surface are the two states this whole rebuild exists to separate.
+ *
+ * `silent` is a value, not an absence. A moment where nothing fired is a written record with
+ * `ruleIds: []`.
+ */
+export type MomentDisposition = "blocked" | "advised" | "silent" | "ungoverned";
+
+/** The user's answer to "did the action follow the rule?". Only a user produces this. */
+export type MomentAnswer = "followed" | "not-followed";
+
+/*
+ * A TRUE STATEMENT ABOUT THIS HOST, established by running it rather than by reading its docs.
+ *
+ * ON CLAUDE CODE, A PreToolUse ADVISORY REACHES THE MODEL BESIDE THE TOOL RESULT, NOT BEFORE IT.
+ * `additionalContext` is delivered "next to the tool result", and the wrapper emits no
+ * `permissionDecision`, so the call proceeds while the advisory rides alongside it.
+ *
+ * WHAT THAT COSTS THE MEASUREMENT, and it is structural rather than a defect to fix: the
+ * `stage_lookup` an advisory prompts CANNOT precede the act it was about. Fact 3 is strictly "the
+ * agent read it BEFORE acting", so for every advisory on this host Fact 3 is correctly FALSE. Those
+ * moments are not failures of delivery and not agents ignoring a rule — the agent goes and reads it,
+ * just after the fact. They are recorded in `late_rule_reads` and surfaced as `readLate`.
+ *
+ * A DENY IS THE OPPOSITE and is where Received is genuinely true: the deny lands before the action,
+ * the agent reads the rule, and only then retries. But a denied action never runs, so no outcome
+ * ever arrives, and the retry opens a NEW moment with no link back to the one that blocked it. So
+ * the deny path — the only path where Received is real — cannot reach Conformed at all today. That
+ * gap is tracked as its own issue, not papered over here.
+ *
+ * WHY IT IS WRITTEN HERE. It is a property of the HOST's hook contract, not of the gate, which is
+ * host-agnostic by design; a preflight caller of the same gate would make it false. It lives beside
+ * the record shape because that is where the next reader forms a belief about what Fact 3 means,
+ * and it was expensive to learn: it took driving the real wrapper end to end for both paths.
+ */
+
+
+/**
+ * Schema version of a spool line. Bumped only when an EXISTING field changes meaning — adding a
+ * field does not bump it, because a reader that does not know a field simply does not read it,
+ * whereas a reader that misreads a field it thinks it knows writes a wrong record.
+ */
+export const MOMENT_SPOOL_FORMAT = 1;
+
+/**
+ * The spool filename. Deliberately NOT `gate-journal.jsonl`: the old journal records evaluation
+ * events and this one records governed moments, and one file holding two units is a file whose
+ * counts mean nothing. They coexist until the old journal is removed.
+ */
+export const MOMENT_SPOOL_FILENAME = "moments.jsonl";
+
+/**
+ * How much of an action a spool line may carry verbatim.
+ *
+ * FOUND BY MEASUREMENT, not foresight, and the measurement was taken on THIS population: the gate
+ * journal's first build recorded the intercepted action in full and a real run produced a single
+ * 12 MB line, because the overflow disposition exists precisely FOR enormous actions — so the one
+ * case guaranteed to carry a monster payload was the one writing it to disk verbatim. The
+ * population here is the same (actions intercepted at the host) and the failure mode is the same
+ * (a line-at-a-time reader choking, a file growing without bound), so the bound carries. If the
+ * population changes — a new surface whose actions are routinely larger — re-derive it there rather
+ * than assuming this number travelled.
+ *
+ * 2 KiB is far past any action a human reads back in curation and far under anything that threatens
+ * the file.
+ */
+export const MOMENT_ACTION_RENDERING_MAX_CHARS = 2048;
+
+/**
+ * Mints a moment id.
+ *
+ * WITHOUT THE STORE, ALWAYS. The agent references a moment id before the database has ever seen
+ * that moment — the id travels out with the delivered rule and comes back on a read, an ask and an
+ * answer — so it cannot be an autoincrement key, and it cannot wait on a write. A v4 UUID is unique
+ * with no coordination, which is the only property required of it.
+ */
+export function mintMomentId(): string {
+  return randomUUID();
+}
+
+/**
+ * A writer's run: one process lifetime of one role.
+ *
+ * `seq` is the NEXT sequence number this run will use, and it is consumed before the write is
+ * attempted, never after — a consumed-but-unwritten number is exactly the hole the fold must be
+ * able to name, and incrementing only on success would hide the failures this design exists to
+ * surface.
+ *
+ * `path === null` is the disabled sink and the DEFAULT everywhere it is plumbed, matching the gate
+ * sidecar's and the gate journal's own discipline: with a default path, every core ever constructed
+ * — tests, evals, one-off scripts — would append into the user's real store.
+ */
+export interface MomentRun {
+  readonly path: string | null;
+  readonly writerRole: MomentWriterRole;
+  readonly runId: string;
+  seq: number;
+}
+
+/** A line as it sits on disk, once parsed and recognised. */
+export type MomentSpoolRecord =
+  | ({ kind: "run-start"; writerRole: MomentWriterRole; at: string } & MomentSpoolEnvelope)
+  | ({ kind: "interception" } & MomentInterceptionFields & MomentSpoolEnvelope)
+  | ({
+      kind: "read";
+      /**
+       * `null` when the agent read a rule without naming the moment that prompted it. Recorded
+       * anyway — a read that cannot be joined is a known state, not an error, and it is the only
+       * thing that separates "delivery never named its moment" from "the agent never read".
+       */
+      momentId: string | null;
+      /**
+       * `null` when the lookup returned no rules at all — a stage-name miss, or a stage matched with
+       * nothing live bound to it. The READ still happened and is still recorded: the attempt is the
+       * numerator a recognition rate needs, and dropping it would corrupt exactly that count.
+       */
+      ruleId: string | null;
+      /**
+       * The stage the AGENT NAMED when it asked — a different fact from the stage the GATE MATCHED,
+       * which lives on the interception as `stageId`. Both exist because they answer different
+       * questions and can disagree in the same call: the gate matches a trigger pattern against an
+       * action, while the agent names a stage it believes it is acting at.
+       *
+       * IT LIVES ON THE READ, NOT ON THE MOMENT, because that is where the naming happened. A
+       * `stage_lookup` reached from `agent_context` has no moment behind it at all, and without this
+       * field that read would carry no stage attribution whatsoever — the agent plainly named a
+       * stage and the record would not say which.
+       *
+       * `null` when the caller named nothing this build could resolve to a stage.
+       */
+      namedStageId: string | null;
+      /**
+       * The circle the LOOKUP was scoped to, or `null` on a line written before this field existed.
+       *
+       * ON THE READ, not inferred from the moment, because a read does not always have a moment: a
+       * `stage_lookup` reached from `agent_context` names no moment at all, and joining through
+       * `governed_moments` to find a circle would drop exactly those reads from a circle's coverage
+       * map — turning "this stage was looked up in another project" into "nobody has ever looked
+       * this stage up", which is the misreport the map exists to prevent.
+       */
+      circle: string | null;
+      readAt: string;
+    } & MomentSpoolEnvelope)
+  | ({
+      kind: "outcome";
+      /** Set when the writer knows the moment it is closing — the store closing its own moment. */
+      momentId: string | null;
+      /** Set instead when the writer is a separate process that only knows the host's tool call. */
+      toolUseId: string | null;
+      /**
+       * Whether the act SUCCEEDED — `"ok"`, `"failed"`, or `null` for not observed.
+       *
+       * WHY IT IS ITS OWN FIELD AND NOT INFERRED FROM THE DIGEST. The digest is identity, not
+       * meaning: two moments over the same command differ only by an opaque hash, so a push that
+       * landed and a push the remote rejected read identically — including in the ask backlog, where
+       * a user would be asked whether a push that never landed followed the rule with nothing on the
+       * record saying it never landed.
+       *
+       * Before failed calls were closed at all, a failure was distinguishable by the ABSENCE of an
+       * outcome. Closing them removed that signal, so the fact the interceptor already holds — which
+       * of the host's two closing events fired — is written down instead of discarded.
+       *
+       * `null` IS HONEST AND COMMON: a store-side moment closes itself with no host event behind it,
+       * and every record written before this field existed carries null too. Not observed is not
+       * "succeeded".
+       */
+      outcomeStatus: "ok" | "failed" | null;
+      outcomeAt: string;
+      outcomeSha256: string;
+    } & MomentSpoolEnvelope)
+  | ({ kind: "ask"; momentId: string; askedAt: string } & MomentSpoolEnvelope)
+  | ({ kind: "answer"; momentId: string; answer: MomentAnswer; answeredAt: string } & MomentSpoolEnvelope);
+
+/** What every line carries, whatever it says. */
+export interface MomentSpoolEnvelope {
+  v: number;
+  runId: string;
+  seq: number;
+}
+
+/** The interception record's own fields, as they sit on disk. */
+export interface MomentInterceptionFields {
+  momentId: string;
+  at: string;
+  /**
+   * The host's own id for the tool call this moment governs, or `null` when there is no host tool
+   * call at all (a moment the store opens on itself).
+   *
+   * WHY IT IS RECORDED AND WHAT IT IS NOT. The outcome of a host tool call is reported by a SECOND
+   * hook process that never saw this moment's id — the two events share only the host's
+   * `tool_use_id`. Recording it here is what lets the fold join the outcome back to this moment
+   * later, at no cost on the interceptor's critical path.
+   *
+   * It is NOT the moment id and must never become one. It identifies a TOOL CALL, not a governed
+   * moment: store-side moments have none, so adopting it as identity would break "one record shape
+   * for every interception point" at the first slice that has two of them. The interceptor mints
+   * the moment id (invariant 07); this is a foreign key to the host's world.
+   *
+   * The host documents it as nullable (`str | None` / `string | undefined`,
+   * https://code.claude.com/docs/en/agent-sdk/hooks, "Callback functions -> Inputs"), so absence is
+   * a real case: that moment simply closes with its outcome never observed.
+   */
+  toolUseId: string | null;
+  /**
+   * The circle this moment was governed under, or `null` when nothing resolved one.
+   *
+   * ON THE RECORD, NOT ON THE QUERY, and that is forced rather than chosen. The spool is home-level
+   * and shared, so every project's store folds every project's moments — a query cannot filter on a
+   * field the record does not carry, and without this an overview for one circle reported another
+   * circle's fires, silences, deliveries and conformance debt, across project boundaries.
+   *
+   * `null` is a real and common value: the gate can fail before resolving a circle, and a hook with
+   * no pinned circle never had one. It is never guessed at, and a reader counts those separately
+   * rather than folding them into whichever circle happened to ask.
+   */
+  circle: string | null;
+  /**
+   * `null` means NOT KNOWN — the writer had no session identity to record. It never means "no
+   * session". A record that cannot tell those apart is the failure this rebuild exists to end, so
+   * the field is required and explicitly nullable rather than optional.
+   */
+  sessionId: string | null;
+  /**
+   * The tool surface. `null` when the payload naming it could not be read at all — an unparseable
+   * or truncated hook envelope. Not knowing which surface arrived is a different fact from knowing
+   * it was some particular one, and only one of those two can be recorded honestly.
+   */
+  surface: string | null;
+  /**
+   * The action, by identity and by bounded rendering. ALL FOUR ARE NULL TOGETHER when the action
+   * itself was never legible — an envelope this process could not parse carries no action to hash.
+   * A zero-length rendering with a hash of the empty string would be a fabricated observation of an
+   * action nobody saw.
+   */
+  actionSha256: string | null;
+  actionRendering: string | null;
+  /** Length of the WHOLE action, so a clipped rendering still reports what it is a prefix of. */
+  actionChars: number | null;
+  actionClipped: boolean | null;
+  /** `null` when no stage matched. Distinct from a stage whose id is unknown, which cannot occur. */
+  stageId: string | null;
+  /**
+   * `[]` is a VALUE: the gate looked and nothing was bound. `null` is NOT KNOWN: nothing evaluated
+   * this moment at all, which is what an `ungoverned` disposition means. Collapsing the two would
+   * report "no rule governs this action" for an action no rule set was ever consulted about — the
+   * exact substitution of a verdict for an absence this record exists to prevent.
+   */
+  ruleIds: string[] | null;
+  disposition: MomentDisposition;
+  /** Same two states: `[]` is "nothing was delivered", `null` is "delivery never happened". */
+  deliveredRuleIds: string[] | null;
+}
+
+/** What a caller supplies at interception; the spool derives the hash and the bounded rendering. */
+export interface MomentInterception {
+  momentId: string;
+  at: string;
+  /** The host's tool-call id, or null when no host tool call is in play. See the field above. */
+  toolUseId: string | null;
+  /** The circle this moment was governed under, or null when nothing resolved one. */
+  circle: string | null;
+  sessionId: string | null;
+  surface: string | null;
+  /** The raw action, or `null` when this interceptor never had a legible one. See `renderAction`. */
+  action: string | null;
+  stageId: string | null;
+  ruleIds: string[] | null;
+  disposition: MomentDisposition;
+  deliveredRuleIds: string[] | null;
+}
+
+/**
+ * Derives an action's identity and its bounded rendering in ONE place, so two writers cannot
+ * describe the same action differently and later fail to correlate.
+ *
+ * THE HASH IS ALWAYS COMPUTED, including for short actions, and that is a change from the gate
+ * journal's hash-only-when-clipped rule. The reason that rule existed was cost, and the cost was
+ * measured rather than assumed: sha256 over this population is 0.4 us at 64 and 256 chars, 0.9 us at
+ * 2 KiB and 21 us at 64 KiB (Node 25, Apple silicon, mean of 20k iterations). At the small end that
+ * is invisible beside the file append it accompanies, and at the large end it is a rounding error
+ * beside the payload itself. Identity is worth more than 0.4 us: the hash is how an outcome is
+ * matched to the action that produced it, and how two moments over the same action are provably the
+ * same action once the rendering has been clipped.
+ */
+export function renderAction(action: string | null): {
+  actionSha256: string | null;
+  actionRendering: string | null;
+  actionChars: number | null;
+  actionClipped: boolean | null;
+} {
+  // NO ACTION MEANS NO OBSERVATION OF ONE. Every field goes null together rather than reporting a
+  // hash of "" and a length of 0, which would read downstream as a real, empty action.
+  if (action === null) {
+    return { actionSha256: null, actionRendering: null, actionChars: null, actionClipped: null };
+  }
+  const clipped = action.length > MOMENT_ACTION_RENDERING_MAX_CHARS;
+  return {
+    actionSha256: createHash("sha256").update(action).digest("hex"),
+    actionRendering: clipped ? action.slice(0, MOMENT_ACTION_RENDERING_MAX_CHARS) : action,
+    actionChars: action.length,
+    actionClipped: clipped,
+  };
+}
+
+/** The same derivation for what the tool returned. Outcomes are recorded by identity, never whole. */
+export function outcomeSha256(outcome: string): string {
+  return createHash("sha256").update(outcome).digest("hex");
+}
+
+/**
+ * The single append. Consumes a sequence number, then writes one line — `openSync(path,"a",0o600)`,
+ * `writeSync`, `closeSync`, nothing else. Every failure is swallowed, deliberately and without
+ * exception; see this module's header for why that is safe only because the sequence is consumed
+ * first.
+ *
+ * The descriptor is closed in a `finally` rather than after the write: a throw between open and
+ * close (a full disk, an unserializable field) would otherwise leak one descriptor per append until
+ * the process hits its limit, at which point optional instrumentation starts breaking operations
+ * that have nothing to do with it.
+ */
+export function appendMomentRecord(run: MomentRun, body: Record<string, unknown>): void {
+  const seq = run.seq;
+  run.seq = seq + 1;
+  if (run.path === null) return;
+  try {
+    const line = `${JSON.stringify({ v: MOMENT_SPOOL_FORMAT, runId: run.runId, seq, ...body })}\n`;
+    // THE DIRECTORY MAY NOT EXIST, and until this call it was assumed to. The spool resolves to
+    // `$MONET_STORAGE_DIR` else `~/.monet` — home-level by construction, because the hook wrapper
+    // can import nothing and must agree with this file on one path. But a project-local `.monet`
+    // store is a supported configuration, and a user who has only ever had one may have no
+    // `~/.monet` at all: every append then failed ENOENT into the catch below, and every read saw
+    // an absent file and reported the ordinary pre-first-append state. Recording was silently off
+    // for a whole supported shape — the precise conflation between "nothing happened" and "nothing
+    // was recorded" this subsystem exists to end, sitting inside the subsystem itself.
+    mkdirSync(dirname(run.path), { recursive: true });
+    const fd = openSync(run.path, "a", 0o600);
+    try {
+      writeSync(fd, line);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // Intentionally total. The hole this leaves is the record.
+  }
+}
+
+/**
+ * Opens a run and declares it on the spool.
+ *
+ * The run-start record IS seq 0 rather than an unnumbered preamble, so it sits inside the sequence
+ * it declares: if the run-start append is the one that fails, the fold reports run R missing seq 0
+ * instead of silently learning nothing about the run's role. A run's sequence therefore always
+ * begins at 0, whether or not its declaration survived.
+ */
+export function startMomentRun(path: string | null, writerRole: MomentWriterRole): MomentRun {
+  const run: MomentRun = { path, writerRole, runId: randomUUID(), seq: 0 };
+  appendMomentRecord(run, { kind: "run-start", writerRole, at: new Date().toISOString() });
+  return run;
+}
+
+/** The interception record — the one that opens a moment. Every other record attaches to it. */
+export function spoolInterception(run: MomentRun, moment: MomentInterception): void {
+  appendMomentRecord(run, {
+    kind: "interception",
+    momentId: moment.momentId,
+    at: moment.at,
+    toolUseId: moment.toolUseId,
+    circle: moment.circle,
+    sessionId: moment.sessionId,
+    surface: moment.surface,
+    ...renderAction(moment.action),
+    stageId: moment.stageId,
+    ruleIds: moment.ruleIds,
+    disposition: moment.disposition,
+    deliveredRuleIds: moment.deliveredRuleIds,
+  });
+}
+
+/**
+ * The agent read a delivered rule. One record per rule, because receipt is a property of one
+ * (moment, rule) pair — a count of reads over a count of deliveries is the ratio of two unrelated
+ * totals, which is what this design replaces.
+ */
+export function spoolRuleRead(
+  run: MomentRun,
+  fields: {
+    momentId: string | null;
+    ruleId: string | null;
+    namedStageId: string | null;
+    circle: string | null;
+    readAt?: string;
+  },
+): void {
+  appendMomentRecord(run, {
+    kind: "read",
+    momentId: fields.momentId,
+    ruleId: fields.ruleId,
+    namedStageId: fields.namedStageId,
+    circle: fields.circle,
+    readAt: fields.readAt ?? new Date().toISOString(),
+  });
+}
+
+/**
+ * The tool returned.
+ *
+ * TWO KEYS, AND THE CALLER STATES BOTH. A writer that owns the moment (the store, closing a moment
+ * it opened in the same process) names `momentId` and the fold applies it directly. A writer that
+ * does not — the host's PostToolUse hook, a fresh process with no memory of the PreToolUse that
+ * opened the moment — names `toolUseId` instead, and the fold resolves it against the interception
+ * that recorded the same tool call. Neither is inferred from the other and neither is optional in
+ * the type, because "which key is this outcome carrying" is exactly the thing a reader must not
+ * have to guess.
+ */
+export function spoolOutcome(
+  run: MomentRun,
+  fields: {
+    momentId: string | null;
+    toolUseId: string | null;
+    outcome: string;
+    /** `null` when this writer has no host event behind it to say. Never a stand-in for "ok". */
+    outcomeStatus: "ok" | "failed" | null;
+    outcomeAt?: string;
+  },
+): void {
+  appendMomentRecord(run, {
+    kind: "outcome",
+    momentId: fields.momentId,
+    toolUseId: fields.toolUseId,
+    outcomeStatus: fields.outcomeStatus,
+    outcomeAt: fields.outcomeAt ?? new Date().toISOString(),
+    outcomeSha256: outcomeSha256(fields.outcome),
+  });
+}
+
+/**
+ * The agent asked the user whether the action followed the rule.
+ *
+ * Asking is itself an event, not a judgment — which is what stops the regress: nothing needs to
+ * judge whether the meta-rule was obeyed, because "did it ask" is read off the record. It is also
+ * what separates `unanswered` (a queue the user owes) from `not asked` (a defect the agent owes).
+ */
+export function spoolAsk(run: MomentRun, fields: { momentId: string; askedAt?: string }): void {
+  appendMomentRecord(run, {
+    kind: "ask",
+    momentId: fields.momentId,
+    askedAt: fields.askedAt ?? new Date().toISOString(),
+  });
+}
+
+/**
+ * The user answered.
+ *
+ * This is the raw spool append and it performs NO existence check — the check that an answer
+ * attaches and never creates lives at the store-backed entry point (`attachMomentAnswer` in
+ * moment-ledger.ts), because it is the only place that can see whether the moment exists. Callers
+ * holding a store must go through that one.
+ */
+export function spoolAnswer(
+  run: MomentRun,
+  fields: { momentId: string; answer: MomentAnswer; answeredAt?: string },
+): void {
+  appendMomentRecord(run, {
+    kind: "answer",
+    momentId: fields.momentId,
+    answer: fields.answer,
+    answeredAt: fields.answeredAt ?? new Date().toISOString(),
+  });
+}
+
+/** What one read of the spool produced. */
+export interface MomentSpoolRead {
+  records: MomentSpoolRecord[];
+  /**
+   * Lines this build could not parse or recognise. Not silently dropped and not fatal: a garbage
+   * line must never stop the fold, and it is not lost from the record either, because a line whose
+   * envelope is unreadable is also a sequence number nobody accounted for and therefore surfaces as
+   * a gap.
+   */
+  malformedLines: number;
+  /**
+   * Lines written by a NEWER format than this build understands. Counted apart from malformed ones
+   * because they are a different fact — the record is intact and this reader is stale — and
+   * collapsing them would report a healthy spool as corrupt.
+   */
+  futureVersionLines: number;
+  /** Byte offset just past the last COMPLETE line consumed. A partial tail is left for next time. */
+  nextCursor: number;
+  /**
+   * The stored cursor pointed past the end of the file, so this read started over from zero. Means
+   * the file was replaced or shortened underneath the cursor. Re-folding is harmless, but the fact
+   * is reported rather than absorbed.
+   */
+  restartedFromZero: boolean;
+}
+
+/**
+ * How much of the spool one read may buffer.
+ *
+ * A MEMORY BOUND, NOT A MEASURED THRESHOLD. Nothing about the domain sets it: it exists because the
+ * unbounded version allocated the entire remaining spool in one buffer, and `fromByte` is zero far
+ * more often than the incremental design suggests — a fresh database, a reset cursor, or the FIRST
+ * overview in another project on the same home-level spool. Nothing reclaims the spool, so on a
+ * long-lived install that made an ordinary MCP read allocate the whole of history at once.
+ *
+ * Bounding the read does NOT bound the work: `foldMomentSpool` loops until the spool is consumed, so
+ * a new store still replays everything — it just does so in chunks it can hold.
+ */
+export const MOMENT_SPOOL_READ_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * Reads the spool from a byte offset, at most one chunk at a time.
+ *
+ * THE CURSOR NEVER ADVANCES PAST A PARTIAL LINE. An append is one `writeSync` of one line, but
+ * nothing in POSIX promises that write is atomic against a concurrent reader, so a read can land
+ * mid-line. Stopping at the last newline means the next read picks that line up whole instead of
+ * discarding it as garbage.
+ *
+ * NOR PAST A LINE THIS BUILD CANNOT READ. A future-format line stops the cursor dead rather than
+ * being stepped over: skipping it would leave the record permanently absent from the ledger once a
+ * build that understands it arrives, and nothing would ever say so. Stalling is loud and
+ * recoverable; silent forward-loss is neither. The line is still counted in `futureVersionLines` so
+ * a reader can see why the cursor stopped moving.
+ *
+ * A MISSING FILE IS NOT AN ERROR — it is the ordinary state before the first append. Any OTHER open
+ * failure IS an error and is raised: `EACCES`, `EIO` and descriptor exhaustion used to be reported
+ * as an empty spool, which made broken recording indistinguishable from healthy inactivity — the
+ * exact incident this subsystem was built after.
+ */
+export function readMomentSpool(path: string, fromByte: number): MomentSpoolRead {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") throw error;
+    return {
+      records: [],
+      malformedLines: 0,
+      futureVersionLines: 0,
+      nextCursor: 0,
+      restartedFromZero: fromByte > 0,
+    };
+  }
+  let buffer: Buffer;
+  let start: number;
+  let restartedFromZero = false;
+  try {
+    const size = fstatSync(fd).size;
+    start = fromByte;
+    if (start > size || start < 0) {
+      start = 0;
+      restartedFromZero = true;
+    }
+    const remaining = size - start;
+    if (remaining <= 0) {
+      return { records: [], malformedLines: 0, futureVersionLines: 0, nextCursor: start, restartedFromZero };
+    }
+    // ONE CHUNK, unless a single line is longer than one — an oversized line still has to be read
+    // whole or the cursor could never get past it, so that one case grows to the line's own size.
+    let length = Math.min(remaining, MOMENT_SPOOL_READ_CHUNK_BYTES);
+    buffer = readRange(fd, start, length);
+    while (buffer.lastIndexOf(0x0a) < 0 && length < remaining) {
+      length = Math.min(remaining, length * 4);
+      buffer = readRange(fd, start, length);
+    }
+  } finally {
+    closeSync(fd);
+  }
+
+  const lastNewline = buffer.lastIndexOf(0x0a);
+  if (lastNewline < 0) {
+    return { records: [], malformedLines: 0, futureVersionLines: 0, nextCursor: start, restartedFromZero };
+  }
+
+  const records: MomentSpoolRecord[] = [];
+  let malformedLines = 0;
+  let futureVersionLines = 0;
+  // Offsets are tracked per line so the cursor can stop exactly before a line this build cannot read.
+  let cursorLimit = lastNewline + 1;
+  let offset = 0;
+  while (offset <= lastNewline) {
+    const newline = buffer.indexOf(0x0a, offset);
+    if (newline < 0 || newline > lastNewline) break;
+    const line = buffer.subarray(offset, newline).toString("utf8");
+    const lineEnd = newline + 1;
+    if (line.trim().length > 0) {
+      const parsed = parseMomentSpoolLine(line);
+      if (parsed === "future-version") {
+        futureVersionLines += 1;
+        cursorLimit = offset; // stop BEFORE it; a later build must still fold it
+        break;
+      }
+      if (parsed === null) malformedLines += 1;
+      else records.push(parsed);
+    }
+    offset = lineEnd;
+  }
+
+  return {
+    records,
+    malformedLines,
+    futureVersionLines,
+    nextCursor: start + cursorLimit,
+    restartedFromZero,
+  };
+}
+
+/** One positioned read, filled to `length` or to what the file had. */
+function readRange(fd: number, start: number, length: number): Buffer {
+  const buffer = Buffer.allocUnsafe(length);
+  let filled = 0;
+  while (filled < length) {
+    const read = readSync(fd, buffer, filled, length - filled, start + filled);
+    if (read <= 0) break;
+    filled += read;
+  }
+  return buffer.subarray(0, filled);
+}
+
+/**
+ * Parses one line. Returns `null` for a line this build cannot make a record out of, and the
+ * sentinel `"future-version"` for one written by a later format.
+ *
+ * STRICT ON PURPOSE. Every field a record needs is checked before the record is admitted, because a
+ * half-recognised line would fold into a row that looks like an observation and is not one. The
+ * cost of strictness is a malformed count; the cost of laxness is a ledger that cannot be trusted.
+ */
+export function parseMomentSpoolLine(line: string): MomentSpoolRecord | null | "future-version" {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const row = raw as Record<string, unknown>;
+  if (typeof row.v !== "number") return null;
+  if (row.v > MOMENT_SPOOL_FORMAT) return "future-version";
+  if (typeof row.runId !== "string" || row.runId.length === 0) return null;
+  if (typeof row.seq !== "number" || !Number.isInteger(row.seq) || row.seq < 0) return null;
+  const envelope: MomentSpoolEnvelope = { v: row.v, runId: row.runId, seq: row.seq };
+
+  switch (row.kind) {
+    case "run-start":
+      if (!isWriterRole(row.writerRole) || typeof row.at !== "string") return null;
+      return { kind: "run-start", writerRole: row.writerRole, at: row.at, ...envelope };
+    case "interception": {
+      if (typeof row.momentId !== "string" || row.momentId.length === 0) return null;
+      if (typeof row.at !== "string") return null;
+      if (!("surface" in row) || (row.surface !== null && typeof row.surface !== "string")) return null;
+      if (row.sessionId !== null && typeof row.sessionId !== "string") return null;
+      // PRESENT-AND-NULLABLE, never merely absent. An omitted field would read as "no host tool
+      // call" when it actually means "this writer forgot to say", and those are the two states the
+      // whole record exists to keep apart.
+      if (!("toolUseId" in row) || (row.toolUseId !== null && typeof row.toolUseId !== "string")) return null;
+      // ABSENT IS UNKNOWN, NOT MALFORMED. `circle` was added to this record additively, without a
+      // format bump — correctly, since a reader that does not know a field simply does not read it.
+      // Requiring the KEY undid that: every interception written before the field existed became
+      // malformed, and a malformed line is consumed and its cursor advanced, so real history was
+      // destroyed on the first fold that reached it rather than merely being incomplete.
+      //
+      // The schema already has a word for this. `circle` is nullable, NULL means nothing resolved
+      // one, and those moments are reported as `unattributed` — the exact state such a line is in.
+      // A present-but-wrong-typed value is still refused: that is a shape error, not an old writer.
+      if ("circle" in row && row.circle !== null && typeof row.circle !== "string") return null;
+      // The four action fields stand or fall together — a half-null set is not an observation.
+      const actionKnown =
+        typeof row.actionSha256 === "string" &&
+        typeof row.actionRendering === "string" &&
+        typeof row.actionChars === "number" &&
+        typeof row.actionClipped === "boolean";
+      const actionAbsent =
+        row.actionSha256 === null &&
+        row.actionRendering === null &&
+        row.actionChars === null &&
+        row.actionClipped === null;
+      if (!actionKnown && !actionAbsent) return null;
+      if (row.stageId !== null && typeof row.stageId !== "string") return null;
+      // Present-and-nullable on both, for the same reason as toolUseId above: an absent field
+      // would read as "the gate found nothing", which is a verdict, not the absence it really is.
+      if (!("ruleIds" in row) || !(row.ruleIds === null || isStringArray(row.ruleIds))) return null;
+      if (!("deliveredRuleIds" in row) || !(row.deliveredRuleIds === null || isStringArray(row.deliveredRuleIds))) {
+        return null;
+      }
+      if (!isDisposition(row.disposition)) return null;
+      return {
+        kind: "interception",
+        momentId: row.momentId,
+        at: row.at,
+        toolUseId: row.toolUseId,
+        circle: ("circle" in row ? row.circle : null) as string | null,
+        sessionId: row.sessionId,
+        surface: row.surface as string | null,
+        actionSha256: row.actionSha256 as string | null,
+        actionRendering: row.actionRendering as string | null,
+        actionChars: row.actionChars as number | null,
+        actionClipped: row.actionClipped as boolean | null,
+        stageId: row.stageId,
+        ruleIds: row.ruleIds as string[] | null,
+        disposition: row.disposition,
+        deliveredRuleIds: row.deliveredRuleIds as string[] | null,
+        ...envelope,
+      };
+    }
+    case "read": {
+      if (typeof row.readAt !== "string") return null;
+      if (!("ruleId" in row) || (row.ruleId !== null && typeof row.ruleId !== "string")) return null;
+      if (!("momentId" in row) || (row.momentId !== null && typeof row.momentId !== "string")) return null;
+      // Present-and-nullable, like every other "not known" field here: an omitted namedStageId would
+      // read as "the agent named nothing", which is a claim, not the absence it really is.
+      if (!("namedStageId" in row) || (row.namedStageId !== null && typeof row.namedStageId !== "string")) {
+        return null;
+      }
+      // ABSENT-IS-NULL here, unlike the interception's own `circle`, which is required. The
+      // difference is deliberate: a read line with no `circle` is still a read that happened, and
+      // rejecting it would discard a real observation over one missing fact. An interception with
+      // no `circle` key is a line from a writer that did not know about the field at all, and every
+      // count a person reads is scoped by it.
+      if ("circle" in row && row.circle !== null && typeof row.circle !== "string") return null;
+      return {
+        kind: "read",
+        momentId: row.momentId as string | null,
+        ruleId: row.ruleId as string | null,
+        namedStageId: row.namedStageId as string | null,
+        circle: ("circle" in row ? row.circle : null) as string | null,
+        readAt: row.readAt,
+        ...envelope,
+      };
+    }
+    case "outcome": {
+      if (typeof row.outcomeAt !== "string" || typeof row.outcomeSha256 !== "string") return null;
+      // Present-and-nullable, like every other "not known" field here.
+      if (!("outcomeStatus" in row)) return null;
+      if (row.outcomeStatus !== null && row.outcomeStatus !== "ok" && row.outcomeStatus !== "failed") return null;
+      const byMoment = row.momentId === null || typeof row.momentId === "string";
+      const byToolUse = row.toolUseId === null || typeof row.toolUseId === "string";
+      if (!byMoment || !byToolUse) return null;
+      // AN OUTCOME THAT NAMES NEITHER KEY IS NOT AN OBSERVATION. It could never be attached to
+      // anything, and folding it would put a row in the loss ledger that names nothing missing.
+      if (row.momentId === null && row.toolUseId === null) return null;
+      return {
+        kind: "outcome",
+        momentId: row.momentId as string | null,
+        toolUseId: row.toolUseId as string | null,
+        outcomeStatus: row.outcomeStatus as "ok" | "failed" | null,
+        outcomeAt: row.outcomeAt,
+        outcomeSha256: row.outcomeSha256,
+        ...envelope,
+      };
+    }
+    case "ask":
+      if (typeof row.momentId !== "string" || typeof row.askedAt !== "string") return null;
+      return { kind: "ask", momentId: row.momentId, askedAt: row.askedAt, ...envelope };
+    case "answer":
+      if (typeof row.momentId !== "string" || typeof row.answeredAt !== "string") return null;
+      if (row.answer !== "followed" && row.answer !== "not-followed") return null;
+      return {
+        kind: "answer",
+        momentId: row.momentId,
+        answer: row.answer,
+        answeredAt: row.answeredAt,
+        ...envelope,
+      };
+    default:
+      return null;
+  }
+}
+
+function isWriterRole(value: unknown): value is MomentWriterRole {
+  return value === "host-hook" || value === "gate-cli" || value === "core";
+}
+
+function isDisposition(value: unknown): value is MomentDisposition {
+  return value === "blocked" || value === "advised" || value === "silent" || value === "ungoverned";
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}

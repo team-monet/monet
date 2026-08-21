@@ -40,7 +40,7 @@
  * is declared with a different but still TEXT-affinity type name).
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, existsSync, copyFileSync, mkdirSync, readdirSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, readFileSync, existsSync, copyFileSync, mkdirSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -453,6 +453,69 @@ async function buildUnscrubbedFixtureDb(path: string): Promise<void> {
     }
   } finally {
     j1CheckDb.close();
+  }
+
+  // ROUND 6, K1: THE GOVERNED-MOMENT TABLES.
+  //
+  // WHY THIS FIXTURE EXTENSION EXISTS AT ALL. `findScrubViolations` walks every TEXT column of every
+  // table that exists IN A GIVEN DB — so a table that never appears in this fixture is a table the
+  // closure test silently checks nothing about. `governed_moments.action_rendering` holds a bounded
+  // rendering of the real command an agent was about to run, which is the most privacy-sensitive
+  // column these tables have, and until this block existed the suite reported a clean bill of health
+  // for a column it had never looked at. A green that cannot fail reads exactly like a green that
+  // did not.
+  //
+  // The rows only appear once something FOLDS a spool into the database, which is why this seeds a
+  // spool the way `monet gate` writes one and then triggers the fold through the ordinary
+  // conformance read — no private API, the same path a real session takes.
+  const spoolPath = `${path}.moments.jsonl`;
+  const hookWrittenAction = "cd /Users/dev/code/monet-core && git push --force  # jane.doe@example.com";
+  appendFileSync(
+    spoolPath,
+    `${JSON.stringify({
+      v: 1,
+      runId: "run-gate-fixture",
+      seq: 0,
+      kind: "interception",
+      momentId: "fixture-moment-1",
+      at: "2026-08-19T00:00:00.000Z",
+      toolUseId: "toolu_fixture",
+      circle: SAMPLED_CIRCLE,
+      sessionId: null,
+      surface: "Bash",
+      actionSha256: "a".repeat(64),
+      actionRendering: hookWrittenAction,
+      actionChars: hookWrittenAction.length,
+      actionClipped: false,
+      stageId: "stage-fixture",
+      ruleIds: ["rule-fixture"],
+      disposition: "advised",
+      deliveredRuleIds: [],
+    })}\n`,
+  );
+  const momentCore = new MonetCore(path, { momentSpoolPath: spoolPath });
+  try {
+    momentCore.momentConformance(); // folds on demand — the wiring a real read goes through
+  } finally {
+    momentCore.close();
+  }
+
+  // Non-vacuity precondition, same discipline as G1 and J1 above: if the fold did not actually land
+  // the row, this extension would silently check nothing and the suite would go back to reporting a
+  // clean bill of health for a column it never looked at.
+  const k1CheckDb = new Database(path, { readonly: true });
+  try {
+    const row = k1CheckDb
+      .prepare(`SELECT action_rendering FROM governed_moments WHERE moment_id = 'fixture-moment-1'`)
+      .get() as { action_rendering: string } | undefined;
+    if (row?.action_rendering !== hookWrittenAction) {
+      throw new Error(
+        `buildUnscrubbedFixtureDb: expected governed_moments.action_rendering to hold the hook-written ` +
+          `command verbatim — got ${JSON.stringify(row?.action_rendering)}. The K1 fixture extension is broken.`,
+      );
+    }
+  } finally {
+    k1CheckDb.close();
   }
 }
 

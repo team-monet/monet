@@ -12,7 +12,6 @@ import { MonetCore } from "../src/engine";
 import { chooseStoreEmbedder } from "../src/store-embedder";
 import type { EmbeddingProvider } from "../src/embedding";
 import { createMonetCoreMcpServer } from "../src/mcp-server";
-import { GATE_JOURNAL_FILENAME } from "../src/gate-journal";
 import { deriveCircle } from "../src/circle";
 
 /** Exported so a script can REFUSE the live store by asking the resolver that owns the path,
@@ -47,7 +46,6 @@ async function main(): Promise<void> {
     //
     // Beside the resolved database, so it follows the store it describes rather than the process's
     // cwd — the same reasoning that keeps the host-side hook off the cwd rung.
-    gateJournalPath: path.join(path.dirname(dbPath), GATE_JOURNAL_FILENAME),
   });
   await createMonetCoreMcpServer(core);
   // stderr so it doesn't corrupt the stdio MCP channel

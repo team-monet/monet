@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { GATE_JOURNAL_FILENAME } from "@team-monet/core";
+import { MOMENT_SPOOL_FILENAME } from "@team-monet/core";
 
 /**
  * Storage path resolution for the local runtime. The store itself is provided by
@@ -73,60 +73,21 @@ export function getGateMirrorPath(baseDir?: string): string {
 }
 
 /**
- * Default path for the gate journal — the append-only record every governing mouth writes what it
- * actually did to, including its declines.
+ * The governed-moment spool.
  *
- * FILENAME FROM CORE, never a local literal: `GATE_JOURNAL_FILENAME` is exported by
- * `@team-monet/core` precisely because the mouths live in two repos (its own comment: "Shared with
- * the client's hook wrapper and gate CLI — all three mouths write ONE stream"), and gate-cli.ts in
- * this same client already imports it for exactly that reason. A second spelling of the name here
- * would be a fourth mouth writing a file the other three do not read, which is the whole failure
- * one shared constant exists to prevent.
+ * SAME TWO RUNGS AS THE JOURNAL ABOVE, AND FOR THE SAME REASON RATHER THAN BY IMITATION: the
+ * busiest writer is the hook wrapper `install-cli.ts` generates, a standalone script that can import
+ * nothing from this module and therefore bakes in `$MONET_STORAGE_DIR` else `os.homedir()/.monet`.
+ * The wrapper is the fixed point; this function follows it. The project-aware resolution
+ * `getMonetDir` uses would put an in-process writer and the hook in two different files, which is
+ * the one failure a shared record cannot survive.
  *
- * DELIBERATELY NOT `getMonetDir`, and deliberately WITHOUT a `baseDir` parameter — the one function
- * in this file that diverges from every neighbour above (P1, Codex round 1 on PR #76). Those resolve
- * THREE rungs (MONET_STORAGE_DIR → an already-existing project-local `.monet` → home); this resolves
- * the TWO that gate-cli.ts's `defaultGateCliDependencies` and the hook wrapper install-cli.ts
- * GENERATES both resolve (MONET_STORAGE_DIR → home). The reason is the same invariant the shared
- * filename above exists to serve: the journal is ONE stream, and its `parentId` correlates a hook
- * event to the gate event it caused ACROSS mouths — a correlation that means nothing once the two
- * halves land in different files. Routed through `getMonetDir`, a project holding its own `.monet`
- * with MONET_STORAGE_DIR unset split exactly that way: MCP-originated events into the project's
- * journal, hook and `monet gate` events into home's. A `baseDir` parameter would be a lie for the
- * same reason — nothing this function reads is project-rooted, and a parameter accepted and ignored
- * invites the `getGateJournalPath(projectDir)` call site that READS as project-aware and is not.
- *
- * WHICH DIRECTION to converge was the actual choice, and store-adjacency lost on reachability, not
- * on merit: the hook wrapper is a standalone generated script with no import of this module
- * available to it (see install-cli.ts, whose own comment already states these two rungs and why the
- * cwd one is absent from them), so home is the only answer all three writers can reach today.
- * Aligning all three on project-aware resolution — the journal beside the store it describes, the
- * way the mirror already is — is known follow-up work, blocked on giving that generated script a
- * resolver it can actually call.
- *
- * Home is `os.homedir()`, which INVERTS what this comment argued one commit ago (P2, Codex round 2
- * on PR #76). That argument was that deriving home as `HOME || USERPROFILE` matched `getMonetDir`'s
- * idiom and kept ONE notion of home in this file, which beat importing `os`. It optimized the wrong
- * thing. The party this function must agree with is the hook wrapper install-cli.ts GENERATES, and
- * that wrapper is the fixed point rather than the follower — a standalone script that cannot import
- * this module, so it bakes in `os.homedir()` and nothing here can change what it resolves. When
- * MONET_STORAGE_DIR, HOME and USERPROFILE are ALL absent — a minimal service environment, a
- * launchd/systemd unit, a bare container — the env-only chain falls through to `process.cwd()`
- * while the hook falls through to the passwd DB and lands in the account's real home. Two files
- * again, one rung further down than the split this function was extracted to close. Agreeing with
- * the hook is FUNCTIONAL; agreeing with the neighbouring function's spelling is COSMETIC.
- *
- * So this file holds two notions of home ON PURPOSE, one per invariant, and `getMonetDir` above is
- * deliberately left exactly as it is. It resolves the STORE — a per-project file whose every
- * reader imports this module, so its env-only chain is self-consistent by construction and has no
- * outside party to match. This resolves the JOURNAL — one shared stream whose writers include a
- * generated script that can import nothing, so it must match that script's resolution instead of
- * its neighbour's. Making the two spellings identical would trade a real divergence for a
- * cosmetic one.
+ * A DIFFERENT FILE FROM THE JOURNAL, deliberately. The journal records evaluation events and this
+ * records governed moments; one file holding two units is a file whose counts mean nothing.
  */
-export function getGateJournalPath(): string {
+export function getMomentSpoolPath(): string {
   const storageDir = process.env.MONET_STORAGE_DIR || path.join(os.homedir(), MONET_DIR);
-  return path.join(storageDir, GATE_JOURNAL_FILENAME);
+  return path.join(storageDir, MOMENT_SPOOL_FILENAME);
 }
 
 /** The materialize registry/manifest shares the store home's established resolution chain. */

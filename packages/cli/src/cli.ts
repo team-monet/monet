@@ -4,7 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
-import { ensureMonetDir, getDbPath, getGateJournalPath, getGateMirrorPath, getMonetDir } from "./db/index.js";
+import { ensureMonetDir, getDbPath, getGateMirrorPath, getMomentSpoolPath, getMonetDir } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { generateAgentConfig, toYaml } from "./config-cli.js";
 import { openServedCore, openStatusCore } from "./bootstrap.js";
@@ -96,28 +96,24 @@ program
     // circle.ts's OWN internal store lookup with projectDir; this pairs the SERVED CORE's store with
     // it too). Rooting the store and the mirror at the SAME projectDir is what makes "one project
     // notion, three call sites" (this comment's own opening line) actually true, not just asserted.
-    // JOURNAL (monet-client#75): the same "one long-running serving process is the one positioned
-    // to maintain it" argument the mirror above is wired on, applied to the record the gate's own
-    // mouths write. `stage_lookup` and core-side `gate()` open the journal at their mouth
-    // (engine.ts's beginGateJournal), but with `gateJournalPath` unset that call returns a no-op
-    // closer — so every MCP-originated evaluation through the shipped binary recorded nothing,
-    // while the hook and `monet gate` mouths kept writing.
+    // SPOOL: the same "one long-running serving process is the one positioned to maintain it"
+    // argument the mirror above is wired on, applied to the governed-moment record. Without this,
+    // store-side interception, the ask signal and every conformance surface are silently inert in
+    // the shipped binary — the option is optional at the seam, never at an entry point.
     //
     // NOT rooted at `projectDir`, and the one line here that deliberately steps outside "one
-    // project notion, three call sites" above (P1, Codex round 1 on PR #76): unlike the store and
-    // the mirror, the journal is ONE stream shared with mouths that do not run in this process at
-    // all — the installed hook wrapper and `monet gate` — and its `parentId` correlates a hook
-    // event to the gate event it caused ACROSS them. Those two resolve MONET_STORAGE_DIR, else
-    // home; rooting THIS writer at `projectDir` pointed it at a different file from the one they
-    // append to whenever the project carried its own `.monet`, which is silent loss of exactly the
-    // correlation the record exists to carry. `getGateJournalPath()` therefore takes no baseDir at
-    // all — see db/index.ts for why it resolves the two rungs it does, and for the follow-up that
-    // would make all three writers project-aware together instead.
+    // project notion, three call sites" above: unlike the store and the mirror, the spool is ONE
+    // stream shared with writers that do not run in this process at all — the installed hook
+    // wrapper and `monet gate` — and the fold's per-run sequence only proves completeness if all
+    // three append to the same file. Those two resolve MONET_STORAGE_DIR, else home; rooting THIS
+    // writer at `projectDir` would point it at a different file whenever the project carried its
+    // own `.monet`. `getMomentSpoolPath()` therefore takes no baseDir at all — see db/index.ts for
+    // why it resolves the two rungs it does, and why the generated wrapper is the fixed point.
     const core = await openServedCore(getDbPath(projectDir), {
       scopeContext: projectDir,
       defaultCircle: circle,
       gateSidecarPath: getGateMirrorPath(projectDir),
-      gateJournalPath: getGateJournalPath(),
+      momentSpoolPath: getMomentSpoolPath(),
     });
     console.error(`Monet started`);
     console.error(`Storage: ${getDbPath(projectDir)}`);

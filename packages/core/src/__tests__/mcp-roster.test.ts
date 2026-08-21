@@ -29,7 +29,7 @@ async function makeMcpPair(core: MonetCore): Promise<{ client: Client; cleanup: 
 }
 
 describe("tool roster — drift gate", () => {
-  it("registers exactly the 19 documented tools (sorted)", async () => {
+  it("registers exactly the 21 documented tools (sorted)", async () => {
     const core = new MonetCore(":memory:");
     const { client, cleanup } = await makeMcpPair(core);
     try {
@@ -40,6 +40,12 @@ describe("tool roster — drift gate", () => {
         "tool roster changed — review the canonical tool descriptions and this enumeration together.",
       ).toEqual([
         "agent_context",
+        // The fourth fact enters the record ONLY through these two, and they are deliberately two:
+        // the ask is the agent's event, the answer is the user's. One combined call would make the
+        // agent the author of a fact it does not own and would erase the difference between
+        // `unanswered` (asked, waiting) and `not asked` (an agent defect).
+        "conformance_answer",
+        "conformance_ask",
         "memory_checkpoint",
         "memory_circle_manage",
         "memory_declare",

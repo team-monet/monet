@@ -146,7 +146,7 @@ describe("declare-time firing test: sovereignty, and rationing", () => {
    * RATIONED. "Patterns given, no example" is deliberately NOT advised: it would fire on nearly
    * every pattern declaration ever made, and an advisory that fires every time is the unrationed,
    * zero-yield noise the residency law exists to prevent. That signal already has two homes —
-   * gateStats().unverifiedPatterns, and the gate journal.
+   * gateCoverage().unverifiedPatterns.
    */
   it("says nothing when no example was supplied — silence is not an oversight here", async () => {
     const core = new MonetCore(":memory:", { defaultCircle: "acme" });
@@ -171,60 +171,5 @@ describe("declare-time firing test: sovereignty, and rationing", () => {
     const stage = core.stages().find((s) => s.name === "worker delegation")!;
     core.close();
     expect(stage.verified).toBe(false);
-  });
-});
-
-describe("declare-time firing test: warned AND recorded", () => {
-  // §2 says "warned-and-recorded on sovereign ones". The warning reaches the author now; the record
-  // answers what no in-session warning can — which patterns were admitted anyway.
-  it("appends a declare-check event naming the admission", async () => {
-    const path = join(mkTmp(), "gate-journal.jsonl");
-    const core = new MonetCore(":memory:", { defaultCircle: "acme", gateJournalPath: path });
-    await core.declare({
-      species: "stage", stage: "worker delegation",
-      patterns: ["Bash:verifier"], instance: "Task:verifier confirm",
-    });
-    core.close();
-
-    const lines = readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
-    const check = lines.filter((line) => line.mouth === "declare-check");
-    expect(check).toHaveLength(2); // arrival + disposition, same as every other mouth
-    expect(check[1].disposition).toBe("declined: pattern-matches-no-example");
-    expect(check[1].admitted).toBe(true); // sovereignty: warned, written anyway
-    expect(check[1].claimType).toBe("source-observed");
-  });
-
-  /**
-   * CORRECTED (Codex P2 on PR #144): this used to assert that a PASSING check recorded nothing,
-   * which made a clean check, a check with no example, and a code path that never ran one
-   * observable — the exact ambiguity the journal exists to remove, and the very thing the principle
-   * ratified 2026-08-04 names. A check that ran says so.
-   */
-  it("records a passing check as a clean event, not as silence", async () => {
-    const path = join(mkTmp(), "gate-journal.jsonl");
-    const core = new MonetCore(":memory:", { defaultCircle: "acme", gateJournalPath: path });
-    await core.declare({
-      species: "stage", stage: "worker delegation",
-      patterns: ["Task:verifier"], instance: "Task:verifier confirm",
-    });
-    core.close();
-    const lines = readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l))
-      .filter((line) => line.mouth === "declare-check");
-    expect(lines).toHaveLength(2);
-    expect(lines[1].disposition).toBe("silent");
-    expect(lines[1].claimType).toBe("source-observed");
-  });
-
-  // Checked as far as it could be, which is neither a pass nor a failure — and saying so is the
-  // whole point of recording it at all.
-  it("records a check with no example as declined: no-example, claimed unavailable", async () => {
-    const path = join(mkTmp(), "gate-journal.jsonl");
-    const core = new MonetCore(":memory:", { defaultCircle: "acme", gateJournalPath: path });
-    await core.declare({ species: "stage", stage: "git force push", patterns: ["Bash:git push --force"] });
-    core.close();
-    const lines = readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l))
-      .filter((line) => line.mouth === "declare-check");
-    expect(lines[1].disposition).toBe("declined: no-example");
-    expect(lines[1].claimType).toBe("unavailable");
   });
 });

@@ -28,29 +28,21 @@ export interface ServedCoreOptions {
    */
   gateSidecarPath?: string;
   /**
-   * Where the gate journal is appended — the per-evaluation record carrying rule IDENTITY, which
-   * the sqlite `gate_events` row does not (it records `rule_count` and stage ids only, so "declared
-   * but never fired" is unanswerable from it).
+   * Where the governed-moment spool is appended — the append-only record every writer can reach,
+   * including the standalone hook wrapper, which can open no store.
    *
-   * OPTIONAL for the same reason `gateSidecarPath` above is, and passed on exactly the same terms:
-   * `MonetCoreOptions.gateJournalPath` has NO DEFAULT in engine.ts (`opts.gateJournalPath ?? null`,
-   * and null makes the whole journal one null check — `beginGateJournal` returns a no-op closer),
-   * deliberately so that no core built by a test or a one-off script appends into a real store. A
-   * caller that omits this therefore gets exactly today's behavior; the two callers of THIS function
-   * pass it UNCONDITIONALLY, matching `gateSidecarPath`'s own precedent — optional at the seam, not
-   * optional at the entry points.
+   * OPTIONAL for the same reason `gateSidecarPath` above is, and on the same terms:
+   * `MonetCoreOptions.momentSpoolPath` has NO DEFAULT in engine.ts, deliberately, so that no core
+   * built by a test or a one-off script appends into a real store. A caller that omits it gets a
+   * no-op; the two callers of THIS function pass it UNCONDITIONALLY.
    *
-   * WHY IT HAD TO BE DECLARED HERE (monet-client#75): `openServedCore` spreads this interface into
-   * `new MonetCore(...)`, so an option absent from this type never reaches the engine no matter
-   * what a caller writes. Before this field existed, the ONLY wiring of `gateJournalPath` anywhere
-   * was monet-core's dev-only `scripts/mcp-cli.ts` — whose own comment calls itself "THE JOURNAL'S
-   * ONLY PRODUCTION WIRING" — which the shipped binary never runs. The result measured on a real
-   * store: 20704 journal lines from `host-hook` and `gate-cli`, and ZERO from `stage-lookup` or
-   * `core-gate`, against 146 `stage_lookup` calls that did write their sqlite rows over the same
-   * window. Both MCP-originated mouths journaled nothing, silently, and it is not reconstructible
-   * after the fact.
+   * WHY IT MUST BE DECLARED HERE, and this is not a formality (monet-client#75): `openServedCore`
+   * spreads this interface into `new MonetCore(...)`, so an option ABSENT FROM THIS TYPE never
+   * reaches the engine no matter what a caller writes. That is exactly how the predecessor of this
+   * field went unwired in the shipped binary while looking correct at both call sites — the wiring
+   * existed, the type did not, and the omission was silent and unreconstructible after the fact.
    */
-  gateJournalPath?: string;
+  momentSpoolPath?: string;
 }
 
 type StoreEmbedderSelector = (dbPath: string) => Promise<EmbeddingProvider>;

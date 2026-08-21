@@ -7,7 +7,7 @@
  * network in the path, and silence when nothing matches", and that stages "need no taxonomy and no
  * self-recognition — a correction landing on an action with no stage IS the stage's creation".
  *
- * This module owns every statement against `stages`, `rule_bindings` and `gate_events`; the engine
+ * This module owns every statement against `stages` and `rule_bindings`; the engine
  * delegates (refactoring-build directive, same shape as src/resolution.ts and src/lifecycle-edges.ts).
  *
  * ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@
  *
  * Seeding is a heuristic over one observed instance and is expected to be wrong sometimes. That is
  * survivable BY CONSTRUCTION and not by care: a pattern that never fires shows up in
- * `gateStats().unverifiedPatterns` (stages carry `verified`, flipped on first live fire), and
+ * `gateCoverage().unverifiedPatterns` (stages carry `verified`, flipped on first live fire), and
  * DECLARATION replaces a stage's patterns outright. The failure mode of a bad seed is a dead
  * pattern surfaced in curation, never a wrong deny — blocking severity is declaration-only.
  *
@@ -362,113 +362,6 @@ export const GATE_SCHEMA_SQL = `
   -- exist under every path (fresh install via this CREATE TABLE, or upgrade via the ALTER).
 
   /*
-   * GATE INSTRUMENTATION. The design names the empirical checks it wants on gates — "fire precision
-   * and silence rate (the gate-firing design's own measures)" — so the log ships WITH the firing
-   * path rather than being retrofitted once a suspicion arises: a rate you could not compute for
-   * the weeks before you thought to ask is a rate you cannot use to judge the design.
-   *
-   * ONE ROW PER gateQuery(), including the silences. Completeness is what makes it a RATE: silence
-   * is the denominator of fire precision and the numerator of silence rate, so a log of only the
-   * fires would measure nothing.
-   *
-   * VOLUME IS NOT resolution_events' VOLUME, and an earlier version of this comment implied it was.
-   * resolution_events gets one row per memory_store — an act a human or agent chose to perform,
-   * numbering in the hundreds per day at most. This table gets one row per INTERCEPTED ACTION: every
-   * Bash call, every tool invocation on a wired surface, whether or not anything matched. That is
-   * two or three orders of magnitude more, and it grows with how hard the agent is working rather
-   * than with how much is being remembered.
-   *
-   * RETENTION IS DEFERRED, EXPLICITLY. Nothing prunes this table today, and on a busy store it will
-   * become the largest one. The house already has the precedent to copy when that day comes —
-   * SOURCE_ATTEMPT_EVENT_RETENTION (source-ledger.ts:44) keeps only the newest 128 immutable
-   * attempt receipts per source — and the equivalent here is a per-circle cap plus a rolled-up
-   * daily aggregate, since the RATES are what curation reads and the individual rows only matter
-   * while they are recent enough to investigate. Not built now: capping before there is a single
-   * real store's volume to size it against would be guessing, and a wrong cap silently destroys the
-   * evidence the design says to measure.
-   *
-   * LOCAL AND UNSYNCED, exactly like resolution_events (engine.ts init()): this records what THIS
-   * device was asked to do, at THIS device's stage set. Replicating it would merge two machines'
-   * action streams under one timeline and make every rate computed from it a lie. It is therefore
-   * absent from maxPersistedSyncTimestamp's table map and from the sync envelope, and its clock is
-   * wall time rather than the persisted sync clock.
-   *
-   * action_context IS THE RAW ACTION, verbatim — the actual command line, path or prompt the host
-   * intercepted. That is deliberate (curation needs to see what a stage failed to match, and a
-   * normalized context answers a different question), and it is the reason this table is the most
-   * privacy-sensitive one in the store: it can hold /Users/... paths, hostnames and flags. Two
-   * consequences, both already true of this schema rather than new: the table is local-only so
-   * nothing leaves the machine, and anything derived FROM the store for sharing must scrub it. The
-   * existing schema-driven scrub closure (scripts/scrub-db.mjs + scrub-db-closure.test.ts) walks
-   * every TEXT column of every table at runtime and therefore covers this column automatically the
-   * moment it holds a match — it does not enumerate columns by name, which is exactly why it was
-   * built that way.
-   */
-  CREATE TABLE IF NOT EXISTS gate_events (
-    -- INTEGER PRIMARY KEY (SQLite's rowid alias), not a generator id: instrumentation must not
-    -- perturb the thing it instruments by consuming ids from the same sequence concepts use.
-    id INTEGER PRIMARY KEY,
-    ts INTEGER NOT NULL,
-    action_context TEXT NOT NULL,
-    -- The stage that ANSWERED: the one contributing the highest-severity rule. Not the oldest —
-    -- when a deny and an advisory both match, the row must name the stage that produced the deny,
-    -- or a curation reader auditing "which stage is blocking me" reads the wrong name. NULL =
-    -- silence. Every matched stage is in gate_event_stages below.
-    matched_stage_id TEXT,
-    rule_count INTEGER NOT NULL,
-    max_severity TEXT,                -- NULL when no rule fired
-    latency_us INTEGER NOT NULL,
-    circle TEXT NOT NULL,
-    -- The STORED text is an excerpt of a longer command. Storage only: matching always ran on the
-    -- whole thing, so unlike the two capped matchers this replaced, it says nothing about coverage.
-    truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
-    -- The context was past the refusal threshold and nothing was matched against it. Distinct from
-    -- a silence with rule_count 0: that one means nothing governs, this one means nobody looked.
-    overflow INTEGER NOT NULL DEFAULT 0 CHECK (overflow IN (0, 1)),
-    -- WHICH MATCHER produced this row. 'mechanical' = gateQuery (trigger-pattern fire against an
-    -- intercepted action). 'recognized' = stageLookup (the agent named a stage). The two are
-    -- instrumented in the SAME table because both are "the gate answering a question", but they
-    -- are NOT the same population — see gateStats' own comment for why every other field on that
-    -- read stays scoped to 'mechanical' rather than blending the two. Added on the CREATE TABLE
-    -- above for a fresh install; an EXISTING store gets it via the guarded ALTER in
-    -- createGateSchema immediately below (SQLite has no ADD COLUMN IF NOT EXISTS).
-    matcher TEXT NOT NULL DEFAULT 'mechanical' CHECK (matcher IN ('mechanical', 'recognized'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_gate_events_circle_ts ON gate_events(circle, ts);
-  -- The read dimension's join probes events BY STAGE, which idx_gate_events_circle_ts cannot
-  -- serve: it narrows the circle/window range and then rescans it beneath every stage, so
-  -- byStageRead degrades as stages x window events. This table is deliberately unbounded, so that
-  -- is a real ceiling rather than a theoretical one (Codex P2 on PR #51, and it was right).
-  --
-  -- MEASURED before adding it, because an index added on intuition is exactly what this repo's own
-  -- threshold discipline warns about. gateStats over a synthetic store, mean of five runs:
-  --
-  --     25 stages /   5k events:    14.1ms ->   2.0ms
-  --    100 stages /  50k events:   670.0ms ->  22.1ms
-  --    200 stages / 200k events:  6945.1ms -> 109.3ms
-  --
-  -- Today's dogfood store is 24 stages and 387 recognized rows, where none of this is visible — but
-  -- the recognized population is the one still growing, at roughly 60 rows a day.
-  --
-  -- CREATED AFTER THE GUARDED ALTER BELOW, never here: it indexes matcher, and on a store predating
-  -- that column this block runs before the ALTER that adds it. The suite's own schema-upgrade test
-  -- caught that; the create lives immediately after the guard.
-
-  /*
-   * EVERY stage a query matched, not just the one that answered. byStage asks "how often does
-   * this stage fire", and answering it from gate_events.matched_stage_id undercounts every stage
-   * that matched alongside a higher-severity one — precisely the broad stages whose fire rate is
-   * most worth watching. Rows exist only for fires, so this table is bounded by matches rather
-   * than by intercepted actions.
-   */
-  CREATE TABLE IF NOT EXISTS gate_event_stages (
-    event_id INTEGER NOT NULL,
-    stage_id TEXT NOT NULL,
-    PRIMARY KEY (event_id, stage_id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_gate_event_stages_stage ON gate_event_stages(stage_id);
-
-  /*
    * THE GENERATION COUNTER — the materialized-mirror snapshot principle made CHECKABLE.
    *
    * The design's own extracted principle says a build artifact is a snapshot: "after the source
@@ -518,46 +411,6 @@ export function createGateTables(db: StoragePort): void {
  * concurrent migrator gets there first.
  */
 export function migrateGateColumns(db: StoragePort): void {
-  // COLUMN-GUARD PATTERN (SQLite has no ADD COLUMN IF NOT EXISTS), same convention as engine.ts's
-  // own migrate(): PRAGMA table_info, then ALTER only if missing. Lives HERE, in the function that
-  // owns gate_events' schema, rather than in engine.ts's migrate() — this module owns every
-  // statement against stages/rule_bindings/gate_events, migration included (module header).
-  //
-  // A store created before the recognized matcher shipped has a gate_events table with no
-  // `matcher` column; the CREATE TABLE IF NOT EXISTS above is a no-op against it, so the column
-  // must be added explicitly. Safe on a fresh store too — the guard simply finds the column
-  // already present (declared in the CREATE TABLE above) and does nothing. Every pre-existing row
-  // on an upgraded store backfills to 'mechanical', which is true by construction: 'recognized'
-  // did not exist before this slice, so every event any prior build could have written was one.
-  //
-  // NOT ATOMIC AGAINST A CONCURRENT SECOND MIGRATOR (review fix — Codex round 3): the MCP server
-  // and a `monet` CLI call are a SUPPORTED topology sharing one `.monet` DB (storage.ts's own WAL +
-  // busy_timeout setup exists exactly for this — "the MCP server and a `monet` CLI call can share
-  // one `.monet` DB"), so two processes CAN both open a pre-column store at once, both see the
-  // column absent via this PRAGMA probe, and both attempt the ALTER. The LOSER's ALTER throws
-  // SQLite's "duplicate column name" — which, unhandled, would abort that process's entire startup
-  // over a race the WINNER already resolved correctly. Caught here AS SUCCESS
-  // (idempotent-by-catch): the only thing this guard promises is "the column exists when this
-  // function returns", and a duplicate-column error is proof that promise is ALREADY kept by
-  // someone else's ALTER, not a real failure. Re-thrown for any OTHER error shape — those are real
-  // problems this guard has no business hiding.
-  const gateEventCols = db.prepare(`PRAGMA table_info(gate_events)`).all() as Array<{ name: string }>;
-  if (!gateEventCols.some((c) => c.name === "matcher")) {
-    try {
-      db.exec(
-        `ALTER TABLE gate_events ADD COLUMN matcher TEXT NOT NULL DEFAULT 'mechanical' CHECK (matcher IN ('mechanical', 'recognized'))`,
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes("duplicate column name")) throw error;
-    }
-  }
-  // The read dimension's per-stage index, created HERE rather than beside the table because it
-  // indexes `matcher` — on a store predating that column, the schema block above runs before the
-  // guard that adds it. Rationale and the measurement that justified it sit with the DDL there.
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_gate_events_stage_lookup ON gate_events(matched_stage_id, matcher, circle, ts)`,
-  );
   // SAME GUARD, for breadth (slice 4b-B follow-up): a store created before breadth shipped has a
   // rule_bindings table with no `circle` column at all. UNLIKE `matcher`, there is no single
   // constant default — the correct value is "whichever circle this binding's own concept already
@@ -1817,7 +1670,7 @@ export function parseTriggerPatterns(json: string): TriggerPattern[] {
  * is the WILDCARD (matches every tool), and a non-string token was filtered out of the run, which
  * SHORTENS it (a shorter run matches strictly more). So a corrupt row silently widened a gate's
  * firing surface — the direction that produces confident wrong denies. Every shape violation now
- * drops the whole pattern instead, and the count surfaces in `gateStats().malformedPatterns` so a
+ * drops the whole pattern instead, and the count surfaces in `gateCoverage().malformedPatterns` so a
  * stage that has gone quiet says why.
  *
  * `tool` ABSENT or explicitly null is not corruption: that is the legitimate any-tool pattern a
@@ -2723,7 +2576,7 @@ export interface GateQueryOptions {
    * silently disappear. The CLI that wires the host hooks always passes it.
    *
    * FILTERING IS NOT RETIREMENT. Nothing here retires anything: mismatched rules stop being
-   * DELIVERED and show up in `gateStats().retirementCandidates` for curation to act on. Inventing a
+   * DELIVERED and show up in `gateCoverage().retirementCandidates` for curation to act on. Inventing a
    * model-change detector that retires rules on its own would be a scheduled-review mechanism in
    * disguise, which the design rules out.
    */
@@ -2802,7 +2655,7 @@ export interface StageLookupResult {
    * OTHER circles but none in the caller's own (stages are store-global; rule bindings are
    * circle-scoped — see the module header's "WHY STAGES ARE STORE-GLOBAL" note). Both render as
    * `matched: true, rules: []` here, which is correct (this circle's gate truly delivers nothing),
-   * but a curation reader asking "does anything govern this stage at all" needs `gateStats`/the
+   * but a curation reader asking "does anything govern this stage at all" needs `gateCoverage`/the
    * stage registry, not this result, to tell the two apart.
    */
   matched: boolean;
@@ -3204,7 +3057,7 @@ function toGateRule(row: BindingJoinRow): GateRule {
     // shape (long AND specifically front-loaded with nothing) with no realistic authoring path,
     // blocking or advisory. DELIBERATELY NOT chased with a SQL-side blank check instead: this
     // module already learned that lesson once (see hasNoReason's own "THE PREDICATE IS NOT IN THE
-    // SQL" doctrine, and gateStats' `unexplainedDenies` comment) — SQLite's TRIM() and JS's
+    // SQL" doctrine, and gateCoverage' `unexplainedDenies` comment) — SQLite's TRIM() and JS's
     // `.trim()` disagree on tabs/newlines, and a wider hand-picked character set would only move
     // the disagreement to some OTHER whitespace character neither implementation has hit yet. ONE
     // definition of "blank," applied to whatever text actually reached this function, stays the
@@ -3307,38 +3160,20 @@ export function evaluateGate(db: StoragePort, opts: GateQueryOptions): { result:
 }
 
 /**
- * Apply what a gate read owes. Safe to skip entirely: everything here is instrumentation and the
- * `verified` flag, neither of which any verdict depends on.
+ * Apply what a gate read owes: the `verified` flip, and nothing else any more.
+ *
+ * WHAT THIS USED TO ALSO DO: insert a `gate_events` row plus its per-stage links. That table is
+ * gone — the governed moment replaced it, and unlike a verdict row it can name the rules that
+ * fired and be joined back to the act that prompted them. The flip stays because `verified` is not
+ * instrumentation: it is what arms a declaration-born pattern, and `unverifiedPatterns` reads it.
+ *
+ * Safe to skip entirely: no verdict depends on anything here.
  */
 export function commitGateWrites(db: StoragePort, pending: PendingGateWrites, nextSyncTimestamp?: () => number): void {
   if (pending.verifyStageIds.length > 0) {
     const stamp = nextSyncTimestamp ? nextSyncTimestamp() : pending.now;
     const flip = db.prepare(`UPDATE stages SET verified = 1, sync_updated_at = ? WHERE id = ?`);
     for (const id of pending.verifyStageIds) flip.run(stamp, id);
-  }
-  const eventId = db.prepare(
-    `INSERT INTO gate_events (ts, action_context, matched_stage_id, rule_count, max_severity, latency_us, circle, truncated, overflow, matcher)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    pending.now,
-    pending.actionContext.length > MAX_RECORDED_CONTEXT_BYTES
-      ? pending.actionContext.slice(0, MAX_RECORDED_CONTEXT_BYTES)
-      : pending.actionContext,
-    pending.primaryStageId,
-    pending.ruleCount,
-    pending.maxSeverity,
-    pending.latencyUs,
-    pending.circle,
-    pending.actionContext.length > MAX_RECORDED_CONTEXT_BYTES ? 1 : 0,
-    pending.overflow ? 1 : 0,
-    pending.matcher,
-  ).lastInsertRowid;
-  // `lastInsertRowid` is optional on the port (an adapter may not report it). Without it the
-  // per-stage links are skipped rather than written against a guessed id — an undercount in
-  // byStage is a worse-but-honest stat, a link to the wrong event is a wrong one.
-  if (pending.matchedStageIds.length > 0 && eventId !== undefined) {
-    const link = db.prepare(`INSERT OR IGNORE INTO gate_event_stages (event_id, stage_id) VALUES (?, ?)`);
-    for (const id of pending.matchedStageIds) link.run(Number(eventId), id);
   }
 }
 
@@ -3526,7 +3361,7 @@ export interface LiveStageIndexResult {
  *
  * `assertQueryableCircle` GUARDED HERE TOO (post-merge review round, P2 — the SAME "guard once,
  * every caller inherits it" principle the paragraph above already states for the transaction fix,
- * applied to a DIFFERENT bug this function shares with `gateStats`). `liveStageNamesCapped`/
+ * applied to a DIFFERENT bug this function shares with `gateCoverage`). `liveStageNamesCapped`/
  * `countLiveStages` (below) both embed `RULE_LIVENESS_WHERE` directly — the identical collapsed-OR
  * predicate (`assertQueryableCircle`'s own doc comment) that degenerates to "global rules only" the
  * instant `circle` itself is `'*'`. `evaluateStageLookup`'s own call into this function was already
@@ -3534,7 +3369,7 @@ export interface LiveStageIndexResult {
  * `resolveCircle` (which, by design — see `assertQueryableCircle`'s own comment — passes an explicit
  * `'*'` straight through unchanged). An unguarded `prewarm('*')` therefore silently returned a stage
  * index missing every stage whose only live rule was purely LOCAL — the exact "curation silently
- * omits" failure class `gateStats`' own fix (this same round) closes one surface over. Guarded here,
+ * omits" failure class `gateCoverage`' own fix (this same round) closes one surface over. Guarded here,
  * not at `prewarm()`'s own entrance, for the identical reason the transaction wrap above is here and
  * not duplicated at every caller.
  */
@@ -3711,117 +3546,43 @@ export function stageLookup(db: StoragePort, opts: StageLookupOptions): StageLoo
 // ---- instrumentation readback -----------------------------------------------
 
 /**
- * The design's own acceptance evidence for gates: "fire precision and silence rate". This is the
- * readback, shaped exactly like ResolutionStats (windowed counts plus an all-time total that says
- * whether the window is representative) so the two read as one instrument in curation.
+ * WHAT THE GATE'S REGISTRY CAN SAY ABOUT ITSELF — the curation lists, and nothing that counts acts.
  *
- * `unverifiedPatterns` is deliberately STORE-GLOBAL rather than circle-scoped, unlike the counts: a
- * stage is a registry entry with no circle, and "this pattern has never matched anything anywhere"
- * is the question a dead pattern needs asked of it.
+ * THIS USED TO CARRY RATES TOO (`fires`, `silences`, `overflows`, `delivered`, `byStage`,
+ * `byStageRead`), all read from a `gate_events` row per intercepted action. That table is gone: a
+ * verdict row could not name the rules that fired, could not be joined back to the act that
+ * prompted it, and could not record an interception that declined to evaluate at all. The governed
+ * moment replaced it, and the rates are derived there now (`momentCounts`), with the read dimension
+ * answered by `momentStageReads` against this registry.
  *
- * EVERY FIELD BELOW EXCEPT `byMatcher` IS SCOPED TO THE MECHANICAL MATCHER — additive, not a
- * restructure: `fires`/`silences`/`delivered`/`byStage` and the rest were "fire precision and
- * silence rate" for gateQuery before stageLookup existed, and a recognized lookup's `matched` is a
- * different verdict over a different population (an agent naming a stage, not an intercepted
- * action — see stageLookup's own doc comment). Blending the two would silently change what these
- * numbers have always meant the moment stageLookup starts getting called, which is exactly the
- * kind of drift "additive only" is meant to rule out. `byMatcher` is the one new field, and the one
- * place a reader sees recognized activity at all.
+ * WHAT REMAINS IS EVERYTHING THAT READS `stages` AND `rule_bindings` — facts about what is
+ * DECLARED, not about what happened. Those never depended on the event table and are unchanged.
+ *
+ * `unverifiedPatterns` is deliberately STORE-GLOBAL rather than circle-scoped: a stage is a registry
+ * entry with no circle, and "this pattern has never matched anything anywhere" is the question a
+ * dead pattern needs asked of it.
  */
-export interface GateStats {
-  windowDays: number;
-  /** Queries in the window where at least one stage matched. */
-  fires: number;
-  /**
-   * Queries in the window where nothing matched — the agent was off the map.
-   *
-   * EXCLUDES OVERFLOWS. Deriving silence as "not a fire" folded the refusals in, so the
-   * confident-silence rate the design's validation checks read was inflated by exactly the queries
-   * where nothing was confident about anything.
-   */
-  silences: number;
-  /** Queries refused as past the size threshold. Not silence: nobody looked. */
-  overflows: number;
-  /** Fires that delivered at least one rule. `fires - delivered` is the projection-hook population. */
-  delivered: number;
-  windowTotal: number;
-  /** All-time query count for this circle: says whether the window is representative. */
-  total: number;
-  /** Fires per stage in the window, biggest first. */
-  byStage: Array<{ stageId: string; stageName: string; fires: number }>;
-  /**
-   * Counts per matcher in the window — 'mechanical' (gateQuery) vs 'recognized' (stageLookup). The
-   * ONE field on this type that is NOT scoped to the mechanical matcher alone (see the interface's
-   * own doc comment). Only matcher values that actually appear in the window are listed — no
-   * zero-filled row for a matcher that never fired, same convention `byStage` already uses.
-   */
-  byMatcher: Array<{ matcher: GateMatcher; count: number }>;
-  /**
-   * THE READ DIMENSION, per stage, in the window (#28): how many times each stage's rules were
-   * delivered because an agent NAMED it through `stage_lookup`. The second field on this type not
-   * scoped to the mechanical matcher.
-   *
-   * A DIFFERENT QUESTION FROM `byStage`, not a better one. `byStage` counts an intercepted action
-   * matching a trigger pattern; this counts the agent asking. A read proves DELIVERY and nothing
-   * more — never that the rule changed the action — which is a weaker claim than a fire, and it is
-   * listed separately rather than blended for exactly the reason the doc comment above gives.
-   *
-   * ZERO-READ STAGES ARE INCLUDED, and they are the point. Every other list on this type reports
-   * what happened; this one has to report what did NOT, because a stage nobody has ever asked for is
-   * indistinguishable from a healthy quiet one until something says so. Ordered reads-first-ascending
-   * so the zeroes lead.
-   *
-   * SCOPED TO STAGES WITH A LIVE RULE IN THIS CIRCLE, via the shared liveness predicate: a stage
-   * with nothing bound to it in this circle has nothing to deliver, so counting it as unread would
-   * manufacture a finding out of an empty registry entry.
-   */
-  byStageRead: Array<{ stageId: string; stageName: string; reads: number }>;
-  /** Stages whose patterns have never fired anywhere. Store-global; the dead-pattern watchlist. */
+export interface GateCoverage {
   unverifiedPatterns: Array<{ stageId: string; stageName: string; origin: StageOrigin; patterns: string[] }>;
-  /**
-   * Stages carrying at least one unreadable pattern. Those patterns are INERT — corruption narrows
-   * a gate to nothing rather than widening it — so this is the only place a stage that has gone
-   * quiet for that reason says so. Surfaced regardless of `verified`, because a stage can lose a
-   * pattern to corruption long after proving the ones it had.
-   */
   malformedPatterns: Array<{ stageId: string; stageName: string; malformed: number; readable: string[] }>;
-  /**
-   * Agent-scoped rules whose model tag is not the tag now running — "a new model retires the old
-   * model's compensations automatically", surfaced for curation to act on.
-   *
-   * These are already excluded from delivery by gateQuery. They are NOT retired: retirement is a
-   * decision about a stored memory, and a delivery filter that also deleted things would be a
-   * scheduled-review mechanism wearing a gate's clothes. Empty when no runtime tag is supplied,
-   * because without one there is nothing to be a candidate against.
-   */
   retirementCandidates: Array<{ conceptId: string; title: string; modelTag: string; stageName: string }>;
   /** True number omitted after the source cap; absent when the list is complete. */
   retirementCandidatesOmitted?: number;
-  /**
-   * Live denies in this circle carrying no reason — see GateRule.reasonMissing for how one exists
-   * at all (relay from an older peer; local creation is refused).
-   *
-   * LISTED, NOT COUNTED, and listed for a specific reason: this is a REPAIR QUEUE, and a repair
-   * queue that cannot say what to repair is just an alarm. A count tells a reader the population is
-   * not zero; these fields tell them what to type. `stageName` and `title` are exactly the `stage`
-   * and `content` a repairing declaration takes, so the rendered line can name the rule instead of
-   * sending somebody to go find it.
-   *
-   * A non-empty list is NOT an error state — the denies are live and doing their job. What is
-   * missing is the sentence shown to whoever they stop, and only a human can supply it.
-   *
-   * Empty today and intended to stay that way, but the shape is the one it will need: the sync
-   * surface is what makes this population reachable, and inheriting a count somebody has to widen
-   * later is how a disclosure ends up narrower than the thing it discloses.
-   */
   unexplainedDenies: Array<{ conceptId: string; title: string; stageName: string }>;
-  /** True number omitted after the source cap; absent when the list is complete. */
   unexplainedDeniesOmitted?: number;
+  /**
+   * Every stage with a live rule bound in this circle.
+   *
+   * THE DENOMINATOR FOR THE READ DIMENSION, and the reason it is here rather than derived by a
+   * caller: "which stages has nobody ever looked up" is this list minus the stages agents have
+   * actually named (momentStageReads). Scoped to stages with something live to deliver, so an empty
+   * registry entry cannot manufacture a finding.
+   */
+  liveStages: Array<{ stageId: string; stageName: string }>;
 }
 
-export interface GateStatsOptions {
+export interface GateCoverageOptions {
   circle: string;
-  windowDays: number;
   now?: number;
   /** The model now running. Rules tagged for a different one are reported as retirement candidates. */
   runtimeModelTag?: string;
@@ -3829,130 +3590,40 @@ export interface GateStatsOptions {
   exceptionLimit?: number;
 }
 
-export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
+export function gateCoverage(db: StoragePort, opts: GateCoverageOptions): GateCoverage {
   // ROUND-6'S OWN MISSED ENTRANCE (post-merge review round, P2). `retirementCandidates` and
   // `unexplainedDenies` (below) both embed `(b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')` —
   // RULE_LIVENESS_WHERE's own collapsed-OR shape, restated inline at each — which degenerates to
   // "global rules only" the instant `opts.circle` itself is `'*'`, per `assertQueryableCircle`'s own
   // doc comment. Round 6 swept `gateInternal`/`evaluateStageLookup`/`evaluateGateFromMirror`, every
-  // caller of `RULE_LIVENESS_WHERE` at the time — but `gateStats` was written with its own two
+  // caller of `RULE_LIVENESS_WHERE` at the time — but `gateCoverage` was written with its own two
   // hand-rolled copies of the same predicate rather than the shared constant, so it never appeared
-  // in that sweep's own search surface. An unguarded `gateStats('*')` silently reported ZERO local
+  // in that sweep's own search surface. An unguarded `gateCoverage('*')` silently reported ZERO local
   // retirement candidates and ZERO local unexplained denies for circle '*' — not an empty result
   // (nothing wrong), a WRONG one (curation blind to exactly the rules a human most needs to see).
   assertQueryableCircle(opts.circle);
   const now = opts.now ?? Date.now();
-  const since = now - opts.windowDays * 24 * 60 * 60 * 1000;
-  // MECHANICAL ONLY (see GateStats' own doc comment for why): a recognized lookup's `matched` is
-  // not a "fire" in the sense this query has always measured, and letting it through would move
-  // `windowTotal`/`total` off `fires + silences + overflows` — an invariant curation and tests
-  // already rely on — without changing either constant's name.
-  const window = db
+  // THE READ DIMENSION'S DENOMINATOR. Every stage with a live rule bound in this circle — the set
+  // "which stages has nobody ever looked up" is computed against. Scoped by the shared liveness
+  // predicate, so a registry entry with nothing bound to it in this circle cannot manufacture a
+  // finding by having nothing to deliver.
+  const liveStages = db
     .prepare(
-      `SELECT
-         COUNT(*) AS total,
-         SUM(CASE WHEN matched_stage_id IS NOT NULL THEN 1 ELSE 0 END) AS fires,
-         SUM(CASE WHEN rule_count > 0 THEN 1 ELSE 0 END) AS delivered,
-         SUM(CASE WHEN overflow = 1 THEN 1 ELSE 0 END) AS overflows
-       FROM gate_events WHERE circle = ? AND ts >= ? AND matcher = 'mechanical'`,
-    )
-    .get(opts.circle, since) as { total: number; fires: number | null; delivered: number | null; overflows: number | null };
-  const total = (db.prepare(`SELECT COUNT(*) AS n FROM gate_events WHERE circle = ? AND matcher = 'mechanical'`).get(opts.circle) as { n: number }).n;
-  // Counted from EVERY matched stage, not from the one that answered. A broad stage that matches
-  // constantly alongside a narrow deny would otherwise report zero fires — and a stage reporting
-  // zero fires is exactly what curation reads as "dead, safe to remove". Mechanical-only with no
-  // explicit filter needed: stageLookup never writes gate_event_stages (a recognized lookup
-  // resolves to at most one stage, so matched_stage_id alone already carries it with no undercount
-  // risk — see evaluateStageLookup's own comment), so this table is mechanical fires by construction.
-  const byStage = db
-    .prepare(
-      `SELECT es.stage_id AS stageId, s.name AS stageName, COUNT(*) AS fires
-         FROM gate_event_stages es
-         JOIN gate_events g ON g.id = es.event_id
-         JOIN stages s ON s.id = es.stage_id
-        WHERE g.circle = ? AND g.ts >= ?
-        GROUP BY es.stage_id, s.name
-        ORDER BY fires DESC, stageName ASC`,
-    )
-    .all(opts.circle, since) as Array<{ stageId: string; stageName: string; fires: number }>;
-  // THE ONE UNSCOPED QUERY — byMatcher's whole job is to break the window down BY matcher, so it
-  // reads every row rather than pre-filtering to one.
-  const byMatcher = db
-    .prepare(
-      `SELECT matcher, COUNT(*) AS count
-         FROM gate_events
-        WHERE circle = ? AND ts >= ?
-        GROUP BY matcher
-        ORDER BY matcher ASC`,
-    )
-    .all(opts.circle, since) as Array<{ matcher: GateMatcher; count: number }>;
-  // THE READ DIMENSION (#28). Everything above counts the gate answering an intercepted ACTION;
-  // this counts it answering an agent that NAMED a stage. The data has been in this table since
-  // stageLookup started writing `matcher = 'recognized'` rows and no accessor has ever exposed it —
-  // measured on one dogfood store, 387 recognized rows against 16 mechanical, the entire read
-  // dimension unreachable through the public API while the exposed one has been static since July.
-  //
-  // THE FILTERS LIVE IN THE JOIN, NOT IN `WHERE`, and that is the whole query. A stage with zero
-  // reads is the finding; moving `e.circle`/`e.ts`/`e.matcher` into `WHERE` would turn this back
-  // into an inner join and drop exactly the rows worth reporting — the list would then say only
-  // what already happened, which every other list here already says.
-  //
-  // GROUPED ON `matched_stage_id`, NOT THROUGH `gate_event_stages`, because a recognized call never
-  // writes that table (see byStage's comment above): the link table is structurally blind to reads,
-  // and stage identity for a recognized row lives on `gate_events.matched_stage_id` alone.
-  //
-  // A RECOGNIZED MISS carries a NULL stage by construction (evaluateStageLookup's miss path), so it
-  // joins to nothing and is counted nowhere here. That is correct and worth stating: the miss
-  // population is real and countable, but it is not attributable to a stage, so a per-stage list is
-  // not where it can honestly appear.
-  //
-  // SHARED LIVENESS PREDICATE, never a hand-rolled copy — this function's own opening comment is an
-  // incident report about what two inline copies of it cost.
-  //
-  // LIVENESS IS AN `EXISTS`, NOT A JOIN (Codex P2 on PR #51, and it was right). Joining
-  // `rule_bindings` put one row per BINDING under each stage before the events joined, so
-  // `COUNT(e.id)` multiplied every read by the stage's live-rule count — measured exactly:
-  // `pr delivery` reported 124 reads against a true 31, with 4 live rules, and every other row was
-  // the same product. The question here is "was this STAGE read", so the rules must be a test the
-  // stage passes, never rows the count can multiply against.
-  //
-  // AND A ZERO-RULE HIT IS NOT A DELIVERY (Codex P2 on the same review, and also right).
-  // `evaluateStageLookup` records `matched_stage_id` even when the named stage resolved no
-  // deliverable rules — a stage whose rules are all filtered out by model tag, say — and this field's
-  // contract is that a read proves DELIVERY. Counting those would also let a later declaration
-  // retroactively convert an old empty lookup into a read and quietly drop the stage off the unread
-  // list. No instance exists in the dogfood store today (the minimum recorded `rule_count` is 1), so
-  // this is written against the shape of the record rather than against an observed failure.
-  const byStageRead = db
-    .prepare(
-      `SELECT s.id AS stageId, s.name AS stageName, COUNT(e.id) AS reads
+      `SELECT s.id AS stageId, s.name AS stageName
          FROM stages s
-         LEFT JOIN gate_events e
-           ON e.matched_stage_id = s.id
-          AND e.matcher = 'recognized'
-          AND e.circle = ?
-          AND e.ts >= ?
-          AND e.rule_count > 0
         WHERE EXISTS (
                 SELECT 1
                   FROM rule_bindings b
                   JOIN concepts c ON c.id = b.concept_id
                  WHERE b.stage_id = s.id AND ${RULE_LIVENESS_WHERE}
               )
-        GROUP BY s.id, s.name
-        ORDER BY reads ASC, stageName ASC`,
+        ORDER BY s.name ASC`,
     )
-    .all(
-      opts.circle,
-      since,
-      opts.circle,
-      opts.runtimeModelTag ?? null,
-      opts.runtimeModelTag ?? null,
-    ) as GateStats["byStageRead"];
+    .all(opts.circle, opts.runtimeModelTag ?? null, opts.runtimeModelTag ?? null) as GateCoverage["liveStages"];
   const unverified = db
     .prepare(`SELECT id, name, origin, trigger_patterns FROM stages WHERE verified = 0 ORDER BY created_at ASC, id ASC`)
     .all() as Array<{ id: string; name: string; origin: StageOrigin; trigger_patterns: string }>;
-  const malformedPatterns: GateStats["malformedPatterns"] = [];
+  const malformedPatterns: GateCoverage["malformedPatterns"] = [];
   for (const stage of db
     .prepare(`SELECT id, name, trigger_patterns FROM stages ORDER BY created_at ASC, id ASC`)
     .all() as Array<{ id: string; name: string; trigger_patterns: string }>) {
@@ -3987,7 +3658,7 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
     )
     .all(...(exceptionLimit !== undefined
       ? [opts.runtimeModelTag, opts.circle, exceptionLimit + 1]
-      : [opts.runtimeModelTag, opts.circle])) as GateStats["retirementCandidates"]);
+      : [opts.runtimeModelTag, opts.circle])) as GateCoverage["retirementCandidates"]);
   const retirementCandidates = exceptionLimit === undefined
     ? retirementCandidatesAll
     : retirementCandidatesAll.slice(0, exceptionLimit);
@@ -4020,25 +3691,14 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
           )
         ORDER BY s.name ASC, c.title ASC, b.concept_id ASC`,
     )
-    .all(opts.circle) as Array<GateStats["unexplainedDenies"][number] & { reason: string | null }>)
+    .all(opts.circle) as Array<GateCoverage["unexplainedDenies"][number] & { reason: string | null }>)
     .filter((row) => hasNoReason(row.reason))
     .map(({ conceptId, title, stageName }) => ({ conceptId, title, stageName }));
   const unexplainedDenies = exceptionLimit === undefined
     ? unexplainedDeniesAll
     : unexplainedDeniesAll.slice(0, exceptionLimit);
-  const fires = window.fires ?? 0;
-  const overflows = window.overflows ?? 0;
   return {
-    windowDays: opts.windowDays,
-    fires,
-    silences: window.total - fires - overflows,
-    overflows,
-    delivered: window.delivered ?? 0,
-    windowTotal: window.total,
-    total,
-    byStage,
-    byMatcher,
-    byStageRead,
+    liveStages,
     unverifiedPatterns: unverified.map((stage) => ({
       stageId: stage.id,
       stageName: stage.name,

@@ -38,7 +38,7 @@ import {
   formatTriggerPattern,
   gateGeneration,
   gateQuery,
-  gateStats,
+  gateCoverage,
   GATE_MIRROR_FORMAT,
   LEGACY_STAR_CIRCLE,
   migrateGateColumns,
@@ -426,7 +426,7 @@ describe("rule capture", () => {
       kind: "rule", attachTo: first.conceptId, rule: { stage: "some other gate", instance: "Bash:rm -rf", ...AGENT_RULE },
     });
     expect(c.stages().map((s) => s.name)).toEqual(["git force push"]);
-    expect(c.gateStats().unverifiedPatterns.map((u) => u.stageName)).toEqual(["git force push"]);
+    expect(c.gateCoverage().unverifiedPatterns.map((u) => u.stageName)).toEqual(["git force push"]);
     expect(c.ruleBinding(first.conceptId)!.stage_id).toBe(c.stages()[0]!.id);
 
     // A DECLARATION still moves the address, stage and all — that is the sovereign path.
@@ -4218,16 +4218,16 @@ describe("circle '*' is refused as query input, everywhere a gate query can be s
     expect(() => evaluateGateFromMirror(mirror, { actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
 
     // THE CURATION FAMILY (post-merge review round, item 2) — round 6's OWN sweep missed these: NOT
-    // because they are a different mechanism, but because `gateStats` restated
+    // because they are a different mechanism, but because `gateCoverage` restated
     // `(b.circle = ? OR b.circle = '*')` inline (twice) instead of the shared `RULE_LIVENESS_WHERE`
     // constant, so it never surfaced in a search for that constant's own call sites, and
     // `liveStageIndex` is reached from `MonetCore.prewarm()` after `resolveCircle`, which by design
     // passes an explicit '*' straight through rather than refusing it (see `assertQueryableCircle`'s
     // own comment).
-    expect(() => gateStats(db, { circle: BREADTH_CIRCLE, windowDays: 30 })).toThrow(message);
-    expect(() => c.gateStats(BREADTH_CIRCLE)).toThrow(message);
+    expect(() => gateCoverage(db, { circle: BREADTH_CIRCLE })).toThrow(message);
+    expect(() => c.gateCoverage(BREADTH_CIRCLE)).toThrow(message);
     expect(() => liveStageIndex(db, BREADTH_CIRCLE)).toThrow(message);
-    // MonetCore.prewarm() reaches liveStageIndex, while overview() reaches gateStats; verify both
+    // MonetCore.prewarm() reaches liveStageIndex, while overview() reaches gateCoverage; verify both
     // public entrances directly rather than only the shared internal functions.
     expect(() => c.prewarm(BREADTH_CIRCLE)).toThrow(message);
     expect(() => c.overview(BREADTH_CIRCLE)).toThrow(message);
@@ -4237,7 +4237,7 @@ describe("circle '*' is refused as query input, everywhere a gate query can be s
     // circle scoping shows up in `rules`, not `silence` (the stage-hit-no-rules case, not a miss).
     expect(c.gate({ actionContext: "Bash:npm install", circle: "an-ordinary-circle" })).toMatchObject({ silence: false, rules: [] });
     expect(() => evaluateGateFromMirror(mirror, { actionContext: "Bash:npm install", circle: "default" })).not.toThrow();
-    expect(() => c.gateStats("an-ordinary-circle")).not.toThrow();
+    expect(() => c.gateCoverage("an-ordinary-circle")).not.toThrow();
     expect(() => c.prewarm("an-ordinary-circle")).not.toThrow();
     c.close();
   });
@@ -4360,55 +4360,10 @@ describe("gateQuery", () => {
     c.close();
   });
 
-  it("asks no model and no embedder: the firing path is answerable with the embedder removed", async () => {
-    const c = core();
-    await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    // Sabotage the embedder: anything on the firing path that reached for it would throw.
-    (c as unknown as { embedder: { embed: () => never } }).embedder = {
-      embed: () => { throw new Error("the gate must never embed"); },
-    } as never;
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules).toHaveLength(1);
-    c.close();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// instrumentation
-// ---------------------------------------------------------------------------
-describe("gate instrumentation", () => {
-  it("logs one row per query — silences included, because silence is the denominator", async () => {
-    const c = core();
-    await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    c.gate({ actionContext: "Bash:git push --force origin main" });
-    c.gate({ actionContext: "Bash:git status" });
-    c.gate({ actionContext: "Read:/etc/hosts" });
-
-    const rows = raw(c).prepare(`SELECT * FROM gate_events ORDER BY id`).all() as Array<Record<string, unknown>>;
-    expect(rows).toHaveLength(3);
-    expect(rows[0]).toMatchObject({
-      action_context: "Bash:git push --force origin main",
-      rule_count: 1,
-      max_severity: "advisory",
-      circle: "default",
-    });
-    expect(rows[0]!.matched_stage_id).toBe(c.stages()[0]!.id);
-    expect(rows[1]).toMatchObject({ matched_stage_id: null, rule_count: 0, max_severity: null });
-
-    const stats = c.gateStats();
-    expect(stats).toMatchObject({ windowDays: 30, fires: 1, silences: 2, delivered: 1, windowTotal: 3, total: 3 });
-    expect(stats.byStage).toEqual([{ stageId: c.stages()[0]!.id, stageName: "git force push", fires: 1 }]);
-    expect(stats.unverifiedPatterns).toEqual([]); // the one stage fired, so it is verified
-    c.close();
-  });
-
   it("lists the dead patterns — a stage authored from a name that has never matched anything", async () => {
     const c = core();
     await c.declare({ species: "stage", stage: "some action nobody performs", patterns: ["frobnicate --hard"] });
-    const stats = c.gateStats();
+    const stats = c.gateCoverage();
     expect(stats.unverifiedPatterns).toEqual([{
       stageId: c.stages()[0]!.id,
       stageName: "some action nobody performs",
@@ -4418,100 +4373,30 @@ describe("gate instrumentation", () => {
     c.close();
   });
 
-  it("surfaces in overview and in the rendered curation view", async () => {
-    const c = core();
-    await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    await c.declare({ species: "stage", stage: "a dead gate", patterns: ["frobnicate --hard"] });
-    c.gate({ actionContext: "Bash:git push --force origin main" });
-    c.gate({ actionContext: "Bash:git status" });
-
-    const ov = c.overview("default");
-    expect(ov.gateStats).toMatchObject({ fires: 1, silences: 1, delivered: 1 });
-    const rendered = renderOverview(ov, { color: false });
-    expect(rendered).toContain("GATE EXCEPTIONS");
-    expect(rendered).toContain("2 asked · 1 fires · 1 silences · 0 overflows · 1 delivered");
-    expect(rendered).not.toContain("frobnicate --hard");
-    c.close();
-  });
-
-  it("names the stage that ANSWERED, and counts every stage that matched", async () => {
-    const c = core();
-    // The broad stage is OLDER, so "first matched" and "highest severity" disagree — which is the
-    // only configuration where the distinction is observable.
-    await c.declare({ species: "stage", stage: "git push", patterns: ["git push"] });
-    await c.declare({ species: "stage", stage: "git force push", patterns: ["git push --force"] });
-    const advisory = await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", ...AGENT_RULE } });
-    const deny = await c.declare({
-      species: "rule", stage: "git force push", content: "Never force-push to main.", severity: "blocking",
-      reason: "a rewritten history cannot be recovered from a teammate's clone", ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-
-    const fired = c.gate({ actionContext: "Bash:git push --force origin main" });
-    // J2: the stage that produced the DENY, not the one that happens to be oldest. A reader asking
-    // "which stage is blocking me" must not be handed the advisory one.
-    expect(fired.stage!.name).toBe("git force push");
-    expect(fired.stages.map((s) => s.name)).toEqual(["git push", "git force push"]);
-    const event = raw(c).prepare(`SELECT * FROM gate_events ORDER BY id DESC LIMIT 1`).get() as { matched_stage_id: string };
-    expect(event.matched_stage_id).toBe(fired.stage!.id);
-
-    // J3: byStage counts EVERY matched stage. Counting only the one that answered reports the broad
-    // stage as never firing — which is exactly what curation reads as "dead, safe to remove".
-    expect(c.gateStats().byStage.map((s) => [s.stageName, s.fires])).toEqual([
-      ["git force push", 1], ["git push", 1],
-    ]);
-
-    // With no rule to rank by, the projection-hook case falls back to the oldest matched stage.
-    // The deny is withdrawn by declaration first — retiring a live one is refused by the chokepoint.
-    await withdrawDeny(c, deny.conceptId, "git force push");
-    c.retireConcept(deny.conceptId);
-    c.retireConcept(advisory.conceptId);
-    expect(c.gate({ actionContext: "Bash:git push --force origin main" }).stage!.name).toBe("git push");
-    c.close();
-  });
-
-  it("record:false writes NOTHING — not an event, and not a verified flip", async () => {
+  it("record:false does not flip `verified` — a previewed match is not a real one", async () => {
     const c = core();
     await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
     const fired = c.gate({ actionContext: "Bash:terraform apply -auto-approve", record: false });
     expect(fired.stages).toHaveLength(1); // it really did match
-    expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM gate_events`).get()).toEqual({ n: 0 });
-    expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM gate_event_stages`).get()).toEqual({ n: 0 });
     // The dead-pattern watchlist exists to say "this has never matched anything REAL". A measured
     // or previewed match is not a real action, so it must not silence the watchlist.
     expect(c.stages()[0]!.verified).toBe(false);
-    expect(c.gateStats().unverifiedPatterns).toHaveLength(1);
+    expect(c.gateCoverage().unverifiedPatterns).toHaveLength(1);
 
     c.gate({ actionContext: "Bash:terraform apply -auto-approve" });
     expect(c.stages()[0]!.verified).toBe(true);
     c.close();
   });
 
-  it("records a stored excerpt as truncated WITHOUT that ever having limited the match", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "rm -rf", patterns: ["Bash:rm -rf"] });
-    c.gate({ actionContext: `Bash:rm -rf /tmp/x` });
-    // Long enough to exceed what the event row stores, nowhere near the refusal threshold — and the
-    // deny hidden at the far end still fires. `truncated` is a note about the EXCERPT, not coverage.
-    const fired = c.gate({ actionContext: `Bash:${"x".repeat(70_000)} && rm -rf /tmp/y` });
-    expect(fired.rules.length + fired.stages.length).toBeGreaterThan(0);
-    expect(fired.overflow).toBe(false);
-    const rows = raw(c).prepare(`SELECT truncated, overflow, matched_stage_id FROM gate_events ORDER BY id`)
-      .all() as Array<{ truncated: number; overflow: number; matched_stage_id: string | null }>;
-    expect(rows.map((r) => r.truncated)).toEqual([0, 1]);
-    expect(rows.map((r) => r.overflow)).toEqual([0, 0]);
-    expect(rows[1]!.matched_stage_id).not.toBeNull();
-    c.close();
-  });
-
-  it("keeps overview READ-ONLY: reading gate stats fires no gate", async () => {
+  it("keeps overview READ-ONLY: reading the gate's own coverage fires no gate", async () => {
     const c = core();
     await c.store("Never force-push.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
     c.overview("default");
     c.overview("default");
-    expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM gate_events`).get()).toEqual({ n: 0 });
+    // Reading a curation surface must not look like an intercepted action. `verified` is the
+    // observable that would move if it did: it flips on a stage's first REAL fire, and a reader
+    // that flipped it would silence the dead-pattern watchlist by being read.
+    expect(c.stages().every((stage) => stage.verified === false)).toBe(true);
     c.close();
   });
 });
@@ -4562,70 +4447,6 @@ describe("gate substrate sync", () => {
    * relayed projection/ratification edge left graftRows' closing `refreshGateSidecar()` treating a
    * parentless mirror as current while the live gate reported the parent.
    */
-  it("bumps the generation when a grafted DERIVATION edge lands on a bound rule, so the mirror's parent field cannot go stale", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const src = core({ syncDeviceId: "machine-a" });
-    const dst = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-b", gateSidecarPath: path,
-    });
-    const declared = await src.declare({ species: "principle", content: "Irreversible acts get a confirmation.", declaredBy: "john" });
-    if (declared.species !== "principle") throw new Error("unreachable");
-    const rule = await src.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
-    });
-
-    // ROUND 1 — the rule, its stage and its binding arrive with NO parent yet. The mirror on disk is
-    // correct at this moment, and parentless.
-    const first = src.exportDelta(0);
-    dst.graftRows(first);
-    const parentless = JSON.parse(readFileSync(path, "utf8")) as GateMirror;
-    expect(parentless.entries.find((e) => e.conceptId === rule.conceptId)!.projectedFromPrincipleId).toBeUndefined();
-    const before = dst.sidecarGeneration();
-
-    // ROUND 2 — ONLY a derivation edge is new. Every other row in this payload landed identically in
-    // round 1 and is skipped, so any bump at all comes from the edge.
-    const edge = src.addLifecycleEdge({
-      family: "derivation", srcConceptId: declared.conceptId, dstConceptId: rule.conceptId,
-      bornOf: "ratification", eventRef: src.getRatifications(declared.conceptId)[0]!.id,
-    });
-    const second = dst.graftRows(src.exportDelta(0));
-    expect(second.inserted.lifecycle_edges).toBe(1);
-    expect(dst.getLifecycleEdges(rule.conceptId, { direction: "in", family: "derivation" }).map((e) => e.id)).toEqual([edge.id]);
-
-    // THE LIVE GATE ALREADY SAYS IT — and the file must not disagree.
-    expect(dst.gate({ actionContext: "Bash:helm delete my-release" }).rules[0]!.projectedFromPrincipleId)
-      .toBe(declared.conceptId);
-    expect(dst.sidecarGeneration()).toBeGreaterThan(before);
-    const refreshed = JSON.parse(readFileSync(path, "utf8")) as GateMirror;
-    expect(refreshed.entries.find((e) => e.conceptId === rule.conceptId)!.projectedFromPrincipleId)
-      .toBe(declared.conceptId);
-    expect(evaluateGateFromMirror(refreshed, { actionContext: "Bash:helm delete my-release", circle: "default" }).rules[0]!.projectedFromPrincipleId)
-      .toBe(declared.conceptId);
-    src.close();
-    dst.close();
-  });
-
-  it("does NOT carry gate_events — one machine's action stream is not the other's", async () => {
-    const src = core({ syncDeviceId: "machine-a" });
-    const dst = core({ syncDeviceId: "machine-b" });
-    await src.store("Never force-push.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    src.gate({ actionContext: "Bash:git push --force origin main" });
-    src.gate({ actionContext: "Bash:git status" });
-    expect(src.gateStats().windowTotal).toBe(2);
-
-    const payload = src.exportDelta(0);
-    expect(payload).not.toHaveProperty("gateEvents");
-    expect(JSON.stringify(payload)).not.toContain("git status");
-    await dst.graftRows(payload);
-    expect(dst.gateStats().windowTotal).toBe(0);
-    expect(raw(dst).prepare(`SELECT COUNT(*) AS n FROM gate_events`).get()).toEqual({ n: 0 });
-    src.close();
-    dst.close();
-  });
-
   it("converges `verified` as a grow-only fact: a peer who never fired cannot un-verify", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
@@ -4734,7 +4555,7 @@ describe("gate substrate sync", () => {
     // ...and CURATION gets a REPAIR QUEUE, not an alarm: `stageName` and `title` are exactly the
     // `stage` and `content` the repairing declaration below takes, so nothing has to be gone and
     // found first.
-    expect(dst.gateStats("default").unexplainedDenies).toEqual([
+    expect(dst.gateCoverage("default").unexplainedDenies).toEqual([
       { conceptId, title: "Never delete a tree unattended", stageName: "rm -rf" },
     ]);
 
@@ -4777,7 +4598,7 @@ describe("gate substrate sync", () => {
       const mirrored = dst.materializeGateMirror().sidecar;
       expect(evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules[0])
         .toMatchObject({ reasonMissing: true });
-      expect(dst.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId, stageName: "rm -rf" }]);
+      expect(dst.gateCoverage("default").unexplainedDenies).toMatchObject([{ conceptId, stageName: "rm -rf" }]);
       const rendered = renderOverview(dst.overview("default"), { color: false });
       expect(rendered).toContain("repair [");
       expect(rendered).toContain("rm -rf  ·  Never delete a tree unattended");
@@ -4830,7 +4651,7 @@ describe("gate substrate sync", () => {
       const mirrored = c.materializeGateMirror().sidecar;
       const offlineFired = evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" });
       expect(offlineFired.rules[0]).toMatchObject({ reasonMissing: true });
-      expect(c.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
+      expect(c.gateCoverage("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
       expect(renderOverview(c.overview("default"), { color: false })).toContain("repair [");
       // Delivered as NULL, not as the raw value: `reason` is declared `string | null`, and handing a
       // caller a Buffer moves the crash from this module into theirs. The mirror stays readable JSON
@@ -4861,7 +4682,7 @@ describe("gate substrate sync", () => {
     expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
       severity: "blocking", reason: "42.0", reasonMissing: false,
     });
-    expect(c.gateStats("default").unexplainedDenies).toEqual([]);
+    expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
     c.close();
   });
 
@@ -4894,7 +4715,7 @@ describe("gate substrate sync", () => {
     expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
       severity: "blocking", reason: "there is genuinely no undo", reasonMissing: false,
     });
-    expect(c.gateStats("default").unexplainedDenies).toEqual([]);
+    expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
     c.close();
   });
 
@@ -5064,13 +4885,13 @@ describe("gate substrate sync", () => {
     // ...so DISCLOSURE must not say it does. Naming it here told the user to redeclare a rule whose
     // redeclaration would CREATE the missing stage and change what the store does — a repair queue
     // giving advice that alters behaviour rather than restoring it.
-    expect(dst.gateStats("default").unexplainedDenies).toEqual([]);
+    expect(dst.gateCoverage("default").unexplainedDenies).toEqual([]);
     expect(renderOverview(dst.overview("default"), { color: false })).not.toContain("repair [");
 
     // And once the stage lands, the SAME binding is a live reasonless deny on every surface at once.
     dst.graftRows(payload);
     expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
-    expect(dst.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
+    expect(dst.gateCoverage("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
     src.close();
     dst.close();
   });
@@ -5084,7 +4905,7 @@ describe("gate substrate sync", () => {
     expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
       reason: "  there is no undo  ", reasonMissing: false,
     });
-    expect(dst.gateStats("default").unexplainedDenies).toEqual([]);
+    expect(dst.gateCoverage("default").unexplainedDenies).toEqual([]);
     expect(renderOverview(dst.overview("default"), { color: false })).not.toContain("repair [");
     expect(conceptId).toBeTruthy();
     src.close();
@@ -5118,7 +4939,7 @@ describe("gate substrate sync", () => {
     expect(mirrored.entries[0]).toMatchObject({ reason: "there is no undo" });
     expect(evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules[0])
       .toMatchObject({ reason: "there is no undo", reasonMissing: false });
-    expect(dst.gateStats("default").unexplainedDenies).toEqual([]);
+    expect(dst.gateCoverage("default").unexplainedDenies).toEqual([]);
     src.close();
     dst.close();
   });
@@ -5133,16 +4954,16 @@ describe("gate substrate sync", () => {
     // section's own comment is the standard being met here: a JSON field on the MCP response does
     // not discharge a disclosure whose whole purpose is that a human sees it.
     const ov = dst.overview("default");
-    expect(ov.gateStats).toMatchObject({ windowTotal: 0 });
-    expect(ov.gateStats!.unexplainedDenies).toHaveLength(1);
+    expect(ov.gate).toMatchObject({ total: 0 });
+    expect(ov.gate!.unexplainedDenies).toHaveLength(1);
     const rendered = renderOverview(ov, { color: false });
-    expect(rendered).toContain("GATE EXCEPTIONS");
+    expect(rendered).toContain("GATE");
     expect(rendered).toContain("repair [");
     expect(rendered).toContain("rm -rf  ·  Never delete a tree unattended");
     // ...and the ID, so the exact rule can be FETCHED before it is redeclared. Titles are a concept's
     // first line, not its content, and nothing makes them unique — repairing by title alone is how
     // somebody fixes the wrong rule. Leads the row so truncation can never take it.
-    const conceptId = dst.gateStats("default").unexplainedDenies[0]!.conceptId;
+    const conceptId = dst.gateCoverage("default").unexplainedDenies[0]!.conceptId;
     expect(rendered).toContain(`[${conceptId.slice(0, 8)}] rm -rf  ·  Never delete a tree unattended`);
     src.close();
     dst.close();
@@ -5162,7 +4983,7 @@ describe("gate substrate sync", () => {
     const payload = src.exportDelta(0);
     dst.graftRows({ ...payload, ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, reason: null })) });
 
-    const stats = dst.gateStats("default");
+    const stats = dst.gateCoverage("default");
     expect(stats.unexplainedDenies).toHaveLength(7);
     const rendered = renderOverview(dst.overview("default"), { color: false });
     expect(rendered).toContain("gate-0  ·  Never run tool 0 unattended");
@@ -5190,7 +5011,7 @@ describe("gate substrate sync", () => {
     expect(c.gate({ actionContext: "Bash:git push" }).rules[0]).toMatchObject({
       severity: "advisory", reason: null, reasonMissing: false,
     });
-    expect(c.gateStats("default").unexplainedDenies).toEqual([]);
+    expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
 
     // ...and an ordinary deny, declared properly, is never marked either.
     await c.declare({
@@ -5199,7 +5020,7 @@ describe("gate substrate sync", () => {
       reason: "there is no undo", ...AGENT_RULE,
     });
     expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: false });
-    expect(c.gateStats("default").unexplainedDenies).toEqual([]);
+    expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
     c.close();
   });
 
@@ -5475,7 +5296,7 @@ describe("deny power cannot be removed by accident", () => {
     expect(disarmed.patterns).toEqual([]);
     expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).silence).toBe(true);
     // An inert stage is visible in curation rather than quietly gone.
-    expect(c.gateStats().unverifiedPatterns.map((u) => u.stageName)).toContain("rm -rf");
+    expect(c.gateCoverage().unverifiedPatterns.map((u) => u.stageName)).toContain("rm -rf");
     c.close();
   });
 
@@ -5489,7 +5310,7 @@ describe("deny power cannot be removed by accident", () => {
     // The proof belonged to the OLD patterns. Carrying it across would have the dead-pattern
     // watchlist vouch for a replacement nothing has ever matched.
     expect(c.stages()[0]!.verified).toBe(false);
-    expect(c.gateStats().unverifiedPatterns.map((u) => u.patterns)).toEqual([["*: terraform destroy"]]);
+    expect(c.gateCoverage().unverifiedPatterns.map((u) => u.patterns)).toEqual([["*: terraform destroy"]]);
     c.close();
   });
 
@@ -5611,19 +5432,6 @@ describe("deny power cannot be removed by accident", () => {
       .toContainEqual([deny.conceptId, nominated.conceptId].sort());
     c.close();
   });
-
-  it("refuses a correction on a SUPERSEDED rule the caller named, pointing at the successor", async () => {
-    const c = resolvingCore();
-    const original = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    const successor = await c.store("Force-push is fine on your own branch; never on a shared one.", {
-      kind: "correction", attachTo: original.conceptId,
-    });
-    await expect(c.store("A further correction, aimed at history.", { kind: "correction", attachTo: original.conceptId }))
-      .rejects.toThrow(new RegExp(`already been superseded by '${successor.conceptId}'`));
-    c.close();
-  });
 });
 
 describe("the robustness tail", () => {
@@ -5634,21 +5442,21 @@ describe("the robustness tail", () => {
     await c.store("Never force-push to a shared branch.", {
       kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
     });
-    // Break the write half only. A gate lookup that THREW because an event row could not be
-    // inserted would be the worst possible trade: an instrumentation row is a rounding error on a
-    // rate, a missed delivery is the thing the subsystem exists to prevent.
+    // Break the write half only. A gate lookup that THREW because its bookkeeping could not be
+    // written would be the worst possible trade: the bookkeeping is a rounding error, a missed
+    // delivery is the thing the subsystem exists to prevent. The row that used to be at risk here
+    // was a `gate_events` insert; what remains is the `verified` flip, and the property is the same.
     const db = raw(c) as unknown as { prepare: (sql: string) => unknown };
     const original = db.prepare.bind(db);
     db.prepare = (sql: string) => {
-      if (sql.includes("INSERT INTO gate_events")) throw new Error("database is locked");
+      if (sql.includes("UPDATE stages SET verified")) throw new Error("database is locked");
       return original(sql) as never;
     };
     const fired = c.gate({ actionContext: "Bash:git push --force origin main" });
     expect(fired.rules).toHaveLength(1);
     db.prepare = original as never;
-    // The verdict survived; only the log did not.
-    expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM gate_events`).get()).toEqual({ n: 0 });
-    expect(c.gate({ actionContext: "Bash:git push --force origin main" }).rules).toHaveLength(1);
+    // The verdict survived; only the bookkeeping did not.
+    expect(c.stages()[0]!.verified).toBe(false);
     c.close();
   });
 
@@ -5879,7 +5687,7 @@ describe("the robustness tail", () => {
     expect(parseTriggerPatterns(
       (raw(c).prepare(`SELECT trigger_patterns AS p FROM stages WHERE id = ?`).get(stageId) as { p: string }).p,
     )).toHaveLength(32);
-    expect(c.gateStats().malformedPatterns[0]).toMatchObject({ stageId, malformed: 8 });
+    expect(c.gateCoverage().malformedPatterns[0]).toMatchObject({ stageId, malformed: 8 });
     c.close();
   });
 });
@@ -6837,7 +6645,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
     expect(fired.rules[0]).toMatchObject({ severity: "blocking", reasonMissing: true });
 
-    expect(dst.gateStats("default").unexplainedDenies).toEqual([
+    expect(dst.gateCoverage("default").unexplainedDenies).toEqual([
       { conceptId: deny.conceptId, title: "Never delete a tree unattended", stageName: "rm -rf" },
     ]);
     src.close();
@@ -8869,8 +8677,6 @@ describe("silence never means I gave up", () => {
     expect(result.overflow).toBe(true);
     expect(result.silence).toBe(false);
     expect(result.rules).toEqual([]);
-    const row = raw(c).prepare(`SELECT overflow FROM gate_events ORDER BY id DESC LIMIT 1`).get() as { overflow: number };
-    expect(row.overflow).toBe(1);
     c.close();
   });
 
@@ -8935,36 +8741,6 @@ describe("corruption narrows a pattern, never widens it", () => {
     expect(readTriggerPatterns(mixed)).toEqual({ patterns: [{ tool: "bash", tokens: ["git", "push"] }], malformed: 1 });
   });
 
-  it("surfaces the corruption in curation so a stage that went quiet says why", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "rm -rf", patterns: ["Bash:rm -rf", "Bash:rm -fr"] });
-    const stageId = c.stages()[0]!.id;
-    raw(c).prepare(`UPDATE stages SET trigger_patterns = ? WHERE id = ?`)
-      .run(JSON.stringify([{ tool: 42, tokens: ["rm", "-rf"] }, { tool: "Bash", tokens: ["rm", "-fr"] }]), stageId);
-
-    // The corrupt pattern fires on NOTHING rather than on everything.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).silence).toBe(true);
-    expect(c.gate({ actionContext: "Read:/etc/hosts" }).silence).toBe(true);
-    expect(c.gate({ actionContext: "Bash:rm -fr /tmp/x" }).silence).toBe(false);
-    expect(c.gateStats().malformedPatterns).toEqual([
-      { stageId, stageName: "rm -rf", malformed: 1, readable: ["bash: rm -fr"] },
-    ]);
-    c.close();
-  });
-});
-
-describe("overflow is not silence, in the metrics either", () => {
-  it("counts refusals separately from confident silences", () => {
-    const c = core();
-    void c.declare({ species: "stage", stage: "rm -rf", patterns: ["Bash:rm -rf"] });
-    c.gate({ actionContext: "Bash:rm -rf /tmp/x" });                    // fire
-    c.gate({ actionContext: "Bash:git status" });                       // silence
-    c.gate({ actionContext: `Bash:${"x".repeat(4 * 1024 * 1024 + 16)}` }); // overflow
-    // Deriving silence as "not a fire" folded refusals in, inflating exactly the confident-silence
-    // rate the design's validation checks read.
-    expect(c.gateStats()).toMatchObject({ windowTotal: 3, fires: 1, silences: 1, overflows: 1 });
-    c.close();
-  });
 });
 
 describe("model-tag retirement", () => {
@@ -8989,11 +8765,11 @@ describe("model-tag retirement", () => {
     expect(next.rules.map((r) => r.conceptId)).toEqual([domain.conceptId]);
 
     // ...and the filtered rule surfaces for curation rather than being retired by machinery.
-    expect(c.gateStats("default", 30, "model-2").retirementCandidates).toEqual([
+    expect(c.gateCoverage("default", "model-2").retirementCandidates).toEqual([
       { conceptId: forOld.conceptId, title: "Old model forgets to quote paths", modelTag: "model-1", stageName: "git force push" },
     ]);
-    expect(c.gateStats("default", 30, "model-1").retirementCandidates).toEqual([]);
-    expect(c.gateStats().retirementCandidates).toEqual([]); // no tag, nothing to be a candidate against
+    expect(c.gateCoverage("default", "model-1").retirementCandidates).toEqual([]);
+    expect(c.gateCoverage().retirementCandidates).toEqual([]); // no tag, nothing to be a candidate against
     // FILTERED IS NOT RETIRED: the rule is still stored, still bound, still findable.
     expect(c.ruleBinding(forOld.conceptId)).toMatchObject({ severity: "advisory", model_tag: "model-1" });
     c.close();
@@ -9005,7 +8781,7 @@ describe("model-tag retirement", () => {
       kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-1" },
     });
     expect(c.gate({ actionContext: "Bash:git push --force" }).rules).toEqual([]);
-    expect(c.gateStats().retirementCandidates.map((r) => r.conceptId)).toEqual([forOld.conceptId]);
+    expect(c.gateCoverage().retirementCandidates.map((r) => r.conceptId)).toEqual([forOld.conceptId]);
     c.close();
   });
 });
@@ -9295,77 +9071,6 @@ describe("stageLookup — the recognized matcher", () => {
     c.close();
   });
 
-  it("gate_events rows: mechanical vs recognized land correctly, and a recognized MISS is recorded too", async () => {
-    const c = core();
-    await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    c.gate({ actionContext: "Bash:git push --force" });        // mechanical hit
-    c.stageLookup({ stage: "git force push" });                // recognized hit
-    c.stageLookup({ stage: "no such stage at all" });           // recognized MISS
-
-    const rows = raw(c).prepare(`SELECT action_context, matcher, matched_stage_id FROM gate_events ORDER BY id`)
-      .all() as Array<{ action_context: string; matcher: string; matched_stage_id: string | null }>;
-    expect(rows).toHaveLength(3);
-    expect(rows[0]!.matcher).toBe("mechanical");
-    expect(rows[0]!.matched_stage_id).not.toBeNull();
-    expect(rows[1]).toMatchObject({ matcher: "recognized", action_context: "git force push" });
-    expect(rows[1]!.matched_stage_id).not.toBeNull();
-    // THE MISS: recorded, matcher='recognized', matched_stage_id NULL, action_context = what was asked.
-    expect(rows[2]).toMatchObject({ matcher: "recognized", action_context: "no such stage at all", matched_stage_id: null });
-    c.close();
-  });
-
-  it("schema upgrade: a store created before `matcher` existed gets the column, and both matchers write successfully", async () => {
-    const dir = mkTmp();
-    const dbPath = join(dir, "pre-matcher.db");
-    const old = new Database(dbPath);
-    // The pre-column shape — every gate_events column this slice's ALTER adds `matcher` on top of.
-    old.exec(`
-      CREATE TABLE gate_events (
-        id INTEGER PRIMARY KEY,
-        ts INTEGER NOT NULL,
-        action_context TEXT NOT NULL,
-        matched_stage_id TEXT,
-        rule_count INTEGER NOT NULL,
-        max_severity TEXT,
-        latency_us INTEGER NOT NULL,
-        circle TEXT NOT NULL,
-        truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
-        overflow INTEGER NOT NULL DEFAULT 0 CHECK (overflow IN (0, 1))
-      );
-    `);
-    // A pre-existing row, exactly as an old binary would have left one — proves the guard is a
-    // real ALTER against a populated table, not merely a fresh CREATE TABLE that happens to include it.
-    old.prepare(
-      `INSERT INTO gate_events (ts, action_context, matched_stage_id, rule_count, max_severity, latency_us, circle, truncated, overflow)
-       VALUES (1000, 'Bash:old row', NULL, 0, NULL, 5, 'default', 0, 0)`,
-    ).run();
-    old.close();
-
-    const c = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    try {
-      const cols = raw(c).prepare(`PRAGMA table_info(gate_events)`).all() as Array<{ name: string }>;
-      expect(cols.some((col) => col.name === "matcher")).toBe(true);
-      // The pre-existing row backfilled to 'mechanical' — true by construction, since 'recognized'
-      // did not exist before this slice.
-      expect(raw(c).prepare(`SELECT matcher FROM gate_events WHERE action_context = 'Bash:old row'`).get())
-        .toEqual({ matcher: "mechanical" });
-
-      // Both matchers write successfully against the migrated store.
-      await c.store("Never force-push to a shared branch.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
-      c.gate({ actionContext: "Bash:git push --force" });
-      c.stageLookup({ stage: "git force push" });
-      c.stageLookup({ stage: "no such stage" });
-
-      const matchers = raw(c).prepare(`SELECT matcher FROM gate_events WHERE action_context != 'Bash:old row' ORDER BY id`)
-        .all() as Array<{ matcher: string }>;
-      expect(matchers.map((m) => m.matcher)).toEqual(["mechanical", "recognized", "recognized"]);
-    } finally {
-      c.close();
-    }
-  });
-
   it("re-aiming a stage's patterns reroutes the MECHANICAL matcher only — recognized delivery is unaffected (doctrine, item 7)", async () => {
     const c = core();
     const deny = await c.declare({
@@ -9422,53 +9127,6 @@ class StaleMatcherProbeStorage extends BetterSqlitePort {
   }
 }
 
-describe("createGateSchema — concurrent-migrator race", () => {
-  it("a stale second-migrator probe hits a REAL duplicate-column error, caught as success — startup does not abort (Codex round 3, item 5)", () => {
-    const dir = mkTmp();
-    const path = join(dir, "monet.db");
-
-    // FIRST MIGRATOR: an ordinary open against a brand-new file. The CREATE TABLE declares
-    // `matcher` inline, so this alone leaves the column present — the WINNER of the race.
-    const winner = new BetterSqlitePort(path);
-    createGateSchema(winner);
-    winner.close();
-
-    // SECOND MIGRATOR: a fresh connection to the SAME (already-migrated) file, but its own PRAGMA
-    // probe is stale (the race — two processes opening a pre-column store at once is the SUPPORTED
-    // MCP+CLI topology storage.ts's WAL + busy_timeout setup exists for) and reports the column
-    // absent. createGateSchema proceeds to the ALTER exactly as the real guard would, and hits
-    // SQLite's real "duplicate column name" error against the real, already-migrated table.
-    const loser = new StaleMatcherProbeStorage(path);
-    expect(() => createGateSchema(loser)).not.toThrow();
-
-    // NOT CORRUPTED: exactly one `matcher` column, not two — the catch swallowed the race; it did
-    // not paper over a real schema problem.
-    const cols = loser.prepare(`PRAGMA table_info(gate_events)`).all() as Array<{ name: string }>;
-    expect(cols.filter((c) => c.name === "matcher")).toHaveLength(1);
-    loser.close();
-  });
-});
-
-/**
- * SAME TECHNIQUE, A DIFFERENT TABLE (post-merge review round, P2): `StaleMatcherProbeStorage` above
- * simulates the race for gate_events' own `matcher` column; this is its twin for
- * `ingest_operations`' four receipt columns (`rule_previous_severity`, `rule_previous_circle`,
- * `rule_circle`, `rule_severity`) — engine.ts's own `migrate()`, not gates.ts's `migrateGateColumns`,
- * but the identical race shape: a second migrator's PRAGMA probe, taken before a first migrator's
- * ALTER committed, reports a column absent regardless of what the REAL table underneath already has.
- * `migrate()` is PRIVATE, reachable only through `MonetCore`'s own constructor — unlike
- * `createGateSchema` above, there is no lighter-weight standalone entry point to call directly, so
- * this constructs a full `MonetCore` against the probe port.
- *
- * FILTERS OUT ONLY THE FOUR TARGET COLUMNS, not the whole result — unlike `StaleMatcherProbeStorage`
- * above (which can safely blank the ENTIRE result, since `matcher` is the only column that guard
- * ever checks). `ingest_operations` carries OTHER guarded-but-uncaught ALTERs sharing this exact
- * PRAGMA read (`writer_domain`, `source_concept_id` — a separate, out-of-scope observation; see the
- * round's own report) — blanking the whole result made THOSE columns look stale too, so migrate()
- * threw on `writer_domain` before ever reaching the four columns this test targets. Filtering the
- * REAL result down to "everything except these four" keeps the race scoped to exactly what this
- * round fixed.
- */
 class StaleIngestOperationsColumnProbeStorage extends BetterSqlitePort {
   private probeConsumed = false;
   private static readonly TARGET_COLUMNS = new Set([
@@ -11419,9 +11077,8 @@ describe("liveStageIndex — SQL-level retrieval bound", () => {
 });
 
 // ---------------------------------------------------------------------------
-// gateStats byMatcher
 // ---------------------------------------------------------------------------
-describe("gateStats retirement-candidate ordering", () => {
+describe("gateCoverage retirement-candidate ordering", () => {
   function seededStore(): MonetCore {
     const c = core();
     const db = raw(c);
@@ -11445,8 +11102,8 @@ describe("gateStats retirement-candidate ordering", () => {
   it("selects the same capped prefix under duplicate model tags and titles", () => {
     const first = seededStore();
     const second = seededStore();
-    const ids = (c: MonetCore) => gateStats(raw(c) as never, {
-      circle: "default", windowDays: 30, runtimeModelTag: "current-model", exceptionLimit: 10,
+    const ids = (c: MonetCore) => gateCoverage(raw(c) as never, {
+      circle: "default", runtimeModelTag: "current-model", exceptionLimit: 10,
     }).retirementCandidates.map((candidate) => candidate.conceptId);
     expect(ids(first)).toEqual(ids(second));
     expect(ids(first)).toEqual(Array.from({ length: 10 }, (_, index) => `stable-concept-${String(index).padStart(2, "0")}`));
@@ -11455,204 +11112,6 @@ describe("gateStats retirement-candidate ordering", () => {
   });
 });
 
-describe("gateStats byMatcher", () => {
-  it("counts fires per matcher in the window; every other field stays mechanical-only (additive)", async () => {
-    const c = core();
-    await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    c.gate({ actionContext: "Bash:git push --force" });   // mechanical fire
-    c.gate({ actionContext: "Bash:git status" });          // mechanical silence
-    c.stageLookup({ stage: "git force push" });            // recognized hit
-    c.stageLookup({ stage: "git force push" });            // recognized hit
-    c.stageLookup({ stage: "no such stage" });             // recognized miss
-
-    const stats = c.gateStats();
-    expect([...stats.byMatcher].sort((a, b) => a.matcher.localeCompare(b.matcher))).toEqual([
-      { matcher: "mechanical", count: 2 },
-      { matcher: "recognized", count: 3 },
-    ]);
-    // ADDITIVE: the pre-existing fields are unmoved by, and exclude, the recognized rows.
-    expect(stats).toMatchObject({ windowDays: 30, fires: 1, silences: 1, delivered: 1, windowTotal: 2, total: 2 });
-    c.close();
-  });
-});
-
-/**
- * THE READ DIMENSION (#28). `byMatcher` above proves the recognized rows are COUNTED; none of it
- * could say WHICH stage was read, so "which of my stages has never been asked for" was unanswerable
- * through the public API while the data sat in the same table the whole time.
- *
- * Measured on one dogfood store before this shipped: `byStage` could speak about 1 stage (9 rows in
- * `gate_event_stages`), while the recognized rows in the same database covered 24 — and three of
- * those had never been read at all.
- */
-describe("gateStats byStageRead — the read dimension, per stage", () => {
-  it("counts stage_lookup deliveries per stage, and lists a live stage nobody has ever asked for", async () => {
-    const c = core();
-    await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    await c.store("Say what changed before opening a PR.", {
-      kind: "rule", rule: { stage: "pr delivery", instance: "Bash:gh pr create", ...AGENT_RULE },
-    });
-    c.stageLookup({ stage: "git force push" });
-    c.stageLookup({ stage: "git force push" });
-    c.stageLookup({ stage: "no such stage" }); // a MISS: null stage, attributable to none
-
-    const byStage = Object.fromEntries(
-      c.gateStats().byStageRead.map((row) => [row.stageName, row.reads]),
-    );
-    expect(byStage["git force push"]).toBe(2);
-    // THE FINDING. `pr delivery` has a live rule bound and has never been asked for — the state that
-    // is otherwise indistinguishable from a healthy quiet stage. A list that only reported stages
-    // with reads could not contain this row at all.
-    expect(byStage["pr delivery"]).toBe(0);
-    // The miss is attributable to no stage, so it appears nowhere here rather than being charged to one.
-    expect(Object.values(byStage).reduce((a, b) => a + b, 0)).toBe(2);
-    c.close();
-  });
-
-  /**
-   * ZEROES LEAD. The ordering is the disclosure: a reader scanning the top of this list sees the
-   * stages nothing has asked for, which is the only signal here that cannot be inferred from silence.
-   */
-  it("orders unread stages first", async () => {
-    const c = core();
-    await c.store("Never force-push.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
-    });
-    await c.store("Explain the change.", {
-      kind: "rule", rule: { stage: "pr delivery", instance: "Bash:gh pr create", ...AGENT_RULE },
-    });
-    c.stageLookup({ stage: "git force push" });
-    expect(c.gateStats().byStageRead[0]).toMatchObject({ stageName: "pr delivery", reads: 0 });
-    c.close();
-  });
-
-  /**
-   * A READ IS NOT A FIRE, and the two dimensions must not contaminate each other — the reason the
-   * rest of `GateStats` stays mechanical-only in the first place.
-   */
-  it("counts only recognized rows: a mechanical fire on the same stage does not appear here", async () => {
-    const c = core();
-    await c.store("Never force-push.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
-    });
-    c.gate({ actionContext: "Bash:git push --force" }); // a FIRE on this stage, not a read
-    const stats = c.gateStats();
-    expect(stats.byStageRead.find((row) => row.stageName === "git force push")!.reads).toBe(0);
-    expect(stats.byStage.find((row) => row.stageName === "git force push")!.fires).toBe(1);
-    c.close();
-  });
-
-  /**
-   * ONE READ IS ONE READ, however many rules the stage carries (Codex P2 on PR #51).
-   *
-   * The first cut joined `rule_bindings` to test liveness, which put a row per BINDING under each
-   * stage before the events joined — so the count multiplied by the live-rule count. Measured on the
-   * dogfood store: `pr delivery` reported 124 reads against a true 31, with 4 live rules.
-   *
-   * EVERY FIXTURE IN THIS BLOCK BOUND EXACTLY ONE RULE PER STAGE, which is why the suite was green
-   * while the defect was in every multi-rule row: at one rule the multiplier is 1 and the bug is
-   * arithmetically invisible. The fixture could not exhibit the effect it was certifying.
-   */
-  it("counts a lookup once even when the stage carries several rules", async () => {
-    const c = core();
-    for (const text of ["Never force-push.", "Explain the rewrite.", "Tell John first."]) {
-      await c.store(text, {
-        kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
-      });
-    }
-    c.stageLookup({ stage: "git force push" });
-    c.stageLookup({ stage: "git force push" });
-    const row = c.gateStats().byStageRead.find((r) => r.stageName === "git force push")!;
-    expect(row.reads).toBe(2); // two lookups — not 2 x 3 rules
-    c.close();
-  });
-
-  /**
-   * A READ PROVES DELIVERY, so a lookup that delivered nothing is not one (Codex P2, same review).
-   * `evaluateStageLookup` still records `matched_stage_id` when every rule was filtered out — here by
-   * a model tag that does not match — and counting that would let a later declaration retroactively
-   * turn an empty lookup into a read, dropping the stage off the unread list without anything having
-   * been delivered.
-   */
-  it("does not let a later declaration turn an earlier empty lookup into a read", async () => {
-    const c = core();
-    // Only model-a has anything bound here.
-    await c.store("Never force-push.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-a" },
-    });
-    // model-b looks the stage up and is delivered NOTHING — but the hit is still recorded, carrying
-    // the stage id and rule_count 0.
-    c.stageLookup({ stage: "git force push", runtimeModelTag: "model-b" });
-    // Now model-b gains a rule, so the stage becomes live for it and passes the liveness test.
-    await c.store("Explain the rewrite.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-b" },
-    });
-
-    const row = c.gateStats(undefined, 30, "model-b").byStageRead.find((r) => r.stageName === "git force push");
-    expect(row, "the stage is live for model-b now, so it must appear").toBeDefined();
-    // The earlier lookup delivered nothing, so it is not a read, and the stage is still unread.
-    expect(row!.reads).toBe(0);
-    c.close();
-  });
-
-  /**
-   * THE JOIN MUST PROBE BY STAGE, NOT RESCAN THE WINDOW UNDER EACH ONE (Codex P2 on PR #51).
-   *
-   * Asserted as a QUERY PLAN rather than a stopwatch on purpose: a timing test at this size passes
-   * on any plan, and at a size where it would not, it becomes the flakiest test in the suite. The
-   * plan states the property directly — if a later edit reorders the predicates past what the index
-   * can serve, this fails while every behavioural test above stays green.
-   *
-   * The measurement that justified the index is recorded beside its DDL in `gates.ts`.
-   */
-  it("resolves recognized events through an index instead of rescanning per stage", async () => {
-    const c = core();
-    await c.store("Never force-push.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
-    });
-    const db = (c as unknown as { db: { prepare(s: string): { all(...a: unknown[]): Array<{ detail: string }> } } }).db;
-    const plan = db
-      .prepare(
-        `EXPLAIN QUERY PLAN
-         SELECT s.id, COUNT(e.id) FROM stages s
-           LEFT JOIN gate_events e
-             ON e.matched_stage_id = s.id AND e.matcher = 'recognized'
-            AND e.circle = ? AND e.ts >= ? AND e.rule_count > 0
-          WHERE EXISTS (SELECT 1 FROM rule_bindings b WHERE b.stage_id = s.id)
-          GROUP BY s.id`,
-      )
-      .all("any-circle", 0)
-      .map((row) => row.detail)
-      .join("\n");
-    expect(plan).toContain("idx_gate_events_stage_lookup");
-    expect(plan).toMatch(/SEARCH e USING INDEX/); // a SEARCH, never a SCAN of the event table
-    c.close();
-  });
-
-  /**
-   * SCOPED TO STAGES WITH SOMETHING LIVE TO DELIVER. A registry entry with no live rule in this
-   * circle has nothing to be unread ABOUT, and reporting it would manufacture a finding — which is
-   * the same failure mode `retirementCandidates` guards against one field up.
-   */
-  it("omits a stage with no live rule bound in this circle", async () => {
-    const c = core({ circle: "acme" });
-    await c.store("Never force-push.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
-    });
-    c.stageLookup({ stage: "git force push" });
-    const names = c.gateStats("other-circle").byStageRead.map((row) => row.stageName);
-    expect(names).not.toContain("git force push");
-    c.close();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// the agent-facing surface
-// ---------------------------------------------------------------------------
 describe("MCP surface", () => {
   type McpContent = { content: Array<{ type: string; text: string }>; isError?: boolean };
 

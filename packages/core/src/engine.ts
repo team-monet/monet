@@ -20,6 +20,19 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { StoragePort, BetterSqlitePort, StorageExclusiveLockError } from "./storage";
+import { mintMomentId, spoolInterception, spoolOutcome, spoolRuleRead, startMomentRun } from "./moment-spool";
+import type { MomentAnswer } from "./moment-spool";
+import {
+  attachMomentAnswer,
+  attachMomentAsk,
+  momentConformance,
+  momentCounts,
+  momentLossCount,
+  momentStageReads,
+  momentsOwingAQuestion,
+} from "./moment-ledger";
+import type { MomentConformance, MomentCounts } from "./moment-ledger";
+import type { MomentRun } from "./moment-spool";
 import { hasCoveringSkeletonSurface, inspectSkeletonMirrors } from "./skeleton-mirror";
 import { MONET_SCHEMA_VERSION } from "./schema-version";
 import {
@@ -113,7 +126,7 @@ import {
   gateGeneration,
   commitGateWrites,
   evaluateGate,
-  gateStats,
+  gateCoverage,
   getRuleBinding,
   hasLiveBinding,
   hasLineBreak,
@@ -143,7 +156,7 @@ import {
 import type {
   GateDeps,
   GateResult,
-  GateStats,
+  GateCoverage,
   SidecarMaterialization,
   RuleBindingOrigin,
   RuleBindingRow,
@@ -156,10 +169,6 @@ import type {
   TriggerPattern,
 } from "./gates";
 import { readFileSync } from "node:fs";
-import { appendConformanceAnnotations, computeConformance } from "./conformance";
-import type { ConformanceAnnotation, JournalDispositionLine } from "./conformance";
-import { blockingRuleIdsOf, clipActionContext, closeGateJournalEvent, gateJournalDisposition, openGateJournalEvent } from "./gate-journal";
-import type { GateJournalClaimType, GateJournalDisposition, GateJournalMouth } from "./gate-journal";
 import { RATIFICATION_ENTRANCES, classifyRatificationPair } from "./lifecycle-edges";
 import { NON_LATIN_LETTER_TOLERANCE, nonLatinLetterShare } from "./script-gate";
 import { inspectLifecycleEdgeIntegrity } from "./diagnostics";
@@ -1997,23 +2006,37 @@ export interface MemoryOverview {
      *  for the (capped) list itself, same possibleDuplicates/counts.possibleDuplicates convention. */
     skeleton: number;
   };
-  /** Aggregate gate activity plus actionable exceptions only. Empty exception lists are omitted. */
-  gateStats: Pick<GateStats, "fires" | "silences" | "overflows" | "delivered" | "windowDays" | "windowTotal" | "total"> & {
-    retirementCandidates?: GateStats["retirementCandidates"];
+  /**
+   * WHAT THE GATE HAS DONE, and what its registry can say about itself.
+   *
+   * REBUILT ON THE GOVERNED MOMENT. The counts used to come from a `gate_events` row per intercepted
+   * action; they now come from the moment record, which unlike a verdict row can name the rules that
+   * fired and be joined back to the act. Two shapes changed with it, both deliberately:
+   *
+   *   - `ungoverned` replaces the old `overflows`, and is wider: it counts every moment NOTHING
+   *     evaluated — an overflow, a surface the hook could not read, or a call into the store. The
+   *     split is on whether a gate looked, because `silences` is a claim that one did.
+   *   - `unreadStages` is derived by joining the live stage registry against the stages agents have
+   *     actually NAMED through `stage_lookup`, rather than against a per-stage event count. A stage
+   *     absent from that set has never been asked for, which is the state indistinguishable from a
+   *     healthy quiet one until something says so.
+   *
+   * `conformance` is the fourth fact and the only one no machine produced. `unanswered` and
+   * `notAsked` are reported separately and never summed: one is a queue owed to the user, the other
+   * is an agent defect. `followed` says the action followed the rule — never that the rule caused
+   * it, which is unobservable.
+   *
+   * `losses` is what the record knows it never received. Empty exception lists are omitted.
+   */
+  gate: MomentCounts & {
+    conformance: MomentConformance;
+    losses: number;
+    retirementCandidates?: GateCoverage["retirementCandidates"];
     retirementCandidatesOmitted?: number;
-    unexplainedDenies?: GateStats["unexplainedDenies"];
+    unexplainedDenies?: GateCoverage["unexplainedDenies"];
     unexplainedDeniesOmitted?: number;
-    /**
-     * Live stages in this circle that `stage_lookup` has never been asked for in the window (#28).
-     *
-     * THE ZEROES ONLY, never the full per-stage table. `GateStats.byStageRead` carries every stage
-     * with its count for a diagnostic consumer; what belongs on a curation surface is the part a
-     * reader cannot get from silence — a stage nobody has asked for looks exactly like a healthy
-     * quiet one. Omitted when empty, like every other exception list here, so a clean circle stays
-     * silent.
-     */
+    /** Live stages in this circle that `stage_lookup` has never been asked for. The zeroes only. */
     unreadStages?: Array<{ stageId: string; stageName: string }>;
-    /** True number omitted after the surface cap; absent when the list is complete. */
     unreadStagesOmitted?: number;
   };
   livingModel: LivingModelCard[];
@@ -2260,16 +2283,12 @@ export interface MonetCoreOptions {
    */
   gateSidecarPath?: string;
   /**
-   * Where to append the gate journal — the
-   * record of what every governing mechanism actually did, including its declines. NO DEFAULT, for
-   * exactly the reason `gateSidecarPath` has none: a default would make every MonetCore ever
-   * constructed append into the user's real store. Unset means core's own two mouths write nothing;
-   * the host-side mouths (the hook wrapper, the gate CLI) name the path themselves.
-   *
-   * This does NOT replace `gate_events`. That table stays, unchanged, feeding `gateStats` — see
-   * gate-journal.ts's own comment for the two reasons a verdict row cannot be this record.
+   * The governed-moment spool. Null (the default) makes every moment call a no-op, the same
+   * discipline `gateJournalPath` and `gateSidecarPath` hold and for the same reason: with a default
+   * path, every core ever constructed — tests, evals, one-off scripts — would append into the
+   * user's real store.
    */
-  gateJournalPath?: string;
+  momentSpoolPath?: string;
   /**
    * Which model this runtime is serving. Agent-scoped rules — compensations for one model's failure
    * habits — are delivered only when their tag matches this one, which is the mechanism behind "a
@@ -2463,10 +2482,18 @@ export class MonetCore {
   private newId: () => string;
   /** Where declarations re-materialize the blocking mirror. Null = nobody wired a hook to read it. */
   private gateSidecarPath: string | null;
-  /** Gate journal sink; null (the default) makes every journal call a no-op. See gate-journal.ts. */
-  private gateJournalPath: string | null;
+  /** Governed-moment spool sink; null (the default) makes every moment call a no-op. */
+  private momentSpoolPath: string | null;
   /**
-   * Which model this runtime is serving — the default `gate()`/`stageLookup()`/`gateStats()` all
+   * This process's writer run, started on first use.
+   *
+   * LAZY, so a core that never records a moment leaves no run-start behind, and PER PROCESS, which
+   * is what the sequence is scoped to. Started once and reused: a fresh run per call would make
+   * every record seq 0 of its own run and the completeness proof would have nothing to prove.
+   */
+  private momentRun: MomentRun | null = null;
+  /**
+   * Which model this runtime is serving — the default `gate()`/`stageLookup()`/`gateCoverage()` all
    * fall back to when a call omits an explicit `runtimeModelTag`. Set at construction (the
    * `runtimeModelTag` option) or later via `setRuntimeModelTag` — see that method's own comment for
    * why a setter exists at all: it is what lets a host wire this ONCE, after the fact, so every
@@ -2504,7 +2531,7 @@ export class MonetCore {
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
     this.gateSidecarPath = opts.gateSidecarPath ?? null;
-    this.gateJournalPath = opts.gateJournalPath ?? null;
+    this.momentSpoolPath = opts.momentSpoolPath ?? null;
     this.runtimeModelTag = opts.runtimeModelTag ?? null;
     this.scopeContext = opts.scopeContext ?? null;
     // CIRCLE-MINTING GUARD 1 of N (see BREADTH_CIRCLE's own comment, gates.ts): the session/store
@@ -2716,7 +2743,7 @@ export class MonetCore {
       // contributes nothing rather than failing.)
       lifecycle_edges: ["created_at", "sync_updated_at"],
       ratifications: ["created_at", "sync_updated_at"],
-      // Stages and rule bindings sync, so their stamps hold the clock up too. `gate_events` is
+      // Stages and rule bindings sync, so their stamps hold the clock up too. The moment record is
       // absent on purpose: it is local-only instrumentation on wall time, exactly like
       // resolution_events.
       stages: ["created_at", "sync_updated_at"],
@@ -8254,14 +8281,16 @@ export class MonetCore {
     // Curation's view — carries how each member entered (monet-core#142). The always-on
     // agent_context path deliberately keeps the narrower `skeleton()`; see SkeletonCurationEntry.
     const skeletonMembers = this.skeletonForCuration(circle);
-    const fullGateStats = this.gateStats(circle, GATE_STATS_WINDOW_DAYS, undefined, OVERVIEW_EXCEPTION_LIMIT);
-    const retirementCandidates = fullGateStats.retirementCandidates;
-    const unexplainedDenies = fullGateStats.unexplainedDenies;
-    // THE ZEROES, capped like every other exception list here (#28). `byStageRead` is the full
-    // per-stage table and belongs to a diagnostic reader; a curation surface gets only the stages
-    // nothing has asked for, because that is the one state indistinguishable from health.
-    const unreadStagesAll = fullGateStats.byStageRead
-      .filter((row) => row.reads === 0)
+    const coverage = this.gateCoverage(circle, undefined, OVERVIEW_EXCEPTION_LIMIT);
+    const retirementCandidates = coverage.retirementCandidates;
+    const unexplainedDenies = coverage.unexplainedDenies;
+    // THE ZEROES, capped like every other exception list here (#28). A curation surface gets only
+    // the stages nothing has ever asked for, because that is the one state indistinguishable from
+    // health. Derived by joining the live registry against the stages agents actually NAMED —
+    // never against the stage the gate matched, which is a different fact.
+    const namedStages = this.momentStageReads(circle);
+    const unreadStagesAll = coverage.liveStages
+      .filter((stage) => !namedStages.has(stage.stageId))
       .map(({ stageId, stageName }) => ({ stageId, stageName }));
     const unreadStages = unreadStagesAll.slice(0, OVERVIEW_EXCEPTION_LIMIT);
     const unreadStagesOmitted = unreadStagesAll.length - unreadStages.length;
@@ -8291,24 +8320,20 @@ export class MonetCore {
         extractionCandidates: this.extractionCandidateCount(circle),
         skeleton: skeletonMembers.length,
       },
-      gateStats: {
-        fires: fullGateStats.fires,
-        silences: fullGateStats.silences,
-        overflows: fullGateStats.overflows,
-        delivered: fullGateStats.delivered,
-        windowDays: fullGateStats.windowDays,
-        windowTotal: fullGateStats.windowTotal,
-        total: fullGateStats.total,
+      gate: {
+        ...this.momentCounts(circle),
+        conformance: this.momentConformance(circle),
+        losses: this.momentLossCount(),
         ...(retirementCandidates.length > 0 ? {
           retirementCandidates,
-          ...(fullGateStats.retirementCandidatesOmitted !== undefined
-            ? { retirementCandidatesOmitted: fullGateStats.retirementCandidatesOmitted }
+          ...(coverage.retirementCandidatesOmitted !== undefined
+            ? { retirementCandidatesOmitted: coverage.retirementCandidatesOmitted }
             : {}),
         } : {}),
         ...(unexplainedDenies.length > 0 ? {
           unexplainedDenies,
-          ...(fullGateStats.unexplainedDeniesOmitted !== undefined
-            ? { unexplainedDeniesOmitted: fullGateStats.unexplainedDeniesOmitted }
+          ...(coverage.unexplainedDeniesOmitted !== undefined
+            ? { unexplainedDeniesOmitted: coverage.unexplainedDeniesOmitted }
             : {}),
         } : {}),
         ...(unreadStages.length > 0 ? {
@@ -10657,67 +10682,6 @@ export class MonetCore {
    * Separate from `skeleton()` on purpose. See SkeletonCurationEntry for why the extra field must
    * not reach the always-on delivery path.
    */
-  /**
-   * Runs the conformance pass over this store's gate journal and appends what it found.
-   * Returns the annotations written.
-   *
-   * NOT WIRED TO ANY TRIGGER, deliberately. §7 leaves the pass's trigger open in its own words —
-   * "'rides the next session start' names the event, not the payer: agent_context is
-   * latency-sensitive" — and this journal is capped at 64 MiB, so reading it whole on a hot path is
-   * exactly the unmeasured cost that section flags. Inventing a trigger here would decide something
-   * the design deliberately left open. Callable now; scheduled when the consumer that pays for it
-   * (curation, and the judgment half beside it) exists.
-   *
-   * Idempotent, so it is safe under whatever eventually calls it, however often.
-   */
-  runConformancePass(): ConformanceAnnotation[] {
-    if (this.gateJournalPath === null) return [];
-    const lines: JournalDispositionLine[] = [];
-    const seenEventLines = new Map<string, number>();
-    // THE RETAINED GENERATION IS READ TOO (Codex P2 on PR #144, and it was right). Rotation moves
-    // unprocessed events into `.prev`, and this pass is deliberately not on a timer — so the very
-    // first run can easily land after a rotation, at which point a whole generation of fires would
-    // be silently absent from every tally and could never be annotated afterwards. Oldest first, so
-    // recurrence ordering across the boundary stays chronological.
-    for (const path of [`${this.gateJournalPath}.prev`, this.gateJournalPath]) {
-      let raw: string;
-      try {
-        raw = readFileSync(path, "utf8");
-      } catch {
-        continue; // no such generation yet is not an error
-      }
-      for (const line of raw.split("\n")) {
-        if (line.trim().length === 0) continue;
-        // A truncated final line (a kill mid-append) must not cost the whole pass its input.
-        let parsed: JournalDispositionLine;
-        try {
-          parsed = JSON.parse(line) as JournalDispositionLine;
-        } catch {
-          continue; // skip the unreadable line, keep the rest
-        }
-        // Rotation can leave one line in both generations; an id+phase pair identifies it.
-        const dedupeKey = `${parsed.phase ?? ""}:${parsed.id ?? ""}:${String(parsed.fireEventId ?? "")}`;
-        if (parsed.id !== undefined || parsed.fireEventId !== undefined) {
-          const seenAt = seenEventLines.get(dedupeKey);
-          if (seenAt !== undefined) {
-            // NEWEST WINS FOR A CONFORMANCE LINE (Codex P2 on PR #144, and it was right). Keeping
-            // the first occurrence meant a stale `retriedUnchanged: false` in `.prev` outranked its
-            // own monotone upgrade in the active file — so every later pass concluded the prior
-            // value was still false and appended another identical annotation, breaking the
-            // idempotence this dedupe exists to protect and growing the journal until rotation.
-            if (parsed.phase === "conformance") lines[seenAt] = parsed;
-            continue;
-          }
-          seenEventLines.set(dedupeKey, lines.length);
-        }
-        lines.push(parsed);
-      }
-    }
-    const annotations = computeConformance(lines);
-    appendConformanceAnnotations(this.gateJournalPath, annotations);
-    return annotations;
-  }
-
   skeletonForCuration(circle?: string): SkeletonCurationEntry[] {
     return this.skeletonMemberRows(this.resolveCircle(circle ?? this.defaultCircle)).map(toSkeletonCurationEntry);
   }
@@ -11944,7 +11908,6 @@ export class MonetCore {
     if (this.sidecarGeneration() !== before) this.refreshGateSidecar();
     // Recorded only now: the declaration is committed, so `admitted: true` is a fact rather than a
     // prediction. See journalFiringAdvisories.
-    this.journalFiringAdvisories(input, firingAdvisories);
     return result;
   }
 
@@ -12026,7 +11989,7 @@ export class MonetCore {
    *
    * RATIONED, per the residency law that governs advisories. "Patterns given, no example" is NOT
    * advised: it would fire on nearly every pattern declaration there has ever been, and that signal
-   * already has two homes — `gateStats().unverifiedPatterns`, and now the gate journal.
+   * already has two homes — `gateCoverage().unverifiedPatterns`, and the governed-moment record.
    */
   private patternFiringAdvisories(input: DeclareInput): DeclareAdvisory[] {
     // Everything echoed below is CALLER TEXT, and the MCP schema bounds neither `instance` nor a
@@ -12082,55 +12045,254 @@ export class MonetCore {
   }
 
   /**
-   * WARNED **AND RECORDED** (§2) — the recording half, run only once the declaration has actually
-   * landed (Codex P2 on PR #144, and it was right).
+   * Records that the agent READ a delivered rule, against the moment that prompted the read.
    *
-   * It used to append inside the check itself, before the write. When a declaration then failed —
-   * an embedder throw, a rolled-back transaction — the store correctly kept nothing while the
-   * journal kept `admitted: true` forever, claiming an inert pattern was let through that never
-   * existed. A record of an act that did not happen is worse than no record, and this journal's
-   * entire argument is that its events are acts.
+   * THE RECEIVED FACT, and the reason delivery carries a moment id at all. Receipt is a property of
+   * ONE (moment, rule) pair — "the agent read this rule, and that read fell between this delivery
+   * and this act". A count of reads over a count of deliveries is the ratio of two unrelated
+   * totals, which is the measurement this whole record replaces.
+   *
+   * `namedStageId` IS THE STAGE THE AGENT ASKED FOR — a different fact from the stage the gate
+   * MATCHED, which lives on the interception. Both are kept because they answer different questions
+   * and can disagree in one call, and because a stage nobody ever names is otherwise
+   * indistinguishable from a healthy quiet one.
+   *
+   * A NULL momentId IS RECORDED, NOT REFUSED. The agent called `stage_lookup` without naming a
+   * moment — because delivery never named one, or because it dropped it. That is a known state and
+   * a finding, not an error: the line lands in the spool permanently, and the fold reports it as an
+   * unjoinable read rather than attaching it to a moment it cannot identify.
+   *
+   * NEVER THROWS AND NEVER BLOCKS. The spool append swallows its own failures; the sequence number
+   * it consumed is what makes a swallowed write visible later.
    */
-  private journalFiringAdvisories(input: DeclareInput, advisories: readonly DeclareAdvisory[]): void {
-    // ONE EVENT PER CHECK THAT RAN, not one per warning (Codex P2 on PR #144, and it was right —
-    // and it is the principle ratified 2026-08-04 catching this very code). Writing only on failure
-    // left a passing check, a check with no example, and a code path that never ran as one
-    // observable: precisely the ambiguity this journal's arrival/outcome contract exists to remove,
-    // reproduced inside the record that was supposed to remove it.
-    //
-    // No patterns means no check to record — the species carries no firing surface at all, which is
-    // a different thing from a check that ran and found nothing.
-    if (input.patterns === undefined || input.patterns.length === 0) return;
-
-    const handle = openGateJournalEvent(this.gateJournalPath, {
-      mouth: "declare-check",
-      claimType: "source-observed",
-      stage: input.stage,
-      patterns: input.patterns.map((pattern) => clipAdvisoryEcho(pattern)),
-      instance: input.instance === undefined ? undefined : clipAdvisoryEcho(input.instance),
-    });
-    if (advisories.length === 0) {
-      const hasExample = typeof input.instance === "string" && input.instance.trim().length > 0;
-      closeGateJournalEvent(this.gateJournalPath, handle, {
-        mouth: "declare-check",
-        // Checked and clean, versus checked as far as it could be. The second is not a failure and
-        // not a pass; saying so is the whole point.
-        disposition: hasExample ? "silent" : "declined: no-example",
-        claimType: hasExample ? "source-observed" : "unavailable",
-        admitted: true,
+  /**
+   * Opens a governed moment for a call into the store, returning its id (or null when no spool is
+   * configured).
+   *
+   * THE STORE INTERCEPTS ITSELF. This process holds the database handle, so unlike a host tool call
+   * there is no second process and no `tool_use_id` to join through — the moment is opened and
+   * closed here, keyed by the id this mints. It still goes THROUGH THE SPOOL rather than straight to
+   * sqlite, and that is the whole point: the spool carries the per-run sequence that proves
+   * completeness, and a path that bypassed it would be a second population with no proof, which is
+   * the fault this record exists to remove.
+   *
+   * DISPOSITION IS `ungoverned`, AND THAT IS AN OBSERVATION RATHER THAN A SHRUG. No gate evaluates
+   * calls into the store — the gate's patterns are declared against host tool surfaces — so nothing
+   * looked at this moment. `silent` would claim the gate looked and found nothing bound, which is
+   * the substitution of a verdict for an absence this whole record exists to prevent. `ruleIds` and
+   * `deliveredRuleIds` are null for the same reason.
+   *
+   * THE ARGUMENTS ARE DELIBERATELY NOT RENDERED. `action` is null: no consumer has been named for
+   * what a store call's arguments were, and they carry the very memory content this store exists to
+   * hold. Minimization governs — a field with no named consumer does not ship — and the surface
+   * plus the moment's own id already identify the call. If a consumer is ever named, render it then
+   * and re-derive the privacy posture at the same time.
+   */
+  openStoreMoment(surface: string, circle?: string): string | null {
+    if (this.momentSpoolPath === null) return null;
+    try {
+      if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
+      const momentId = mintMomentId();
+      spoolInterception(this.momentRun, {
+        momentId,
+        at: new Date().toISOString(),
+        toolUseId: null,
+        // THE CIRCLE THIS CALL TARGETS, not merely the one the server defaults to. A tool argument
+        // naming another circle used to be invisible here, so a `memory_recall` against circle B
+        // was counted in circle A's totals while B saw no moment at all — the store's own calls
+        // reporting under the wrong project is the same misattribution the record carries `circle`
+        // to prevent. Resolved through the alias table like every other circle-accepting entry
+        // point, so a renamed circle attributes to its canonical name.
+        circle: this.resolveCircle(circle ?? this.defaultCircle),
+        sessionId: null,
+        surface,
+        action: null,
+        stageId: null,
+        ruleIds: null,
+        disposition: "ungoverned",
+        deliveredRuleIds: null,
       });
-      return;
+      return momentId;
+    } catch {
+      // Instrumentation is owed to the record, never to the caller's operation.
+      return null;
     }
-    closeGateJournalEvent(this.gateJournalPath, handle, {
-      mouth: "declare-check",
-      disposition: `declined: ${advisories[0]!.kind.replace(/_/g, "-")}`,
-      // The check ran and observed the result directly; only the ADMISSION is sovereign.
-      claimType: "source-observed",
-      admitted: true, // sovereignty: warned, written anyway
-      findings: advisories.map((advisory) => advisory.kind),
-      message: advisories.map((advisory) => advisory.message).join(" "),
-    });
   }
+
+  /**
+   * Closes a store-side moment with what the call returned.
+   *
+   * BY IDENTITY, NEVER BY CONTENT — the outcome is a sha256 of the serialized result, so a later
+   * pass can tell two calls apart and tell a repeat from a change without this record holding a
+   * copy of anything the store returned.
+   *
+   * CALLED ON FAILURE TOO. A call that threw still HAPPENED, and a moment that opened and never
+   * closed is indistinguishable from a process that died mid-call — which is a different finding.
+   */
+  closeStoreMoment(momentId: string | null, outcome: string, outcomeStatus: "ok" | "failed" | null = null): void {
+    if (momentId === null || this.momentSpoolPath === null || this.momentRun === null) return;
+    try {
+      // THE STATUS THE CALLER ACTUALLY OBSERVED. This used to be hard-coded `null` on the reasoning
+      // that no HOST closing event stands behind a store-side call — true, and beside the point: the
+      // wrapper that closes these moments has distinct resolve and reject branches, so it witnesses
+      // firsthand whether the handler returned or threw. Writing `null` there discarded a fact the
+      // writer held, making a failed store operation indistinguishable from a successful one.
+      // `null` remains the default and still means NOT OBSERVED, for any caller that genuinely
+      // cannot tell — which is the state this column exists to keep distinct from a verdict.
+      spoolOutcome(this.momentRun, { momentId, toolUseId: null, outcome, outcomeStatus });
+    } catch {
+      // Same posture as every other append here.
+    }
+  }
+
+  /**
+   * THE FOLD, WIRED — on demand, at the reads and writes that need a moment to exist.
+   *
+   * Everything below folds this store's spool into this store's database before it answers, because
+   * an answer normally arrives before its moment has been folded and a read that skipped the fold
+   * would report a moment that is simply not there yet. It is cursor-based and incremental, so a
+   * fold with nothing to do costs one stat and a read of zero bytes.
+   *
+   * NO INTERVAL. Nothing here runs on a timer; if one is ever added it is a backstop against
+   * unbounded spool growth when nobody is asking, never the mechanism.
+   *
+   * These are the ONLY paths that put a moment row into a store database. The interceptors write
+   * the spool and nothing else, which is what keeps invariant 05 intact: the hook is store-less and
+   * stays that way.
+   */
+  /**
+   * The run a conformance write must have, or an error the caller sees.
+   *
+   * SILENCE WAS THE BUG. With the default `momentSpoolPath: null` these methods returned quietly
+   * while the MCP handlers answered `recorded: "ask"` / `recorded: "answer"` — telling a user their
+   * conformance answer was saved when no byte was written anywhere. That answer is the one datum in
+   * this system nothing can reproduce, so a refusal the agent can relay is the only safe outcome.
+   *
+   * READS still return zeroes rather than throwing: "no spool configured" is a truthful description
+   * of an empty record, and a store with instrumentation switched off should still open an overview.
+   */
+  private requireMomentRun(): MomentRun {
+    const run = this.momentRunForWrite();
+    if (run === null) {
+      throw new Error(
+        "no governed-moment spool is configured for this store, so a conformance answer cannot be " +
+          "recorded. Nothing was written.",
+      );
+    }
+    return run;
+  }
+
+  private momentRunForWrite(): MomentRun | null {
+    if (this.momentSpoolPath === null) return null;
+    if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
+    return this.momentRun;
+  }
+
+  /**
+   * Records that the agent asked the user whether the action followed the rule.
+   *
+   * ATTACHES, NEVER CREATES. `attachMomentAsk` throws `UnknownMomentError` for an id the record has
+   * never seen, and that is deliberately not softened here: an ask against a moment nobody
+   * intercepted would make this a back door for moments that never happened.
+   *
+   * AN ASK THE AGENT NEVER ACTUALLY MADE IS NOT DEFENDED AGAINST, and nothing here tries to detect
+   * one. It cannot corrupt the measurement: no answer follows an ask that was never put to anyone,
+   * so the moment sits in `unanswered` forever — a visible state owed to the user, not a false
+   * verdict. Machinery to catch it would cost more than the failure it prevents.
+   */
+  recordMomentAsk(momentId: string): void {
+    const run = this.requireMomentRun();
+    attachMomentAsk(this.db, run, { momentId });
+  }
+
+  /**
+   * Records the user's answer against an existing moment.
+   *
+   * THE USER OWNS THIS VALUE. Three of the four facts are mechanical; this one is not, and nothing
+   * in this system may infer it. `followed` says the action followed the rule — never that the rule
+   * caused it, which is unobservable and is not what is being measured.
+   */
+  recordMomentAnswer(momentId: string, answer: MomentAnswer): void {
+    const run = this.requireMomentRun();
+    attachMomentAnswer(this.db, run, { momentId, answer });
+  }
+
+  /** What the gate did, across every moment on record. Folds first. */
+  momentCounts(circle?: string): MomentCounts {
+    if (this.momentSpoolPath === null) {
+      return { fires: 0, silences: 0, ungoverned: 0, delivered: 0, total: 0, unopened: 0, unattributed: 0 };
+    }
+    return momentCounts(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
+  }
+
+  /**
+   * How many times each stage was NAMED by an agent through stage_lookup.
+   *
+   * A caller joins this against the stage registry: a declared stage ABSENT from the map is one
+   * nobody has ever looked up, which is otherwise indistinguishable from a healthy quiet stage.
+   */
+  momentStageReads(circle?: string): Map<string, number> {
+    if (this.momentSpoolPath === null) return new Map();
+    return momentStageReads(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
+  }
+
+  /** The four conformance states. Folds first. Zeroes when no spool is configured. */
+  momentConformance(circle?: string): MomentConformance {
+    if (this.momentSpoolPath === null) {
+      return { followed: 0, notFollowed: 0, unanswered: 0, notAsked: 0, unjoinableReads: 0, readLate: 0 };
+    }
+    return momentConformance(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
+  }
+
+  /** How many losses the record is currently carrying, of either kind. */
+  momentLossCount(): number {
+    if (this.momentSpoolPath === null) return 0;
+    return momentLossCount(this.db, this.momentSpoolPath);
+  }
+
+  /** Moments that were read, acted on, and never asked about. Oldest first, bounded by the caller. */
+  momentsOwingAQuestion(limit: number, circle?: string): string[] {
+    if (this.momentSpoolPath === null) return [];
+    return momentsOwingAQuestion(
+      this.db,
+      this.momentSpoolPath,
+      this.resolveCircle(circle ?? this.defaultCircle),
+      limit,
+    );
+  }
+
+  recordRuleReads(
+    momentId: string | null,
+    ruleIds: readonly string[],
+    namedStageId: string | null,
+    circle?: string,
+  ): void {
+    if (this.momentSpoolPath === null) return;
+    try {
+      if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
+      const at = new Date().toISOString();
+      // THE CIRCLE THE LOOKUP WAS SCOPED TO, recorded on every read so stage coverage can be read
+      // per circle. The spool is home-level and this store folds every project's reads, so without
+      // it one lookup of a global stage in one project answered "has anyone ever consulted this
+      // stage?" for every other project too.
+      const readCircle = this.resolveCircle(circle ?? this.defaultCircle);
+      // F7: A LOOKUP THAT RETURNED NOTHING IS STILL A READ. This used to return early on an empty
+      // rule set, which silently covered two real outcomes — a stage-name miss, and a stage matched
+      // with no live rules bound (its own gate exit code) — and left no trace of either. The attempt
+      // is the numerator a recognition rate needs; `ruleId: null` says a read happened and delivered
+      // no identity, which is a different claim from "no read happened".
+      if (ruleIds.length === 0) {
+        spoolRuleRead(this.momentRun, { momentId, ruleId: null, namedStageId, circle: readCircle, readAt: at });
+        return;
+      }
+      for (const ruleId of ruleIds) {
+        spoolRuleRead(this.momentRun, { momentId, ruleId, namedStageId, circle: readCircle, readAt: at });
+      }
+    } catch {
+      // Instrumentation is owed to the record, never to the caller's operation.
+    }
+  }
+
 
   /**
    * WARNING-LIGHT ADVISORIES for the declaration entrance (user-ratified requirement, 2026-07-29):
@@ -12236,7 +12398,7 @@ export class MonetCore {
 
   /**
    * Set which model this runtime is serving, AFTER construction. THE single place `gate()`,
-   * `stageLookup()` and `gateStats()` all resolve `this.runtimeModelTag` from when a call omits an
+   * `stageLookup()` and `gateCoverage()` all resolve `this.runtimeModelTag` from when a call omits an
    * explicit tag (see `gate()`'s own comment for that fallback chain).
    *
    * WHY A SETTER, not just the constructor option: `MonetCore` is typically constructed by one
@@ -12245,7 +12407,7 @@ export class MonetCore {
    * Before this setter existed, that second piece of code had no way to make its resolution the
    * ONE the engine itself uses — it could only pass its own copy of the tag as a per-call argument
    * to whichever methods it happened to call directly. That let two surfaces reachable from the
-   * SAME process (stageLookup, called by the stage_lookup MCP tool; gateStats, called from inside
+   * SAME process (stageLookup, called by the stage_lookup MCP tool; gateCoverage, called from inside
    * overview()) read model tag from two different places and silently diverge whenever
    * MONET_MODEL_TAG was set but the MonetCore construction site did not forward it — exactly the
    * review-caught bug this setter exists to close. Calling this once, at registration, makes every
@@ -12324,70 +12486,70 @@ export class MonetCore {
    * Writes, despite reading like a query: one instrumentation row per call (the fire-precision and
    * silence-rate measures the design asks for), and the first match verifies a stage's pattern.
    */
-  /**
-   * Opens a journal event at the mouth of a gate-family call and returns a closer that must run on
-   * EVERY exit, including throws. §1: a mechanism that declines still witnesses.
-   *
-   * The closer is deliberately shaped so a caller cannot forget the failure path — see gate()'s own
-   * try/catch, where an exception is journaled as a decline and then re-thrown unchanged. Nothing
-   * here alters what the caller sees: the journal observes, it never participates.
-   */
-  private beginGateJournal(
-    mouth: GateJournalMouth,
-    arrival: Record<string, unknown>,
-    record = true,
-  ): (disposition: GateJournalDisposition, claimType: GateJournalClaimType, extra?: Record<string, unknown>) => void {
-    // `record: false` MEANS ASKING WITHOUT IT COUNTING (Codex P1 on PR #144, and it was right). That
-    // is the existing GateQueryOptions contract for benchmarks and previews, and journaling them
-    // anyway put previews into the fire record where the conformance pass could not tell them from
-    // real interceptions — crediting a benchmark's blocking preview as an observed `changed`, and
-    // letting a benchmark loop fill a production journal. An option that means "do not count this"
-    // has to mean it on every counter.
-    const path = record ? this.gateJournalPath : null;
-    if (path === null) return () => undefined; // no sink configured: the whole path costs one null check
-    const handle = openGateJournalEvent(path, { mouth, claimType: "source-observed", ...arrival });
-    return (disposition, claimType, extra) =>
-      closeGateJournalEvent(path, handle, { mouth, disposition, claimType, ...(extra ?? {}) });
-  }
 
   gate(opts: {
     actionContext: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
   }): GateResult {
     // At the mouth: before the circle is resolved, because resolveCircle can throw and a call that
     // died on an unqueryable circle is an arrival that must not vanish.
-    const closeJournal = this.beginGateJournal("core-gate", clipActionContext(opts.actionContext), opts.record !== false);
+    const result = this.gateUnjournaled(opts);
+    // AND THE MOMENT, because THIS is the public gate. `monet gate` writes its own interception from
+    // the CLI — it is the only party that holds the host's tool-call identity — and wiring the
+    // moment there alone left every embedder that configures a spool and calls this method
+    // recording no fires and no silences at all, while `record: false` still advertised itself as
+    // the way to opt out of counting. Recording silently off for a supported configuration is the
+    // failure this whole subsystem exists to end, and here it also breaks a documented contract.
+    if (opts.record !== false) this.spoolApiGateMoment(opts.actionContext, opts.circle, result);
+    return result;
+  }
+
+  /**
+   * The interception for a gate call made through the library rather than through the hook.
+   *
+   * NO OUTCOME, EVER, and that is honest rather than incomplete: nothing here observes whether the
+   * caller went on to act. The hook path closes its moments because the host fires a second event;
+   * a library caller returns into code this store cannot see. So these moments count toward fires,
+   * silences and delivery, and never toward conformance — which needs an outcome.
+   *
+   * NO MOMENT ID IS RETURNED, deliberately: adding one would change this method's public return
+   * type, and a library caller has no channel to carry it back on a read anyway. Fact 3 is
+   * therefore unreachable here for the same structural reason it is for an advisory, not because
+   * anything failed.
+   */
+  private spoolApiGateMoment(actionContext: string, circle: string | undefined, result: GateResult): void {
+    if (this.momentSpoolPath === null) return;
     try {
-      const result = this.gateUnjournaled(opts);
-      closeJournal(
-        gateJournalDisposition(result),
-        // `source: "live"` means the store itself answered; a sidecar answer is a claim from a
-        // frozen artifact and is typed weaker. gate() is always live, but the mapping is written
-        // out rather than hardcoded so the two paths stay comparable in one stream.
-        result.source === "live" ? "source-observed" : "parsed",
-        {
-          stageIds: result.stages.map((stage) => stage.id),
-          stageNames: result.stages.map((stage) => stage.name),
-          // THE FIELD #62 NEEDS. `gate_events` records rule_count and stage ids but no rule
-          // identity, so "declared but never fired" has never been answerable from it. Here the
-          // ids are named, which is the whole query.
-          ruleIds: result.rules.map((rule) => rule.conceptId),
-          // WHICH OF THEM ACTUALLY BLOCKED (Codex P1 on PR #144, and it was right). One evaluation
-          // can match a blocking rule and an advisory one; the event is a `deny` as a whole, and a
-          // conformance pass reading ids alone would credit the advisory rules with an interception
-          // they had no part in. Recorded only when the distinction exists to be made.
-          //
-          // SHARED with `gate-cli`'s write rather than inlined here (monet#37). This mouth was the
-          // only one that ever wrote the field, and the busiest one silently did not — exactly the
-          // divergence that keeping the derivation next to `gateJournalDisposition` prevents.
-          ...blockingRuleIdsOf(result.rules),
-        },
-      );
-      return result;
-    } catch (error) {
-      closeJournal("declined: internal-error", "unavailable", {
-        error: error instanceof Error ? error.message : String(error),
+      if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
+      const ruleIds = result.rules.map((rule) => rule.conceptId);
+      spoolInterception(this.momentRun, {
+        momentId: mintMomentId(),
+        at: new Date().toISOString(),
+        toolUseId: null,
+        circle: this.resolveCircle(circle ?? this.defaultCircle),
+        sessionId: null,
+        // The surface is the action context's own `Tool:` prefix — derived, never passed, so it
+        // cannot disagree with what was matched. A context with no prefix yields null rather than
+        // an invented surface name.
+        surface: actionContext.indexOf(":") > 0 ? actionContext.slice(0, actionContext.indexOf(":")) : null,
+        action: actionContext,
+        stageId: result.stage?.id ?? null,
+        // NULL ON OVERFLOW, never [] — the gate short-circuits before matching, so an empty array
+        // here would claim it looked and found nothing bound. Same rule the CLI writer follows.
+        ruleIds: result.overflow ? null : ruleIds,
+        disposition: result.overflow
+          ? "ungoverned"
+          : result.silence || ruleIds.length === 0
+            ? "silent"
+            : result.rules.some((rule) => rule.severity === "blocking")
+              ? "blocked"
+              : "advised",
+        // EVERY identity, unlike the CLI's blocking-only set, and the difference is real rather
+        // than an inconsistency: the deny payload names only blocking rules, whereas this method
+        // hands the caller the entire GateResult. Delivery is what actually reached the receiver.
+        deliveredRuleIds: result.overflow ? null : ruleIds,
       });
-      throw error; // observed, never absorbed — the caller's contract is unchanged
+    } catch {
+      // Instrumentation is owed to the record, never to the caller's operation.
     }
   }
 
@@ -12433,47 +12595,46 @@ export class MonetCore {
    * no-rules vs miss, the live-index-on-miss self-repair, and why every call records an event).
    *
    * Same read/write transaction split as gate(), for the same reason: the verdict is computed and
-   * returned first, and the gate_events write is separate and allowed to fail silently.
+   * returned first, and the bookkeeping write is separate and allowed to fail silently.
    */
   stageLookup(opts: {
-    stage: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
+    stage: string;
+    circle?: string;
+    now?: number;
+    record?: boolean;
+    runtimeModelTag?: string;
+    /**
+     * Suppress this method's OWN governed-moment read record, for a caller that will write a more
+     * accurate one itself.
+     *
+     * EXACTLY ONE CALLER SETS IT, and it must: the MCP adapter fits the returned rules to a
+     * response budget, so only IT knows which identities actually reached the agent. Recording
+     * here as well would both double-count and re-credit rules the fitter dropped — the defect a
+     * Codex round already closed once. Distinct from `record`, which governs the separate
+     * stage-event instrumentation and whose meaning must not be overloaded.
+     */
+    recordMomentRead?: boolean;
   }): StageLookupResult {
     // §1's honest limit, recorded rather than papered over: this path can witness an EMPTY answer,
     // but nothing can witness a recognition that never happened. A `declined: stage-miss` here says
     // "an agent named a stage that does not exist" — it says nothing about the moments no agent
     // recognized at all, and the design's own caveat ("its silence proves nothing") still governs
     // the advisory path. The record shrinks the undecidable to that core and no further.
-    const closeJournal = this.beginGateJournal("stage-lookup", { stage: opts.stage }, opts.record !== false);
-    try {
-      const result = this.stageLookupUnjournaled(opts);
-      closeJournal(
-        !result.matched
-          ? "declined: stage-miss"
-          : result.rules.length === 0
-            ? "stage-hit-no-rules"
-            : result.rules.some((rule) => rule.severity === "blocking")
-              ? "deny"
-              : "advisory",
-        "source-observed",
-        {
-          // A lookup names ONE stage, so this is a one-or-zero list rather than gate()'s set —
-          // kept as a list anyway so both mouths' events are read by the same query.
-          stageIds: result.stage ? [result.stage.id] : [],
-          stageNames: result.stage ? [result.stage.name] : [],
-          ruleIds: result.rules.map((rule) => rule.conceptId),
-          // Advisory-only by design: a blocking severity is DELIVERED here, never enforced. The
-          // disposition above says "deny" because that is what was delivered; this says the gate
-          // did not act on it, so a conformance pass never reads an enforcement that never happened.
-          enforced: false,
-        },
+    const result = this.stageLookupUnjournaled(opts);
+    // STAGE-READ COVERAGE FOR THE PUBLIC API. Only the MCP adapter recorded these, so a library
+    // caller's lookups were invisible to `momentStageReads` — and that map's whole job is to name
+    // the stages NOBODY has ever consulted. A stage an embedder looks up every day read as one
+    // never looked up at all. `momentId: null`: a library caller has no interception to name, which
+    // is the documented unjoinable-read case rather than a defect.
+    if (opts.record !== false && opts.recordMomentRead !== false) {
+      this.recordRuleReads(
+        null,
+        result.rules.map((rule) => rule.conceptId),
+        result.stage?.id ?? null,
+        opts.circle,
       );
-      return result;
-    } catch (error) {
-      closeJournal("declined: internal-error", "unavailable", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
     }
+    return result;
   }
 
   private stageLookupUnjournaled(opts: {
@@ -12501,16 +12662,10 @@ export class MonetCore {
     return result;
   }
 
-  /** How the gates have been firing — fire precision and silence rate, the design's own measures. */
-  gateStats(
-    circle?: string,
-    windowDays = GATE_STATS_WINDOW_DAYS,
-    runtimeModelTag?: string,
-    exceptionLimit?: number,
-  ): GateStats {
-    return gateStats(this.db, {
+  /** What the gate's own registry can say about itself — the curation lists, never act counts. */
+  gateCoverage(circle?: string, runtimeModelTag?: string, exceptionLimit?: number): GateCoverage {
+    return gateCoverage(this.db, {
       circle: this.resolveCircle(circle ?? this.defaultCircle),
-      windowDays,
       runtimeModelTag: runtimeModelTag ?? this.runtimeModelTag ?? undefined,
       exceptionLimit,
     });
@@ -13358,6 +13513,22 @@ export class MonetCore {
         // ON CONFLICT returns changes=1 for both insert and update paths in SQLite
         if (r.changes > 0) {
           inserted.circle_aliases++;
+          // A REPLICATED ALIAS STRANDS LOCAL ROWS EXACTLY AS A LOCAL ONE DOES — third and last site
+          // of the rule stated at renameCircle/mergeCircle: any path that publishes an active
+          // `from -> into` alias moves this population with it.
+          //
+          // WHY IT REACHES HERE AT ALL: the moment tables are LOCAL-ONLY by design — they appear in
+          // no export or graft payload — so a peer that renames a circle has no idea this machine
+          // holds measurement history under the old name. Once its alias lands, `resolveCircle`
+          // here returns the new name and those rows answer to neither.
+          //
+          // GUARDED ON A REAL REDIRECT. An archived-circle row points a name at ITSELF, so `from`
+          // and `to` are equal and there is nothing to move; only an active rename/merge alias is
+          // a redirect. The move itself is guarded on the tables existing, since a store that has
+          // never recorded a moment does not have them.
+          if (row.status === "active" && row.from_name !== row.to_name) {
+            this.moveMomentCircle(row.from_name, row.to_name);
+          }
           // GateMirror.circleAliases/circles are derived from this table (see gateMirrorCircles,
           // gates.ts) — a landed rename, archive or unarchive is mirror content whether or not any
           // rule lives in the circle it names.
@@ -14490,7 +14661,7 @@ export class MonetCore {
         //
         // So the reasonless deny lands, guards the action it was declared to guard, and is
         // DISCLOSED instead: `reasonMissing` on the delivered rule and on the sidecar entry,
-        // counted in gateStats. The promise is unmet for that rule and visibly so, which is
+        // counted in the gate's own coverage. The promise is unmet for that rule and visibly so, which is
         // survivable; hiding it would make the promise false, which is not. The repair is an
         // ordinary local declaration supplying the reason — no migration, and deliberately no
         // backfill, because a backfill would be us inventing the sentence a human owes.
@@ -14987,11 +15158,43 @@ export class MonetCore {
         .run(from, to, to);
       // Flatten chains: any alias that pointed to `from` should now point to `to`.
       this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(to, from);
+      // THE GOVERNED-MOMENT POPULATION MOVES TOO, and it is NOT in moveCircleScopedTables above.
+      //
+      // Kept here rather than added to that helper for the same reason `rule_bindings` is: the
+      // helper's OTHER caller is the legacy-star migration, which runs long before these tables can
+      // exist. They are created lazily by the first fold, so a store that has never folded has no
+      // such tables at all — hence the guard rather than a bare UPDATE.
+      //
+      // THIS HALF ALONE IS NOT ENOUGH, and the other half lives in the fold. The spool is immutable
+      // and append-only, so every record written before this rename still says `from` forever; the
+      // next re-fold would write the old name straight back over the rows moved here. moment-ledger's
+      // `resolveCircleAlias` closes that on the way in, using the alias row written just above. The
+      // two together are what make the rename hold: this one moves the history that is already
+      // folded, that one keeps every later fold converging on the same name.
+      this.moveMomentCircle(from, to);
       return { from, to, action: "renamed", conceptsUpdated, observationsUpdated, edgesUpdated, entitiesUpdated };
     })();
     // The mirror names each rule's circle, so a rename that moved a deny changed the file's content.
     this.refreshGateSidecar();
     return result;
+  }
+
+  /**
+   * Repoint the folded governed-moment population at a renamed circle.
+   *
+   * TABLE-EXISTENCE GUARDED, because the moment tables are created lazily by the first fold and are
+   * deliberately off the `PRAGMA user_version` ladder — a store that has never recorded a moment
+   * genuinely does not have them, and that is a supported state rather than a broken one.
+   */
+  private moveMomentCircle(from: string, to: string): void {
+    const has = (table: string): boolean =>
+      this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table) !== undefined;
+    if (has("governed_moments")) {
+      this.db.prepare(`UPDATE governed_moments SET circle = ? WHERE circle = ?`).run(to, from);
+    }
+    if (has("moment_reads")) {
+      this.db.prepare(`UPDATE moment_reads SET circle = ? WHERE circle = ?`).run(to, from);
+    }
   }
 
   /**
@@ -15736,6 +15939,20 @@ export class MonetCore {
           )
           .run(from, into, into);
         this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(into, from);
+        // THE GOVERNED-MOMENT POPULATION MOVES WITH THE ALIAS, exactly as in renameCircle.
+        //
+        // THE RULE THIS FOLLOWS, since it is now two call sites and no longer an incident: ANY path
+        // that publishes an active `from -> into` alias must move this population in the same
+        // transaction. Once the alias lands, both names resolve to `into`, so rows still carrying
+        // `from` are reachable from NEITHER name — not wrong, worse: silently absent, in a record
+        // whose entire premise is that absence must never be mistaken for coverage. A merge is a
+        // supported operation and was orphaning the moments, conformance history and stage-read
+        // coverage of the circle it consumed.
+        //
+        // The fold's own `resolveCircleAlias` handles the other half — records that keep ARRIVING
+        // under the old name, which they will, since a hook pins its circle in settings.json and
+        // no circle operation rewrites that file. Neither half covers the other's case.
+        this.moveMomentCircle(from, into);
         // NO EXPLICIT bumpGateGeneration(this.db) CALL HERE ANY MORE (removed — Codex round 11, item
         // 3; was added unconditionally at review fix MATERIAL M2). Same reasoning as renameCircle's
         // own removed call, immediately above it in this file: circle_aliases is mirror content

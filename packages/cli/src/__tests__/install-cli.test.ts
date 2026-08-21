@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
-import { MonetCore } from "@team-monet/core";
+import { BetterSqlitePort, MonetCore, foldMomentSpool, observedMomentLosses, readGovernedMoment } from "@team-monet/core";
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalRemoteKey, deriveCircle } from "../circle";
 import { GATE_FAIL_OPEN_MARKER } from "../gate-cli";
@@ -14,6 +14,7 @@ import {
   buildWrapperScript,
   isMonetGateHandler,
   runInstall,
+  POST_TOOL_USE_FLAG,
   upsertMonetGateHook,
   GATED_TOOL_MATCHERS,
   type HookHandler,
@@ -186,24 +187,57 @@ describe("install-cli: settings.json shapes (pure, no fs)", () => {
     ]);
   });
 
-  it("upsertMonetGateHook: never touches an UNRELATED matcher group or event", () => {
+  // UPDATED WHEN THE OUTCOME HALF SHIPPED. This used to assert PostToolUse was left entirely
+  // alone, which was true only while this command wrote one event. It now writes both, so the
+  // property that actually matters — and the one this test was always about — is that ANOTHER
+  // TOOL'S handlers survive untouched in either event. The marked wrapper is appended beside
+  // `./log-it.sh`, never in place of it.
+  it("upsertMonetGateHook: never touches an UNRELATED matcher group, in either event", () => {
     const wrapperPath = "/x/.monet/gate-hook.mjs";
+    const foreignPost = { type: "command", command: "./log-it.sh" };
     const settings: SettingsFile = {
       hooks: {
         PreToolUse: [{ matcher: "Write|Edit", hooks: [{ type: "command", command: "./format-check.sh" }] }],
-        PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "./log-it.sh" }] }],
+        PostToolUse: [{ matcher: "^Bash$", hooks: [foreignPost] }],
       },
       someOtherTopLevelKey: "preserved verbatim",
     };
     const handler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath] };
+    const postHandler: HookHandler = {
+      type: "command",
+      command: "/usr/bin/node",
+      args: [wrapperPath, POST_TOOL_USE_FLAG],
+    };
     const result = upsertMonetGateHook(settings, handler, wrapperPath);
     expect(result.hooks?.PreToolUse).toEqual([
       { matcher: "Write|Edit", hooks: [{ type: "command", command: "./format-check.sh" }] },
       { matcher: BASH_MATCHER, hooks: [handler] },
       { matcher: DELEGATION_MATCHER, hooks: [handler] },
     ]);
-    expect((result.hooks as Record<string, unknown>).PostToolUse).toEqual(settings.hooks!.PostToolUse);
+    // The foreign handler keeps its place and its order; ours joins the same group.
+    expect(result.hooks?.PostToolUse).toEqual([
+      { matcher: BASH_MATCHER, hooks: [foreignPost, postHandler] },
+      { matcher: DELEGATION_MATCHER, hooks: [postHandler] },
+    ]);
     expect(result.someOtherTopLevelKey).toBe("preserved verbatim");
+  });
+
+  // THE MARKER IS THE WHOLE DIFFERENCE between the two entries, and it decides which path the one
+  // script takes. A PostToolUse entry that lost it would run the PreToolUse path and emit a
+  // permission decision about a tool that has already run.
+  it("upsertMonetGateHook: the PostToolUse handler is the same wrapper, marked", () => {
+    const wrapperPath = "/x/.monet/gate-hook.mjs";
+    const handler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath] };
+    const result = upsertMonetGateHook({}, handler, wrapperPath);
+    const post = result.hooks?.PostToolUse ?? [];
+    expect(post.map((group) => group.matcher)).toEqual([BASH_MATCHER, DELEGATION_MATCHER]);
+    for (const group of post) {
+      expect(group.hooks).toEqual([{ type: "command", command: "/usr/bin/node", args: [wrapperPath, POST_TOOL_USE_FLAG] }]);
+    }
+    // And the PreToolUse entry is the same wrapper WITHOUT it.
+    for (const group of result.hooks?.PreToolUse ?? []) {
+      expect(group.hooks).toEqual([{ type: "command", command: "/usr/bin/node", args: [wrapperPath] }]);
+    }
   });
 
   it("upsertMonetGateHook: removing the only handler from a group drops the now-empty group, not left dangling", () => {
@@ -944,7 +978,340 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
    * without the other, THAT is the finding. Collapsing them into a single event would rebuild the
    * "one observable for three states" defect this whole design exists to remove.
    */
-  it("gate journal: an interception writes both mouths' events, correlated, with the rule ids that fired", async () => {
+  /**
+   * THE GOVERNED-MOMENT RECORD, END TO END through the real generated wrapper and the real
+   * `monet gate`. These assert the TWO-PROCESS CONTRACT holds in fact and not only in comments:
+   * the hook mints the id and forwards it, the gate writes the interception because only it knows
+   * the rule identity, and a separate PostToolUse process closes the moment through the host's own
+   * tool_use_id.
+   */
+  function readSpool(dir: string): Array<Record<string, unknown>> {
+    const path = join(dir, "moments.jsonl");
+    if (!existsSync(path)) return [];
+    return readFileSync(path, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  /**
+   * FINDINGS FROM AN INDEPENDENT AUDIT that ran the wrapper instead of reading it.
+   *
+   * Every one of these was green in the suite above. What the suite above tests is the HAPPY PATH
+   * through a working install; what these test is every path that returns before reaching the one
+   * line that records a moment, and what the record contains when it does.
+   */
+  /**
+   * The R3 fix closed failed calls, and introduced two gaps of its own. Both are the same shape:
+   * a fact the interceptor was holding, dropped on the way to the record.
+   */
+  async function closeWith(dir: string, mirrorPath: string, wrapperPath: string, payload: Record<string, unknown>): Promise<void> {
+    spawnWrapper(wrapperPath, [POST_TOOL_USE_FLAG], dir, {
+      encoding: "utf8",
+      input: JSON.stringify({
+        session_id: "test-session",
+        hook_event_name: "PostToolUseFailure",
+        tool_name: "Bash",
+        tool_input: { command: "git push --force" },
+        tool_use_id: "toolu_test",
+        ...payload,
+      }),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    void mirrorPath;
+  }
+
+  it("N1 — three different failures do not produce one constant digest", async () => {
+    const digests: string[] = [];
+    for (const payload of [
+      { error: "fatal: remote rejected" },
+      { error_message: "permission denied" },
+      { tool_response: { stdout: "", stderr: "network unreachable", interrupted: false } },
+    ]) {
+      const dir = mkTmp();
+      const mirrorPath = join(dir, "gate-mirror.json");
+      await buildFixtureMirror(mirrorPath);
+      const wrapperPath = writeRealWrapper(dir);
+      spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+        encoding: "utf8",
+        input: claudeCodeHookJson("git push --force"),
+        env: { ...process.env, MONET_STORAGE_DIR: dir },
+      });
+      await closeWith(dir, mirrorPath, wrapperPath, payload);
+      digests.push(readSpool(dir).filter((r) => r.kind === "outcome")[0].outcomeSha256 as string);
+    }
+    // A digest taken over one GUESSED field name collapses every failure whose detail lives
+    // elsewhere into sha256('{"failed":true,"error":null}') — a constant that reads exactly like a
+    // real observation. Hashing over both removes the guess instead of improving it.
+    expect(new Set(digests).size).toBe(3);
+  });
+
+  it("N2 — the record says whether the act succeeded or failed", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
+    spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    await closeWith(dir, mirrorPath, wrapperPath, { error: "fatal: remote rejected" });
+
+    const outcome = readSpool(dir).filter((r) => r.kind === "outcome")[0];
+    // Before R3 a failure was distinguishable by the ABSENCE of an outcome. Now it is closed like a
+    // success, so without this the user is asked whether a push that never landed followed the
+    // rule, with nothing on the record saying it never landed.
+    expect(outcome.outcomeStatus).toBe("failed");
+
+    const db = new BetterSqlitePort(":memory:");
+    try {
+      const interception = readSpool(dir).filter((r) => r.kind === "interception")[0];
+      const folded = readGovernedMoment(db, join(dir, "moments.jsonl"), interception.momentId as string);
+      expect(folded?.outcomeStatus).toBe("failed");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("N2 — a successful close says so, and a store-side close says nothing", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
+    spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    spawnWrapper(wrapperPath, [POST_TOOL_USE_FLAG], dir, {
+      encoding: "utf8",
+      input: JSON.stringify({
+        session_id: "test-session",
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "git push --force" },
+        tool_response: { stdout: "done", stderr: "", interrupted: false, isImage: false },
+        tool_use_id: "toolu_test",
+      }),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(readSpool(dir).filter((r) => r.kind === "outcome")[0].outcomeStatus).toBe("ok");
+  });
+
+  it("R3 — a governed tool call that RAN AND FAILED closes its moment", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
+    const spoolPath = join(dir, "moments.jsonl");
+
+    spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    // The host's lifecycle has TWO closing events — one after a tool call succeeds, one after it
+    // fails. The action HAPPENED either way, so whether it followed the rule is exactly as askable.
+    const post = spawnWrapper(wrapperPath, [POST_TOOL_USE_FLAG], dir, {
+      encoding: "utf8",
+      input: JSON.stringify({
+        session_id: "test-session",
+        hook_event_name: "PostToolUseFailure",
+        tool_name: "Bash",
+        tool_input: { command: "git push --force" },
+        error: "fatal: remote rejected",
+        tool_use_id: "toolu_test",
+      }),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(post.status).toBe(0);
+
+    const outcomes = readSpool(dir).filter((r) => r.kind === "outcome");
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0].toolUseId).toBe("toolu_test");
+
+    const db = new BetterSqlitePort(":memory:");
+    try {
+      const interception = readSpool(dir).filter((r) => r.kind === "interception")[0];
+      const folded = readGovernedMoment(db, spoolPath, interception.momentId as string);
+      // #60's own Done-when: every host tool call opens AND CLOSES a moment. Without this the
+      // failed call never closes, so it never reaches the ask backlog either.
+      expect(folded?.outcomeAt).toEqual(expect.any(String));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("R3 — the install wires the failure event alongside the success one", () => {
+    const wrapperPath = "/x/.monet/gate-hook.mjs";
+    const handler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath] };
+    const result = upsertMonetGateHook({}, handler, wrapperPath);
+    const failure = result.hooks?.PostToolUseFailure ?? [];
+    expect(failure.map((group) => group.matcher)).toEqual([BASH_MATCHER, DELEGATION_MATCHER]);
+    for (const group of failure) {
+      expect(group.hooks).toEqual([{ type: "command", command: "/usr/bin/node", args: [wrapperPath, POST_TOOL_USE_FLAG] }]);
+    }
+  });
+
+  it("R4 — an unanticipated gate exit code still opens a moment", () => {
+    const dir = mkTmp();
+    const script = buildWrapperScript({
+      execPath: join(dir, "nonexistent-node-binary"),
+      scriptPath: join(dir, "nonexistent-cli.js"),
+    });
+    const wrapperPath = join(dir, "gate-hook.mjs");
+    writeFileSync(wrapperPath, script, { mode: 0o755 });
+    const stubBin = join(dir, "stub-bin");
+    mkdirSync(stubBin, { recursive: true });
+    // An exit code no path produces today. "No path produces it" is exactly the assumption that
+    // rots, and a `default:` that records nothing is the silently-absent case this design forbids.
+    writeFileSync(join(stubBin, "monet"), `#!/bin/sh\nexit 7\n`, { mode: 0o755 });
+
+    spawnWrapper(wrapperPath, [], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("echo hello"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir, PATH: stubBin },
+    });
+    expect(readSpool(dir).filter((r) => r.kind === "interception")).toHaveLength(1);
+  });
+
+  it("F1 — a DENY delivers the moment id, so the read it prompts can be joined", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath); // the fixture rule is blocking
+    const wrapperPath = writeRealWrapper(dir);
+
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    const emitted = JSON.parse(result.stdout) as {
+      hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string };
+      systemMessage?: string;
+    };
+    expect(emitted.hookSpecificOutput.permissionDecision).toBe("deny");
+
+    const interception = readSpool(dir).filter((r) => r.kind === "interception")[0];
+    const momentId = interception.momentId as string;
+    // INVARIANT 3, ON THE PATH THAT MATTERS MOST. Without the id here, the stage_lookup this deny
+    // tells the agent to run lands as moment_id: null — so Received, and therefore Conformed, are
+    // structurally unreachable for every blocking rule. And `delivered` counts exactly these
+    // moments (an advisory sends no rule id at all), so the two halves of the measurement were
+    // disjoint populations.
+    const carried = `${emitted.hookSpecificOutput.permissionDecisionReason}\n${emitted.systemMessage ?? ""}`;
+    expect(carried).toContain(momentId);
+  });
+
+  it("F4 — a gated call with NO mirror still opens a moment", async () => {
+    const dir = mkTmp();
+    const wrapperPath = writeRealWrapper(dir);
+    // The state every new install is in until a mirror exists.
+    const result = spawnWrapper(wrapperPath, ["--mirror", join(dir, "absent-mirror.json")], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(result.status).toBe(0);
+    const interceptions = readSpool(dir).filter((r) => r.kind === "interception");
+    // "No rule set was ever consulted" is exactly what `ungoverned` means, and the comments on this
+    // path already claimed it was recorded that way. Nothing was written at all.
+    expect(interceptions).toHaveLength(1);
+    expect(interceptions[0].disposition).toBe("ungoverned");
+    expect(interceptions[0].ruleIds).toBeNull();
+  });
+
+  it("F4 — a gated call with a MALFORMED mirror still opens a moment", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    writeFileSync(mirrorPath, "{ not json at all");
+    const wrapperPath = writeRealWrapper(dir);
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(result.status).toBe(0);
+    expect(readSpool(dir).filter((r) => r.kind === "interception")).toHaveLength(1);
+  });
+
+  it("F5 — a Bash call with no command opens a moment", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
+    const payload = JSON.stringify({
+      session_id: "sess-AAA",
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: {},
+      tool_use_id: "toolu_nocmd",
+    });
+    spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8", input: payload, env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    // An interception point that opens no moment is the omission invariant 2 forbids by name.
+    expect(readSpool(dir).filter((r) => r.kind === "interception")).toHaveLength(1);
+  });
+
+  it("F5 — a delegation with no subagent_type or description opens a moment", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
+    const payload = JSON.stringify({
+      session_id: "sess-AAA",
+      hook_event_name: "PreToolUse",
+      tool_name: "Agent",
+      tool_input: {},
+      tool_use_id: "toolu_nodeleg",
+    });
+    spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8", input: payload, env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(readSpool(dir).filter((r) => r.kind === "interception")).toHaveLength(1);
+  });
+
+  it("F5 — a broken install (monet exits 1) opens a moment", () => {
+    const dir = mkTmp();
+    const script = buildWrapperScript({
+      execPath: join(dir, "nonexistent-node-binary"),
+      scriptPath: join(dir, "nonexistent-cli.js"),
+    });
+    const wrapperPath = join(dir, "gate-hook.mjs");
+    writeFileSync(wrapperPath, script, { mode: 0o755 });
+    const stubBin = join(dir, "stub-bin");
+    mkdirSync(stubBin, { recursive: true });
+    writeFileSync(join(stubBin, "monet"), `#!/bin/sh\necho "monet source: unknown command 'gate'" >&2\nexit 1\n`, { mode: 0o755 });
+
+    spawnWrapper(wrapperPath, [], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("echo hello"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir, PATH: stubBin },
+    });
+    // The wrapper's own comment on this branch says "a permanently-broken install is precisely a
+    // condition that otherwise persists unnoticed". It wrote nothing, so it persisted unnoticed.
+    expect(readSpool(dir).filter((r) => r.kind === "interception")).toHaveLength(1);
+  });
+
+  it("F6 — a gate-evaluated moment keeps the session id the hook was handed", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
+    spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    const interception = readSpool(dir).filter((r) => r.kind === "interception")[0];
+    // The value was in the interceptor's hand and was discarded for exactly the moments a gate
+    // evaluated. NULL is honest for "not known" — it is not honest for "known and dropped".
+    expect(interception.sessionId).toBe("test-session");
+  });
+
+  it("governed moment: the gate writes the interception, carrying the id the hook minted", async () => {
     const dir = mkTmp();
     const mirrorPath = join(dir, "gate-mirror.json");
     await buildFixtureMirror(mirrorPath);
@@ -957,217 +1324,138 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     });
     expect(result.status).toBe(0);
 
-    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
-      .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
-
-    const hook = lines.filter((l) => l.mouth === "host-hook");
-    const gate = lines.filter((l) => l.mouth === "gate-cli");
-    expect(hook).toHaveLength(2); // arrival + disposition
-    expect(gate).toHaveLength(2);
-
-    // The correlation: the gate the hook spawned names the hook's event as its parent. This is what
-    // makes "the hook arrived but the gate never evaluated" a query rather than an inference.
-    expect(gate[0].parentId).toBe(hook[0].id);
-    expect(gate[0].phase).toBe("arrival");
-    expect(gate[1].phase).toBe("disposition");
-
-    // Both agree on the verdict, from their own vantage points.
-    expect(hook[1].disposition).toBe("deny");
-    expect(gate[1].disposition).toBe("deny");
-    // Rule identity — the thing gate_events has never carried, and #62's whole query.
-    expect(Array.isArray(gate[1].ruleIds) && (gate[1].ruleIds as string[]).length).toBe(1);
-    // A mirror answer is true as of a frozen generation, not as of the store. Typed honestly.
-    expect(gate[1].claimType).toBe("parsed");
-    expect(hook[1].claimType).toBe("source-observed");
+    const spool = readSpool(dir);
+    // EXACTLY ONE WRITER on the governed path. The hook spawned the gate, so the hook writes no
+    // interception of its own — no defensive skeleton standing in for one that may not arrive.
+    const interceptions = spool.filter((r) => r.kind === "interception");
+    expect(interceptions).toHaveLength(1);
+    const moment = interceptions[0];
+    expect(moment.disposition).toBe("blocked");
+    // The rule identity the hook could never have supplied — this is WHY the gate is the writer.
+    expect(moment.ruleIds).toHaveLength(1);
+    expect(moment.stageId).toEqual(expect.any(String));
+    expect(moment.surface).toBe("Bash");
+    // And the host's key for the tool call, which only the hook ever saw, forwarded across.
+    expect(moment.toolUseId).toBe("toolu_test");
+    // The run declared itself at seq 0 and the interception followed it.
+    const runStart = spool.filter((r) => r.kind === "run-start");
+    expect(runStart).toHaveLength(1);
+    expect(runStart[0].writerRole).toBe("gate-cli");
+    expect(runStart[0].seq).toBe(0);
+    expect(moment.seq).toBe(1);
   });
 
-  /**
-   * WHAT THE RECORD ACTUALLY CARRIES ON A MIXED-SEVERITY DENY (monet#37).
-   *
-   * THE REASON THIS TEST IS E2E AND NOT A UNIT FIXTURE, which is the whole lesson of the defect it
-   * closes. `conformance.test.ts` already had a green test for mixed-severity scoping — and it
-   * SUPPLIED `blockingRuleIds` in its own fixture, so it proved the pass consumes the field and said
-   * nothing about whether anything writes it. Measured across a 36,892-line production journal, the
-   * field appeared on ZERO lines: the only mouth that ever wrote it was core's in-process `gate()`,
-   * and the mouth on every real hook-path deny silently did not. A force-push deny then credited its
-   * `changed` verdict to four advisory rules that had no part in the block.
-   *
-   * So this spawns the real wrapper against the real `monet gate` and reads the real journal off
-   * disk. A fixture that hands itself the answer cannot fail the way production failed.
-   */
-  it("gate journal: a mixed-severity deny records WHICH rules blocked, and that it was enforced", async () => {
+  it("governed moment: a foreign tool is recorded ungoverned, with what was NOT observed left null", async () => {
     const dir = mkTmp();
     const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
 
-    // Two rules, two stages, one command — the shape the real journal showed: every over-credited
-    // deny on record spanned two stages and mixed a blocking rule with advisories.
+    const payload = JSON.stringify({
+      session_id: "s1",
+      hook_event_name: "PreToolUse",
+      tool_name: "SomeRenamedTool",
+      tool_input: { command: "whatever" },
+      tool_use_id: "toolu_foreign",
+    });
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: payload,
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(result.status).toBe(0);
+
+    const interceptions = readSpool(dir).filter((r) => r.kind === "interception");
+    expect(interceptions).toHaveLength(1);
+    const moment = interceptions[0];
+    // Invariant 02: a surface nothing could intercept is RECORDED, never omitted.
+    expect(moment.disposition).toBe("ungoverned");
+    // The host's own name for the tool, verbatim and unmapped — the §0 evidence.
+    expect(moment.surface).toBe("SomeRenamedTool");
+    // NOT KNOWN, and it says so. `[]` here would claim the gate looked and found nothing bound; it
+    // never ran at all. The action is null for the same reason: none was ever extracted.
+    expect(moment.ruleIds).toBeNull();
+    expect(moment.deliveredRuleIds).toBeNull();
+    expect(moment.actionSha256).toBeNull();
+    expect(moment.actionRendering).toBeNull();
+  });
+
+  it("governed moment: PostToolUse closes it through the host's tool_use_id", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
+    const spoolPath = join(dir, "moments.jsonl");
+
+    spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    const post = spawnWrapper(wrapperPath, [POST_TOOL_USE_FLAG], dir, {
+      encoding: "utf8",
+      input: JSON.stringify({
+        session_id: "test-session",
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "git push --force" },
+        tool_response: { stdout: "done", stderr: "", interrupted: false, isImage: false },
+        tool_use_id: "toolu_test",
+      }),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    // The tool has already run: this hook has no opinion to offer and must stay completely silent.
+    expect(post.status).toBe(0);
+    expect(post.stdout).toBe("");
+
+    const spool = readSpool(dir);
+    const outcomes = spool.filter((r) => r.kind === "outcome");
+    expect(outcomes).toHaveLength(1);
+    // Keyed by the tool call, NOT by a moment id — this process never saw one.
+    expect(outcomes[0].momentId).toBeNull();
+    expect(outcomes[0].toolUseId).toBe("toolu_test");
+    expect(outcomes[0].outcomeSha256).toEqual(expect.any(String));
+
+    // And the fold joins the two halves into one moment that is both opened and closed.
+    const db = new BetterSqlitePort(":memory:");
+    try {
+      const interception = spool.filter((r) => r.kind === "interception")[0];
+      const folded = readGovernedMoment(db, spoolPath, interception.momentId as string);
+      expect(folded).toMatchObject({ opened: true, toolUseId: "toolu_test", disposition: "blocked" });
+      expect(folded?.outcomeSha256).toBe(outcomes[0].outcomeSha256);
+      // Nothing was lost on either side of the join.
+      expect(observedMomentLosses(db, spoolPath)).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("governed moment: delivery names its moment so the read can join to it", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
     const core = new MonetCore(":memory:", { gateSidecarPath: mirrorPath, defaultCircle: "acme-widgets" });
     await core.declare({
-      species: "rule", stage: "git force push", patterns: ["Bash:git push --force"],
-      content: "Never force-push to main.", severity: "blocking", scope: "domain",
-      reason: "a rewritten history cannot be recovered from a teammate's clone", circle: "*",
-    });
-    await core.declare({
-      species: "rule", stage: "pr delivery", patterns: ["Bash:git push"],
-      content: "Say what changed before pushing.", severity: "advisory", scope: "domain",
-      reason: "an unexplained push costs the reviewer the diff", circle: "*",
+      species: "rule", stage: "terraform apply", patterns: ["Bash:terraform apply"],
+      content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
     });
     core.materializeGateMirror();
     core.close();
-
     const wrapperPath = writeRealWrapper(dir);
-    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+
+    const result = spawnWrapper(wrapperPath, ["--circle", "acme-widgets", "--mirror", mirrorPath], dir, {
       encoding: "utf8",
-      input: claudeCodeHookJson("git push --force"),
+      input: claudeCodeHookJson("terraform apply"),
       env: { ...process.env, MONET_STORAGE_DIR: dir },
     });
     expect(result.status).toBe(0);
-
-    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
-      .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
-    const hookDisposition = lines.filter((l) => l.mouth === "host-hook" && l.phase === "disposition")[0]!;
-    const gateDisposition = lines.filter((l) => l.mouth === "gate-cli" && l.phase === "disposition")[0]!;
-
-    // Both rules fired and the fire is a deny as a whole — the situation the field exists for.
-    expect(gateDisposition.disposition).toBe("deny");
-    expect((gateDisposition.ruleIds as string[]).length).toBe(2);
-
-    // ATTRIBUTION, WRITTEN AT EVALUATION TIME because it cannot be recovered afterwards: severity is
-    // a moving target, and on the real journal 507 of ~962 gate-cli fire lines already name a rule
-    // the current mirror no longer holds. Recorded then, or never.
-    const blocking = gateDisposition.blockingRuleIds as string[];
-    expect(Array.isArray(blocking)).toBe(true);
-    expect(blocking).toHaveLength(1);
-    expect(blocking[0]).not.toBe(undefined);
-    // The blocking id is one of the fired ids, and strictly fewer than all of them.
-    expect(gateDisposition.ruleIds as string[]).toContain(blocking[0]);
-
-    // ENFORCED, STATED RATHER THAN ASSUMED. The pass reads an absent `enforced` as true, so the
-    // guard against counting an unenforced deny as `changed` was structurally inert on the only
-    // path that matters. The wrapper is the mouth that refused the call, so it is the one that says so.
-    expect(hookDisposition.enforced).toBe(true);
+    const emitted = JSON.parse(result.stdout) as { hookSpecificOutput: { additionalContext: string } };
+    const interception = readSpool(dir).filter((r) => r.kind === "interception")[0];
+    expect(interception.disposition).toBe("advised");
+    // Invariant 03: the instruction the agent reads carries THIS moment's id, so the stage_lookup
+    // it prompts joins to the exact interception rather than being counted against a total.
+    expect(emitted.hookSpecificOutput.additionalContext).toContain(interception.momentId as string);
   });
 
-  /**
-   * THE §0 EVENT, AND ITS ABSENCE OF A SIBLING.
-   *
-   * This is the exact incident the design is an answer to, now leaving a trace: a tool_name the
-   * guard does not recognize. The hook declines — correctly, it is not a gated surface — and the
-   * gate is never spawned. So the journal shows a hook event with `declined: foreign-tool` and NO
-   * gate-cli event at all, which is precisely the shape a months-dark surface would have had.
-   */
-  it("gate journal: a foreign tool_name is recorded as a decline, and the gate leaves no event because it never ran", () => {
-    const dir = mkTmp();
-    const wrapperPath = writeRealWrapper(dir);
-
-    const result = spawnWrapper(wrapperPath, [], dir, {
-      encoding: "utf8",
-      input: JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "SomeToolTheHostRenamed", tool_input: { command: "x" } }),
-      env: { ...process.env, MONET_STORAGE_DIR: dir },
-    });
-    expect(result.status).toBe(0);
-    expect(result.stdout).toBe(""); // the agent-facing signal is unchanged: still silence
-
-    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
-      .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
-
-    expect(lines.filter((l) => l.mouth === "gate-cli")).toHaveLength(0); // never spawned
-    const hook = lines.filter((l) => l.mouth === "host-hook");
-    expect(hook).toHaveLength(2);
-    expect(hook[1].disposition).toBe("declined: foreign-tool");
-    // Recorded verbatim and unmapped: the question this answers months later is "what did the host
-    // actually call it", and any normalization here would destroy the only evidence of a rename.
-    expect(hook[1].hostToolName).toBe("SomeToolTheHostRenamed");
-  });
-
-  /**
-   * CODEX P2 ON PR #63, and it was right on both counts. Two ways this journal was quietly lying
-   * about the very ambiguity it exists to remove.
-   */
-  it("gate journal: an unrecognized gate exit code is declined, never written down as silence", () => {
-    const dir = mkTmp();
-    // A gate that exits 7 — not one of the five documented outcomes. The wrapper still fails open;
-    // what must change is that the RECORD stops claiming a healthy evaluation happened.
-    const stubPath = join(dir, "gate-7.cjs");
-    writeFileSync(stubPath, '#!/usr/bin/env node\nprocess.stdin.resume();process.stdin.on("end",()=>process.exit(7));\n');
-    const wrapperPath = join(dir, "gate-hook.mjs");
-    writeFileSync(wrapperPath, buildWrapperScript({ execPath: process.execPath, scriptPath: stubPath }), { mode: 0o755 });
-
-    const result = spawnSync(process.execPath, [wrapperPath], {
-      encoding: "utf8",
-      input: claudeCodeHookJson("echo hi"),
-      env: { ...process.env, MONET_STORAGE_DIR: dir },
-    });
-    expect(result.stdout).toBe(""); // fail-open is unchanged
-
-    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
-      .split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
-    const disposition = lines[1]!;
-    expect(disposition.disposition).toBe("declined: gate-unknown-status");
-    expect(disposition.claimType).toBe("unavailable"); // never a verdict about an evaluation we did not see
-    expect(disposition.gateExitCode).toBe(7);
-  });
-
-  // The arrival must be on disk BEFORE stdin is read, not merely before it is parsed: reading is
-  // where a monster payload exhausts memory and where a stalled producer never sends EOF, and those
-  // are exactly the failures a two-phase journal exists to make visible.
-  it("gate journal: the arrival is written before stdin is read", () => {
-    const dir = mkTmp();
-    const wrapperPath = writeRealWrapper(dir);
-    spawnSync(process.execPath, [wrapperPath], {
-      encoding: "utf8",
-      input: claudeCodeHookJson("echo hi"),
-      env: { ...process.env, MONET_STORAGE_DIR: dir },
-    });
-    // Filtered by mouth: the real gate this spawns journals into the SAME stream, so the raw line
-    // order interleaves two mouths' events.
-    const hook = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
-      .split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>)
-      .filter((l) => l.mouth === "host-hook");
-    // Nothing about the payload can be on the arrival line, because nothing had been read yet.
-    expect(hook[0]!.phase).toBe("arrival");
-    expect(hook[0]!.stdinBytes).toBeUndefined();
-    // It lands on the disposition, where it is actually known.
-    expect(hook[1]!.stdinBytes).toBeGreaterThan(0);
-  });
-
-  // CODEX P2 ON PR #63: a MONET_STORAGE_DIR that does not exist yet made every append throw into a
-  // swallowing catch — silently, and precisely on a fresh install or a direct gate call before the
-  // store was initialised. The first invocations are the ones a record most needs to have. (Hit for
-  // real during development, which is how the swallow got noticed at all.)
-  it("gate journal: creates the configured storage directory rather than losing the first events", () => {
-    const dir = join(mkTmp(), "deep", "nested", "never-created");
-    const wrapperPath = writeRealWrapper(mkTmp());
-    spawnSync(process.execPath, [wrapperPath], {
-      encoding: "utf8",
-      input: claudeCodeHookJson("echo hi"),
-      env: { ...process.env, MONET_STORAGE_DIR: dir },
-    });
-    expect(existsSync(join(dir, "gate-journal.jsonl"))).toBe(true);
-  });
-
-  // Silence is still silence to the agent — and now it is an EVENT, so its absence means something.
-  it("gate journal: an ungoverned command produces no agent-facing signal and a full pair of events", async () => {
-    const dir = mkTmp();
-    const mirrorPath = join(dir, "gate-mirror.json");
-    await buildFixtureMirror(mirrorPath);
-    const wrapperPath = writeRealWrapper(dir);
-
-    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
-      encoding: "utf8",
-      input: claudeCodeHookJson("git push --force-with-lease"), // deliberately NOT the denied pattern
-      env: { ...process.env, MONET_STORAGE_DIR: dir },
-    });
-    expect(result.stdout).toBe(""); // unchanged: nothing is delivered
-
-    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
-      .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
-    const hookDisposition = lines.filter((l) => l.mouth === "host-hook")[1];
-    const gateDisposition = lines.filter((l) => l.mouth === "gate-cli")[1];
-    expect(hookDisposition.disposition).toBe("silent");
-    expect(gateDisposition.disposition).toBe("silent");
-    expect(gateDisposition.ruleIds).toEqual([]);
-  });
 });
 
 describe("install-cli: runInstall (real fs, isolated tmp dirs — never the real ~/.claude or ~/.monet)", () => {

@@ -347,9 +347,11 @@ export interface GraftPayload {
   /** Normative substrate. Optional: a payload from before this slice simply carries none. */
   lifecycleEdges?: SyncLifecycleEdgeRow[];
   ratifications?: SyncRatificationRow[];
-  /** Gate substrate. `gate_events` is deliberately absent — local instrumentation, like
-   *  `resolution_events`: replicating it would merge two machines' action streams under one
-   *  timeline and make every rate computed from it a lie. */
+  /** Gate substrate. The governed-moment tables — `governed_moments`, `moment_reads`,
+   *  `moment_runs`, `moment_losses`, `moment_fold_cursor` — are deliberately absent, like
+   *  `resolution_events`: replicating a local action stream would merge two machines' timelines
+   *  under one clock and make every rate computed from it a lie. Their per-run sequence is scoped
+   *  to one process on one machine, so a merged stream could not even be checked for completeness. */
   stages?: SyncStageRow[];
   ruleBindings?: SyncRuleBindingRow[];
 }
