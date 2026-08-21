@@ -987,7 +987,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_store",
-    'Store durable knowledge. Similar evidence normally attaches to an existing concept; novel, incoherent, species-mismatched, or stage-mismatched evidence creates a concept. The acknowledgement returns `circle`, `action`, and `conceptId`; anomalous forks also return `resolutionMode` and `score`, flagged pairs add `nearMatchId`/`nearMatchScore`, and correction/rule outcomes add `contradiction`, `ruleSuccession`, or `extractionCandidate` only when present. Use `attachTo` only when identity is known, or `resolution="forceNew"` for known-distinct items. Use kind="correction" to challenge prior memory. Use kind="rule" with `rule`; stored rules are advisory because blocking severity is declaration-only in memory_declare. Synthesis happens later on explicit read.',
+    'Store durable knowledge. Similar evidence normally attaches to an existing concept; novel, incoherent, species-mismatched, or stage-mismatched evidence creates a concept. The acknowledgement returns `circle`, `action`, and `conceptId`; anomalous forks also return `resolutionMode` and `score`, flagged pairs add `nearMatchId`/`nearMatchScore`, and correction/rule outcomes add `contradiction`, `ruleSuccession`, or `extractionCandidate` only when present, and a store into an archived circle adds `guidance` naming what recall will not reach. Use `attachTo` only when identity is known, or `resolution="forceNew"` for known-distinct items. Use kind="correction" to challenge prior memory. Use kind="rule" with `rule`; stored rules are advisory because blocking severity is declaration-only in memory_declare. Synthesis happens later on explicit read.',
     {
       content: z
         .string()
@@ -1101,8 +1101,16 @@ export function registerMonetCoreTools(
         });
         const anomalousResolution = r.resolutionMode !== undefined &&
           ANOMALOUS_STORE_RESOLUTION_MODES.has(r.resolutionMode);
+        // WHERE THE MEMORY IS, read off the result rather than re-resolved here (Codex round 1 on
+        // #55, finding 2). `scope()` consults live alias state, so a rename committed by a second
+        // connection between core.store()'s commit and this line — one .monet file shared by the
+        // MCP server and a monet CLI call is a supported topology, storage.ts — made this name the
+        // rename's target while the write had landed elsewhere. This field's documented job is to be
+        // passed to id-based tools, so it must be the circle the concept is IN; the write-time
+        // landing circle is a different fact and rides its own field into the disclosure below.
+        const conceptCircle = r.concept.circle;
         const envelope = {
-          circle: scope(circle), // the circle these ids live in — pass it to id-based tools if it isn't your session default
+          circle: conceptCircle, // the circle these ids live in — pass it to id-based tools if it isn't your session default
           action: r.action,
           conceptId: r.conceptId,
           ...(anomalousResolution
@@ -1122,6 +1130,54 @@ export function registerMonetCoreTools(
           // extracting a principle. A flag, not an extraction — the four-test battery and the human
           // ratification stay explicit (memory_ratify).
           ...(r.extractionCandidate ? { extractionCandidate: r.extractionCandidate } : {}),
+          // ARCHIVED DESTINATION (#55). A write into an archived circle is legitimate — archiving
+          // hides a circle, it does not seal it (archiveCircle) — so this discloses rather than
+          // refuses. What it refuses to do is let the caller walk away believing the memory is
+          // store-wide recallable: an archived circle is out of memory_search's default scan, out of
+          // memory_overview and out of the default circle listing, so an agent that stores here and
+          // moves on has recorded something its next session will not find by asking.
+          //
+          // READ OFF THE RESULT, never asked here — the same discipline memory_reassign_circle's
+          // deny disclosure follows. The flag is frozen inside core.store()'s own write reservation,
+          // so the sentence and the write share one instant; asking the store after the call would
+          // put the whole write between the answer and what it describes.
+          //
+          // PRESENT ONLY WHEN IT FIRES, like every other conditional field on this envelope. A key
+          // repeating "not archived" on every ordinary write is payload with no reader, and silence
+          // is the healthy state.
+          //
+          // WORDED AS OF THE WRITE, WHICH IS THE ONLY INSTANT THIS SENTENCE KNOWS (Codex round 3).
+          // Both the verdict and the name are frozen — deliberately, because re-reading either here
+          // is the race round 2 closed — so the sentence may not speak in the present tense about a
+          // world it stopped observing. It says the circle WAS archived when the write landed, keeps
+          // the consequence conditional on that still being so, and sends the caller to
+          // memory_circle_manage to LOOK rather than instructing a fix.
+          //
+          // The instruction it used to give was not merely imprecise, it was unusable in this PR's
+          // own race: after a rename the frozen name is an active alias, and unarchiveCircle refuses
+          // one ("archive the canonical circle instead"). A remediation that throws for the exact
+          // caller most likely to need it is worse than none, because it reads as the way out.
+          // SPOKEN ABOUT THE LANDING CIRCLE, not the concept's current one — the two are the same
+          // until a later move, and the verdict belongs to the first (Codex round 4). Both halves
+          // come from the result's own frozen pair, so the sentence names the circle its `true` was
+          // actually about, and says nothing at all if the pair is missing.
+          //
+          // THE EXCLUSION LIST IS WHAT ARCHIVING ACTUALLY DOES, measured rather than assumed
+          // (Codex round 4): store-wide search skips the circle, and `listCircles` drops it from the
+          // default listing — which is what another circle's overview shows as `otherCircles`. The
+          // overview of the archived circle ITSELF is complete when you name it, so claiming the
+          // memory is "out of the overview" was false in exactly the mode a worried caller would
+          // check first. `search`, `fetch` and `overview` all reach it by name, which the preceding
+          // clause already promises.
+          ...(r.landedInArchivedCircle && r.landedCircle
+            ? {
+              guidance:
+                `ARCHIVED CIRCLE: '${r.landedCircle}' was archived when this write landed. The ` +
+                `memory is stored and reachable by naming that circle, but while that circle ` +
+                `remains archived it stays out of store-wide recall and out of the default circle ` +
+                `listing. Check or change the circle's state with memory_circle_manage.`,
+            }
+            : {}),
         };
         return mutOk(envelope, "memory_store", capturedBlock);
       } catch (e) {

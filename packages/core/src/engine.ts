@@ -887,6 +887,54 @@ export interface IngestResult {
    * extracted. The lead runs the battery in conversation and records the outcome via memory_ratify.
    */
   extractionCandidate?: { pairedRuleId: string; score: number };
+  /**
+   * Did this write land in a circle the store has flagged ARCHIVED? Archiving does not seal a circle
+   * — `archiveCircle` accepts explicit reads and writes by contract, and that is unchanged — but it
+   * removes the circle from store-wide search, from the overview and from `listCircles`. So the write
+   * succeeded and the memory is fetchable by naming the circle, while a caller that believes it just
+   * made something store-wide recallable did not: that gap, unreported, is #55.
+   *
+   * READ INSIDE THE WRITE TRANSACTION, for the same reason `ReassignResult.wasCircleLocalLiveDeny`
+   * is. One `.monet` file shared by the MCP server and a `monet` CLI call is a supported topology
+   * (storage.ts), and this method awaits an embed and a segmentation pass between resolving the
+   * circle and mutating anything — so a second connection committing `archiveCircle` inside that
+   * window would reproduce the exact silence this field exists to end, through a narrower gap.
+   * `BEGIN IMMEDIATE` freezes the flag and the write it describes into one instant.
+   *
+   * KEYED ON THE RESOLVED DESTINATION, so an ACTIVE alias pointing at an archived circle discloses
+   * too: the caller named a live-looking circle and still landed in the attic.
+   *
+   * ANSWERED ON EVERY PATH THAT RETURNS A RESULT, `false` included — the write asked, under the
+   * reservation, and both answers are verdicts.
+   *
+   * STORED ON THE RECEIPT, so an idempotency REPLAY returns the verdict the write recorded rather
+   * than a fresh reading of the circle (`ingest_operations.landed_in_archived_circle`; Codex round 1
+   * on #55). Archive state is mutable — unlike the immutable resolution event `resolutionMode` is
+   * safely rebuilt from — so re-deriving it flipped a retry's answer whenever the circle was
+   * archived or unarchived in between, breaking the "a repeated write returns its original result"
+   * contract. ABSENT, never `false`, on a receipt written before that column existed: no verdict was
+   * recorded there, and "not known" must not be answered with the reassuring one.
+   *
+   * THE DESTINATION TRAVELS WITH IT, in `landedCircle` below — never by rewriting `concept.circle`,
+   * which answers a different question (Codex rounds 2 and 4).
+   */
+  landedInArchivedCircle?: boolean;
+  /**
+   * THE CIRCLE THAT VERDICT IS ABOUT: where this write landed, at the instant it landed
+   * (`ingest_operations.landed_circle`). Set and absent in lockstep with `landedInArchivedCircle` —
+   * a verdict whose subject is unknown is half a fact, and naming the wrong circle is worse than
+   * naming none.
+   *
+   * SEPARATE FROM `concept.circle` ON PURPOSE, which is where the concept IS and stays uniformly
+   * live. The two answer different questions and diverge for real: `renameCircle` moves the concept
+   * and clears the archived flag in one act, and `reassignCircle` moves it with no alias left
+   * behind at all — so a replay reporting the historical name as the concept's circle hands the
+   * caller a value `circleOf(id)` no longer matches and id-based tools reject. Use this one to speak
+   * about the write, `concept.circle` to address the memory.
+   *
+   * On a fresh write the two are equal by construction; they part only across a later move.
+   */
+  landedCircle?: string;
 }
 
 /**
@@ -3411,6 +3459,44 @@ export class MonetCore {
         if (!message.includes("duplicate column name")) throw error;
       }
     }
+    // WAS THE DESTINATION ARCHIVED WHEN THIS WRITE LANDED (Codex round 1 on #55, finding 1) — the
+    // same PRODUCED-value lesson `rule_circle` records two blocks up, on the one axis where it bites
+    // hardest: archive state is MUTABLE, so re-deriving this at replay time from `circle_aliases`
+    // reported the circle's state NOW rather than the verdict the write recorded. Measured: store
+    // into a live circle, archive it, replay the same operationId — the flag flipped false→true, and
+    // unarchiving flipped it back. `resolutionMode` may be rebuilt from the substrate because a
+    // resolution event is immutable once written; this is not that kind of fact.
+    //
+    // NULLABLE ON PURPOSE, and read back as ABSENT rather than `false` (getOperationResult): a
+    // receipt written before this column existed recorded no verdict, and "not known" is not the
+    // same answer as "the destination was fine" — the one distinction this whole field exists to
+    // preserve. Same guarded-ALTER, same write site, same replay-read shape as the four columns above.
+    if (!operationCols.some((c) => c.name === "landed_in_archived_circle")) {
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN landed_in_archived_circle INTEGER`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
+    }
+    // THE CIRCLE THAT VERDICT IS ABOUT (Codex round 2 on #55) — the column above without this one
+    // was half a fact. A replay restored the stored verdict but rebuilt the circle from the live
+    // concept row, so `renameCircle` (which also clears the archived flag) made the response say
+    // "the write landed in 'new', and its destination was archived" when the write had landed in
+    // 'old' and 'new' was not archived at all. A verdict and the subject it judges have to be
+    // recovered from the same instant, which means both are stored or neither is.
+    //
+    // NULLABLE for the same reason, and honored the same way: a receipt from before these columns
+    // keeps the live rehydration it has always had, because inventing a frozen destination for a
+    // write that recorded none would be the same fabrication as inventing its verdict.
+    if (!operationCols.some((c) => c.name === "landed_circle")) {
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN landed_circle TEXT`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
+    }
     // aliases: slugs/ids a concept ANSWERS TO after absorbing another on merge — so an asserted
     // reference to a merged-away slug (`supports: #old-slug`) still resolves to the survivor.
     const conceptCols = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
@@ -4227,6 +4313,8 @@ export class MonetCore {
       ruleSuccession?: RuleSuccession;
       ruleBindingChange?: RuleBindingChange;
       extractionCandidate?: { pairedRuleId: string; score: number };
+      /** Absent on the replay branch below, which returns `prior` already carrying its own answer. */
+      landedInArchivedCircle?: boolean;
       prior?: IngestResult;
       proofToken?: EmbeddingWidthProofToken;
     } => {
@@ -4680,12 +4768,20 @@ export class MonetCore {
       const returnScore = opts.resolution === "forceNew" ? (liveMatches[0]?.score ?? 0)
         : opts.attachTo ? cosine(emb, jsonToEmb(row.embedding))
         : autoScore;
+      // THE DISCLOSURE, FROZEN BY THE SAME RESERVATION AS THE WRITE (#55) — see IngestResult's own
+      // field for why it is asked here and not before the embed above, nor at the MCP layer after
+      // the call returns. Asked on EVERY resolution branch because all three land somewhere: an
+      // attach, a fork and a creation are equally invisible to store-wide recall in an archived
+      // circle, and a disclosure that fired on only one of them would be silent exactly where the
+      // caller had least reason to check. Computed BEFORE the receipt insert below, because the
+      // receipt has to record the verdict rather than let a replay re-derive it (Codex round 1).
+      const landedInArchivedCircle = this.isArchivedCircle(circle);
       if (opts.operationId) {
         this.db
           .prepare(
             `INSERT INTO ingest_operations
-               (operation_id, concept_id, observation_id, writer_domain, source_concept_id, action, score, near_match_id, near_match_score, contradiction_id, rule_previous_severity, rule_previous_circle, rule_circle, rule_severity)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (operation_id, concept_id, observation_id, writer_domain, source_concept_id, action, score, near_match_id, near_match_score, contradiction_id, rule_previous_severity, rule_previous_circle, rule_circle, rule_severity, landed_in_archived_circle, landed_circle)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             opts.operationId, row.id, obsId, receiptExpectation.domain,
@@ -4702,11 +4798,20 @@ export class MonetCore {
             // reports it directly), just never threaded into the receipt until now. Same
             // optional-chain-to-null shape as the three fields above it.
             ruleBindingChange?.severity ?? null,
+            // THE VERDICT THIS WRITE RECORDED, stored rather than re-derived at replay: archive
+            // state moves, so the only place this answer survives a later archive/unarchive is here.
+            // Written as 0/1 — a stored `0` is the verdict "the destination was live", which a NULL
+            // (no verdict recorded) must never be confused with.
+            landedInArchivedCircle ? 1 : 0,
+            // AND THE CIRCLE THAT VERDICT IS ABOUT, written in the same statement so the two can
+            // never be recovered from different instants. This is the RESOLVED destination — the
+            // same value the verdict was computed against — not the caller's own argument.
+            circle,
           );
       }
 
       const proofToken = this.captureEmbeddingWidthProof(emb.length);
-      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate, proofToken };
+      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate, landedInArchivedCircle, proofToken };
     })();
 
     if (txResult.prior) return txResult.prior;
@@ -4717,7 +4822,7 @@ export class MonetCore {
       this.lastConceptByCircle.set(circle, txResult.row.id);
     }
 
-    const { action, row, observationId, nearMatchId, nearMatchScore, resolutionMode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate } = txResult;
+    const { action, row, observationId, nearMatchId, nearMatchScore, resolutionMode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate, landedInArchivedCircle } = txResult;
 
     // forceNew score is informational nearest-neighbor; attachTo score is cosine(new obs, target concept).
     const returnScore = txResult.score;
@@ -4738,6 +4843,11 @@ export class MonetCore {
       ...(ruleSuccession !== undefined ? { ruleSuccession } : {}),
       ...(ruleBindingChange !== undefined ? { ruleBindingChange } : {}),
       ...(extractionCandidate !== undefined ? { extractionCandidate } : {}),
+      // Carried as the boolean it was answered as, `false` included: this path DID ask, under the
+      // reservation, so both answers are verdicts. Emitted WITH the circle it is about, in one
+      // spread, because the two are one fact — see `landedCircle`. The replay branches above return
+      // `prior`, which carries the identical pair read back off the receipt.
+      ...(landedInArchivedCircle !== undefined ? { landedInArchivedCircle, landedCircle: circle } : {}),
     };
   }
 
@@ -17261,17 +17371,55 @@ export class MonetCore {
     const resolution = this.db
       .prepare(`SELECT mode FROM resolution_events WHERE observation_id = ?`)
       .get(operation.observation_id) as { mode: ResolutionMode } | undefined;
+    // Same cast-at-the-read shape `replayRuleOutcome` uses for its own migrated columns: the row
+    // type predates them, and a receipt from an older schema simply has nothing here.
+    const operationArchivedVerdict =
+      (operation as { landed_in_archived_circle?: number | null }).landed_in_archived_circle ?? null;
+    // THE DESTINATION THIS WRITE REACHED, recovered from the receipt rather than from the concept
+    // row, which keeps moving (Codex round 2 on #55). `renameCircle` rewrites `concepts.circle` AND
+    // clears the archived flag, so replaying a write that landed in an archived 'old' rebuilt the
+    // circle as 'new' and paired it with the stored TRUE verdict — a response asserting that 'new'
+    // was archived when the write never touched it and 'new' is not archived. The receipt's own
+    // contract answers it: a retry returns the original result, and the original said 'old'.
+    //
+    // ONLY WHEN THE RECEIPT RECORDED ONE. A receipt from before these columns keeps the live
+    // rehydration it has always had — fabricating a frozen destination for a write that stored none
+    // is the same invention as fabricating its verdict, one field over.
+    const operationLandedCircle =
+      (operation as { landed_circle?: string | null }).landed_circle ?? null;
     return {
       action: operation.action,
       conceptId: operation.concept_id,
       observationId: operation.observation_id,
       score: operation.score,
+      // UNIFORMLY LIVE, like every other field the receipt rehydrates (Codex round 4). Round 2
+      // restored the write-time circle onto this object, which quietly repurposed a field whose job
+      // is to say where the concept IS: after a `reassignCircle` the replayed value no longer
+      // matched `circleOf(id)`, so passing it to an id-based tool was rejected outright. The frozen
+      // landing circle is a different fact and now says so in its own field, below.
       concept: toConcept(row),
       ...(contradiction ? { contradiction: toContradiction(contradiction) } : {}),
       ...(operation.near_match_id !== null
         ? { nearMatchId: operation.near_match_id, nearMatchScore: operation.near_match_score ?? 0 }
         : {}),
       ...(resolution ? { resolutionMode: resolution.mode } : {}),
+      // THE STORED VERDICT, NOT A FRESH READING OF THE CIRCLE (Codex round 1 on #55, finding 1).
+      // This is where `resolutionMode`'s rebuild-from-the-substrate discipline stops applying: a
+      // resolution event is immutable once written, so rebuilding it reproduces the original answer
+      // by construction, while archive state is a flag anyone can flip afterwards. Re-deriving this
+      // one made a retry report the circle's state NOW — measured flipping false→true across an
+      // `archiveCircle`, and back across an `unarchiveCircle` — which is precisely the "a repeated
+      // write returns its original result" contract receipts exist to hold.
+      //
+      // NULL IS "NO VERDICT RECORDED", NOT `false`: receipts written before this column existed
+      // never asked the question, and answering for them would invent the reassuring answer — the
+      // one direction this disclosure must never fail in.
+      // BOTH OR NEITHER. The two columns are written by one INSERT, so a receipt has both or has
+      // nothing — and a verdict without the name of the circle it judges is exactly the half-fact
+      // round 2 was about. If one were ever missing, saying nothing beats naming the wrong circle.
+      ...(operationArchivedVerdict !== null && operationLandedCircle !== null
+        ? { landedInArchivedCircle: operationArchivedVerdict === 1, landedCircle: operationLandedCircle }
+        : {}),
       ...this.replayRuleOutcome(operation),
     };
   }
