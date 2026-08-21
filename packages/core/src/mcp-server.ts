@@ -65,7 +65,7 @@ export const MONET_SERVER_INSTRUCTIONS =
   + "Start each project session with agent_context; when it names a stage you are about to act at, call stage_lookup first — the rules never travel with the index, so a stage you do not look up is a stage whose rules do not exist for you. "
   + "Recall with memory_search pointer cards, then memory_fetch content — a search that stops at the cards has recalled nothing. "
   + "Write with memory_store when something durable crosses the boundary: a norm change, or context with no artifact home; never a narrative summary of work whose artifact already exists. When the user states something meant to govern every session, memory_declare places it and memory_ratify records what admitted it — never on your own initiative. "
-  + "Track the session's own work with memory_checkpoint as it happens: open the plan when a directive lands, inbox anything you notice that is not this work, and settle both with the user before you report completion. "
+  + "Track the session's own work with memory_checkpoint as it happens: open the plan when a directive lands, inbox anything you notice that is not this work, and settle both with the user through memory_workstreams before you report completion. "
   + "Nothing is owed at session end: every record Monet keeps is written by the mechanism that made it, as it happens.";
 
 // Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
