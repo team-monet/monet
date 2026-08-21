@@ -16,7 +16,7 @@
  * bootstrap.test.ts already follows for its own fake selector.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -211,6 +211,54 @@ describe("a record is never attributed to the wrong database", () => {
     const json = JSON.parse(runDoctor(dir, ["--json"]).stdout) as { startupFailure: { status: string } };
     expect(json.startupFailure).toEqual({ status: "none" });
   }, 60000);
+});
+
+describe("no entry point goes quiet about the diagnosis it could not leave", () => {
+  // A reader who checks the expected sidecar, finds nothing, and was told nothing concludes that no
+  // startup ever failed. Every entry point must therefore say SOMETHING — and core's dev server,
+  // which had no null branch at all, is the one that used to say nothing (Codex round 2, PR #79).
+  it("core's dev server names the path it could not write to", () => {
+    const dir = storeDir();
+    // The directory exists — so the store path resolves — but nothing can be created inside it.
+    chmodSync(dir, 0o555);
+    try {
+      const run = spawnNode(["scripts/mcp-cli.ts"], CORE_ROOT, { MONET_STORAGE_DIR: dir });
+
+      expect(run.status).toBe(1);
+      expect(run.stdout).toBe("");
+      expect(run.stderr).toContain("could not write the diagnosis to");
+      expect(run.stderr).toContain(startupFailurePath(join(dir, "monet-core.db")));
+      expect(run.stderr).toContain("this stderr is the only record");
+    } finally {
+      chmodSync(dir, 0o755); // so afterEach can remove it
+    }
+  }, 30000);
+
+  it("core's dev server says so plainly when there is no store path to write beside at all", () => {
+    // The failure happened inside resolveDbPath itself, so no location was ever established. Naming
+    // a path here would be inventing one.
+    const dir = storeDir();
+    writeFileSync(join(dir, "blocker"), "a regular file");
+
+    const run = spawnNode(["scripts/mcp-cli.ts"], CORE_ROOT, {
+      MONET_STORAGE_DIR: join(dir, "blocker", "nested"),
+    });
+
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain("no store path could be resolved");
+    expect(run.stderr).toContain("this stderr is the only record");
+  }, 30000);
+
+  it("the shipped entry points say it without claiming a direction the other one contradicts", () => {
+    // `monet start` prints its message AFTER this line (it rethrows into the shared handler); the
+    // stdio entry prints it BEFORE. "the message below" was true at one and false at the other.
+    const dir = storeDir();
+    writeFileSync(join(dir, "blocker"), "a regular file");
+    const target = join(dir, "blocker", "nested", ".monet");
+
+    const run = runStart(dir, ["--dir", target], { MONET_STORAGE_DIR: "" });
+    expect(run.stderr).toContain("this stderr is the only record");
+  }, 30000);
 });
 
 describe("`monet doctor` is where a reader finds it", () => {

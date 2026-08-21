@@ -310,10 +310,30 @@ export function recordStartupFailure(options: RecordStartupFailureOptions): stri
     // two syscalls instead of by the whole open/write/close, and closing it properly needs either a
     // lock or per-writer files with a reader that merges them — machinery out of proportion to a
     // race between two diagnoses of the same moment.
+    //
+    // NO RECORD CONTENT MAY PERMANENTLY BLOCK A FUTURE RECORD, and validation alone does not buy
+    // that (Codex round 2, PR #79). A canonical, perfectly well-formed `9999-12-31T23:59:59.999Z`
+    // passes every field check and then wins every comparison for the next eight thousand years —
+    // one bad file and the store can never record another startup failure, while the pointer line
+    // keeps directing readers to it. So the deferral is bounded at BOTH ends: the existing record
+    // must be newer than ours AND not dated in the future. Those two together make the window
+    // exactly "someone else published while I was writing", which is the only case this guard was
+    // ever for — anything outside it gets replaced.
+    //
+    // The bound reads the REAL clock deliberately, not `options.now`: the seam exists to make two
+    // records' ORDER deterministic in a test, and letting it also move "now" would let a test (or a
+    // caller) re-open the unbounded-future hole this closes. Both clocks agree for any honest
+    // writer, which on a local-first store is the only writer there is.
     const existing = readStartupFailure(options.store);
-    if (existing.status === "found" && existing.record.at > record.at) {
-      unlinkSync(tmp);
-      return path; // the destination already holds a more recent diagnosis — which is the contract
+    if (existing.status === "found") {
+      // Both are canonical ISO by validation, so both parse. Compared as INSTANTS rather than as
+      // text: `toISOString` also emits expanded years (`+275760-09-13T…`), which sort before every
+      // ordinary year as strings while being later in time.
+      const existingAt = Date.parse(existing.record.at);
+      if (existingAt > Date.parse(record.at) && existingAt <= Date.now()) {
+        unlinkSync(tmp);
+        return path; // the destination already holds a more recent diagnosis — which is the contract
+      }
     }
     renameSync(tmp, path);
     return path;
@@ -340,8 +360,25 @@ export function recordStartupFailure(options: RecordStartupFailureOptions): stri
  * three-state result exists to prevent. A record this function cannot vouch for entirely is
  * `unreadable`, and says which field made it so.
  */
+/**
+ * A timestamp this module can both compare and trust: parseable, finite, and in exactly the form
+ * `Date.prototype.toISOString` produces — which is what the writer emits, so a record it wrote
+ * always satisfies this.
+ *
+ * ROUND-TRIP, NOT "PARSES" (Codex round 2, PR #79). `at` is not decoration: it decides which of two
+ * records is the more recent, so a value that merely looks stringy is a value the ordering rule
+ * reads as an instant. `"zzzz"` passed a `typeof` check, and every subsequent comparison against it
+ * was a string comparison it always won. Canonical form is also what makes comparing two records
+ * meaningful at all: `2026-08-21T00:00:00Z` and `2026-08-21T00:00:00.000Z` are the same instant and
+ * sort differently as text.
+ */
+function isCanonicalIsoTimestamp(value: string): boolean {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
 function missingRecordField(candidate: Partial<StartupFailureRecord>): string | null {
-  if (typeof candidate.at !== "string") return "at";
+  if (typeof candidate.at !== "string" || !isCanonicalIsoTimestamp(candidate.at)) return "at";
   if (typeof candidate.pid !== "number") return "pid";
   if (typeof candidate.phase !== "string" || !(STARTUP_PHASES as readonly string[]).includes(candidate.phase)) {
     return "phase";

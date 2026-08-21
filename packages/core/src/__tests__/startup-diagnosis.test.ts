@@ -469,6 +469,28 @@ describe("a published record is whole, and never older than the one it replaces"
     }
   });
 
+  it("no stored timestamp can permanently block a future record — a well-formed FUTURE date is replaced, not deferred to", () => {
+    // VALIDATION ALONE DOES NOT BUY THIS, which is why the guard is bounded at both ends.
+    // `9999-12-31T23:59:59.999Z` is canonical ISO: it parses, it round-trips, it passes every field
+    // check — and under a "newer wins" rule it wins for the next eight thousand years. One such
+    // file, however it got there, and the store could never record another startup failure while
+    // the pointer line kept sending readers to it.
+    const dir = tempDir();
+    const store = storeIn(dir);
+    try {
+      const forged = { ...validRecord(store), at: "9999-12-31T23:59:59.999Z" };
+      writeFileSync(startupFailurePath(store), JSON.stringify(forged));
+      expect(readStartupFailure(store).status).toBe("found"); // well-formed: the reader cannot reject it
+
+      expect(recordStartupFailure({ store, error: new Error("a real, present-day failure") })).not.toBeNull();
+
+      const read = readStartupFailure(store);
+      expect(read.status === "found" && read.record.error.message).toBe("a real, present-day failure");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("an OLDER record never buries a NEWER one — the losing writer leaves the newer diagnosis in place", () => {
     // TWO SERVERS FAILING AGAINST ONE STORE IS THE ORDINARY SHAPE, not an exotic one: a contended
     // store means a second process by definition, and a host retrying a failed connection makes
@@ -479,8 +501,12 @@ describe("a published record is whole, and never older than the one it replaces"
     const dir = tempDir();
     const store = storeIn(dir);
     try {
-      const newer = new Date("2026-08-21T12:00:00.000Z");
-      const older = new Date("2026-08-21T11:00:00.000Z");
+      // Both instants sit firmly in the PAST, and that is load-bearing rather than cosmetic: the
+      // guard refuses to defer to a record dated in the future (see the invariant above), so a test
+      // that stamped tomorrow would be exercising that refusal instead of the ordering it means to.
+      // Two real concurrent writers are always both in the past by the time either compares.
+      const newer = new Date("2020-01-01T12:00:00.000Z");
+      const older = new Date("2020-01-01T11:00:00.000Z");
 
       expect(recordStartupFailure({ store, error: new Error("the NEWER failure"), now: () => newer })).not.toBeNull();
       // The straggler: same store, an older instant, publishing second.
@@ -502,13 +528,13 @@ describe("a published record is whole, and never older than the one it replaces"
     const dir = tempDir();
     const store = storeIn(dir);
     try {
-      const at = new Date("2026-08-21T12:00:00.000Z");
+      const at = new Date("2020-01-01T12:00:00.000Z");
       recordStartupFailure({ store, error: new Error("first"), now: () => at });
       recordStartupFailure({ store, error: new Error("same instant"), now: () => at });
       const same = readStartupFailure(store);
       expect(same.status === "found" && same.record.error.message).toBe("same instant");
 
-      recordStartupFailure({ store, error: new Error("later"), now: () => new Date("2026-08-21T12:00:01.000Z") });
+      recordStartupFailure({ store, error: new Error("later"), now: () => new Date("2020-01-01T12:00:01.000Z") });
       const later = readStartupFailure(store);
       expect(later.status === "found" && later.record.error.message).toBe("later");
     } finally {
@@ -535,6 +561,14 @@ describe("a published record is whole, and never older than the one it replaces"
 describe("a fragment is never presented as a verdict", () => {
   const cases: Array<[string, Record<string, unknown>]> = [
     ["at", { at: 17 }],
+    // `at` DECIDES WHICH RECORD IS NEWER, so a value that is merely stringy is a value the ordering
+    // rule will read as an instant. Each of these was accepted before Codex round 2.
+    ["at", { at: "zzzz" }],
+    ["at", { at: "" }],
+    ["at", { at: "not a date at all" }],
+    ["at", { at: "2026-13-45T99:99:99.999Z" }], // shaped like a timestamp, not one
+    ["at", { at: "2026-08-21T00:00:00Z" }], // a real instant, NOT canonical — sorts wrong as text
+    ["at", { at: "2026-08-21" }],
     ["pid", { pid: undefined }],
     ["phase", { phase: undefined }],
     ["phase", { phase: "a phase this build has never heard of" }],

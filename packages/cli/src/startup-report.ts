@@ -50,9 +50,12 @@ export function reportStartupFailure(error: unknown, context: StartupFailureCont
     // about it leaves a reader who checks the expected path and finds nothing concluding "no
     // startup ever failed" — the exact conflation between an absent record and an absent event
     // this change exists to end.
+    // "THIS STDERR", not "the message below": the two entry points print their error message on
+    // opposite sides of this call (cli.ts rethrows into the shared handler, index.ts prints first),
+    // so naming a direction is wrong at one of them. The dev entry point mirrors this wording.
     console.error(
       `monet: startup failed in phase '${phase}'; could not write the diagnosis to ` +
-        `${getStartupFailurePath(context.projectDir)} — the message below is the only record.`,
+        `${getStartupFailurePath(context.projectDir)} — this stderr is the only record.`,
     );
     return;
   }

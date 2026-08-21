@@ -13,7 +13,7 @@ import { chooseStoreEmbedder } from "../src/store-embedder";
 import type { EmbeddingProvider } from "../src/embedding";
 import { createMonetCoreMcpServer } from "../src/mcp-server";
 import { deriveCircle } from "../src/circle";
-import { inStartupPhase, recordStartupFailure } from "../src/startup-diagnosis";
+import { inStartupPhase, recordStartupFailure, startupFailurePath } from "../src/startup-diagnosis";
 
 /** Exported so a script can REFUSE the live store by asking the resolver that owns the path,
  *  rather than reimplementing its precedence and getting a subset of it right (#160). */
@@ -83,7 +83,26 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           error: e,
           fallbackPhase: transportConnected ? "post-connect" : "unknown",
         });
-    if (written !== null) console.error(`monet-core: the full startup diagnosis is at ${written}`);
+    // SILENCE IS THE ONE THING THIS MAY NOT DO (Codex round 2, PR #79). A reader who checks the
+    // expected sidecar, finds nothing, and was told nothing concludes that no startup ever failed —
+    // the absent-record/absent-event conflation this whole mechanism exists to end, reappearing at
+    // the one entry point that had no null branch. The two shipped entry points already say this;
+    // saying it here too is what keeps the answer independent of which server a reader ran.
+    if (written !== null) {
+      console.error(`monet-core: the full startup diagnosis is at ${written}`);
+    } else if (startedDbPath !== null) {
+      console.error(
+        `monet-core: could not write the diagnosis to ${startupFailurePath(startedDbPath)} — ` +
+          `this stderr is the only record.`,
+      );
+    } else {
+      // The failure happened in resolveDbPath itself, so there is no store, and therefore no
+      // location a record could have gone. Say that, rather than naming a path that was never real.
+      console.error(
+        `monet-core: no store path could be resolved, so there is nowhere a startup diagnosis ` +
+          `could be written — this stderr is the only record.`,
+      );
+    }
     process.exit(1);
   });
 }
