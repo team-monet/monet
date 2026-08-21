@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { MOMENT_SPOOL_FILENAME } from "@team-monet/core";
+import { MOMENT_SPOOL_FILENAME, STARTUP_FAILURE_FILENAME } from "@team-monet/core";
 
 /**
  * Storage path resolution for the local runtime. The store itself is provided by
@@ -88,6 +88,20 @@ export function getGateMirrorPath(baseDir?: string): string {
 export function getMomentSpoolPath(): string {
   const storageDir = process.env.MONET_STORAGE_DIR || path.join(os.homedir(), MONET_DIR);
   return path.join(storageDir, MOMENT_SPOOL_FILENAME);
+}
+
+/**
+ * Where a failed startup leaves its diagnosis (#13).
+ *
+ * ROOTED THE SAME WAY THE STORE IS, and that is the whole point: the record answers "why did the
+ * server serving THIS store fail to start", so it must land in the directory the failing process
+ * resolved for the store itself — never a second "current project" notion (see getMonetDir's own
+ * comment for what that class of bug costs). The filename comes from @team-monet/core, which owns
+ * the record's format, exactly as MOMENT_SPOOL_FILENAME above does: two spellings of one path is
+ * how a writer and a reader stop meeting.
+ */
+export function getStartupFailurePath(baseDir?: string): string {
+  return path.join(getMonetDir(baseDir), STARTUP_FAILURE_FILENAME);
 }
 
 /** The materialize registry/manifest shares the store home's established resolution chain. */

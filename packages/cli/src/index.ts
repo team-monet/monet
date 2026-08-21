@@ -3,11 +3,22 @@ import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@t
 import { ensureMonetDir, getDbPath, getGateMirrorPath, getMomentSpoolPath } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { openServedCore } from "./bootstrap.js";
+import { reportStartupFailure } from "./startup-report.js";
+
+// Prefer an explicit project dir over cwd — a host may spawn this server elsewhere.
+// (Claude Code sets CLAUDE_PROJECT_DIR for stdio MCP servers and discourages relying on cwd.)
+//
+// HOISTED OUT OF main() (#13) so the failure handler below resolves the SAME project dir the store
+// was opened from. Recomputing it there would be a second "current project" notion in one process —
+// the class of bug getDbPath/ensureMonetDir's own comments exist to keep closed — and would point
+// the diagnosis at a directory the failing open never touched.
+const projectDir = path.resolve(process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd());
+
+/** Set once the server factory returns: past that point the transport is live, so a failure after
+ *  it is a materially different fact from one before it. Read only by the handler below. */
+let transportConnected = false;
 
 async function main() {
-  // Prefer an explicit project dir over cwd — a host may spawn this server elsewhere.
-  // (Claude Code sets CLAUDE_PROJECT_DIR for stdio MCP servers and discourages relying on cwd.)
-  const projectDir = path.resolve(process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd());
   // P1-1 (Codex round 3 on PR #42): ensureMonetDir(projectDir), matching cli.ts's own `start`
   // action fix exactly (moved below projectDir's own computation, same reasoning) — see that
   // file's comment for the full CANTOPEN explanation.
@@ -51,6 +62,7 @@ async function main() {
     momentSpoolPath: getMomentSpoolPath(),
   });
   await createMonetCoreMcpServer(core);
+  transportConnected = true;
   console.error(`Monet MCP server running on stdio · ${getDbPath(projectDir)}`);
   console.error(`Circle: ${circle}`);
 }
@@ -61,5 +73,8 @@ main().catch((error: unknown) => {
   } else {
     console.error("Failed to start Monet:", error);
   }
+  // #13: the lines above go to a stream the host may never show. Leave the cause somewhere
+  // addressable before exiting — see startup-report.ts.
+  reportStartupFailure(error, { projectDir, transportConnected });
   process.exit(1);
 });

@@ -12,11 +12,14 @@ import {
   inspectStoredEmbedderState,
   instantiateEmbedderForPin,
   purgeConnectorPopulation,
+  readStartupFailure,
   retirementData,
+  startupFailurePath,
   validateEmbeddingProviderOutput,
   type EmbeddingMigrationProgress,
   type EmbeddingMigrationReport,
   type EmbeddingProvider,
+  type StartupFailureRead,
   type StoredEmbedderStateInspection,
   type VerifiedBackupResult,
 } from "@team-monet/core";
@@ -371,11 +374,45 @@ function printProvider(provider: ProviderResult): void {
   }
 }
 
+/**
+ * The last startup failure, if the store's directory holds one (#13).
+ *
+ * ON STDERR, NOT STDOUT, and before anything else runs. stdout carries the report (or the `--json`
+ * document), and this must not enter either — the same reason the `store:` and `provider:` context
+ * lines above it are on stderr. Printed BEFORE the inspection so it still appears when the store
+ * itself cannot be read: an unreadable store is exactly the case where the last startup's own
+ * account of what happened is the most useful thing `doctor` can say.
+ *
+ * SILENCE IS THE HEALTHY STATE. No record prints nothing at all. What is never silent is a record
+ * that exists and cannot be parsed — that is reported as its own state, because a reader who is
+ * told nothing concludes no startup ever failed.
+ */
+function printStartupFailure(read: StartupFailureRead, storeDir: string): void {
+  if (read.status === "none") return;
+  if (read.status === "unreadable") {
+    console.error(`startup: ${startupFailurePath(storeDir)} exists but could not be read (${read.reason}).`);
+    return;
+  }
+  const record = read.record;
+  console.error(
+    `startup: last recorded startup failure — ${record.at}, pid ${record.pid}, phase '${record.phase}': ` +
+      `${record.error.name}${record.error.code ? ` [${record.error.code}]` : ""}: ${record.error.message}`,
+  );
+  // A later successful start deliberately does NOT clear the record (a host retries, and deleting
+  // it would destroy the evidence of the attempts that failed), so the timestamp is what decides
+  // whether this is the current problem. Say that here rather than letting a reader assume freshness.
+  console.error(
+    `startup: full record at ${startupFailurePath(storeDir)}; it is not cleared by a later ` +
+      `successful start, so check the timestamp above before acting on it.`,
+  );
+}
+
 function jsonDoctor(
   inspection: StoredEmbedderStateInspection,
   assessment: StoredEmbedderStateInspection["assessment"],
   provider: ProviderResult,
   nextCommands: string[],
+  startupFailure: StartupFailureRead,
 ): Record<string, unknown> {
   return {
     schema: RECOVERY_SCHEMA,
@@ -394,6 +431,9 @@ function jsonDoctor(
     assessment,
     rawAssessment: inspection.assessment,
     provider,
+    // Three states, carried through verbatim: absent, unreadable, or the record. A machine reader
+    // must be able to tell "no startup has failed" from "I could not tell" (#13).
+    startupFailure,
     nextCommands,
   };
 }
@@ -429,6 +469,10 @@ function inspectOrThrow(dbPath: string, dependencies: RecoveryCliDependencies): 
 async function runDoctor(options: DoctorOptions, dependencies: RecoveryCliDependencies): Promise<void> {
   const dbPath = path.resolve(dependencies.dbPath(options.dir));
   console.error(`store: ${dbPath}`);
+  // Read from the directory of the store being examined, NOT from a re-resolved project dir: with
+  // `--dir` in play those are different stores, and a record from the wrong one is worse than none.
+  const startupFailure = readStartupFailure(path.dirname(dbPath));
+  printStartupFailure(startupFailure, path.dirname(dbPath));
   try {
     const inspection = inspectOrThrow(dbPath, dependencies);
     let provider: ProviderResult = { loadStatus: "not-checked" };
@@ -443,7 +487,7 @@ async function runDoctor(options: DoctorOptions, dependencies: RecoveryCliDepend
     }
     const nextCommands = nextCommandsForInspection(inspection, assessment, provider);
     if (options.json) {
-      printJson(jsonDoctor(inspection, assessment, provider, nextCommands));
+      printJson(jsonDoctor(inspection, assessment, provider, nextCommands, startupFailure));
     } else {
       console.log("Monet Doctor");
       console.log("------------");

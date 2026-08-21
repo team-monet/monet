@@ -8,6 +8,7 @@ import { ensureMonetDir, getDbPath, getGateMirrorPath, getMomentSpoolPath, getMo
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { generateAgentConfig, toYaml } from "./config-cli.js";
 import { openServedCore, openStatusCore } from "./bootstrap.js";
+import { reportStartupFailure } from "./startup-report.js";
 import { registerRecoveryCommands } from "./repair-cli.js";
 import { registerGateCommands } from "./gate-cli.js";
 import { registerInstallCommands } from "./install-cli.js";
@@ -109,16 +110,33 @@ program
     // writer at `projectDir` would point it at a different file whenever the project carried its
     // own `.monet`. `getMomentSpoolPath()` therefore takes no baseDir at all — see db/index.ts for
     // why it resolves the two rungs it does, and why the generated wrapper is the fixed point.
-    const core = await openServedCore(getDbPath(projectDir), {
-      scopeContext: projectDir,
-      defaultCircle: circle,
-      gateSidecarPath: getGateMirrorPath(projectDir),
-      momentSpoolPath: getMomentSpoolPath(),
-    });
-    console.error(`Monet started`);
-    console.error(`Storage: ${getDbPath(projectDir)}`);
-    console.error(`Circle:  ${circle}`);
-    await createMonetCoreMcpServer(core);
+    // #13: EVERY throw from here down reaches the host as `-32000: Connection closed`, because the
+    // transport does not exist until createMonetCoreMcpServer connects it. The catch does not
+    // change what the host sees — nothing can, without a protocol channel — it leaves the cause
+    // somewhere addressable and rethrows into the shared parseAsync handler below, which still owns
+    // the message and the exit code. See startup-report.ts.
+    //
+    // Scoped to `start` rather than folded into that shared handler on purpose: the handler serves
+    // every subcommand, and `monet status`/`doctor`/`gate` failing is not a startup failure — a
+    // record written for one of those would be a false positive in the one file a reader trusts to
+    // mean "the server could not start".
+    let transportConnected = false;
+    try {
+      const core = await openServedCore(getDbPath(projectDir), {
+        scopeContext: projectDir,
+        defaultCircle: circle,
+        gateSidecarPath: getGateMirrorPath(projectDir),
+        momentSpoolPath: getMomentSpoolPath(),
+      });
+      console.error(`Monet started`);
+      console.error(`Storage: ${getDbPath(projectDir)}`);
+      console.error(`Circle:  ${circle}`);
+      await createMonetCoreMcpServer(core);
+      transportConnected = true;
+    } catch (error) {
+      reportStartupFailure(error, { projectDir, transportConnected });
+      throw error;
+    }
   });
 
 program

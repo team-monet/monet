@@ -52,6 +52,12 @@ monet doctor --dir ~/.monet --json  # machine-readable result; diagnostics stay 
 
 `doctor` prints the absolute database path, SQLite integrity and schema, the durable model pin, all four live embedding populations (including dimensions and malformed-row samples), any migration sentinel, and copy-paste next commands. It does not construct `MonetCore` or alter the database. A healthy diagnosis exits `0`; a completed diagnosis that needs recovery or provider action exits `2`; inspection failures exit `1`. An unavailable provider is reported separately from store safety—for example, an unsupported hashing tokenizer or missing ONNX cache does not by itself mean the database is corrupt. For an ONNX or custom model ID whose shape cannot be proven from the pin alone, `--check-provider` can reconcile an otherwise `unknown` assessment only when the exact provider loads and every clean live population has the same matching vector width.
 
+### When the server will not start at all
+
+A host that cannot start the server reports only that the connection closed — the transport does not exist until every fallible startup step has already succeeded, so there is no protocol channel left to explain a failure. The cause is written beside the store instead, at `startup-failure.json` next to `monet.db`: the step it died in, the error and its code, the time, and the pid. `doctor` prints that record on stderr before anything else, including when the store itself is too damaged to inspect.
+
+The record holds only the most recent failure, and a later successful start does not clear it — hosts retry, so fail → fail → succeed is ordinary, and clearing on success would erase the evidence of the attempts that failed. Read the timestamp before acting on it.
+
 Repairs are previews unless both confirmation flags are present. Choose exactly one mode:
 
 ```bash

@@ -13,6 +13,7 @@ import { chooseStoreEmbedder } from "../src/store-embedder";
 import type { EmbeddingProvider } from "../src/embedding";
 import { createMonetCoreMcpServer } from "../src/mcp-server";
 import { deriveCircle } from "../src/circle";
+import { inStartupPhase, recordStartupFailure } from "../src/startup-diagnosis";
 
 /** Exported so a script can REFUSE the live store by asking the resolver that owns the path,
  *  rather than reimplementing its precedence and getting a subset of it right (#160). */
@@ -30,12 +31,22 @@ export async function chooseStartupEmbedder(dbPath: string): Promise<EmbeddingPr
   return chooseStoreEmbedder(dbPath);
 }
 
+/** Set once the factory returns — see the same flag in the client's own entry points (#13). */
+let transportConnected = false;
+/** The store this run resolved, remembered for the failure handler. Null means the failure happened
+ *  in resolveDbPath itself — the one case where there is no directory to write a record into. */
+let startedDbPath: string | null = null;
+
 async function main(): Promise<void> {
   const dbPath = resolveDbPath();
+  startedDbPath = dbPath;
   // Per-project circle so a shared ~/.monet store isolates per project (MONET_CIRCLE overrides).
   const circle = process.env.MONET_CIRCLE || deriveCircle();
-  const core = new MonetCore(dbPath, {
-    embedder: await chooseStartupEmbedder(dbPath),
+  // Phase-tagged for the same reason the client's openServedCore tags its own two steps (#13): a
+  // model load and a store open fail for unrelated reasons, and are indistinguishable at the host.
+  const embedder = await inStartupPhase("embedder-selection", () => chooseStartupEmbedder(dbPath));
+  const core = await inStartupPhase("store-open", () => new MonetCore(dbPath, {
+    embedder,
     scopeContext: process.cwd(),
     defaultCircle: circle,
     // THE JOURNAL'S ONLY PRODUCTION WIRING (Codex P1 on PR #144, and it was right). `gateJournalPath`
@@ -46,8 +57,9 @@ async function main(): Promise<void> {
     //
     // Beside the resolved database, so it follows the store it describes rather than the process's
     // cwd — the same reasoning that keeps the host-side hook off the cwd rung.
-  });
+  }));
   await createMonetCoreMcpServer(core);
+  transportConnected = true;
   // stderr so it doesn't corrupt the stdio MCP channel
   console.error(`monet-core MCP server running (stdio) · ${dbPath} · circle=${circle}`);
 }
@@ -59,6 +71,17 @@ async function main(): Promise<void> {
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((e) => {
     console.error(e);
+    // #13: stderr is at the host's discretion — leave the cause beside the store too. Same record,
+    // same filename, same directory as the shipped entry points write, so one reader finds either.
+    const written = startedDbPath === null
+      ? null
+      : recordStartupFailure({
+          dir: path.dirname(startedDbPath),
+          store: startedDbPath,
+          error: e,
+          fallbackPhase: transportConnected ? "post-connect" : "unknown",
+        });
+    if (written !== null) console.error(`monet-core: full startup diagnosis written to ${written}`);
     process.exit(1);
   });
 }
