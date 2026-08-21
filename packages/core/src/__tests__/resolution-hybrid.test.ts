@@ -75,6 +75,12 @@ async function seedConcept(core: MonetCore, members: string[]): Promise<string> 
   return first.conceptId;
 }
 
+/** Live (non-superseded) observations on a concept — the "did anything get absorbed" check. */
+const liveObservations = (core: MonetCore, conceptId: string): number =>
+  (dbOf(core)
+    .prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL`)
+    .get(conceptId) as { n: number }).n;
+
 const duplicateEdges = (core: MonetCore, conceptId: string): Array<{ srcId: string; dstId: string; weight: number }> =>
   core.edges({ circle: CIRCLE, type: "possible_duplicate_of" }).filter((e) => e.srcId === conceptId || e.dstId === conceptId);
 
@@ -134,6 +140,22 @@ const POOLING_COHERENT = [
   "postgres pool sizing is derived from the pgbouncer transaction mode budget per service",
 ];
 
+/**
+ * THE #52 PAIR: two texts with NO shared topic, vocabulary or domain, whose evidence cosine lands
+ * in the ambiguous band anyway. This is the fixture for the misfile the correction exemption used
+ * to execute — a coherent, healthy concept about caching, and a correction about a CLI pagination
+ * bug that has nothing to do with it. The measured obs-level score here is ~0.57, within a hair of
+ * the 0.556 the field report carried, which is the point: in the ambiguous band the score does not
+ * distinguish a weak match from no match at all, so nothing built on top of it may ATTACH.
+ */
+const CACHING_COHERENT = [
+  "generated per-user content is cached in the regional edge store for one hour",
+  "the per-user cache key includes the account tier and the rendered locale",
+  "cache entries for generated content are evicted when the account tier changes",
+];
+const UNRELATED_CORRECTION =
+  "the command line tool reports the wrong thread count when paginating past the first page";
+
 describe("resolution decision — the pure function", () => {
   const thresholds: ResolutionThresholds = { tauAttach: 0.8, tauAmbiguous: 0.5 };
   const nominate = (obsScore: number, centroidScore: number, conceptId = "c1") => ({
@@ -174,21 +196,46 @@ describe("resolution decision — the pure function", () => {
     expect(paired.attachToConceptId).toBeUndefined();
   });
 
-  it("forks in the ambiguous band, and exempts a correction there", () => {
-    expect(resolveIncoming({ nomination: nominate(0.6, 0.6), thresholds })).toMatchObject({
+  it("forks in the ambiguous band, for a correction exactly as for anything else (#52)", () => {
+    const plain = resolveIncoming({ nomination: nominate(0.6, 0.6), thresholds });
+    expect(plain).toMatchObject({
       action: "ambiguous", mode: "ambiguous-fork", duplicateEdge: { conceptId: "c1", weight: 0.6 }, nearMatchScore: 0.6,
     });
-    expect(resolveIncoming({ nomination: nominate(0.6, 0.6), kind: "correction", thresholds })).toMatchObject({
-      action: "ambiguous", mode: "correction-attach", attachToConceptId: "c1", nearMatchScore: 0.6,
-    });
+    // The exemption that used to attach here is gone: intent disambiguates WHAT a correction
+    // asserts, never WHICH concept a weak evidence cosine points at.
+    const correction = resolveIncoming({ nomination: nominate(0.6, 0.6), kind: "correction", thresholds });
+    expect(correction).toEqual(plain); // byte-identical: the decision is kind-blind in this band
+    expect(correction.attachToConceptId).toBeUndefined();
   });
 
-  it("scopes the correction exemption to the ambiguous band ONLY", () => {
-    // In the fork-signal band the doubt is about the TARGET'S COHERENCE, which no assertion of
-    // intent resolves: a correction cannot fix a concept by being absorbed into its incoherence.
+  it("never attaches a correction below tauAttach, in ANY band", () => {
+    // The whole point of #52: no band under the attach line may absorb a correction, whatever the
+    // centroid is doing and whatever the caller intended.
     expect(resolveIncoming({ nomination: nominate(0.9, 0.2), kind: "correction", thresholds }).mode).toBe("fork-signal");
-    // And below the band there is nothing to correct.
     expect(resolveIncoming({ nomination: nominate(0.3, 0.9), kind: "correction", thresholds }).mode).toBe("new");
+    // ...and across the whole ambiguous band, including both of its edges.
+    for (const obsScore of [0.5, 0.5000001, 0.556, 0.604, 0.637, 0.7, 0.7999999]) {
+      const decision = resolveIncoming({ nomination: nominate(obsScore, 0.6), kind: "correction", thresholds });
+      expect(decision.mode).toBe("ambiguous-fork");
+      expect(decision.attachToConceptId).toBeUndefined();
+      expect(decision.duplicateEdge).toEqual({ conceptId: "c1", weight: obsScore });
+    }
+    // The FIRST score that may attach a correction is tauAttach itself, with identity confirming.
+    expect(resolveIncoming({ nomination: nominate(0.8, 0.6), kind: "correction", thresholds }))
+      .toMatchObject({ action: "attached", mode: "attach", attachToConceptId: "c1" });
+  });
+
+  it("resolves identically with and without a kind, at every band boundary", () => {
+    // `kind` no longer influences the decision anywhere. Pinned as an equivalence rather than as a
+    // list of modes, so a future kind-specific branch cannot be added here unnoticed.
+    for (const [obs, centroid] of [
+      [0.4999999, 0.9], [0.5, 0.9], [0.6, 0.6], [0.7999999, 0.9], [0.8, 0.5], [0.8, 0.4999999], [0.9, 0.2],
+    ]) {
+      const base = resolveIncoming({ nomination: nominate(obs, centroid), thresholds });
+      for (const kind of ["correction", "rule", "fact", "principle", undefined]) {
+        expect(resolveIncoming({ nomination: nominate(obs, centroid), kind, thresholds })).toEqual(base);
+      }
+    }
   });
 
   it("treats both band edges as inclusive, exactly as the pre-split engine did", () => {
@@ -492,12 +539,15 @@ describe("resolution — all four bands through store()", () => {
 
 describe("resolution — corrections follow the nomination", () => {
   /**
-   * A correction must land on the concept whose EVIDENCE it corrects. The store here is built so
-   * the two rules point at different concepts: the bimodal concept holds the matching observation
-   * (evidence), while a decoy's single observation out-scores that bimodal concept's blurred
-   * CENTROID (identity). The old rule sent the correction to the decoy.
+   * A correction's near match must be the concept whose EVIDENCE it corrects. The store here is
+   * built so the two rules point at different concepts: the bimodal concept holds the matching
+   * observation (evidence), while a decoy's single observation out-scores that bimodal concept's
+   * blurred CENTROID (identity). The pre-hybrid rule sent the correction to the decoy.
+   *
+   * Since #52 this band FORKS rather than attaching, so what the test pins is the surviving half:
+   * nomination still follows evidence, and the pair the fork surfaces names the evidence match.
    */
-  it("attaches an ambiguous-band correction to the evidence match, not the nearest centroid", async () => {
+  it("pairs an ambiguous-band correction with the evidence match, not the nearest centroid", async () => {
     const core = newCore({ tauAttach: 0.95, tauAmbiguous: 0.5 });
     try {
       const bimodal = await seedConcept(core, [POOLING, ...THEMING]);
@@ -509,17 +559,91 @@ describe("resolution — corrections follow the nomination", () => {
       expect(bimodalGeom.bestObservation).toBeGreaterThan(decoyGeom.bestObservation); // evidence -> bimodal
       expect(decoyGeom.centroid).toBeGreaterThan(bimodalGeom.centroid); // centroid -> decoy
       expect(bimodalGeom.bestObservation).toBeGreaterThanOrEqual(0.5);
-      expect(bimodalGeom.bestObservation).toBeLessThan(0.95); // ambiguous band, where the exemption lives
+      expect(bimodalGeom.bestObservation).toBeLessThan(0.95); // the ambiguous band
 
       const corrected = await core.store(POOLING_AGAIN, { circle: CIRCLE, kind: "correction" });
 
-      expect(corrected.action).toBe("ambiguous");
-      expect(corrected.resolutionMode).toBe("correction-attach");
-      expect(corrected.conceptId).toBe(bimodal);
-      expect(corrected.conceptId).not.toBe(decoy);
-      // The contradiction machinery is untouched and still opens on the concept it landed on.
+      expect([corrected.action, corrected.resolutionMode]).toEqual(["ambiguous", "ambiguous-fork"]);
+      // The NEAR MATCH follows the evidence — the decoy's winning centroid buys it nothing.
+      expect(corrected.nearMatchId).toBe(bimodal);
+      expect(corrected.nearMatchId).not.toBe(decoy);
+      expect(corrected.nearMatchScore).toBeCloseTo(bimodalGeom.bestObservation, 6);
+      // Nothing was absorbed, so nothing was disputed: both concepts are exactly as they were.
+      expect(corrected.conceptId).not.toBe(bimodal);
+      expect(corrected.contradiction).toBeUndefined();
+      expect((await core.getConcept(bimodal))!.status).toBe("active");
+      expect((await core.getConcept(decoy))!.status).toBe("active");
+      // ...but the pair IS in front of curation, one memory_resolve from merged.
+      expect(duplicateEdges(core, corrected.conceptId)).toHaveLength(2);
+    } finally {
+      core.close();
+    }
+  });
+
+  /**
+   * ISSUE #52, the field report, pinned end to end: a correction lands in the ambiguous band
+   * against a concept it shares no topic with, and the store must not absorb it. The old exemption
+   * attached here and — because the attach set `landedOnExisting` — opened a value-conflict
+   * contradiction, flipping a healthy, unrelated concept to `disputed` and appending an unrelated
+   * paragraph to its body. Four calls to undo one store, all of them needing someone to notice.
+   */
+  it("does not absorb an ambiguous-band correction into a topically unrelated concept", async () => {
+    const core = newCore({ tauAttach: 0.85, tauAmbiguous: 0.5 });
+    try {
+      const caching = await seedConcept(core, CACHING_COHERENT);
+      const before = (await core.getConcept(caching))!;
+      const { bestObservation } = geometry(core, caching, UNRELATED_CORRECTION);
+
+      // THE PREMISE, asserted not assumed: this really is an ambiguous-band score between two
+      // texts with nothing in common — the exact band the exemption used to attach in.
+      expect(bestObservation).toBeGreaterThanOrEqual(0.5);
+      expect(bestObservation).toBeLessThan(0.85);
+
+      const corrected = await core.store(UNRELATED_CORRECTION, { circle: CIRCLE, kind: "correction" });
+
+      // It forks like every other kind in this band.
+      expect(corrected.conceptId).not.toBe(caching);
+      expect([corrected.action, corrected.resolutionMode]).toEqual(["ambiguous", "ambiguous-fork"]);
+      // And the innocent concept is untouched: no contradiction, no dispute, no appended body.
+      expect(corrected.contradiction).toBeUndefined();
+      const after = (await core.getConcept(caching))!;
+      expect(after.status).toBe("active");
+      expect(after.status).toBe(before.status);
+      expect(after.body).toBe(before.body); // the unrelated sentence is NOT appended
+      expect(liveObservations(core, caching)).toBe(CACHING_COHERENT.length); // 3, not 4
+      // Nothing is LOST, either — the near match is still named and the pair reaches curation.
+      expect(corrected.nearMatchId).toBe(caching);
+      expect(corrected.nearMatchScore).toBeCloseTo(bestObservation, 6);
+      expect(duplicateEdges(core, corrected.conceptId)).toHaveLength(2);
+    } finally {
+      core.close();
+    }
+  });
+
+  /**
+   * THE CONTROL FOR #52 — what the fix must NOT have cost. A correction whose evidence clears
+   * tauAttach against a COHERENT concept still attaches, still absorbs, and still opens its
+   * contradiction. The fix moved the evidence bar for disputing a concept; it did not touch the
+   * contradiction machinery, and a genuine correction must still be able to reach it.
+   */
+  it("still attaches a strong correction to a coherent concept, and still disputes it", async () => {
+    const core = newCore({ tauAttach: 0.85, tauAmbiguous: 0.5 });
+    try {
+      const coherent = await seedConcept(core, POOLING_COHERENT);
+      const { centroid, bestObservation } = geometry(core, coherent, POOLING_AGAIN);
+      // THE PREMISE: evidence clears tauAttach and identity confirms — the one band that attaches.
+      expect(bestObservation).toBeGreaterThanOrEqual(0.85);
+      expect(centroid).toBeGreaterThanOrEqual(0.5);
+
+      const corrected = await core.store(POOLING_AGAIN, { circle: CIRCLE, kind: "correction" });
+
+      expect([corrected.action, corrected.resolutionMode]).toEqual(["attached", "attach"]);
+      expect(corrected.conceptId).toBe(coherent);
+      expect(liveObservations(core, coherent)).toBe(POOLING_COHERENT.length + 1); // absorbed
+      // The contradiction machinery is untouched: a well-evidenced correction still contests.
       expect(corrected.contradiction).toBeDefined();
-      expect((await core.getConcept(bimodal))!.status).toBe("disputed");
+      expect(corrected.contradiction!.status).toBe("open");
+      expect((await core.getConcept(coherent))!.status).toBe("disputed");
     } finally {
       core.close();
     }

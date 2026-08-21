@@ -4569,7 +4569,7 @@ export class MonetCore {
         // THE FORCE-NEW FEED CARRIES THE SAME FLOOR THE AUTOMATIC PATH ALREADY HAS (review fix —
         // Codex 5-B round 5, R5-3). Every auto-path `nearMatchId` is >= tauAmbiguous by
         // construction — the decision table's nearMatch-bearing modes are fork-signal
-        // (obsScore >= tauAttach), correction-attach/ambiguous-fork (>= tauAmbiguous),
+        // (obsScore >= tauAttach), ambiguous-fork (>= tauAmbiguous),
         // blur-duplicate (centroidScore >= tauAttach) and stage-fork (intercepted attach,
         // >= tauAttach), while mode "new" carries none — but `liveMatches[0]` is the raw centroid
         // ranking, where ANY positive cosine appears, so an unfloored force-new import in a
@@ -4656,8 +4656,10 @@ export class MonetCore {
       // (ADR §4.1 step 4 / §4.6). A correction that CREATED its concept — novel evidence, or a
       // fork signal — has nothing to contradict: the concept it would dispute is the one this very
       // call just wrote. `landedOnExisting` is the direct test for that and covers every path
-      // (attachTo, attach, the ambiguous-band correction exemption) without inferring attachment
-      // from the coarse `action` string.
+      // (attachTo, attach) without inferring attachment from the coarse `action` string — and since
+      // #52 retired the ambiguous-band correction exemption, an auto-resolved correction reaches
+      // this hook ONLY through mode "attach", i.e. evidence at or above tauAttach with the centroid
+      // confirming. Disputing a bystander is now gated on the same evidence an absorb is.
       let contradiction: Contradiction | undefined;
       if (opts.kind === "correction" && landedOnExisting) {
         contradiction = this.flagContradiction(row.id, {

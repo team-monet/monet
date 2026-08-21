@@ -48,9 +48,42 @@
  *
  *   obsScore >= tauAttach   & centroidScore >= tauAmbiguous  -> ATTACH        (mode "attach")
  *   obsScore >= tauAttach   & centroidScore <  tauAmbiguous  -> FORK SIGNAL   (mode "fork-signal")
- *   tauAmbiguous <= obsScore < tauAttach                     -> ambiguous fork / correction attach
+ *   tauAmbiguous <= obsScore < tauAttach                     -> AMBIGUOUS FORK (mode "ambiguous-fork")
  *   obsScore <  tauAmbiguous & top centroid >= tauAttach     -> create + PAIR (mode "blur-duplicate")
  *   obsScore <  tauAmbiguous                                 -> CREATE        (mode "new")
+ *
+ * ATTACH IS NOW THE ONLY WAY IN, FOR EVERY KIND (#52). The ambiguous band used to carry one
+ * exemption: kind="correction" attached to the nominated concept instead of forking, on the premise
+ * that a caller asserting "this overrides existing memory" had disambiguated the write. That premise
+ * does not survive contact with what the band actually is. Intent disambiguates WHAT a correction
+ * asserts; it says nothing about WHICH concept a weak evidence cosine is pointing at, and those are
+ * the only two questions. The field report is the proof: a correction about a CLI pagination bug
+ * attached at obsScore 0.556 to a concept about caching per-user content — no shared topic,
+ * vocabulary or domain — appended an unrelated paragraph to its body and, because the attach set
+ * `landedOnExisting`, opened a value-conflict that flipped a healthy concept to `disputed`.
+ *
+ * AND THE BLAST RADIUS IS WHY THIS ONE HAD TO BE THE STRICTEST BRANCH, not the loosest. Every other
+ * ambiguous-band write that lands wrong costs a spurious concept and a duplicate pair, both of which
+ * curation already mediates. A wrong CORRECTION additionally marks an innocent, previously healthy
+ * memory as contested, and that state persists until a human mediates it — so the exemption granted
+ * the most damaging write the weakest evidence test in the table.
+ *
+ * WHY NOT A HIGHER FLOOR FOR CORRECTIONS INSTEAD (the report's own suggested direction 3). Because
+ * the floor would be set on a signal that does not carry the distinction it would be asked to draw.
+ * The same store ranked a completely unrelated pair at 0.637 — HIGHER than the 0.556 that produced
+ * the misfile — so any floor between the two admits one unrelated pair and rejects the other, and
+ * every floor above both starves legitimate attaches. Tuning a threshold cannot repair a score that
+ * is uninformative in this band; refusing to ATTACH on it can, and costs nothing recoverable.
+ *
+ * NOTHING IS LOST BY FORKING. The correction still lands, still names its near match, and still
+ * pairs with `possible_duplicate_of`, so a genuine same-concept correction shows up in exactly the
+ * curation surface that already mediates duplicates and is one `memory_resolve` from merged. That is
+ * the recoverable direction of the asymmetry this file applies everywhere else: a wrong fork is a
+ * merge away, a wrong merge loses provenance and disputes a bystander.
+ *
+ * CORRECTIONS ABOVE tauAttach ARE UNTOUCHED. Evidence-strong, centroid-confirmed corrections attach
+ * through mode "attach" exactly as before and open their contradictions exactly as before — the
+ * contradiction machinery is not changed by this, only the evidence bar for reaching it.
  *
  * Confirmation is deliberately the WEAKER threshold. The spec's word is "far" — an incoming
  * observation "near member observations but far from the centroid" is the fork signal — so the
@@ -102,7 +135,12 @@
  *   species-fork      evidence and identity agreed, but the nominated concept kind was incompatible
  *   stage-fork        evidence and identity agreed, but the nominated RULE is bound to another stage
  *   ambiguous-fork    ambiguous-band evidence — forked with a possible_duplicate_of edge (status quo)
- *   correction-attach ambiguous-band kind="correction" — attached, contradiction machinery takes over
+ *   correction-attach RETIRED (#52). No decision produces this mode any more — an ambiguous-band
+ *                     correction forks like every other kind. The value STAYS in this vocabulary and
+ *                     in DECIDED_RESOLUTION_MODES because `resolution_events` rows written before the
+ *                     fix still carry it: dropping it would type-break the replay read and silently
+ *                     shrink the historical rate DENOMINATOR, restating past fork rates as if those
+ *                     writes had never run the rule.
  *   blur-duplicate    identity matched, evidence DISAGREED — the blur attractor's own output, paired
  *   new               no support from either signal — a genuinely new concept
  *   direct-attach     attachTo bypassed scoring entirely
@@ -185,7 +223,17 @@ export interface ResolutionInput {
   nomination: ResolutionNomination | null;
   /** Top concept by centroid cosine, if any scored above zero. Used ONLY for blur-duplicate pairing. */
   centroidTop?: ResolutionCentroidCandidate | null;
-  /** The incoming observation's kind. Only "correction" changes the outcome (ambiguous band). */
+  /**
+   * The incoming observation's kind. READ BY NOTHING since #52 retired the correction exemption —
+   * the decision is now kind-blind in every band, which is the invariant the rest of the system
+   * already assumes (see the `forkReason` chain in engine.ts's storeInternal, where kind rules are
+   * re-imposed at the WRITE site precisely because resolution does not apply them).
+   *
+   * Retained rather than deleted: it is on an exported type, the engine and
+   * scripts/measure-resolution-bands.ts both pass it, and whether a kind should ever re-enter this
+   * decision is exactly the question #52 leaves open. Removing it is a separate call from fixing
+   * the misfile.
+   */
   kind?: string;
   thresholds: ResolutionThresholds;
 }
@@ -228,7 +276,7 @@ export interface ResolutionDecision {
  * (lower concept id wins), not here — by the time a nomination arrives there is exactly one.
  */
 export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
-  const { nomination, kind } = input;
+  const { nomination } = input;
   const { tauAttach, tauAmbiguous } = input.thresholds;
 
   // Nothing in the circle's evidence matched at all. The centroid still cannot ATTACH anything —
@@ -245,9 +293,9 @@ export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
     // THE FORK SIGNAL (defect 2): near the members, far from the centroid ⇒ bimodal. Fork and
     // surface the pair rather than deepening the incoherence. A wrong fork is recoverable (merge);
     // a wrong merge is not (a split loses provenance) — the same asymmetry the ambiguous band
-    // already resolves in this direction, including for kind="correction": the correction exemption
-    // below is scoped to the AMBIGUOUS band, where the doubt is about strength of match, not about
-    // the target's coherence.
+    // resolves in this direction too, and since #52 it resolves it for kind="correction" as well,
+    // so this branch no longer has to say why corrections are excluded from it: nothing below
+    // tauAttach attaches, whatever the caller's intent.
     return {
       action: "ambiguous",
       mode: "fork-signal",
@@ -260,21 +308,10 @@ export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
 
   if (obsScore >= tauAmbiguous) {
     // AMBIGUOUS BAND — semantics preserved verbatim from the pre-split engine, only the score's
-    // source moved from centroid to evidence. A wrong fork is recoverable; a wrong merge is not.
-    if (kind === "correction") {
-      // Exception (unchanged): the caller is explicitly asserting "this overrides existing memory",
-      // so intent disambiguates. Attach to the nominated concept and let the contradiction
-      // machinery take over. Nomination by evidence matters MOST here — a correction must land on
-      // the concept whose EVIDENCE it corrects, not on whichever centroid happened to be nearest.
-      return {
-        action: "ambiguous",
-        mode: "correction-attach",
-        attachToConceptId: conceptId,
-        nearMatchId: conceptId,
-        nearMatchScore: obsScore,
-        score: obsScore,
-      };
-    }
+    // source moved from centroid to evidence. A wrong fork is recoverable; a wrong merge is not,
+    // and EVERY kind is now held to that, corrections included (#52). The kind="correction"
+    // exemption that used to sit here is retired; the file header's "ATTACH IS NOW THE ONLY WAY IN"
+    // records why its premise was unsound and why a floor would not have replaced it.
     return {
       action: "ambiguous",
       mode: "ambiguous-fork",
@@ -315,8 +352,7 @@ export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
  * would flood curation with every topical neighbour. Only a centroid claiming outright identity,
  * contradicted by the evidence, is worth a human's attention.
  *
- * kind="correction" gets NO exemption here. The ambiguous-band exemption exists because intent
- * disambiguates a weak EVIDENCE match; it cannot manufacture evidence that does not exist. A
+ * kind="correction" gets no special treatment here, and since #52 it gets none anywhere: a
  * correction whose only kinship with a concept is centroid-level must not be absorbed by it —
  * evidence-first is the whole design — so it creates and pairs like any other blur-duplicate, and
  * since it lands on no existing concept the engine opens no contradiction.

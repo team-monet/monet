@@ -271,36 +271,40 @@ describe("lazy enrichment (Sift inline, Sieve deferred — §4.6)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// F6 — ambiguous-band corrections are exempt from fork-on-ambiguous
+// F6 — ambiguous-band corrections fork like everything else (#52)
+//
+// This block used to pin the OPPOSITE: an ambiguous-band correction attached to its near match on
+// the premise that "this overrides existing memory" disambiguated the write. It does not — intent
+// disambiguates what a correction asserts, not which concept a weak evidence cosine points at — and
+// in the field that exemption absorbed a correction into an unrelated concept at 0.556 and flipped
+// that innocent concept to `disputed`. The exemption is retired; the two tests below are now the
+// same assertion twice, which is the point.
 // ---------------------------------------------------------------------------
-describe("F6 — ambiguous-band correction exemption from fork-on-ambiguous", () => {
-  it("ambiguous-band correction attaches to near match, opens contradiction, no possible_duplicate_of edge, no new concept", async () => {
+describe("F6 — ambiguous-band corrections fork like everything else (#52)", () => {
+  it("ambiguous-band correction forks, opens NO contradiction, and records possible_duplicate_of", async () => {
     // tauAttach=0.9 (nothing attaches on score), tauAmbiguous=0.1 (everything in band) —
     // same setup as the existing ambiguous-fork test so scores are in the ambiguous band.
     const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
     const a = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
 
-    // Ambiguous-band score but kind=correction → must attach to near match, not fork.
+    // Ambiguous-band score with kind=correction → forks, exactly as a non-correction would.
     const b = await c.store("Monet Local uses SQLite for its local storage backend.", { kind: "correction" });
 
-    // Action is still "ambiguous" (score honesty) but conceptId is the existing concept.
     expect(b.action).toBe("ambiguous");
-    expect(b.conceptId).toBe(a.conceptId);
+    expect(b.conceptId).not.toBe(a.conceptId);
+    expect(c.conceptCount()).toBe(2);
 
-    // A contradiction must have been opened (the correction path ran).
-    expect(b.contradiction).toBeDefined();
-    expect(b.contradiction!.status).toBe("open");
-
-    // The near-match concept must be disputed.
+    // Nothing landed on the existing concept, so nothing may dispute it.
+    expect(b.contradiction).toBeUndefined();
     const fetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
-    expect(fetched.status).toBe("disputed");
+    expect(fetched.status).toBe("active");
 
-    // No possible_duplicate_of edge — the correction was attached, not forked.
+    // The pair is surfaced instead — recoverable by merge, which a wrong attach never was.
     const dupEdges = c.edges({ circle: "default", type: "possible_duplicate_of" });
-    expect(dupEdges.length).toBe(0);
-
-    // Only one concept exists.
-    expect(c.conceptCount()).toBe(1);
+    expect(dupEdges.some((e) =>
+      (e.srcId === a.conceptId && e.dstId === b.conceptId) ||
+      (e.srcId === b.conceptId && e.dstId === a.conceptId),
+    )).toBe(true);
 
     c.close();
   });
