@@ -731,6 +731,19 @@ describe("archiveCircle / unarchiveCircle", () => {
       expect(ack.circle).toBe("proj");
       expect(ack.guidance).toContain("'proj'");
       expect(ack.guidance).not.toContain("proj-renamed");
+
+      // AND IT CLAIMS NOTHING ABOUT THE PRESENT (Codex round 3). Both halves of this sentence are
+      // frozen, so it may not assert what 'proj' IS — by now the rename has made it an active alias
+      // and cleared the archived flag, and the envelope has no way to know that without the live
+      // re-read whose removal is the point. Write-time framing, conditional consequence.
+      expect(ack.guidance).toContain("was archived when this write landed");
+      expect(ack.guidance).not.toMatch(/is archived/);
+      // AND IT DOES NOT PRESCRIBE THE ONE REMEDY THAT THROWS HERE: 'proj' is an active alias now,
+      // and unarchiveCircle refuses those outright — "archive the canonical circle instead". An
+      // instruction that fails for the very caller most likely to follow it reads as the way out
+      // and is not one.
+      expect(ack.guidance).not.toMatch(/unarchive/i);
+      expect(() => a.unarchiveCircle("proj")).toThrow(/alias pointing to/);
     } finally {
       spy.mockRestore();
       await cleanup();
@@ -752,8 +765,13 @@ describe("archiveCircle / unarchiveCircle", () => {
       expect(archived.conceptId).toBeDefined();
       expect(archived.circle).toBe("shelved");
       expect(archived.guidance).toContain("ARCHIVED CIRCLE");
-      expect(archived.guidance).toContain("shelved");
+      // The verdict is dated to the write, the consequence is conditional on the circle STILL being
+      // archived, and the remedy is a place to look rather than an act to perform — see the rename
+      // race above for why none of the three may harden into a present-tense claim.
+      expect(archived.guidance).toContain("'shelved' was archived when this write landed");
+      expect(archived.guidance).toContain("while that circle remains archived");
       expect(archived.guidance).toContain("memory_circle_manage");
+      expect(archived.guidance).not.toMatch(/is archived/);
 
       const live = await storeOverMcp(client, { content: "The nightly export writes to S3.", circle: "current" });
       expect(live.conceptId).toBeDefined();

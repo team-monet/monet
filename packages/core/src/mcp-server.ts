@@ -1146,13 +1146,25 @@ export function registerMonetCoreTools(
           // PRESENT ONLY WHEN IT FIRES, like every other conditional field on this envelope. A key
           // repeating "not archived" on every ordinary write is payload with no reader, and silence
           // is the healthy state.
+          //
+          // WORDED AS OF THE WRITE, WHICH IS THE ONLY INSTANT THIS SENTENCE KNOWS (Codex round 3).
+          // Both the verdict and the name are frozen — deliberately, because re-reading either here
+          // is the race round 2 closed — so the sentence may not speak in the present tense about a
+          // world it stopped observing. It says the circle WAS archived when the write landed, keeps
+          // the consequence conditional on that still being so, and sends the caller to
+          // memory_circle_manage to LOOK rather than instructing a fix.
+          //
+          // The instruction it used to give was not merely imprecise, it was unusable in this PR's
+          // own race: after a rename the frozen name is an active alias, and unarchiveCircle refuses
+          // one ("archive the canonical circle instead"). A remediation that throws for the exact
+          // caller most likely to need it is worse than none, because it reads as the way out.
           ...(r.landedInArchivedCircle
             ? {
               guidance:
-                `ARCHIVED CIRCLE: '${landedCircle}' is archived. This memory is stored and can be ` +
-                `read back by naming that circle, but it stays out of store-wide recall, the ` +
-                `overview and the default circle list. Unarchive the circle with ` +
-                `memory_circle_manage to put it back in default recall.`,
+                `ARCHIVED CIRCLE: '${landedCircle}' was archived when this write landed. The memory ` +
+                `is stored and reachable by naming that circle, but while that circle remains ` +
+                `archived it stays out of store-wide recall, the overview and the default circle ` +
+                `list. Check or change the circle's state with memory_circle_manage.`,
             }
             : {}),
         };
