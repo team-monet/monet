@@ -594,3 +594,73 @@ describe("R5 — a REPLICATED alias moves the local moment population too", () =
     expect(local.momentCounts("old-team").total).toBe(1);
   });
 });
+
+describe("R6 — a resolved-but-failed tool result is not an ok outcome", () => {
+  it("records isError results as failed, not as success", async () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const db = mkDb();
+    const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets", momentSpoolPath: spool });
+    cores.push(core);
+    const server = new McpServer({ name: "t", version: "0.0.1" }, { capabilities: { tools: {} } });
+    registerMonetCoreTools(server, core);
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.connect(st);
+    const client = new Client({ name: "c", version: "0.0.1" });
+    await client.connect(ct);
+    try {
+      // `err()` returns a RESOLVED result with isError: true — the shape dozens of handlers use to
+      // report a refusal or a caught database error. A fetch for an id that does not exist is one.
+      const res = await client.callTool({ name: "memory_fetch", arguments: { id: "no-such-id" } });
+      expect(res.isError).toBe(true);
+      foldMomentSpool(db, spool);
+      const statuses = (db
+        .prepare(`SELECT surface, outcome_status FROM governed_moments WHERE surface = 'memory_fetch'`)
+        .all()) as Array<{ surface: string; outcome_status: string | null }>;
+      expect(statuses.length).toBeGreaterThan(0);
+      // Recorded as failed. Reading fulfillment as success made this column assert a verdict the
+      // value it was handed contradicts.
+      expect(statuses.every((r) => r.outcome_status === "failed")).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe("R6 — the public gate() and stageLookup() record for a library caller", () => {
+  it("counts fires and silences from MonetCore.gate()", async () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets", momentSpoolPath: spool });
+    cores.push(core);
+    await core.declare({
+      species: "rule", stage: "terraform apply", patterns: ["Bash:terraform apply"],
+      content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
+    });
+    core.gate({ actionContext: "Bash:terraform apply -auto-approve" });
+    core.gate({ actionContext: "Bash:ls -la" });
+
+    const counts = core.momentCounts("acme-widgets");
+    expect(counts.fires).toBe(1);
+    expect(counts.silences).toBe(1);
+    expect(counts.total).toBe(2);
+    // `record: false` is the documented opt-out and must govern this too.
+    core.gate({ actionContext: "Bash:terraform apply -auto-approve", record: false });
+    expect(core.momentCounts("acme-widgets").total).toBe(2);
+  });
+
+  it("counts stage reads from MonetCore.stageLookup()", async () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets", momentSpoolPath: spool });
+    cores.push(core);
+    await core.declare({
+      species: "rule", stage: "terraform apply", patterns: ["Bash:terraform apply"],
+      content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
+    });
+    const r = core.stageLookup({ stage: "terraform apply" });
+    expect(r.rules.length).toBeGreaterThan(0);
+    // Without this, a stage an embedder consults every day reads as one nobody has ever looked up.
+    expect(core.momentStageReads("acme-widgets").size).toBeGreaterThan(0);
+  });
+});

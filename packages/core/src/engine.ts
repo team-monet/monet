@@ -12492,7 +12492,65 @@ export class MonetCore {
   }): GateResult {
     // At the mouth: before the circle is resolved, because resolveCircle can throw and a call that
     // died on an unqueryable circle is an arrival that must not vanish.
-    return this.gateUnjournaled(opts);
+    const result = this.gateUnjournaled(opts);
+    // AND THE MOMENT, because THIS is the public gate. `monet gate` writes its own interception from
+    // the CLI — it is the only party that holds the host's tool-call identity — and wiring the
+    // moment there alone left every embedder that configures a spool and calls this method
+    // recording no fires and no silences at all, while `record: false` still advertised itself as
+    // the way to opt out of counting. Recording silently off for a supported configuration is the
+    // failure this whole subsystem exists to end, and here it also breaks a documented contract.
+    if (opts.record !== false) this.spoolApiGateMoment(opts.actionContext, opts.circle, result);
+    return result;
+  }
+
+  /**
+   * The interception for a gate call made through the library rather than through the hook.
+   *
+   * NO OUTCOME, EVER, and that is honest rather than incomplete: nothing here observes whether the
+   * caller went on to act. The hook path closes its moments because the host fires a second event;
+   * a library caller returns into code this store cannot see. So these moments count toward fires,
+   * silences and delivery, and never toward conformance — which needs an outcome.
+   *
+   * NO MOMENT ID IS RETURNED, deliberately: adding one would change this method's public return
+   * type, and a library caller has no channel to carry it back on a read anyway. Fact 3 is
+   * therefore unreachable here for the same structural reason it is for an advisory, not because
+   * anything failed.
+   */
+  private spoolApiGateMoment(actionContext: string, circle: string | undefined, result: GateResult): void {
+    if (this.momentSpoolPath === null) return;
+    try {
+      if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
+      const ruleIds = result.rules.map((rule) => rule.conceptId);
+      spoolInterception(this.momentRun, {
+        momentId: mintMomentId(),
+        at: new Date().toISOString(),
+        toolUseId: null,
+        circle: this.resolveCircle(circle ?? this.defaultCircle),
+        sessionId: null,
+        // The surface is the action context's own `Tool:` prefix — derived, never passed, so it
+        // cannot disagree with what was matched. A context with no prefix yields null rather than
+        // an invented surface name.
+        surface: actionContext.indexOf(":") > 0 ? actionContext.slice(0, actionContext.indexOf(":")) : null,
+        action: actionContext,
+        stageId: result.stage?.id ?? null,
+        // NULL ON OVERFLOW, never [] — the gate short-circuits before matching, so an empty array
+        // here would claim it looked and found nothing bound. Same rule the CLI writer follows.
+        ruleIds: result.overflow ? null : ruleIds,
+        disposition: result.overflow
+          ? "ungoverned"
+          : result.silence || ruleIds.length === 0
+            ? "silent"
+            : result.rules.some((rule) => rule.severity === "blocking")
+              ? "blocked"
+              : "advised",
+        // EVERY identity, unlike the CLI's blocking-only set, and the difference is real rather
+        // than an inconsistency: the deny payload names only blocking rules, whereas this method
+        // hands the caller the entire GateResult. Delivery is what actually reached the receiver.
+        deliveredRuleIds: result.overflow ? null : ruleIds,
+      });
+    } catch {
+      // Instrumentation is owed to the record, never to the caller's operation.
+    }
   }
 
   private gateUnjournaled(opts: {
@@ -12540,14 +12598,43 @@ export class MonetCore {
    * returned first, and the bookkeeping write is separate and allowed to fail silently.
    */
   stageLookup(opts: {
-    stage: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
+    stage: string;
+    circle?: string;
+    now?: number;
+    record?: boolean;
+    runtimeModelTag?: string;
+    /**
+     * Suppress this method's OWN governed-moment read record, for a caller that will write a more
+     * accurate one itself.
+     *
+     * EXACTLY ONE CALLER SETS IT, and it must: the MCP adapter fits the returned rules to a
+     * response budget, so only IT knows which identities actually reached the agent. Recording
+     * here as well would both double-count and re-credit rules the fitter dropped — the defect a
+     * Codex round already closed once. Distinct from `record`, which governs the separate
+     * stage-event instrumentation and whose meaning must not be overloaded.
+     */
+    recordMomentRead?: boolean;
   }): StageLookupResult {
     // §1's honest limit, recorded rather than papered over: this path can witness an EMPTY answer,
     // but nothing can witness a recognition that never happened. A `declined: stage-miss` here says
     // "an agent named a stage that does not exist" — it says nothing about the moments no agent
     // recognized at all, and the design's own caveat ("its silence proves nothing") still governs
     // the advisory path. The record shrinks the undecidable to that core and no further.
-    return this.stageLookupUnjournaled(opts);
+    const result = this.stageLookupUnjournaled(opts);
+    // STAGE-READ COVERAGE FOR THE PUBLIC API. Only the MCP adapter recorded these, so a library
+    // caller's lookups were invisible to `momentStageReads` — and that map's whole job is to name
+    // the stages NOBODY has ever consulted. A stage an embedder looks up every day read as one
+    // never looked up at all. `momentId: null`: a library caller has no interception to name, which
+    // is the documented unjoinable-read case rather than a defect.
+    if (opts.record !== false && opts.recordMomentRead !== false) {
+      this.recordRuleReads(
+        null,
+        result.rules.map((rule) => rule.conceptId),
+        result.stage?.id ?? null,
+        opts.circle,
+      );
+    }
+    return result;
   }
 
   private stageLookupUnjournaled(opts: {

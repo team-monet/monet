@@ -682,6 +682,16 @@ export function registerMonetCoreTools(
       // knows which branch it is in — the handler returned, or it threw/rejected — so passing it
       // through is reporting a fact this wrapper holds rather than inferring one. Hard-coding
       // `null` made a failed store operation indistinguishable from a successful one.
+      // A RESOLVED RESULT CAN STILL BE A FAILURE, and on this server that is the COMMON shape:
+      // `err()` returns `{ content, isError: true }` — a fulfilled promise — and dozens of handlers
+      // report a caught database error, a scope refusal or a missing id that way rather than by
+      // throwing. Reading fulfillment as success recorded every one of those as `outcome_status:
+      // "ok"`, which is this very column asserting a verdict contradicted by the value it was
+      // handed. The status is derived from the result, never from which branch delivered it.
+      const statusOfResult = (value: unknown): "ok" | "failed" =>
+        typeof value === "object" && value !== null && (value as { isError?: unknown }).isError === true
+          ? "failed"
+          : "ok";
       const closeWith = (value: unknown, outcomeStatus: "ok" | "failed"): void => {
         let rendered: string;
         try {
@@ -703,7 +713,7 @@ export function registerMonetCoreTools(
       if (result instanceof Promise) {
         return result.then(
           (value) => {
-            closeWith(value, "ok");
+            closeWith(value, statusOfResult(value));
             return value;
           },
           (error: unknown) => {
@@ -713,7 +723,7 @@ export function registerMonetCoreTools(
         ).finally(() => inFlightTracker.decrement());
       }
       inFlightTracker.decrement();
-      closeWith(result, "ok");
+      closeWith(result, statusOfResult(result));
       return result;
     };
     const trackedArgs = [...toolArgs.slice(0, -1), trackedHandler];
@@ -1700,7 +1710,11 @@ export function registerMonetCoreTools(
       try {
         // ONE CHAIN: no runtimeModelTag passed here — core.setRuntimeModelTag() was called once at
         // registration (above), so this resolves identically to gate()/gateCoverage() by construction.
-        const r = core.stageLookup({ stage, circle: scope(circle) });
+        // `recordMomentRead: false` — THIS handler records the read itself, a few lines below, over
+        // the rules that survived response fitting. Letting the core record as well would both
+        // double-count the lookup and re-credit identities the fitter dropped, which is the exact
+        // defect an earlier round of this review closed.
+        const r = core.stageLookup({ stage, circle: scope(circle), recordMomentRead: false });
         const fixedFields = {
           circle: scope(circle),
           matched: r.matched,
