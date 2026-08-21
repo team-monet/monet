@@ -1194,12 +1194,23 @@ export function registerRecoveryCommands(
         // moment this connection lets go, and the model chosen from a released-lock read is the
         // one `createCore` then rejects — after the purge has committed. Loading it can happen
         // later; choosing it cannot.
-        // Read THROUGH the owning connection, not `inspect()`: that opens its own and would
-        // deadlock against the exclusive ownership this one still holds.
-        const pinUnderOwnership = purged.staleNativeOwners.length > 0
-          ? (port.prepare(`SELECT embedder_model_id AS modelId FROM sync_meta WHERE singleton = 1`)
-              .get() as { modelId: string | null } | undefined)?.modelId ?? null
-          : null;
+        /*
+         * Read THROUGH the owning connection, not `inspect()`: that opens its own and would
+         * deadlock against the exclusive ownership this one still holds.
+         *
+         * GUARDED, AND NEVER ALLOWED TO THROW. The backup, purge and residue drop have all
+         * committed by this line, and a legacy store can predate `sync_meta` or its additive
+         * `embedder_model_id` column — an unguarded query would exit here with the stale concept
+         * ids unnamed, which is the one thing the late-loading design promises not to do. An
+         * absent pin is a null, and null goes down the recoverable path below.
+         */
+        const readPinUnderOwnership = (): string | null => {
+          const tables = port.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
+          if (!tables.some((column) => column.name === "embedder_model_id")) return null;
+          return (port.prepare(`SELECT embedder_model_id AS modelId FROM sync_meta WHERE singleton = 1`)
+            .get() as { modelId: string | null } | undefined)?.modelId ?? null;
+        };
+        const pinUnderOwnership = purged.staleNativeOwners.length > 0 ? readPinUnderOwnership() : null;
         // Closed HERE, before the reprojection opens its own connection: the exclusive ownership
         // this port holds for the backup would otherwise block it.
         closePort();

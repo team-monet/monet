@@ -465,4 +465,32 @@ describe("monet retire-source", () => {
       }
     });
   });
+
+  it("names the stale concepts even on a store that predates the embedder pin column", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      port.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                               support_count, dirty, embedding, updated_at, created_at)
+         VALUES ('native-owner', 'owner', 'Owner', 'body', 'fact', 'active', 0.6, 1, 'default', 2, 0, '[0.1,0.2]', ?, ?)`,
+      ).run(now, now);
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('grafted-source-obs', 'grafted chunk', '[0.1,0.2]', 'source', 'default',
+                 'native-owner', 'peer', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      // A store old enough to predate the additive pin column. Reading it unguarded threw AFTER
+      // the purge had committed, losing the very ids the error exists to name.
+      port.exec(`ALTER TABLE sync_meta DROP COLUMN embedder_model_id`);
+      port.close();
+
+      await expect(run(["retire-source", "--apply", "--yes"], dependencies))
+        .rejects.toThrow(/still need reprojection.*native-owner/s);
+
+      expect(readdirSync(join(dbPath, "..", "backups")).length).toBeGreaterThan(0);
+    });
+  });
 });
