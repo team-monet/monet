@@ -915,12 +915,26 @@ export interface IngestResult {
    * contract. ABSENT, never `false`, on a receipt written before that column existed: no verdict was
    * recorded there, and "not known" must not be answered with the reassuring one.
    *
-   * THE DESTINATION TRAVELS WITH IT (`ingest_operations.landed_circle`; Codex round 2). `concept
-   * .circle` is what this verdict is ABOUT, so a replay restores that too — otherwise a rename,
-   * which rewrites the concept's circle and clears the archived flag in one act, pairs this frozen
-   * `true` with the name of a circle that is not archived and was never written to.
+   * THE DESTINATION TRAVELS WITH IT, in `landedCircle` below — never by rewriting `concept.circle`,
+   * which answers a different question (Codex rounds 2 and 4).
    */
   landedInArchivedCircle?: boolean;
+  /**
+   * THE CIRCLE THAT VERDICT IS ABOUT: where this write landed, at the instant it landed
+   * (`ingest_operations.landed_circle`). Set and absent in lockstep with `landedInArchivedCircle` —
+   * a verdict whose subject is unknown is half a fact, and naming the wrong circle is worse than
+   * naming none.
+   *
+   * SEPARATE FROM `concept.circle` ON PURPOSE, which is where the concept IS and stays uniformly
+   * live. The two answer different questions and diverge for real: `renameCircle` moves the concept
+   * and clears the archived flag in one act, and `reassignCircle` moves it with no alias left
+   * behind at all — so a replay reporting the historical name as the concept's circle hands the
+   * caller a value `circleOf(id)` no longer matches and id-based tools reject. Use this one to speak
+   * about the write, `concept.circle` to address the memory.
+   *
+   * On a fresh write the two are equal by construction; they part only across a later move.
+   */
+  landedCircle?: string;
 }
 
 /**
@@ -4828,9 +4842,10 @@ export class MonetCore {
       ...(ruleBindingChange !== undefined ? { ruleBindingChange } : {}),
       ...(extractionCandidate !== undefined ? { extractionCandidate } : {}),
       // Carried as the boolean it was answered as, `false` included: this path DID ask, under the
-      // reservation, so both answers are verdicts. The replay branches above return `prior`, which
-      // carries the same field rebuilt from the concept's circle — see getOperationResult.
-      ...(landedInArchivedCircle !== undefined ? { landedInArchivedCircle } : {}),
+      // reservation, so both answers are verdicts. Emitted WITH the circle it is about, in one
+      // spread, because the two are one fact — see `landedCircle`. The replay branches above return
+      // `prior`, which carries the identical pair read back off the receipt.
+      ...(landedInArchivedCircle !== undefined ? { landedInArchivedCircle, landedCircle: circle } : {}),
     };
   }
 
@@ -17370,17 +17385,17 @@ export class MonetCore {
     // is the same invention as fabricating its verdict, one field over.
     const operationLandedCircle =
       (operation as { landed_circle?: string | null }).landed_circle ?? null;
-    const concept = toConcept(row);
     return {
       action: operation.action,
       conceptId: operation.concept_id,
       observationId: operation.observation_id,
       score: operation.score,
-      // The concept as it stands, with ONE field restored to what this write recorded: the circle it
-      // landed in. Everything else about a concept is deliberately live here (the receipt is a
-      // pointer set), but the circle is the subject of a frozen verdict two fields down, and a
-      // verdict is only meaningful about the thing it was passed on.
-      concept: operationLandedCircle !== null ? { ...concept, circle: operationLandedCircle } : concept,
+      // UNIFORMLY LIVE, like every other field the receipt rehydrates (Codex round 4). Round 2
+      // restored the write-time circle onto this object, which quietly repurposed a field whose job
+      // is to say where the concept IS: after a `reassignCircle` the replayed value no longer
+      // matched `circleOf(id)`, so passing it to an id-based tool was rejected outright. The frozen
+      // landing circle is a different fact and now says so in its own field, below.
+      concept: toConcept(row),
       ...(contradiction ? { contradiction: toContradiction(contradiction) } : {}),
       ...(operation.near_match_id !== null
         ? { nearMatchId: operation.near_match_id, nearMatchScore: operation.near_match_score ?? 0 }
@@ -17397,7 +17412,12 @@ export class MonetCore {
       // NULL IS "NO VERDICT RECORDED", NOT `false`: receipts written before this column existed
       // never asked the question, and answering for them would invent the reassuring answer — the
       // one direction this disclosure must never fail in.
-      ...(operationArchivedVerdict !== null ? { landedInArchivedCircle: operationArchivedVerdict === 1 } : {}),
+      // BOTH OR NEITHER. The two columns are written by one INSERT, so a receipt has both or has
+      // nothing — and a verdict without the name of the circle it judges is exactly the half-fact
+      // round 2 was about. If one were ever missing, saying nothing beats naming the wrong circle.
+      ...(operationArchivedVerdict !== null && operationLandedCircle !== null
+        ? { landedInArchivedCircle: operationArchivedVerdict === 1, landedCircle: operationLandedCircle }
+        : {}),
       ...this.replayRuleOutcome(operation),
     };
   }

@@ -1101,17 +1101,16 @@ export function registerMonetCoreTools(
         });
         const anomalousResolution = r.resolutionMode !== undefined &&
           ANOMALOUS_STORE_RESOLUTION_MODES.has(r.resolutionMode);
-        // THE DESTINATION THIS WRITE ACTUALLY REACHED, read off the result instead of re-resolving
-        // the caller's argument here (Codex round 1 on #55, finding 2). `scope()` consults live
-        // alias state, so a rename committed by a second connection between core.store()'s commit
-        // and this line — one .monet file shared by the MCP server and a monet CLI call is a
-        // supported topology, storage.ts — made the acknowledgement name the rename's target while
-        // the write had landed in the old circle. That mattered most in the disclosure below, where
-        // the sentence would have attached a frozen verdict to a circle it was never about: the
-        // boolean and the name it speaks of have to come from the same instant.
-        const landedCircle = r.concept.circle;
+        // WHERE THE MEMORY IS, read off the result rather than re-resolved here (Codex round 1 on
+        // #55, finding 2). `scope()` consults live alias state, so a rename committed by a second
+        // connection between core.store()'s commit and this line — one .monet file shared by the
+        // MCP server and a monet CLI call is a supported topology, storage.ts — made this name the
+        // rename's target while the write had landed elsewhere. This field's documented job is to be
+        // passed to id-based tools, so it must be the circle the concept is IN; the write-time
+        // landing circle is a different fact and rides its own field into the disclosure below.
+        const conceptCircle = r.concept.circle;
         const envelope = {
-          circle: landedCircle, // the circle these ids live in — pass it to id-based tools if it isn't your session default
+          circle: conceptCircle, // the circle these ids live in — pass it to id-based tools if it isn't your session default
           action: r.action,
           conceptId: r.conceptId,
           ...(anomalousResolution
@@ -1158,13 +1157,25 @@ export function registerMonetCoreTools(
           // own race: after a rename the frozen name is an active alias, and unarchiveCircle refuses
           // one ("archive the canonical circle instead"). A remediation that throws for the exact
           // caller most likely to need it is worse than none, because it reads as the way out.
-          ...(r.landedInArchivedCircle
+          // SPOKEN ABOUT THE LANDING CIRCLE, not the concept's current one — the two are the same
+          // until a later move, and the verdict belongs to the first (Codex round 4). Both halves
+          // come from the result's own frozen pair, so the sentence names the circle its `true` was
+          // actually about, and says nothing at all if the pair is missing.
+          //
+          // THE EXCLUSION LIST IS WHAT ARCHIVING ACTUALLY DOES, measured rather than assumed
+          // (Codex round 4): store-wide search skips the circle, and `listCircles` drops it from the
+          // default listing — which is what another circle's overview shows as `otherCircles`. The
+          // overview of the archived circle ITSELF is complete when you name it, so claiming the
+          // memory is "out of the overview" was false in exactly the mode a worried caller would
+          // check first. `search`, `fetch` and `overview` all reach it by name, which the preceding
+          // clause already promises.
+          ...(r.landedInArchivedCircle && r.landedCircle
             ? {
               guidance:
-                `ARCHIVED CIRCLE: '${landedCircle}' was archived when this write landed. The memory ` +
-                `is stored and reachable by naming that circle, but while that circle remains ` +
-                `archived it stays out of store-wide recall, the overview and the default circle ` +
-                `list. Check or change the circle's state with memory_circle_manage.`,
+                `ARCHIVED CIRCLE: '${r.landedCircle}' was archived when this write landed. The ` +
+                `memory is stored and reachable by naming that circle, but while that circle ` +
+                `remains archived it stays out of store-wide recall and out of the default circle ` +
+                `listing. Check or change the circle's state with memory_circle_manage.`,
             }
             : {}),
         };

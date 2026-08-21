@@ -650,7 +650,8 @@ describe("archiveCircle / unarchiveCircle", () => {
     core.archiveCircle("old");
     const first = await core.store("Runbook for the billing service.", { circle: "old", operationId: "op-R" });
     expect(first.landedInArchivedCircle).toBe(true);
-    expect(first.concept.circle).toBe("old");
+    expect(first.landedCircle).toBe("old");
+    expect(first.concept.circle).toBe("old"); // on a fresh write the two agree by construction
 
     // A rename moves the concept AND clears the archived flag — the two facts that used to drift.
     core.renameCircle("old", "new");
@@ -659,9 +660,42 @@ describe("archiveCircle / unarchiveCircle", () => {
 
     const retry = await core.store("a completely different body", { circle: "old", operationId: "op-R" });
     expect(retry.landedInArchivedCircle).toBe(true);
-    expect(retry.concept.circle).toBe("old");
-    // The MCP envelope reads exactly this circle for both its `circle` field and the guidance
-    // sentence, so the acknowledgement follows by construction. (memory_store exposes no
+    expect(retry.landedCircle).toBe("old");
+    // ...and the concept's own circle stays LIVE, which is the field id-based tools are given.
+    expect(retry.concept.circle).toBe("new");
+    expect(retry.concept.circle).toBe(core.circleOf(retry.conceptId));
+
+    core.close();
+  });
+
+  /**
+   * THE MOVE VARIANT, and the reason the landing circle may not be smuggled onto `concept.circle`
+   * (Codex round 4). `reassignCircle` leaves NO alias behind — unlike a rename — so a replay that
+   * reported the historical name as the concept's circle handed the caller a value `circleOf(id)`
+   * does not match and id-based tools reject outright, while the disclosure promised reachability
+   * by naming a circle the memory had left. Two questions, two fields: `concept.circle` addresses
+   * the memory, `landedCircle` speaks about the write.
+   */
+  it("keeps the concept's circle live across a reassign, and still names the write-time circle in the verdict", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    core.archiveCircle("attic");
+    const first = await core.store("Retention policy draft.", { circle: "attic", operationId: "op-M" });
+    expect(first.landedInArchivedCircle).toBe(true);
+    expect(first.landedCircle).toBe("attic");
+
+    core.reassignCircle(first.conceptId, "workshop");
+    expect(core.circleOf(first.conceptId)).toBe("workshop");
+    expect(core.resolveCircleName("attic")).toBe("attic"); // a move publishes no alias
+
+    const retry = await core.store("a completely different body", { circle: "attic", operationId: "op-M" });
+    // ADDRESSABLE: what the ack hands to id-based tools is where the memory actually is.
+    expect(retry.concept.circle).toBe("workshop");
+    expect(retry.concept.circle).toBe(core.circleOf(retry.conceptId));
+    // TRUTHFUL ABOUT THE WRITE: the verdict and the circle it judged are unchanged by the move.
+    expect(retry.landedInArchivedCircle).toBe(true);
+    expect(retry.landedCircle).toBe("attic");
+    // The MCP envelope reads `concept.circle` for its `circle` field and `landedCircle` for the
+    // guidance sentence, so the acknowledgement follows by construction. (memory_store exposes no
     // operationId, so the wire cannot reach a replay at all — this is where it is pinnable.)
 
     core.close();
@@ -687,8 +721,8 @@ describe("archiveCircle / unarchiveCircle", () => {
     const replay = await core.store("anything at all", { circle: "shelf", operationId: "op-old" });
     expect(replay.conceptId).toBe(first.conceptId);
     expect(replay).not.toHaveProperty("landedInArchivedCircle");
-    // And the circle keeps the live rehydration such a receipt has always had — no frozen value is
-    // invented for a write that recorded none.
+    // Neither half is invented: no verdict, and no circle for a verdict to be about.
+    expect(replay).not.toHaveProperty("landedCircle");
     expect(replay.concept.circle).toBe("shelf");
 
     core.close();
@@ -772,6 +806,14 @@ describe("archiveCircle / unarchiveCircle", () => {
       expect(archived.guidance).toContain("while that circle remains archived");
       expect(archived.guidance).toContain("memory_circle_manage");
       expect(archived.guidance).not.toMatch(/is archived/);
+      // THE EXCLUSION LIST IS MEASURED, NOT ASSUMED. Archiving keeps a circle out of store-wide
+      // search and out of the default circle listing — and that is all. `overview("shelved")` is
+      // COMPLETE when the circle is named (asserted directly below), so claiming the memory is out
+      // of "the overview" was false in the very mode a worried caller reaches for first.
+      expect(archived.guidance).toContain("out of store-wide recall");
+      expect(archived.guidance).toContain("out of the default circle listing");
+      expect(archived.guidance).not.toMatch(/overview/i);
+      expect(JSON.stringify(core.overview("shelved"))).toContain(String(archived.conceptId));
 
       const live = await storeOverMcp(client, { content: "The nightly export writes to S3.", circle: "current" });
       expect(live.conceptId).toBeDefined();
