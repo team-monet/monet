@@ -386,6 +386,11 @@ function appendMomentRecord(body) {
       pendingRunStart = null;
     }
     payload += JSON.stringify(Object.assign({ v: MOMENT_SPOOL_FORMAT, runId: run.runId, seq: seq }, body)) + "\\n";
+    // THE DIRECTORY MAY NOT EXIST. Moves in lockstep with moment-spool.ts's own mkdir -- see the
+    // COPIES MOVE TOGETHER note above. A user whose only store is a project-local .monet may have
+    // no ~/.monet at all, and every append here failed ENOENT into the catch below while reads saw
+    // an absent spool and called it the ordinary pre-first-append state.
+    mkdirSync(dirname(MOMENT_SPOOL_PATH), { recursive: true });
     const fd = openSync(MOMENT_SPOOL_PATH, "a", 0o600);
     try {
       writeSync(fd, payload);

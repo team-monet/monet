@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { MonetCore } from "../engine";
 import { BetterSqlitePort } from "../storage";
 import type { StoragePort } from "../storage";
-import { UnknownMomentError, foldMomentSpool, momentConformance, readGovernedMoment } from "../moment-ledger";
+import { UnknownMomentError, foldMomentSpool, momentConformance, momentCounts, readGovernedMoment } from "../moment-ledger";
 import { MOMENT_SPOOL_READ_CHUNK_BYTES, readMomentSpool } from "../moment-spool";
 import { renderOverview } from "../render-overview";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -490,5 +490,49 @@ describe("R3 — unjoinable reads are scoped to the circle that asked", () => {
     // circle-b did nothing, and its overview must not inherit circle-a's count. The read knows its
     // own circle even though the moment does not — that is why this is scopable at all.
     expect(core.momentConformance("circle-b").unjoinableReads).toBe(0);
+  });
+});
+
+describe("R4 — the spool's own directory is created rather than assumed", () => {
+  it("creates the spool directory when the storage home does not exist yet", () => {
+    const dir = mkTmp();
+    // A project-local `.monet` store is supported, and a user who has only ever had one may have
+    // no `~/.monet` at all. The spool is home-level by construction — the hook wrapper can import
+    // nothing and must agree with core on one path — so this is a real, reachable configuration.
+    const spool = join(dir, "never", "created", "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets", momentSpoolPath: spool });
+    cores.push(core);
+    const id = core.openStoreMoment("memory_recall");
+    core.closeStoreMoment(id, "{}", "ok");
+    // Before the directory was created on demand, every append failed ENOENT into a silent catch
+    // and this read reported the ordinary pre-first-append state: recording silently off.
+    expect(core.momentCounts("acme-widgets").total).toBe(1);
+  });
+});
+
+describe("R4 — an interception written before `circle` existed is history, not garbage", () => {
+  it("folds a format-1 interception with no circle key as unattributed", () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const db = mkDb();
+    const m = "77777777-7777-4777-8777-777777777777";
+    // EXACTLY the shape a writer produced before `circle` was added: same format version, no key.
+    // This is not hypothetical — spools written by earlier commits of this branch hold these, and
+    // a malformed line is CONSUMED and its cursor advanced, so rejecting it destroys the record.
+    appendFileSync(spool, `${JSON.stringify({
+      v: 1, runId: "run-old", seq: 0,
+      kind: "interception", momentId: m, at: "2026-08-19T00:00:00.000Z", toolUseId: null,
+      sessionId: null, surface: "Bash", actionSha256: "a".repeat(64), actionRendering: "ls",
+      actionChars: 2, actionClipped: false, stageId: null, ruleIds: [], disposition: "silent",
+      deliveredRuleIds: [],
+    })}\n`);
+    const res = foldMomentSpool(db, spool);
+    expect(res.malformedLines).toBe(0);
+    expect(res.recordsFolded).toBe(1);
+    const row = readGovernedMoment(db, spool, m);
+    expect(row?.opened).toBe(true);
+    // The schema already had a word for an unknown circle, and this is it.
+    expect(row?.circle).toBeNull();
+    expect(momentCounts(db, spool, "acme-widgets").unattributed).toBe(1);
   });
 });

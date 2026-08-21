@@ -225,6 +225,7 @@ describe("the ask and the answer attach to a moment that exists", () => {
     expect(core.momentConformance()).toEqual({
       followed: 0,
       notFollowed: 0,
+      readLate: 0,
       unanswered: 0,
       notAsked: 0,
       unjoinableReads: 0,

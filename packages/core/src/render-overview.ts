@@ -137,6 +137,20 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     if (owedByAgent > 0) {
       lines.push(truncate(yellow(`  never asked: ${owedByAgent} read and acted on without asking`), width));
     }
+    // READ, BUT TOO LATE TO HAVE ACTED ON IT. Dim and unactionable on purpose: on this host a
+    // PreToolUse advisory reaches the model beside the tool result, so this is the NORMAL end state
+    // for an advisory rather than a fault anyone can clear. It is here so that a delivered rule the
+    // agent actually went and read is not read as one nobody engaged with.
+    //
+    // IN NEITHER GATING LIST, and that is the G2 lesson applied rather than repeated: a number with
+    // a benign normal case that only grows would make the all-clear unreachable if it suppressed it,
+    // and would open the section forever if it opened it. It rides inside the section, which any
+    // recorded moment already opens.
+    if (conformance.readLate > 0) {
+      lines.push(truncate(dim(
+        `  ${conformance.readLate} read after acting — delivered and engaged with, never judgeable`,
+      ), width));
+    }
 
     // WHAT THE RECORD KNOWS IT NEVER RECEIVED. Surfaced because a record that quietly holds less
     // than it should is the failure the sequence exists to make impossible.

@@ -12239,7 +12239,7 @@ export class MonetCore {
   /** The four conformance states. Folds first. Zeroes when no spool is configured. */
   momentConformance(circle?: string): MomentConformance {
     if (this.momentSpoolPath === null) {
-      return { followed: 0, notFollowed: 0, unanswered: 0, notAsked: 0, unjoinableReads: 0 };
+      return { followed: 0, notFollowed: 0, unanswered: 0, notAsked: 0, unjoinableReads: 0, readLate: 0 };
     }
     return momentConformance(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }

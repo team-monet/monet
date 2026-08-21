@@ -90,6 +90,18 @@ export const MOMENT_SCHEMA_SQL = `
     -- at the home level, so one project's store folds every project's moments, and without a circle
     -- on the row an overview reported another project's activity as its own.
     circle TEXT,
+    -- READS THAT ARRIVED AFTER THE ACTION, kept apart from rule_reads rather than discarded.
+    --
+    -- WHY THIS COLUMN EXISTS AT ALL. On this host a PreToolUse advisory reaches the model BESIDE
+    -- the tool result, never before it (see moment-spool.ts's header for the full statement), so
+    -- the stage_lookup it prompts necessarily lands after outcome_at. Fact 3 is strictly "the agent
+    -- read it BEFORE acting", so those reads are correctly NOT receipt. But they are still
+    -- observations: the agent did go and read the rule, just too late to have acted on it. Dropping
+    -- them made an advisory that was delivered and engaged with indistinguishable from one nobody
+    -- ever looked at, which is exactly the conflation this record exists to remove.
+    --
+    -- THREE STATES, NOT TWO: no read, a late read, a timely read. Only the third is Received.
+    late_rule_reads TEXT,
     surface TEXT,
     action_sha256 TEXT,
     -- A bounded rendering of the real action. The most privacy-sensitive column in these tables;
@@ -523,6 +535,8 @@ export interface GovernedMomentRow {
   toolUseId: string | null;
   /** The circle this moment was governed under. NULL means nothing resolved one. */
   circle: string | null;
+  /** Reads that arrived after `outcomeAt`. Observed, never receipt. See the schema's own note. */
+  lateRuleReads: Record<string, string>;
   surface: string | null;
   actionSha256: string | null;
   actionRendering: string | null;
@@ -846,6 +860,19 @@ export interface MomentConformance {
   notAsked: number;
   /** Reads that named no moment — the health signal for delivery naming its moment. */
   unjoinableReads: number;
+  /**
+   * Delivered, read, and unjudgeable: every read arrived after the action.
+   *
+   * NOT A DEFECT AND NOT A QUEUE — a third thing, and it needs its own number because it is the
+   * NORMAL outcome for an advisory on this host. A PreToolUse advisory reaches the model beside the
+   * tool result, so the lookup it prompts cannot precede the act. Without this count those moments
+   * are indistinguishable from advisories nobody engaged with, which is the opposite of what
+   * happened: the agent went and read the rule.
+   *
+   * Counted only where NO timely read exists. A moment with one of each is Received on the strength
+   * of the timely one and belongs in the ordinary flow.
+   */
+  readLate: number;
 }
 
 /** How many things the record knows it never received, of either kind. Folds first. */
@@ -881,6 +908,13 @@ export function momentConformance(db: StoragePort, spoolPath: string, circle: st
     notAsked: one(
       `SELECT COUNT(*) AS n FROM governed_moments
         WHERE ${OPENED} AND asked_at IS NULL AND answer IS NULL AND outcome_at IS NOT NULL AND ${READ}`,
+    ),
+    // NEITHER a defect nor a queue: delivered, read, and unjudgeable because every read landed
+    // after the act. `rule_reads = '{}'` is what makes it "no timely read".
+    readLate: one(
+      `SELECT COUNT(*) AS n FROM governed_moments
+        WHERE ${OPENED} AND (rule_reads IS NULL OR rule_reads = '{}')
+          AND late_rule_reads IS NOT NULL AND late_rule_reads != '{}'`,
     ),
     // SCOPED, and this comment used to say the opposite. The old reasoning — "a read that named no
     // moment has no circle to scope by" — was true only while the read record carried no circle of
@@ -1041,6 +1075,42 @@ export function momentsOwingAQuestion(
  * Returns false when no moment carries that id — which is a FINDING, not an error: the caller turns
  * it into a recorded loss. First-write-wins, like every other apply, so a re-fold changes nothing.
  */
+/**
+ * Re-sorts a moment's reads once its outcome is known.
+ *
+ * THE SECOND HALF OF MAKING THE FOLD DETERMINISTIC. A read can only be classified against an
+ * outcome that has already landed, and the two arrive in either order: the read first (its
+ * classification is provisional and this corrects it), or the outcome first (the read path
+ * classifies directly and this finds nothing to move). Because the end state depends only on
+ * `readAt` versus `outcome_at`, one pass and five passes produce the same rows.
+ *
+ * ONE DIRECTION ONLY — timely to late. `outcome_at` is written with COALESCE and never changes once
+ * set, so a read that was correctly timely cannot become late afterwards, and a late read has
+ * nothing to be re-timed against.
+ */
+function reclassifyLateReads(db: StoragePort, momentId: string): void {
+  const row = db
+    .prepare(`SELECT rule_reads, late_rule_reads, outcome_at FROM governed_moments WHERE moment_id = ?`)
+    .get(momentId) as { rule_reads: string; late_rule_reads: string | null; outcome_at: string | null } | undefined;
+  if (row === undefined || row.outcome_at === null) return;
+  const timely = parseJsonObject(row.rule_reads);
+  const late = parseJsonObject(row.late_rule_reads);
+  let moved = false;
+  for (const [ruleId, readAt] of Object.entries(timely)) {
+    if (readAt > row.outcome_at) {
+      delete timely[ruleId];
+      if (!Object.prototype.hasOwnProperty.call(late, ruleId)) late[ruleId] = readAt;
+      moved = true;
+    }
+  }
+  if (!moved) return;
+  db.prepare(`UPDATE governed_moments SET rule_reads = ?, late_rule_reads = ? WHERE moment_id = ?`).run(
+    JSON.stringify(timely),
+    JSON.stringify(late),
+    momentId,
+  );
+}
+
 function applyOutcomeByToolUse(
   db: StoragePort,
   toolUseId: string,
@@ -1057,6 +1127,15 @@ function applyOutcomeByToolUse(
         WHERE tool_use_id = ?`,
     )
     .run(outcomeAt, outcomeSha256, outcomeStatus, toolUseId);
+  if (applied.changes > 0) {
+    // THE HOST-GOVERNED PATH RUNS THROUGH HERE, and it is the one the ordering question is about:
+    // the wrapper keys its outcome by the host's tool call, never by a moment id it cannot know.
+    for (const row of db
+      .prepare(`SELECT moment_id FROM governed_moments WHERE tool_use_id = ?`)
+      .all(toolUseId) as Array<{ moment_id: string }>) {
+      reclassifyLateReads(db, row.moment_id);
+    }
+  }
   return applied.changes > 0;
 }
 
@@ -1167,6 +1246,7 @@ function selectMoment(db: StoragePort, momentId: string): GovernedMomentRow | nu
     sessionId: (row.session_id as string | null) ?? null,
     toolUseId: (row.tool_use_id as string | null) ?? null,
     circle: (row.circle as string | null) ?? null,
+    lateRuleReads: parseJsonObject(row.late_rule_reads),
     surface: (row.surface as string | null) ?? null,
     actionSha256: (row.action_sha256 as string | null) ?? null,
     actionRendering: (row.action_rendering as string | null) ?? null,
@@ -1277,9 +1357,11 @@ function applyRecord(db: StoragePort, record: MomentSpoolRecord): void {
       // the act; a later re-read of the same rule in the same moment does not change whether the
       // rule was received before the agent acted.
       const existing = db
-        .prepare(`SELECT rule_reads, rule_ids, outcome_at FROM governed_moments WHERE moment_id = ?`)
+        .prepare(
+          `SELECT rule_reads, late_rule_reads, rule_ids, outcome_at FROM governed_moments WHERE moment_id = ?`,
+        )
         .get(record.momentId) as
-        | { rule_reads: string; rule_ids: string | null; outcome_at: string | null }
+        | { rule_reads: string; late_rule_reads: string | null; rule_ids: string | null; outcome_at: string | null }
         | undefined;
       if (existing === undefined) {
         // No interception folded yet. The moment id is minted BY the interceptor and only travels
@@ -1291,14 +1373,29 @@ function applyRecord(db: StoragePort, record: MomentSpoolRecord): void {
         );
         return;
       }
-      // A READ AFTER THE ACTION IS NOT A READ BEFORE ACTING. An agent can name a stale moment id
-      // in a later `stage_lookup` — the id is durable and nothing stops it being reused — and
-      // crediting that would report the completed action as governed by a rule the agent met only
-      // afterwards, then ask the user to judge it. Fact 3 is an ORDERING claim, so it is checked
-      // as one. Both stamps are `toISOString()`, whose fixed-width UTC form compares correctly as
-      // text; a read at exactly the outcome instant is KEPT, because a tie cannot be ordered from
-      // the record and discarding a real read on a coincidence is the worse error.
-      if (existing.outcome_at !== null && record.readAt > existing.outcome_at) return;
+      // A READ AFTER THE ACTION IS NOT A READ BEFORE ACTING — but it IS a read, and it is recorded
+      // as one in its own column. Fact 3 is an ORDERING claim, so it is checked as one; both stamps
+      // are `toISOString()`, whose fixed-width UTC form compares correctly as text. A read at
+      // exactly the outcome instant counts as timely, because a tie cannot be ordered from the
+      // record and discarding a real read on a coincidence is the worse error.
+      //
+      // THIS USED TO `return`, AND THAT WAS TWO BUGS AT ONCE. It threw away the observation, and —
+      // because a tool-use-keyed outcome is DEFERRED to phase 2b while reads apply immediately —
+      // whether it threw anything away at all depended on how many passes the fold happened to take.
+      // The same session measured conformance or did not, according to whether an unrelated MCP call
+      // ran between the tool result and the `stage_lookup`. Classifying instead of discarding, plus
+      // the reclassification an arriving outcome performs, makes the end state a function of the two
+      // timestamps alone and of nothing about fold scheduling.
+      if (existing.outcome_at !== null && record.readAt > existing.outcome_at) {
+        const late = parseJsonObject(existing.late_rule_reads);
+        if (Object.prototype.hasOwnProperty.call(late, record.ruleId)) return;
+        late[record.ruleId] = record.readAt;
+        db.prepare(`UPDATE governed_moments SET late_rule_reads = ? WHERE moment_id = ?`).run(
+          JSON.stringify(late),
+          record.momentId,
+        );
+        return;
+      }
       // ONLY A RULE THIS MOMENT WAS GOVERNED BY. A stale gate mirror, or a stage edited between
       // interception and lookup, can hand back a rule that was not bound when the action was
       // intercepted. Crediting it would enter the moment into conformance as though a rule that
@@ -1333,6 +1430,7 @@ function applyRecord(db: StoragePort, record: MomentSpoolRecord): void {
              outcome_sha256 = COALESCE(governed_moments.outcome_sha256, excluded.outcome_sha256),
              outcome_status = COALESCE(governed_moments.outcome_status, excluded.outcome_status)`,
       ).run(record.momentId, record.outcomeAt, record.outcomeSha256, record.outcomeStatus);
+      reclassifyLateReads(db, record.momentId);
       return;
     case "ask":
       db.prepare(

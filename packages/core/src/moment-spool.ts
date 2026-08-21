@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, fstatSync, openSync, readSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, mkdirSync, openSync, readSync, writeSync } from "node:fs";
+import { dirname } from "node:path";
 
 /**
  * The moment spool — the append-only side of the governed-moment record.
@@ -70,6 +71,32 @@ export type MomentDisposition = "blocked" | "advised" | "silent" | "ungoverned";
 
 /** The user's answer to "did the action follow the rule?". Only a user produces this. */
 export type MomentAnswer = "followed" | "not-followed";
+
+/*
+ * A TRUE STATEMENT ABOUT THIS HOST, established by running it rather than by reading its docs.
+ *
+ * ON CLAUDE CODE, A PreToolUse ADVISORY REACHES THE MODEL BESIDE THE TOOL RESULT, NOT BEFORE IT.
+ * `additionalContext` is delivered "next to the tool result", and the wrapper emits no
+ * `permissionDecision`, so the call proceeds while the advisory rides alongside it.
+ *
+ * WHAT THAT COSTS THE MEASUREMENT, and it is structural rather than a defect to fix: the
+ * `stage_lookup` an advisory prompts CANNOT precede the act it was about. Fact 3 is strictly "the
+ * agent read it BEFORE acting", so for every advisory on this host Fact 3 is correctly FALSE. Those
+ * moments are not failures of delivery and not agents ignoring a rule — the agent goes and reads it,
+ * just after the fact. They are recorded in `late_rule_reads` and surfaced as `readLate`.
+ *
+ * A DENY IS THE OPPOSITE and is where Received is genuinely true: the deny lands before the action,
+ * the agent reads the rule, and only then retries. But a denied action never runs, so no outcome
+ * ever arrives, and the retry opens a NEW moment with no link back to the one that blocked it. So
+ * the deny path — the only path where Received is real — cannot reach Conformed at all today. That
+ * gap is tracked as its own issue, not papered over here.
+ *
+ * WHY IT IS WRITTEN HERE. It is a property of the HOST's hook contract, not of the gate, which is
+ * host-agnostic by design; a preflight caller of the same gate would make it false. It lives beside
+ * the record shape because that is where the next reader forms a belief about what Fact 3 means,
+ * and it was expensive to learn: it took driving the real wrapper end to end for both paths.
+ */
+
 
 /**
  * Schema version of a spool line. Bumped only when an EXISTING field changes meaning — adding a
@@ -360,6 +387,15 @@ export function appendMomentRecord(run: MomentRun, body: Record<string, unknown>
   if (run.path === null) return;
   try {
     const line = `${JSON.stringify({ v: MOMENT_SPOOL_FORMAT, runId: run.runId, seq, ...body })}\n`;
+    // THE DIRECTORY MAY NOT EXIST, and until this call it was assumed to. The spool resolves to
+    // `$MONET_STORAGE_DIR` else `~/.monet` — home-level by construction, because the hook wrapper
+    // can import nothing and must agree with this file on one path. But a project-local `.monet`
+    // store is a supported configuration, and a user who has only ever had one may have no
+    // `~/.monet` at all: every append then failed ENOENT into the catch below, and every read saw
+    // an absent file and reported the ordinary pre-first-append state. Recording was silently off
+    // for a whole supported shape — the precise conflation between "nothing happened" and "nothing
+    // was recorded" this subsystem exists to end, sitting inside the subsystem itself.
+    mkdirSync(dirname(run.path), { recursive: true });
     const fd = openSync(run.path, "a", 0o600);
     try {
       writeSync(fd, line);
@@ -681,7 +717,16 @@ export function parseMomentSpoolLine(line: string): MomentSpoolRecord | null | "
       // call" when it actually means "this writer forgot to say", and those are the two states the
       // whole record exists to keep apart.
       if (!("toolUseId" in row) || (row.toolUseId !== null && typeof row.toolUseId !== "string")) return null;
-      if (!("circle" in row) || (row.circle !== null && typeof row.circle !== "string")) return null;
+      // ABSENT IS UNKNOWN, NOT MALFORMED. `circle` was added to this record additively, without a
+      // format bump — correctly, since a reader that does not know a field simply does not read it.
+      // Requiring the KEY undid that: every interception written before the field existed became
+      // malformed, and a malformed line is consumed and its cursor advanced, so real history was
+      // destroyed on the first fold that reached it rather than merely being incomplete.
+      //
+      // The schema already has a word for this. `circle` is nullable, NULL means nothing resolved
+      // one, and those moments are reported as `unattributed` — the exact state such a line is in.
+      // A present-but-wrong-typed value is still refused: that is a shape error, not an old writer.
+      if ("circle" in row && row.circle !== null && typeof row.circle !== "string") return null;
       // The four action fields stand or fall together — a half-null set is not an observation.
       const actionKnown =
         typeof row.actionSha256 === "string" &&
@@ -707,7 +752,7 @@ export function parseMomentSpoolLine(line: string): MomentSpoolRecord | null | "
         momentId: row.momentId,
         at: row.at,
         toolUseId: row.toolUseId,
-        circle: row.circle as string | null,
+        circle: ("circle" in row ? row.circle : null) as string | null,
         sessionId: row.sessionId,
         surface: row.surface as string | null,
         actionSha256: row.actionSha256 as string | null,
