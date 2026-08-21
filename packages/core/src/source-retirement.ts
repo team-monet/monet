@@ -222,7 +222,7 @@ export function dropRetiredSourceResidue(db: StoragePort, opts: { requireEmpty?:
    * `kind='source'` observations look like grafted ones and delete them: exactly the content this
    * command promised to leave alone. The tables can still go; the classification cannot.
    */
-  const hybridsRemain = hybridConnectorConcepts(db, connectorPopulation(db).conceptIds).length > 0;
+
   // ONE WRITE TRANSACTION, AND EACH OBJECT RE-CHECKED INSIDE IT. Concurrent first opens are a
   // supported topology (several `monet start` servers against one store), and a presence check
   // taken outside the write lock is stale by the time the drop runs: both processes see the table,
@@ -255,6 +255,10 @@ export function dropRetiredSourceResidue(db: StoragePort, opts: { requireEmpty?:
     for (const table of tables) {
       db.exec(`DROP TABLE IF EXISTS ${table}`);
     }
+    // COMPUTED HERE, under the same lock as the other re-reads. Taken outside it, another writer
+    // committing a marker-only hybrid in between would leave this reading `false` — and the drop
+    // would take the only column identifying that concept as connector-owned.
+    const hybridsRemain = hybridConnectorConcepts(db, connectorPopulation(db).conceptIds).length > 0;
     if (!hybridsRemain) {
       const columns = conceptColumns(db);
       for (const column of RETIRED_SOURCE_COLUMNS) {

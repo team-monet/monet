@@ -1190,6 +1190,16 @@ export function registerRecoveryCommands(
         // configuration and its attempt history, which a zero row count does not rule out — so the
         // drop belongs on this side of the backup, never in an ordinary open.
         dropRetiredSourceResidue(port);
+        // READ WHILE OWNERSHIP IS STILL HELD. A migration on a shared store can move the pin the
+        // moment this connection lets go, and the model chosen from a released-lock read is the
+        // one `createCore` then rejects — after the purge has committed. Loading it can happen
+        // later; choosing it cannot.
+        // Read THROUGH the owning connection, not `inspect()`: that opens its own and would
+        // deadlock against the exclusive ownership this one still holds.
+        const pinUnderOwnership = purged.staleNativeOwners.length > 0
+          ? (port.prepare(`SELECT embedder_model_id AS modelId FROM sync_meta WHERE singleton = 1`)
+              .get() as { modelId: string | null } | undefined)?.modelId ?? null
+          : null;
         // Closed HERE, before the reprojection opens its own connection: the exclusive ownership
         // this port holds for the backup would otherwise block it.
         closePort();
@@ -1228,17 +1238,19 @@ export function registerRecoveryCommands(
          * could not do when it lost them to a committed purge.
          */
         if (purged.staleNativeOwners.length > 0) {
-          let embedder: EmbeddingProvider;
+          // THE WHOLE REPAIR IS INSIDE THE RECOVERY CATCH, construction included. A core built
+          // against a pin that moved throws too, and outside this catch that throw would take the
+          // concept ids with it — which is the failure this error exists to prevent.
           try {
-            // RE-READ, not the preflight snapshot. `inspect()` ran before this port took exclusive
-            // ownership, and a migration on a shared store can move the pin in between — loading
-            // the old model would then be rejected by `createCore` against the pin that actually
-            // committed, after the purge.
-            const livePin = dependencies.inspect(dbPath).pin;
-            if (livePin.status !== "known" || livePin.modelId === null) {
-              throw new Error(`the store's embedder pin is ${livePin.status}`);
+            if (pinUnderOwnership === null) throw new Error("the store has no embedder pin");
+            const embedder = await dependencies.instantiate(pinUnderOwnership);
+            const core = dependencies.createCore(dependencies.createPort(dbPath), embedder);
+            try {
+              const repaired = core.repairNativeProjections(purged.staleNativeOwners);
+              console.log(`Reprojected ${repaired} native concept(s) that owned a purged observation.`);
+            } finally {
+              core.close();
             }
-            embedder = await dependencies.instantiate(livePin.modelId);
           } catch (error) {
             throw new Error(
               `${purged.staleNativeOwners.length} concept(s) still need reprojection, and the ` +
@@ -1247,13 +1259,6 @@ export function registerRecoveryCommands(
               `and the backup is at ${backup.path}. The concepts are: ` +
               `${purged.staleNativeOwners.join(", ")} — repair them once the model is available.`,
             );
-          }
-          const core = dependencies.createCore(dependencies.createPort(dbPath), embedder);
-          try {
-            const repaired = core.repairNativeProjections(purged.staleNativeOwners);
-            console.log(`Reprojected ${repaired} native concept(s) that owned a purged observation.`);
-          } finally {
-            core.close();
           }
         }
         console.log(`Backup:   ${backup.path}`);
