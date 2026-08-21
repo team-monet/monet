@@ -382,7 +382,7 @@ describe("9. server factory instructions", () => {
 
       // Every tool a deferred-loading host would otherwise never search for. stage_lookup is the
       // load-bearing one: unnamed, a blocking rule never fires at all.
-      for (const named of ["stage_lookup", "memory_declare", "memory_ratify"]) {
+      for (const named of ["stage_lookup", "memory_declare", "memory_ratify", "memory_workstreams"]) {
         expect(MONET_SERVER_INSTRUCTIONS).toContain(named);
       }
       // Declaration stays the user's word, on the surface that reaches an agent with no persona.
