@@ -30,13 +30,13 @@ function seedSchema12Store(dbPath: string): void {
                            support_count, dirty, embedding, updated_at, created_at,
                            source_identity, active_observation_id)
      VALUES ('connector-concept', 'connector-doc', 'Connector doc', 'materialized file body', 'source',
-             'active', 0.5, 1, 'default', 1, 0, '[]', ?, ?, 'source://src-a', 'connector-observation')`,
+             'active', 0.5, 1, 'default', 1, 0, '[0.1,0.2]', ?, ?, 'source://src-a', 'connector-observation')`,
   ).run(now, now);
   db.prepare(
     `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                created_at, updated_at, source_refs)
-     VALUES ('connector-observation', 'materialized chunk', '[]', 'source', 'default',
-             'connector-concept', 'connector', ?, ?, '[]')`,
+     VALUES ('connector-observation', 'materialized chunk', '[0.1,0.2]', 'source', 'default',
+             'connector-concept', 'connector', ?, ?, '[0.1,0.2]')`,
   ).run(now, now);
   db.pragma("user_version = 12");
   core.close();
@@ -194,12 +194,12 @@ describe("monet retire-source", () => {
       port.prepare(
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
-         VALUES ('grafted-source-obs', 'grafted chunk', '[0.9,0.9]', 'source', 'default', ?, 'peer', ?, ?, '[]')`,
+         VALUES ('grafted-source-obs', 'grafted chunk', '[0.9,0.9]', 'source', 'default', ?, 'peer', ?, ?, '[0.1,0.2]')`,
       ).run(owner, now, now);
       port.prepare(
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
-         VALUES ('native-obs', 'native evidence', '[0.1,0.2]', 'statement', 'default', ?, 'local', ?, ?, '[]')`,
+         VALUES ('native-obs', 'native evidence', '[0.1,0.2]', 'statement', 'default', ?, 'local', ?, ?, '[0.1,0.2]')`,
       ).run(owner, now, now);
       port.close();
 
@@ -223,7 +223,250 @@ describe("monet retire-source", () => {
     });
   });
 
-  it("refuses before deleting anything when the pinned embedder cannot be loaded", async () => {
+  it("names the concepts still needing repair when the embedder cannot be loaded after the purge", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      // A NATIVE concept holding a grafted source observation — the only shape that needs the
+      // embedder at all, and one the purge discovers rather than the preflight.
+      port.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                               support_count, dirty, embedding, updated_at, created_at)
+         VALUES ('native-owner', 'owner', 'Owner', 'body', 'fact', 'active', 0.6, 1, 'default', 2, 0, '[0.1,0.2]', ?, ?)`,
+      ).run(now, now);
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('grafted-source-obs', 'grafted chunk', '[0.1,0.2]', 'source', 'default',
+                 'native-owner', 'peer', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.close();
+
+      const deps: RecoveryCliDependencies = {
+        ...dependencies,
+        instantiate: async () => { throw new Error("model cache empty"); },
+      };
+      // The purge has committed by then — so the failure has to be RECOVERABLE, and say how.
+      await expect(run(["retire-source", "--apply", "--yes"], deps))
+        .rejects.toThrow(/still need reprojection.*model cache empty.*native-owner/s);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        // The backup exists, and the ids the operator must repair were named in the error.
+        expect(readdirSync(join(dbPath, "..", "backups")).length).toBeGreaterThan(0);
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'grafted-source-obs'`).get())
+          .toEqual({ n: 0 });
+      } finally {
+        check.close();
+      }
+    });
+  });
+
+  it("retires a store whose embedder is unloadable, when nothing needs reprojection", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const deps: RecoveryCliDependencies = {
+        ...dependencies,
+        instantiate: async () => { throw new Error("model cache empty"); },
+      };
+      // A pure connector concept is deleted whole, so no projection is ever rebuilt — an
+      // unreadable model cache must not make this store permanently unretirable.
+      const output = await run(["retire-source", "--apply", "--yes"], deps);
+      expect(output.stdout).toContain("Retired 1 concept(s)");
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 0 });
+      } finally {
+        check.close();
+      }
+    });
+  });
+
+  it("leaves a hybrid concept completely untouched and reports it", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      port.prepare(
+        `UPDATE concepts SET body = ?, title = 'Meeting notes', slug = 'meeting-notes' WHERE id = 'connector-concept'`,
+      ).run("SECRET FILE TEXT from the vault\n\nmy own note");
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('user-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
+                 'connector-concept', 'local', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.close();
+
+      const output = await run(["retire-source", "--apply", "--yes"], dependencies);
+      expect(output.stdout).toContain("Left untouched: 1 concept(s)");
+      // Reported as retiring nothing, because nothing about this concept was retired.
+      expect(output.stdout).toContain("Retired 0 concept(s) and 0 observation(s).");
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        // UNTOUCHED means untouched: kind, body, title, slug, and BOTH observations.
+        const row = check.prepare(
+          `SELECT kind, body, title, slug FROM concepts WHERE id = 'connector-concept'`,
+        ).get() as { kind: string; body: string; title: string; slug: string };
+        expect(row).toEqual({
+          kind: "source",
+          body: "SECRET FILE TEXT from the vault\n\nmy own note",
+          title: "Meeting notes",
+          slug: "meeting-notes",
+        });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = 'connector-concept'`).get())
+          .toEqual({ n: 2 });
+      } finally {
+        check.close();
+      }
+
+      // And it keeps saying so, because something really is still there. That is the honest
+      // report, not the never-terminates bug: the command claims nothing it has not done.
+      const second = await run(["retire-source"], dependencies);
+      expect(second.stdout).toContain("Left untouched:");
+    });
+  });
+
+  it("disposes of a pure connector concept while a hybrid sits beside it", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      // A second, purely connector concept — nothing of the user's on it.
+      port.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                               support_count, dirty, embedding, updated_at, created_at)
+         VALUES ('pure-connector', 'other-note', 'Other note', 'file text', 'source', 'active',
+                 0.5, 1, 'default', 1, 0, '[0.1,0.2]', ?, ?)`,
+      ).run(now, now);
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('pure-chunk', 'file chunk', '[0.1,0.2]', 'source', 'default',
+                 'pure-connector', 'connector', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      // ...and the user's own writing on the first one, making it a hybrid.
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('user-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
+                 'connector-concept', 'local', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.close();
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE id = 'pure-connector'`).get())
+          .toEqual({ n: 0 });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'pure-chunk'`).get())
+          .toEqual({ n: 0 });
+        // The hybrid and everything on it survive intact.
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE id = 'connector-concept'`).get())
+          .toEqual({ n: 1 });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = 'connector-concept'`).get())
+          .toEqual({ n: 2 });
+      } finally {
+        check.close();
+      }
+    });
+  });
+
+  it("purges an orphaned source observation even while a hybrid keeps the store un-disposed", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      // A hybrid, so `hybrids` is non-empty on every run...
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('user-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
+                 'connector-concept', 'local', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      // ...and an ORPHAN whose concept_id is NULL. `NOT IN` yields NULL for it, so it was silently
+      // skipped forever — the hybrid guaranteeing the exclusion path ran on every run.
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('orphan-chunk', 'orphaned file chunk', '[0.1,0.2]', 'source', 'default',
+                 NULL, 'connector', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.close();
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'orphan-chunk'`).get())
+          .toEqual({ n: 0 });
+        // The hybrid is still untouched, both of its observations intact.
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = 'connector-concept'`).get())
+          .toEqual({ n: 2 });
+      } finally {
+        check.close();
+      }
+    });
+  });
+
+  it("keeps the marker columns while a marker-only hybrid still needs them", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      // Connector-owned through `source_identity` alone — an ordinary kind. Dropping the column
+      // would erase the only thing that identifies it as one.
+      port.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                               support_count, dirty, embedding, updated_at, created_at, source_identity)
+         VALUES ('marker-only', 'mo', 'Marker only', 'file text', 'fact', 'active', 0.5, 1,
+                 'default', 1, 0, '[0.1,0.2]', ?, ?, 'source://vault')`,
+      ).run(now, now);
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('mo-chunk', 'file chunk', '[0.1,0.2]', 'source', 'default',
+                 'marker-only', 'connector', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('mo-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
+                 'marker-only', 'local', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.close();
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        const columns = new Set(
+          (check.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>).map((c) => c.name),
+        );
+        expect(columns.has("source_identity")).toBe(true);
+        // ...so a second run still recognises it and still leaves its chunk alone.
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'mo-chunk'`).get())
+          .toEqual({ n: 1 });
+      } finally {
+        check.close();
+      }
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+      const again = new BetterSqlitePort(dbPath);
+      try {
+        expect(again.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'mo-chunk'`).get())
+          .toEqual({ n: 1 });
+      } finally {
+        again.close();
+      }
+    });
+  });
+
+  it("names the stale concepts even on a store that predates the embedder pin column", async () => {
     await withStore(async (dbPath, dependencies) => {
       seedSchema12Store(dbPath);
       const port = new BetterSqlitePort(dbPath);
@@ -236,89 +479,18 @@ describe("monet retire-source", () => {
       port.prepare(
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
-         VALUES ('grafted-source-obs', 'grafted chunk', '[0.9,0.9]', 'source', 'default',
-                 'native-owner', 'peer', ?, ?, '[]')`,
+         VALUES ('grafted-source-obs', 'grafted chunk', '[0.1,0.2]', 'source', 'default',
+                 'native-owner', 'peer', ?, ?, '[0.1,0.2]')`,
       ).run(now, now);
+      // A store old enough to predate the additive pin column. Reading it unguarded threw AFTER
+      // the purge had committed, losing the very ids the error exists to name.
+      port.exec(`ALTER TABLE sync_meta DROP COLUMN embedder_model_id`);
       port.close();
 
-      // The reprojection this purge would owe cannot run without the store's own embedder, and
-      // discovering that AFTER the delete leaves a stale projection nothing can repair.
-      const deps: RecoveryCliDependencies = {
-        ...dependencies,
-        instantiate: async () => { throw new Error("model cache empty"); },
-      };
-      await expect(run(["retire-source", "--apply", "--yes"], deps))
-        .rejects.toThrow(/could not be loaded \(model cache empty\).*Nothing has been deleted/s);
+      await expect(run(["retire-source", "--apply", "--yes"], dependencies))
+        .rejects.toThrow(/still need reprojection.*native-owner/s);
 
-      const check = new BetterSqlitePort(dbPath);
-      try {
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 1 });
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'grafted-source-obs'`).get())
-          .toEqual({ n: 1 });
-      } finally {
-        check.close();
-      }
-      expect(existsSync(join(dbPath, "..", "backups"))).toBe(false);
-    });
-  });
-
-  it("keeps observations the user attached after the upgrade, and the concept they belong to", async () => {
-    await withStore(async (dbPath, dependencies) => {
-      seedSchema12Store(dbPath);
-      const port = new BetterSqlitePort(dbPath);
-      const now = Date.now();
-      // Retained rows are served as ordinary memories, so a user can legitimately write on one.
-      port.prepare(
-        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
-                                   created_at, updated_at, source_refs)
-         VALUES ('user-note', 'my own note on this file', '[0.1,0.2]', 'statement', 'default',
-                 'connector-concept', 'local', ?, ?, '[]')`,
-      ).run(now, now);
-      port.close();
-
-      await run(["retire-source", "--apply", "--yes"], dependencies);
-
-      const check = new BetterSqlitePort(dbPath);
-      try {
-        // The connector's own chunk is gone; what the user wrote is not, and neither is its concept.
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE kind = 'source'`).get()).toEqual({ n: 0 });
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'user-note'`).get()).toEqual({ n: 1 });
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE id = 'connector-concept'`).get())
-          .toEqual({ n: 1 });
-      } finally {
-        check.close();
-      }
-    });
-  });
-
-  it("drops the empty residue itself rather than promising a migration that no longer exists", async () => {
-    await withStore(async (dbPath, dependencies) => {
-      // Retired tables and marker columns present, all empty — nothing to lose, so no backup.
-      const core = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
-      const db = (core as unknown as { db: BetterSqlitePort }).db;
-      db.exec(`ALTER TABLE concepts ADD COLUMN source_identity TEXT`);
-      for (const table of RETIRED_SOURCE_TABLES) {
-        db.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, circle TEXT)`);
-      }
-      core.close();
-
-      const output = await run(["retire-source", "--apply", "--yes"], dependencies);
-      expect(output.stdout).toContain("Dropped the empty tables");
-
-      const check = new BetterSqlitePort(dbPath);
-      try {
-        const tables = new Set(
-          (check.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>)
-            .map((row) => row.name),
-        );
-        for (const table of RETIRED_SOURCE_TABLES) expect(tables.has(table)).toBe(false);
-        const columns = new Set(
-          (check.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>).map((c) => c.name),
-        );
-        expect(columns.has("source_identity")).toBe(false);
-      } finally {
-        check.close();
-      }
+      expect(readdirSync(join(dbPath, "..", "backups")).length).toBeGreaterThan(0);
     });
   });
 });

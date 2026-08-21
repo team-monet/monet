@@ -68,6 +68,8 @@ export interface RetirementData extends ConnectorPopulation {
    * and therefore whether it needs the store's pinned embedder at all.
    */
   staleNativeOwners: string[];
+  /** Connector concepts the user has written on. Left untouched, and reported to the operator. */
+  hybrids: string[];
 }
 
 function conceptColumns(db: StoragePort): Set<string> {
@@ -140,6 +142,27 @@ export function connectorPopulation(db: StoragePort): ConnectorPopulation {
  * rows alone would report "nothing to retire", skip the backup, and let the next ordinary open
  * drop a registered source's configuration and attempt history for good.
  */
+/**
+ * Connector concepts the user has written native evidence on since the upgrade.
+ *
+ * THE PURGE LEAVES THESE ENTIRELY ALONE. Retained rows are served as ordinary memories, so this
+ * shape is one the policy invites — and a concept that is half materialized file and half the
+ * user's own writing cannot be converted into a clean native one without deciding, field by field,
+ * what happens to its body, title, slug, provenance, revisions and projection. Every one of those
+ * decisions is a way to get it subtly wrong, and the wrong ones are silent.
+ *
+ * So the command disposes of what is purely connector material and reports these instead, leaving
+ * the judgement where the information is. A store holding one keeps reporting it — which is the
+ * honest answer, because something really is left.
+ */
+export function hybridConnectorConcepts(db: StoragePort, conceptIds: readonly string[]): string[] {
+  if (conceptIds.length === 0) return [];
+  return (db.prepare(
+    `SELECT DISTINCT concept_id AS id FROM observations
+      WHERE kind != 'source' AND concept_id IN (SELECT value FROM json_each(?))`,
+  ).all(JSON.stringify([...conceptIds])) as Array<{ id: string }>).map((row) => row.id);
+}
+
 /** Native concepts owning one of these observations — the link identifying them dies with the delete. */
 export function staleNativeOwnersOf(db: StoragePort, population: ConnectorPopulation): string[] {
   if (population.observationIds.length === 0) return [];
@@ -148,7 +171,8 @@ export function staleNativeOwnersOf(db: StoragePort, population: ConnectorPopula
     `SELECT DISTINCT o.concept_id AS id
        FROM observations o
        JOIN concepts c ON c.id = o.concept_id
-      WHERE o.id ${inSet} AND c.id NOT ${inSet} AND c.kind != 'workstream'`,
+      WHERE o.id ${inSet} AND c.id NOT ${inSet}
+        AND c.kind != 'workstream' AND c.status != 'retired'`,
   ).all(JSON.stringify(population.observationIds), JSON.stringify(population.conceptIds)) as Array<{ id: string }>)
     .map((row) => row.id);
 }
@@ -158,7 +182,12 @@ export function retirementData(db: StoragePort): RetirementData {
   const nonemptyTables = discoverRetiredTables(db).filter(
     (table) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n > 0,
   );
-  return { ...population, nonemptyTables, staleNativeOwners: staleNativeOwnersOf(db, population) };
+  return {
+    ...population,
+    nonemptyTables,
+    staleNativeOwners: staleNativeOwnersOf(db, population),
+    hybrids: hybridConnectorConcepts(db, population.conceptIds),
+  };
 }
 
 /** True when nothing is left to dispose of and the residue drop is safe to run unattended. */
@@ -171,7 +200,29 @@ export function isRetirementDisposed(data: RetirementData): boolean {
  * ever correct once `isRetirementDisposed` holds, so every table it drops is empty and every
  * surviving row has NULL in the columns it removes.
  */
-export function dropRetiredSourceResidue(db: StoragePort): void {
+/** Thrown when the residue turned out not to be residue: data appeared between the read and the drop. */
+export class RetiredResidueNotEmptyError extends Error {
+  constructor(readonly tables: string[]) {
+    super(
+      `refusing to drop ${tables.join(", ")}: they hold rows. The emptiness this drop relies on was ` +
+        `read before the write lock was held, so another writer can add data in between — and a drop ` +
+        `taken on a stale read would destroy it with no backup. Re-run the backup-first path.`,
+    );
+    this.name = "RetiredResidueNotEmptyError";
+  }
+}
+
+export function dropRetiredSourceResidue(db: StoragePort, opts: { requireEmpty?: boolean } = {}): void {
+  /*
+   * THE MARKER COLUMNS STAY WHILE A HYBRID DOES.
+   *
+   * A hybrid can be connector-owned through `source_identity` alone, with an ordinary `kind` —
+   * `connectorPopulation` recognises that shape deliberately. Dropping the column would erase the
+   * only thing identifying it, and the next run would see an ordinary native concept whose
+   * `kind='source'` observations look like grafted ones and delete them: exactly the content this
+   * command promised to leave alone. The tables can still go; the classification cannot.
+   */
+
   // ONE WRITE TRANSACTION, AND EACH OBJECT RE-CHECKED INSIDE IT. Concurrent first opens are a
   // supported topology (several `monet start` servers against one store), and a presence check
   // taken outside the write lock is stale by the time the drop runs: both processes see the table,
@@ -180,12 +231,39 @@ export function dropRetiredSourceResidue(db: StoragePort): void {
   // an error. `IF EXISTS` alone would not cover the column half — SQLite has no such form for
   // ALTER TABLE ... DROP COLUMN.
   db.immediateTransaction((): void => {
-    for (const table of discoverRetiredTables(db)) {
+    const tables = discoverRetiredTables(db);
+    // RE-READ UNDER THE WRITE LOCK, for the caller that took no backup. Its emptiness check
+    // happened before this transaction existed, so an older writer could have inserted registry or
+    // ledger rows in between; the no-backup decision rests on "there is nothing to lose", and that
+    // has to still be true here. A caller that DID take a backup passes nothing and drops whatever
+    // it finds — its copy is already on disk.
+    if (opts.requireEmpty) {
+      const nonempty = tables.filter(
+        (table) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n > 0,
+      );
+      // THE ROWS COUNT AS RESIDUE TOO. A shared-store writer can commit a connector concept or a
+      // `kind='source'` observation without touching any retired table — an older process writes
+      // its semantic rows and its ledger bookkeeping separately — so checking tables alone would
+      // still drop the marker columns out from under a concept that had just appeared, with no
+      // backup and nothing disposed.
+      const population = connectorPopulation(db);
+      if (population.conceptIds.length > 0 || population.observationIds.length > 0) {
+        nonempty.push(`${population.conceptIds.length} connector concept(s) / ${population.observationIds.length} observation(s)`);
+      }
+      if (nonempty.length > 0) throw new RetiredResidueNotEmptyError(nonempty);
+    }
+    for (const table of tables) {
       db.exec(`DROP TABLE IF EXISTS ${table}`);
     }
-    const columns = conceptColumns(db);
-    for (const column of RETIRED_SOURCE_COLUMNS) {
-      if (columns.has(column)) db.exec(`ALTER TABLE concepts DROP COLUMN ${column}`);
+    // COMPUTED HERE, under the same lock as the other re-reads. Taken outside it, another writer
+    // committing a marker-only hybrid in between would leave this reading `false` — and the drop
+    // would take the only column identifying that concept as connector-owned.
+    const hybridsRemain = hybridConnectorConcepts(db, connectorPopulation(db).conceptIds).length > 0;
+    if (!hybridsRemain) {
+      const columns = conceptColumns(db);
+      for (const column of RETIRED_SOURCE_COLUMNS) {
+        if (columns.has(column)) db.exec(`ALTER TABLE concepts DROP COLUMN ${column}`);
+      }
     }
   })();
 }
@@ -208,22 +286,43 @@ export interface PurgeResult {
    * them needs the engine's own helper, not a copy of it: see `MonetCore.repairNativeProjections`.
    */
   staleNativeOwners: string[];
+  /** Connector concepts left untouched because the user has written on them. */
+  hybrids: string[];
 }
 
 export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
   return db.immediateTransaction((): PurgeResult => {
     const { conceptIds, observationIds } = connectorPopulation(db);
     if (conceptIds.length === 0 && observationIds.length === 0) {
-      return { concepts: 0, observations: 0, staleNativeOwners: [] };
+      return { concepts: 0, observations: 0, staleNativeOwners: [], hybrids: [] };
     }
 
-    const c = JSON.stringify(conceptIds);
-    const o = JSON.stringify(observationIds);
+    // HYBRIDS ARE NOT IN THE POPULATION AT ALL. A concept holding both materialized file text and
+    // the user's own writing is left exactly as it is — not converted, not partially cleaned — and
+    // reported instead. Everything below therefore operates on rows that are purely connector
+    // material, where deleting the whole thing is unambiguous.
+    const hybrids = new Set(hybridConnectorConcepts(db, conceptIds));
+    const doomedIds = conceptIds.filter((id) => !hybrids.has(id));
+    // A hybrid's connector evidence stays with it: taking its chunks while leaving its body and
+    // title would be the partial state this policy exists to avoid.
+    // `concept_id IS NULL` SPELLED OUT, because `NOT IN` yields NULL for a NULL left-hand side and
+    // quietly drops the row: an orphaned source observation would then be skipped on every run for
+    // as long as any hybrid existed — which is forever, since hybrids are never disposed of here.
+    const doomedObservationIds = hybrids.size === 0 ? observationIds : (db.prepare(
+      `SELECT id FROM observations
+        WHERE kind = 'source'
+          AND (concept_id IS NULL OR concept_id NOT IN (SELECT value FROM json_each(?)))`,
+    ).all(JSON.stringify([...hybrids])) as Array<{ id: string }>).map((row) => row.id);
+    const c = JSON.stringify(doomedIds);
+    const o = JSON.stringify(doomedObservationIds);
     const inSet = `IN (SELECT value FROM json_each(?))`;
     // Entity rows are counted BEFORE their memberships go, so the df recount below sees the exact
     // set that lost a member; reversing the order loses the list of what to recount.
     // Read BEFORE the delete — afterwards the link that identifies them is gone.
-    const staleNativeOwners = staleNativeOwnersOf(db, { conceptIds, observationIds });
+    const staleNativeOwners = staleNativeOwnersOf(db, {
+      conceptIds: doomedIds,
+      observationIds: doomedObservationIds,
+    });
 
     const affectedEntities = tableExists(db, "concept_entities")
       ? db.prepare(
@@ -264,20 +363,15 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
       // concept can end up with no live evidence at all after the successor is purged.
       [`UPDATE observations SET superseded_by = NULL, superseded_at = NULL WHERE superseded_by ${inSet}`, [o]],
       [`DELETE FROM observations WHERE id ${inSet}`, [o]],
-      // A concept the user has since written on SURVIVES, as an ordinary one — only the concepts
-      // left with no evidence at all go.
-      [`DELETE FROM concepts WHERE id ${inSet}
-          AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.concept_id = concepts.id)`, [c]],
+      [`DELETE FROM concepts WHERE id ${inSet}`, [c]],
     ] as Array<[string, string[]]>) {
       const table = /(?:DELETE FROM|UPDATE) ([a-z_]+)/.exec(sql)?.[1];
       if (table && !tableExists(db, table)) continue;
       db.prepare(sql).run(...params);
     }
 
-    if (!tableExists(db, "entities")) {
-      return { concepts: conceptIds.length, observations: observationIds.length, staleNativeOwners };
-    }
-    for (const entity of affectedEntities) {
+    // Only the entity RECOUNT is skipped on a store without the optional table.
+    for (const entity of tableExists(db, "entities") ? affectedEntities : []) {
       db.prepare(
         `UPDATE entities SET df = (
            SELECT COUNT(*) FROM concept_entities ce JOIN concepts cc ON cc.id = ce.concept_id
@@ -287,6 +381,14 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
       db.prepare(`DELETE FROM entities WHERE key = ? AND scope = ? AND df <= 0`)
         .run(entity.key, entity.scope);
     }
-    return { concepts: conceptIds.length, observations: observationIds.length, staleNativeOwners };
+    // COUNTS THAT DESCRIBE WHAT HAPPENED, not what was considered: reporting the connector
+    // population while some of it was deliberately left standing makes a destructive command's
+    // own receipt inaccurate.
+    return {
+      concepts: doomedIds.length,
+      observations: doomedObservationIds.length,
+      staleNativeOwners,
+      hybrids: [...hybrids],
+    };
   })();
 }

@@ -324,7 +324,9 @@ export {
   connectorPopulation,
   dropRetiredSourceResidue,
   isRetirementDisposed,
+  RetiredResidueNotEmptyError,
   retirementData,
+  hybridConnectorConcepts,
   purgeConnectorPopulation,
   RETIRED_SOURCE_TABLES,
 } from "./source-retirement";

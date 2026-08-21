@@ -1122,13 +1122,17 @@ export function registerRecoveryCommands(
         );
       }
 
+      // ONE finally FOR EVERYTHING AFTER createPort(). The preflight below can refuse — an
+      // unusable pin, a model that will not load, residue that turned out not to be empty — and
+      // each of those throws is an EXPECTED outcome a programmatic caller may catch. Leaving the
+      // port outside the cleanup leaked one SQLite connection per refused attempt.
       const port = dependencies.createPort(dbPath);
-      let data: ReturnType<typeof retirementData>;
+      let portClosed = false;
+      const closePort = (): void => {
+        if (!portClosed) { port.close(); portClosed = true; }
+      };
       try {
-        data = retirementData(port);
-      } finally {
-        if (!options.apply) port.close();
-      }
+      const data = retirementData(port);
       const counts = { concepts: data.conceptIds.length, observations: data.observationIds.length };
 
       if (isRetirementDisposed(data)) {
@@ -1137,13 +1141,13 @@ export function registerRecoveryCommands(
         // promise a migration that does not exist. With every table empty and both marker columns
         // null there is nothing to lose, which is why this needs no backup.
         if (options.apply) {
-          dropRetiredSourceResidue(port);
-          port.close();
+          // requireEmpty: the drop re-reads under its own write lock and refuses if data appeared
+          // since the reading above, because THIS path deliberately takes no backup.
+          dropRetiredSourceResidue(port, { requireEmpty: true });
           console.log("Nothing to retire: no connector-owned rows and no registry data.");
           console.log("Dropped the empty tables and marker columns the subsystem left behind.");
           return;
         }
-        port.close();
         console.log("Nothing to retire: this store holds no connector-owned rows and no registry data.");
         console.log(`Its empty tables and marker columns are dropped by: ${commandBase(dbPath).replace(" repair", " retire-source")} --apply --yes`);
         return;
@@ -1153,6 +1157,9 @@ export function registerRecoveryCommands(
         console.log(`Connector-owned rows: ${counts.concepts} concept(s), ${counts.observations} observation(s).`);
         if (data.nonemptyTables.length > 0) {
           console.log(`Registry/ledger data:  ${data.nonemptyTables.join(", ")}`);
+        }
+        if (data.hybrids.length > 0) {
+          console.log(`Left untouched:        ${data.hybrids.length} concept(s) holding both file content and your own writing.`);
         }
         console.log("These are a materialized copy of files outside the store, plus the registry describing");
         console.log("them. The subsystem that could read, re-sync, or repair them was retired (#16), so");
@@ -1173,32 +1180,7 @@ export function registerRecoveryCommands(
        * nothing to retire and the stale projection can never be repaired. Loading it first turns
        * that unrecoverable state into a refusal that touches nothing.
        */
-      // ONLY WHEN A REPROJECTION IS ACTUALLY OWED. A store whose retirement data is nothing but
-      // connector rows, registry entries and ledger history needs no embedding operation at all —
-      // demanding a loadable pin there would leave it permanently refused by the engine over a
-      // model cache it never has to touch.
-      let embedder: EmbeddingProvider | undefined;
-      if (data.staleNativeOwners.length > 0 && (inspection.pin.status !== "known" || inspection.pin.modelId === null)) {
-        throw new Error(
-          `this store's embedder pin is not usable (${inspection.pin.status}), so a purged observation's owner could ` +
-          `not be reprojected afterwards. Diagnose with \`${doctorCommand(dbPath)}\` first — this command ` +
-          `refuses rather than delete rows it cannot finish repairing.`,
-        );
-      }
-      try {
-        if (data.staleNativeOwners.length > 0 && inspection.pin.status === "known" && inspection.pin.modelId !== null) {
-          embedder = await dependencies.instantiate(inspection.pin.modelId);
-        }
-      } catch (error) {
-        throw new Error(
-          `the store's pinned embedder could not be loaded ` +
-          `(${error instanceof Error ? error.message : String(error)}); refusing to purge, because a ` +
-          `purged observation's owner could not be reprojected afterwards. Nothing has been deleted.`,
-        );
-      }
-
-      let closed = false;
-      try {
+      {
         const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
         mkdirSync(path.dirname(destination), { recursive: true });
         const backup = await port.createVerifiedBackup(destination);
@@ -1208,11 +1190,41 @@ export function registerRecoveryCommands(
         // configuration and its attempt history, which a zero row count does not rule out — so the
         // drop belongs on this side of the backup, never in an ordinary open.
         dropRetiredSourceResidue(port);
+        // READ WHILE OWNERSHIP IS STILL HELD. A migration on a shared store can move the pin the
+        // moment this connection lets go, and the model chosen from a released-lock read is the
+        // one `createCore` then rejects — after the purge has committed. Loading it can happen
+        // later; choosing it cannot.
+        /*
+         * Read THROUGH the owning connection, not `inspect()`: that opens its own and would
+         * deadlock against the exclusive ownership this one still holds.
+         *
+         * GUARDED, AND NEVER ALLOWED TO THROW. The backup, purge and residue drop have all
+         * committed by this line, and a legacy store can predate `sync_meta` or its additive
+         * `embedder_model_id` column — an unguarded query would exit here with the stale concept
+         * ids unnamed, which is the one thing the late-loading design promises not to do. An
+         * absent pin is a null, and null goes down the recoverable path below.
+         */
+        const readPinUnderOwnership = (): string | null => {
+          const tables = port.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
+          if (!tables.some((column) => column.name === "embedder_model_id")) return null;
+          return (port.prepare(`SELECT embedder_model_id AS modelId FROM sync_meta WHERE singleton = 1`)
+            .get() as { modelId: string | null } | undefined)?.modelId ?? null;
+        };
+        const pinUnderOwnership = purged.staleNativeOwners.length > 0 ? readPinUnderOwnership() : null;
         // Closed HERE, before the reprojection opens its own connection: the exclusive ownership
         // this port holds for the backup would otherwise block it.
-        port.close();
-        closed = true;
+        closePort();
         console.log(`Retired ${purged.concepts} concept(s) and ${purged.observations} observation(s).`);
+        if (purged.hybrids.length > 0) {
+          console.log(`Left untouched: ${purged.hybrids.length} concept(s) hold both file content and evidence you`);
+          console.log("wrote yourself. Nothing about them was changed.");
+          console.log("");
+          console.log("To dispose of one, move your own observations to an EXISTING native concept —");
+          console.log("`memory_detach` with a destConceptId — then re-run. Detaching without a");
+          console.log("destination mints a new concept carrying the same kind, which lands you back");
+          console.log("here with one more of them. Or leave them: this command keeps reporting them,");
+          console.log("because something really is still there.");
+        }
         if (data.nonemptyTables.length > 0) {
           console.log(`Dropped:  ${data.nonemptyTables.join(", ")} (and the rest of the retired schema).`);
         }
@@ -1221,18 +1233,49 @@ export function registerRecoveryCommands(
         // the observation leaves its owner's support count, centroid and confidence describing
         // evidence that no longer exists. The engine owns that projection logic; the purge only
         // reports who needs it. Safe to open now — the population it would refuse is gone.
+        /*
+         * THE EMBEDDER IS LOADED HERE, and only if the purge actually produced work for it.
+         *
+         * Under this command's policy a connector concept is either deleted whole or left
+         * untouched, so neither needs reprojection — the only owner that does is a NATIVE concept
+         * that held a grafted source observation, and whether one exists is decided by the purge
+         * under its own lock, not by a reading taken before it. Requiring the pin up front
+         * therefore blocked disposal on stores that would never have used it: an unreadable model
+         * cache was enough to make a store permanently unretirable.
+         *
+         * Loading late costs the guarantee that a failure happens before any delete. What replaces
+         * it is that the failure is recoverable and says so: the backup is on disk and the ids that
+         * still need repairing are named, which is exactly what an earlier version of this code
+         * could not do when it lost them to a committed purge.
+         */
         if (purged.staleNativeOwners.length > 0) {
-          const core = dependencies.createCore(dependencies.createPort(dbPath), embedder);
+          // THE WHOLE REPAIR IS INSIDE THE RECOVERY CATCH, construction included. A core built
+          // against a pin that moved throws too, and outside this catch that throw would take the
+          // concept ids with it — which is the failure this error exists to prevent.
           try {
-            const repaired = core.repairNativeProjections(purged.staleNativeOwners);
-            console.log(`Reprojected ${repaired} native concept(s) that owned a purged observation.`);
-          } finally {
-            core.close();
+            if (pinUnderOwnership === null) throw new Error("the store has no embedder pin");
+            const embedder = await dependencies.instantiate(pinUnderOwnership);
+            const core = dependencies.createCore(dependencies.createPort(dbPath), embedder);
+            try {
+              const repaired = core.repairNativeProjections(purged.staleNativeOwners);
+              console.log(`Reprojected ${repaired} native concept(s) that owned a purged observation.`);
+            } finally {
+              core.close();
+            }
+          } catch (error) {
+            throw new Error(
+              `${purged.staleNativeOwners.length} concept(s) still need reprojection, and the ` +
+              `store's pinned embedder could not be loaded ` +
+              `(${error instanceof Error ? error.message : String(error)}). The purge is committed ` +
+              `and the backup is at ${backup.path}. The concepts are: ` +
+              `${purged.staleNativeOwners.join(", ")} — repair them once the model is available.`,
+            );
           }
         }
         console.log(`Backup:   ${backup.path}`);
+      }
       } finally {
-        if (!closed) port.close();
+        closePort();
       }
     });
 
