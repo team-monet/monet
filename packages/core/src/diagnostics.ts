@@ -126,7 +126,27 @@ function unknownPopulations(reason: string): StoredEmbeddingPopulations {
   };
 }
 
-function readSchema(db: Database.Database): SchemaMap {
+/**
+ * The narrow read capability the non-Latin scan needs — satisfied by both `StoragePort` and a raw
+ * better-sqlite3 handle, exactly like `LifecycleEdgeReadDb` below.
+ *
+ * IT EXISTS SO THE SCAN CAN RUN ON A CONNECTION THAT ALREADY HOLDS THE STORE (#14). `repair`
+ * re-reads this count after `createVerifiedBackup` has taken exclusive ownership, and any reader
+ * that opens its own handle is excluded by the very lock that makes the re-read trustworthy. The
+ * two requirements — read under ownership, and read at all — cannot both be met by a second
+ * connection, so the scan has to be expressible against the owning one.
+ */
+export interface NonLatinReadDb {
+  prepare(sql: string): { all(...params: unknown[]): unknown[] };
+}
+
+/**
+ * Rows held in memory at once by the non-Latin scan. Only the count and five sample ids outlive a
+ * page, so this is the scan's whole memory ceiling; it is a paging bound, not a calibrated number.
+ */
+const NON_LATIN_SCAN_PAGE_ROWS = 500;
+
+function readSchema(db: NonLatinReadDb): SchemaMap {
   const presentTables = new Set(db
     .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name`)
     .all()
@@ -372,14 +392,20 @@ function classifyFailure(dbPath: string, error: unknown): StoredEmbedderStateDia
  * body, and migrateEmbeddings' reembedConcept phase then persists an unusable concept vector and
  * rebuilds `related` edges from it (Codex P1, PR #173).
  *
- * STREAMED, not materialized. The diagnostic needs a count and five sample ids; `.all()` on a large
- * source-backed store would hold every row's content in memory at once and could exhaust it while
- * producing the warning that was supposed to prevent a loss (Codex P2).
+ * PAGED, not materialized. The diagnostic needs a count and five sample ids; one unbounded `.all()`
+ * on a large source-backed store would hold every row's content in memory at once and could exhaust
+ * it while producing the warning that was supposed to prevent a loss (Codex P2).
+ *
+ * The bound used to come from `.iterate()`, which only a raw better-sqlite3 handle offers — the
+ * `Statement` a `StoragePort` returns has run/get/all and nothing else, and widening that interface
+ * would reach every implementer including the test ports. Keyset pagination over the `id` primary
+ * key holds the same memory ceiling using only `.all()`, which is what lets this scan run on a
+ * connection that already owns the store (#14; see NonLatinReadDb).
  *
  * The predicates are duplicated here rather than imported because diagnostics reads a raw
  * better-sqlite3 handle on a possibly-unopenable store, before any MonetCore exists.
  */
-function inspectNonLatin(db: Database.Database, schema: SchemaMap): StoredNonLatinContent {
+function inspectNonLatin(db: NonLatinReadDb, schema: SchemaMap): StoredNonLatinContent {
   const observationColumns = schema.get("observations");
   if (!observationColumns || !observationColumns.has("content") || !observationColumns.has("id") || !observationColumns.has("kind")) {
     return { status: "unknown", reason: "observations table lacks id/kind/content" };
@@ -389,12 +415,14 @@ function inspectNonLatin(db: Database.Database, schema: SchemaMap): StoredNonLat
     return { status: "unknown", reason: "concepts table lacks id/kind/body" };
   }
   try {
+    // Each page carries `WHERE id > ?` so the cursor is the last id of the previous page. Fixed
+    // literals only, exactly as in readSchema: nothing from the store is ever interpolated.
     const observationQueries = [
-      `SELECT id, content AS text FROM observations`,
+      `SELECT id, content AS text FROM observations WHERE id > ? ORDER BY id LIMIT ?`,
     ];
     // Concept bodies. applySynthesis writes these WITHOUT the script gate, so this is the one
     // population that can be non-English in a store whose every observation is English.
-    const conceptQuery = `SELECT id, body AS text FROM concepts WHERE body IS NOT NULL`;
+    const conceptQuery = `SELECT id, body AS text FROM concepts WHERE id > ? AND body IS NOT NULL ORDER BY id LIMIT ?`;
 
     /*
      * SAMPLES ARE PER-POPULATION, not first-come. A shared five-slot buffer filled in query order
@@ -404,15 +432,24 @@ function inspectNonLatin(db: Database.Database, schema: SchemaMap): StoredNonLat
      * gets its own quota and they are concatenated.
      */
     const scan = (sql: string, into: string[], quota: number): number => {
+      const statement = db.prepare(sql);
       let n = 0;
-      for (const row of db.prepare(sql).iterate() as Iterable<{ id: string; text: string | null }>) {
-        if (typeof row.text !== "string") continue;
-        if (nonLatinLetterShare(row.text) > NON_LATIN_LETTER_TOLERANCE) {
-          n++;
-          if (into.length < quota) into.push(row.id);
+      // The empty string sorts below every generated id, so the first page starts at the beginning.
+      let cursor = "";
+      for (;;) {
+        const rows = statement.all(cursor, NON_LATIN_SCAN_PAGE_ROWS) as Array<{ id: string; text: string | null }>;
+        for (const row of rows) {
+          if (typeof row.text !== "string") continue;
+          if (nonLatinLetterShare(row.text) > NON_LATIN_LETTER_TOLERANCE) {
+            n++;
+            if (into.length < quota) into.push(row.id);
+          }
         }
+        // A short page means the LIMIT was never reached, so the table is exhausted under this
+        // predicate — SQLite applies LIMIT after filtering, so this holds for the body filter too.
+        if (rows.length < NON_LATIN_SCAN_PAGE_ROWS) return n;
+        cursor = rows[rows.length - 1]!.id;
       }
-      return n;
     };
     const observationSamples: string[] = [];
     const conceptSamples: string[] = [];
@@ -421,6 +458,26 @@ function inspectNonLatin(db: Database.Database, schema: SchemaMap): StoredNonLat
     const offenders = [...observationSamples, ...conceptSamples];
     return { status: "known", tolerance: NON_LATIN_LETTER_TOLERANCE, observationCount, conceptCount, sampleIds: offenders };
   } catch (error) {
+    return { status: "unknown", reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * The non-Latin content count alone, read through a connection the caller already holds.
+ *
+ * `inspectStoredEmbedderState` opens its own handle, which is right for diagnosis and wrong for a
+ * check that has to observe the store WHILE the caller holds exclusive ownership of it: that second
+ * handle is excluded by the caller's own lock and fails SQLITE_BUSY after the busy timeout (#14).
+ * Pass the owning `StoragePort` here instead. Nothing else about the inspection is available this
+ * way, and deliberately so — the rest of it needs a schema and integrity read this cannot promise
+ * on an arbitrary connection.
+ */
+export function inspectNonLatinContent(db: NonLatinReadDb): StoredNonLatinContent {
+  try {
+    return inspectNonLatin(db, readSchema(db));
+  } catch (error) {
+    // readSchema is outside inspectNonLatin's own try, and a caller passing a live port can hit a
+    // real SQLite error here. An unreadable schema is "not known", never a zero.
     return { status: "unknown", reason: error instanceof Error ? error.message : String(error) };
   }
 }

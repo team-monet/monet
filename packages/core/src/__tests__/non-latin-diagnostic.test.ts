@@ -17,8 +17,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore, nonLatinLetterShare, NON_LATIN_LETTER_TOLERANCE, ContentScriptUnsupportedError } from "../engine";
-import { inspectStoredEmbedderState } from "../diagnostics";
+import { inspectNonLatinContent, inspectStoredEmbedderState } from "../diagnostics";
 import { HashingEmbeddingProvider, type EmbeddingProvider } from "../embedding";
+import { BetterSqlitePort } from "../storage";
 
 const dirs: string[] = [];
 const freshDir = (): string => {
@@ -163,6 +164,82 @@ describe("doctor's non-Latin count", () => {
     expect(n.observationCount).toBe(0); // every observation is English
     expect(n.conceptCount).toBe(1);      // the synthesized body is not
     expect(n.sampleIds).toContain(stored.conceptId);
+  });
+
+  it("scans PAST ONE PAGE — the keyset cursor has to advance, or a big store reports a partial count", async () => {
+    /*
+     * The scan reads in id-ordered pages of 500 rather than streaming, so that it can run through a
+     * StoragePort (#14). A cursor that fails to advance loops forever and one that advances wrongly
+     * silently truncates the count — and a fixture under one page can exhibit NEITHER. This seeds
+     * 600 rows by raw INSERT (core.store() would be far slower and adds resolution work that has
+     * nothing to do with paging) with ids chosen so lexical id order interleaves the two scripts,
+     * which is what makes a truncating cursor produce a WRONG count rather than a short one.
+     */
+    const dir = freshDir();
+    const path = join(dir, "monet.db");
+    const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
+    await core.ensureEmbedderPin();
+    await core.store(ENGLISH);
+    const db = (core as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
+    const insert = db.prepare(
+      `INSERT INTO observations (id, content, embedding, author_agent_id) VALUES (?, ?, '[]', 'test')`,
+    );
+    let seededKorean = 0;
+    for (let i = 0; i < 600; i++) {
+      const korean = i % 3 === 0;
+      if (korean) seededKorean++;
+      insert.run(`page-${String(i).padStart(4, "0")}`, korean ? `${KOREAN} ${i}` : `${ENGLISH} ${i}`);
+    }
+    core.close();
+
+    const n = inspectStoredEmbedderState(path).nonLatin;
+    expect(n.status).toBe("known");
+    if (n.status !== "known") return;
+    expect(seededKorean).toBeGreaterThan(500 / 3); // the fixture really does span pages
+    expect(n.observationCount).toBe(seededKorean);
+  });
+
+  it("reads through a connection that already OWNS the store — a second handle is locked out (#14)", async () => {
+    /*
+     * `repair` re-reads this count after createVerifiedBackup has taken exclusive ownership, so the
+     * read has to be expressible against the owning connection. It used to call
+     * inspectStoredEmbedderState, which opens its own handle; that handle waits out its busy
+     * timeout against its own process's lock and fails SQLITE_BUSY, which deadlocked every
+     * English-only repair target.
+     *
+     * Asserted under REAL exclusive ownership, not merely through a port: ownership is the
+     * condition that broke the old reader, so a test taking it any other way would pass on code
+     * that still cannot run where the check has to run.
+     */
+    const path = await seed(new HashingEmbeddingProvider(), [KOREAN, ENGLISH, MOSTLY_ENGLISH]);
+    const unowned = inspectStoredEmbedderState(path).nonLatin;
+
+    const port = new BetterSqlitePort(path);
+    try {
+      port.acquireExclusiveOwnership();
+      const owned = inspectNonLatinContent(port);
+      expect(owned).toEqual(unowned);
+      expect(owned.status).toBe("known");
+      if (owned.status !== "known") return;
+      expect(owned.observationCount).toBe(1);
+      expect(owned.conceptCount).toBe(1);
+    } finally {
+      port.close();
+    }
+  });
+
+  it("reports an unreadable schema as NOT KNOWN rather than as a zero", () => {
+    // A caller's own connection can be pointed at something that is not a Monet store. "0 non-Latin
+    // rows" and "the scan could not run" send an operator to opposite decisions on a one-way
+    // rewrite, so the shape that cannot be mistaken for a verdict is the only safe one here.
+    const dir = freshDir();
+    const port = new BetterSqlitePort(join(dir, "empty.db"));
+    try {
+      const n = inspectNonLatinContent(port);
+      expect(n.status).toBe("unknown");
+    } finally {
+      port.close();
+    }
   });
 
   it("always names a CONCEPT BODY sample, even when observations already filled the sample budget", async () => {

@@ -549,6 +549,26 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
 };
 
 /**
+ * Every space id this build DESCRIBES, which is not the same set as every id it can LOAD.
+ *
+ * The gap is the point. `OnnxEmbeddingProvider` accepts any string and falls back silently when no
+ * profile matches — mean pooling, the labelled legacy thresholds, no script restriction, global
+ * budget and floor — so an unregistered id still produces vectors, and nothing downstream can tell
+ * a described space from a merely loadable one. That is tolerable when SERVING a pin a store
+ * already carries, and not tolerable when MINTING one: `repair --target` writes a permanent pin,
+ * and everything the registry carries beyond the checkpoint is unrecoverable after the rewrite.
+ *
+ * So this exists for the minting surface to check against (#15). It is a key list rather than a
+ * predicate because the list is short by construction and a caller refusing an unknown target
+ * should be able to say what the alternatives are — the operator's actual question at that moment.
+ * A `readonly` array, not the map: the profiles themselves stay private, since exporting them would
+ * invite a second consumer to re-derive behaviour the provider already resolves.
+ */
+export function knownModelProfileIds(): readonly string[] {
+  return Object.keys(MODEL_PROFILES);
+}
+
+/**
  * One transformers.js `progress_callback` event. Verified against 3.8.1, not assumed
  * (`src/utils/hub.js`): `initiate` fires per file before the cache is consulted (line 417),
  * `download` after it (571), `progress` while the body is read (597/607/630), `done` at the end

@@ -747,6 +747,260 @@ describe("doctor and repair CLI", () => {
 });
 
 /**
+ * A TARGET THAT SELECTS NO PROFILE IS AN UNKNOWN, NOT AN EXACT MODEL ID (#15).
+ *
+ * `resolveTargetAlias` passes anything it does not special-case straight through, and nothing
+ * downstream consulted the profile registry — so an unregistered id that happened to load rewrote
+ * every vector, pinned the store to a space no profile describes, and exited 0. The declared width
+ * never caught it (instantiateEmbedderForPin measures the warmup vector and adopts its real width
+ * by design) and neither did the identity check.
+ *
+ * The middle case is the one that matters and the one that was missing: not a blank target and not
+ * a known one, but a PLAUSIBLE unknown — the shape an operator actually types.
+ */
+describe("repair --target refuses a space this build does not describe", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const seedStore = async (label: string, pinnedTo = 1): Promise<string> => {
+    const dir = mkdtempSync(join(tmpdir(), `monet-target-gate-${label}-`));
+    dirs.push(dir);
+    const dbPath = join(dir, "monet.db");
+    const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, pinnedTo) });
+    await seed.store("an entirely english observation", { resolution: "forceNew" });
+    seed.close();
+    return dbPath;
+  };
+
+  /** Stands in for "the unregistered id happens to be loadable", issue #15's shape (b) condition. */
+  const loadableDeps = (dbPath: string, exits: number[]): RecoveryCliDependencies => ({
+    ...defaultRecoveryDependencies(),
+    dbPath: () => dbPath,
+    instantiate: async (modelId: string) => ({
+      dim: 256,
+      modelId,
+      embed: () => new Float32Array(256).fill(0.1),
+    }),
+    now: () => new Date("2026-07-22T01:02:03.004Z"),
+    uuid: () => "12345678-1234-1234-1234-123456789abc",
+    setExitCode: (code) => exits.push(code),
+  });
+
+  it("refuses a plausible-but-unknown model id BEFORE loading a provider or taking a backup", async () => {
+    const dbPath = await seedStore("unknown");
+    const exits: number[] = [];
+    const output = await run(
+      ["repair", "--target", "Xenova/bge-small-en-v1.5-quant", "--apply", "--yes", "--json"],
+      loadableDeps(dbPath, exits),
+    );
+    const result = JSON.parse(output.stdout);
+
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toContain("names no embedding space this build describes");
+    // The message an operator needed and did not get: shape (a) sent one to diagnose a VPN.
+    expect(result.error.message).toContain("NOT a download or network condition");
+    expect(result.error.message).toContain("Xenova/bge-m3:cls:q8");
+    // Refused early enough that nothing was loaded and nothing was written.
+    expect(result.provider).toEqual({ loadStatus: "not-checked" });
+    expect(result.backup).toBeNull();
+    expect(existsSync(join(dirname(dbPath), "backups"))).toBe(false);
+    expect(inspectStoredEmbedderState(dbPath).pin).toMatchObject({ modelId: "hashing:dim=256:tok=1" });
+    expect(exits).toEqual([1]);
+  });
+
+  it("refuses in PREVIEW too — the preview is what an operator reads before committing", async () => {
+    const dbPath = await seedStore("preview");
+    const exits: number[] = [];
+    const output = await run(["repair", "--target", "acme/not-a-real-model", "--json"], loadableDeps(dbPath, exits));
+    expect(JSON.parse(output.stdout).error.message).toContain("names no embedding space this build describes");
+    expect(exits).toEqual([1]);
+  });
+
+  it("still accepts a registered profile id and a canonical hashing pin", async () => {
+    // The gate must not be a blanket refusal: both of these name a fully described space.
+    const dbPath = await seedStore("known");
+    const exits: number[] = [];
+    const profile = await run(
+      ["repair", "--target", "Xenova/bge-small-en-v1.5", "--json"],
+      loadableDeps(dbPath, exits),
+    );
+    expect(JSON.parse(profile.stdout)).toMatchObject({ ok: true, report: { targetModelId: "Xenova/bge-small-en-v1.5" } });
+
+    const hashing = await run(["repair", "--target", "hashing:dim=256:tok=2", "--json"], loadableDeps(dbPath, exits));
+    expect(JSON.parse(hashing.stdout)).toMatchObject({ ok: true, report: { targetModelId: "hashing:dim=256:tok=2" } });
+    expect(exits).toEqual([]);
+  });
+
+  it("accepts the store's OWN pin even when no profile describes it — that mints nothing", async () => {
+    /*
+     * `nextCommandsForInspection` emits `--target <the store's current pin>` as recovery advice
+     * whenever the pinned provider needs action. A gate keyed on the registry alone would make that
+     * shipped command unrunnable for every store pinned outside it — a legacy hand-pin, or a local
+     * model path, both of which instantiateEmbedderForPin still loads on purpose. Re-targeting the
+     * pin a store already carries does not move it into an undescribed space; it is already there.
+     */
+    const dbPath = await seedStore("selfpin");
+    const raw = new Database(dbPath);
+    raw.prepare(`UPDATE sync_meta SET embedder_model_id = ? WHERE singleton = 1`).run("/opt/models/local-thing");
+    raw.close();
+
+    const exits: number[] = [];
+    const output = await run(
+      ["repair", "--target", "/opt/models/local-thing", "--json"],
+      loadableDeps(dbPath, exits),
+    );
+    const result = JSON.parse(output.stdout);
+    // Past the gate: it reached provider preflight, which is what the gate must not prevent here.
+    expect(result.provider).toMatchObject({ loadStatus: "available", modelId: "/opt/models/local-thing" });
+    expect(JSON.stringify(result.error ?? "")).not.toContain("names no embedding space");
+  });
+});
+
+/**
+ * THE POST-BACKUP RECHECK MUST READ THROUGH THE CONNECTION THAT HOLDS THE STORE (#14).
+ *
+ * `applyRepair` re-reads the non-English count after `createVerifiedBackup` has taken exclusive
+ * ownership, so a row written between preflight and the rewrite cannot wave through a one-way
+ * migration. It did that by calling `dependencies.inspect`, which opens its own handle — excluded
+ * by this process's own lock, failing SQLITE_BUSY after the full 5s busy timeout and surfacing as
+ * `(locked): database is locked`, which reads as contention with something else.
+ *
+ * Every English-only target failed, deterministically, with one way past: `--accept-non-latin-loss`,
+ * which works only because it stops the recheck being constructed at all. The sole workaround was
+ * to switch off the data-loss guard.
+ *
+ * The middle case here is a store whose content is ENTIRELY LATIN — the recheck runs, finds nothing,
+ * and must let the migration proceed. Normal (a multilingual target) never builds the closure, and
+ * absent (--accept-non-latin-loss) never runs it; neither can exhibit this at all.
+ */
+describe("repair completes on an English-only target without self-deadlocking", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const ENGLISH_ONLY_TARGET = "Xenova/bge-small-en-v1.5";
+  const KOREAN = "게더를 제거하고 검색만 남기기로 했다. 오늘 측정이 그 결정을 뒷받침한다.";
+
+  /**
+   * Only `instantiate` is faked, and only to declare `readsOnlyLatinScript`. That flag is the whole
+   * of what the real bge-small profile contributes to this chain; the port, the backup, the
+   * exclusive ownership, the recheck's read and the migration are all real.
+   */
+  const englishOnlyDeps = (dbPath: string, exits: number[]): RecoveryCliDependencies => ({
+    ...defaultRecoveryDependencies(),
+    dbPath: () => dbPath,
+    instantiate: async (modelId: string) => ({
+      dim: 256,
+      modelId,
+      readsOnlyLatinScript: true,
+      embed: () => new Float32Array(256).fill(0.1),
+    }),
+    now: () => new Date("2026-07-22T01:02:03.004Z"),
+    uuid: () => "12345678-1234-1234-1234-123456789abc",
+    setExitCode: (code) => exits.push(code),
+  });
+
+  const seedStore = async (label: string, texts: string[]): Promise<string> => {
+    const dir = mkdtempSync(join(tmpdir(), `monet-english-only-${label}-`));
+    dirs.push(dir);
+    const dbPath = join(dir, "monet.db");
+    const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+    for (const text of texts) await seed.store(text, { resolution: "forceNew" });
+    seed.close();
+    return dbPath;
+  };
+
+  it("migrates an all-Latin store to an English-only target instead of blocking on its own lock", async () => {
+    const dbPath = await seedStore("latin", ["an entirely english observation"]);
+    const exits: number[] = [];
+
+    const startedAt = Date.now();
+    const output = await run(
+      ["repair", "--target", ENGLISH_ONLY_TARGET, "--apply", "--yes", "--json"],
+      englishOnlyDeps(dbPath, exits),
+    );
+    const elapsedMs = Date.now() - startedAt;
+    const result = JSON.parse(output.stdout);
+
+    expect(result).toMatchObject({ ok: true, applied: true, report: { targetModelId: ENGLISH_ONLY_TARGET } });
+    expect(inspectStoredEmbedderState(dbPath).pin).toMatchObject({ modelId: ENGLISH_ONLY_TARGET });
+    expect(exits).toEqual([]);
+    /*
+     * The old failure was a 5s busy timeout, so a wall-clock bound is the assertion that
+     * distinguishes "fixed" from "the lock happened not to bite this time". Deliberately loose —
+     * this is a floor against the timeout, not a performance budget.
+     */
+    expect(elapsedMs).toBeLessThan(4_000);
+  });
+
+  it("STILL REFUSES when non-Latin rows are there — the recheck was fixed, not removed", async () => {
+    /*
+     * The guard has to be able to fire from its new reading position. A fix that merely stopped the
+     * deadlock by dropping the check would pass the test above and leave the one-way rewrite
+     * unguarded, which is worse than the deadlock it replaced.
+     */
+    const dbPath = await seedStore("korean", [KOREAN]);
+    const exits: number[] = [];
+    const output = await run(
+      ["repair", "--target", ENGLISH_ONLY_TARGET, "--apply", "--yes", "--json"],
+      englishOnlyDeps(dbPath, exits),
+    );
+    const result = JSON.parse(output.stdout);
+
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toContain("ENGLISH model");
+    expect(result.error.message).toContain("ONE-WAY");
+    expect(result.error.message).not.toContain("database is locked");
+    // Refused at PREFLIGHT, before ownership is taken, so no backup was needed.
+    expect(result.backup).toBeNull();
+    expect(inspectStoredEmbedderState(dbPath).pin).toMatchObject({ modelId: "hashing:dim=256:tok=1" });
+    expect(exits).toEqual([1]);
+  });
+
+  it("refuses from UNDER OWNERSHIP when the rows appear after preflight — the recheck's own reason to exist", async () => {
+    /*
+     * The preflight count is read before the provider loads. This drives the case it cannot see: an
+     * all-Latin store at preflight, non-Latin content written before the rewrite. The recheck is
+     * the only thing standing between that row and a one-way migration, and it now reads it through
+     * the owning connection — the read the old code could not perform at all.
+     */
+    const dbPath = await seedStore("racing", ["an entirely english observation"]);
+    const exits: number[] = [];
+    const deps = englishOnlyDeps(dbPath, exits);
+    const writeKoreanOnce = vi.fn(async (modelId: string) => {
+      // Between preflight (which saw zero) and applyRepair's backup: exactly the window the
+      // recheck exists for, produced here by writing during provider load.
+      if (writeKoreanOnce.mock.calls.length === 1) {
+        const writer = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+        await writer.store(KOREAN, { resolution: "forceNew" });
+        writer.close();
+      }
+      return { dim: 256, modelId, readsOnlyLatinScript: true, embed: () => new Float32Array(256).fill(0.1) };
+    });
+    deps.instantiate = writeKoreanOnce;
+
+    const output = await run(
+      ["repair", "--target", ENGLISH_ONLY_TARGET, "--apply", "--yes", "--json"],
+      deps,
+    );
+    const result = JSON.parse(output.stdout);
+
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toContain("appeared after preflight");
+    expect(result.error.message).not.toContain("database is locked");
+    // The backup was taken before the recheck ran, and is retained for the operator.
+    expect(result.backup).not.toBeNull();
+    expect(inspectStoredEmbedderState(dbPath).pin).toMatchObject({ modelId: "hashing:dim=256:tok=1" });
+    expect(exits).toEqual([1]);
+  });
+});
+
+/**
  * EVERY GUARD MUST BE ABLE TO FAIL.
  *
  * `resegment` is a recovery command that DELETEs and re-INSERTs segment rows in the operator's live
