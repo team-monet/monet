@@ -398,9 +398,26 @@ function classifyFailure(dbPath: string, error: unknown): StoredEmbedderStateDia
  *
  * The bound used to come from `.iterate()`, which only a raw better-sqlite3 handle offers — the
  * `Statement` a `StoragePort` returns has run/get/all and nothing else, and widening that interface
- * would reach every implementer including the test ports. Keyset pagination over the `id` primary
- * key holds the same memory ceiling using only `.all()`, which is what lets this scan run on a
- * connection that already owns the store (#14; see NonLatinReadDb).
+ * would reach every implementer including the test ports. Keyset pagination holds the same memory
+ * ceiling using only `.all()`, which is what lets this scan run on a connection that already owns
+ * the store (#14; see NonLatinReadDb).
+ *
+ * PAGED ON `rowid`, NOT ON `id`, and that is not a detail (Codex P2, PR #77). Keyset pagination
+ * needs an ordering key that is present, unique and totally ordered on every row, and `id` is none
+ * of those here: `id TEXT PRIMARY KEY` on a rowid table carries no CHECK and no NOT NULL, so SQLite
+ * accepts both the empty string and NULL — and accepts MANY NULLs, since uniqueness does not
+ * constrain them. Both are reachable through `graftRows`, which binds the payload's `row.id`
+ * straight into its INSERT with no nonblank validation. An id-keyed cursor gets each of them wrong
+ * in a different direction: `WHERE id > ''` excludes an empty-string row from EVERY page, and a
+ * NULL landing at the end of a full page makes `id > NULL` match nothing, ending the scan early.
+ * Either one reports zero non-Latin rows for a store that holds them, which is a fail-open on a
+ * one-way rewrite — the exact verdict this scan exists to prevent.
+ *
+ * `rowid` has the guarantees `id` lacks. The first page carries no lower bound at all rather than
+ * starting from a sentinel, because a rowid may legally be negative; "no page taken yet" is a state
+ * of the cursor, not a value in its range. If a future migration makes either table WITHOUT ROWID
+ * this query stops resolving and the scan reports `unknown` — not a zero, which is the one answer
+ * that must never be guessed here.
  *
  * The predicates are duplicated here rather than imported because diagnostics reads a raw
  * better-sqlite3 handle on a possibly-unopenable store, before any MonetCore exists.
@@ -415,14 +432,21 @@ function inspectNonLatin(db: NonLatinReadDb, schema: SchemaMap): StoredNonLatinC
     return { status: "unknown", reason: "concepts table lacks id/kind/body" };
   }
   try {
-    // Each page carries `WHERE id > ?` so the cursor is the last id of the previous page. Fixed
-    // literals only, exactly as in readSchema: nothing from the store is ever interpolated.
+    // Two literals per population: the first page takes no lower bound, every page after it
+    // resumes from the previous page's last rowid. Fixed literals only, exactly as in readSchema:
+    // nothing from the store is ever interpolated.
     const observationQueries = [
-      `SELECT id, content AS text FROM observations WHERE id > ? ORDER BY id LIMIT ?`,
+      {
+        first: `SELECT rowid, id, content AS text FROM observations ORDER BY rowid LIMIT ?`,
+        next: `SELECT rowid, id, content AS text FROM observations WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+      },
     ];
     // Concept bodies. applySynthesis writes these WITHOUT the script gate, so this is the one
     // population that can be non-English in a store whose every observation is English.
-    const conceptQuery = `SELECT id, body AS text FROM concepts WHERE id > ? AND body IS NOT NULL ORDER BY id LIMIT ?`;
+    const conceptQuery = {
+      first: `SELECT rowid, id, body AS text FROM concepts WHERE body IS NOT NULL ORDER BY rowid LIMIT ?`,
+      next: `SELECT rowid, id, body AS text FROM concepts WHERE rowid > ? AND body IS NOT NULL ORDER BY rowid LIMIT ?`,
+    };
 
     /*
      * SAMPLES ARE PER-POPULATION, not first-come. A shared five-slot buffer filled in query order
@@ -431,13 +455,17 @@ function inspectNonLatin(db: NonLatinReadDb, schema: SchemaMap): StoredNonLatinC
      * fix, reproduced one level up. Bodies are the hard population to find by browsing, so each
      * gets its own quota and they are concatenated.
      */
-    const scan = (sql: string, into: string[], quota: number): number => {
-      const statement = db.prepare(sql);
+    const scan = (sql: { first: string; next: string }, into: string[], quota: number): number => {
+      const firstPage = db.prepare(sql.first);
+      const nextPage = db.prepare(sql.next);
       let n = 0;
-      // The empty string sorts below every generated id, so the first page starts at the beginning.
-      let cursor = "";
+      // `undefined` is "no page taken yet", which is a state rather than a value — see the note
+      // above on why no sentinel rowid can stand in for it.
+      let cursor: number | undefined;
       for (;;) {
-        const rows = statement.all(cursor, NON_LATIN_SCAN_PAGE_ROWS) as Array<{ id: string; text: string | null }>;
+        const rows = (cursor === undefined
+          ? firstPage.all(NON_LATIN_SCAN_PAGE_ROWS)
+          : nextPage.all(cursor, NON_LATIN_SCAN_PAGE_ROWS)) as Array<{ rowid: number; id: string; text: string | null }>;
         for (const row of rows) {
           if (typeof row.text !== "string") continue;
           if (nonLatinLetterShare(row.text) > NON_LATIN_LETTER_TOLERANCE) {
@@ -448,7 +476,7 @@ function inspectNonLatin(db: NonLatinReadDb, schema: SchemaMap): StoredNonLatinC
         // A short page means the LIMIT was never reached, so the table is exhausted under this
         // predicate — SQLite applies LIMIT after filtering, so this holds for the body filter too.
         if (rows.length < NON_LATIN_SCAN_PAGE_ROWS) return n;
-        cursor = rows[rows.length - 1]!.id;
+        cursor = rows[rows.length - 1]!.rowid;
       }
     };
     const observationSamples: string[] = [];

@@ -199,6 +199,62 @@ describe("doctor's non-Latin count", () => {
     expect(n.observationCount).toBe(seededKorean);
   });
 
+  it("counts a row whose id is the EMPTY STRING — an id-keyed cursor excluded it from every page", async () => {
+    /*
+     * `id TEXT PRIMARY KEY` carries no CHECK and no NOT NULL, and `graftRows` binds the sync
+     * payload's `row.id` straight into its INSERT with no nonblank validation — so an empty-string
+     * id is reachable through the public sync path, not just by hand-editing the file. Paging with
+     * `WHERE id > ''` dropped such a row from EVERY page, so a store holding non-Latin content
+     * reported zero and the one-way rewrite this guard exists to refuse was waved through
+     * (Codex P2, PR #77).
+     */
+    const dir = freshDir();
+    const path = join(dir, "monet.db");
+    const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
+    await core.ensureEmbedderPin();
+    await core.store(ENGLISH);
+    const db = (core as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
+    db.prepare(`INSERT INTO observations (id, content, embedding, author_agent_id) VALUES ('', ?, '[]', 'test')`)
+      .run(KOREAN);
+    core.close();
+
+    const n = inspectStoredEmbedderState(path).nonLatin;
+    expect(n.status).toBe("known");
+    if (n.status !== "known") return;
+    expect(n.observationCount).toBe(1);
+    expect(n.sampleIds).toContain("");
+  });
+
+  it("survives a FULL PAGE of NULL ids — an id-keyed cursor would have ended the scan there", async () => {
+    /*
+     * SQLite permits NULL in a PRIMARY KEY column on a rowid table, and permits MANY of them, since
+     * uniqueness does not constrain NULLs. Ordered by `id` they sort first, so a full page of them
+     * leaves the cursor NULL and `id > NULL` matches nothing — the scan returns having counted only
+     * that page. The fixture is deliberately 500 NULL-id rows (one whole page) plus a tail: a
+     * smaller one cannot exhibit this at all, because a short page ends the scan legitimately.
+     */
+    const dir = freshDir();
+    const path = join(dir, "monet.db");
+    const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
+    await core.ensureEmbedderPin();
+    const db = (core as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
+    const nullId = db.prepare(
+      `INSERT INTO observations (id, content, embedding, author_agent_id) VALUES (NULL, ?, '[]', 'test')`,
+    );
+    for (let i = 0; i < 500; i++) nullId.run(`${KOREAN} ${i}`);
+    const realId = db.prepare(
+      `INSERT INTO observations (id, content, embedding, author_agent_id) VALUES (?, ?, '[]', 'test')`,
+    );
+    for (let i = 0; i < 10; i++) realId.run(`tail-${i}`, `${KOREAN} tail ${i}`);
+    core.close();
+
+    const n = inspectStoredEmbedderState(path).nonLatin;
+    expect(n.status).toBe("known");
+    if (n.status !== "known") return;
+    // 510, not 500: the ten rows PAST the all-NULL first page have to be reached.
+    expect(n.observationCount).toBe(510);
+  });
+
   it("reads through a connection that already OWNS the store — a second handle is locked out (#14)", async () => {
     /*
      * `repair` re-reads this count after createVerifiedBackup has taken exclusive ownership, so the
