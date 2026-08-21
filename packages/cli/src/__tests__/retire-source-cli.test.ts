@@ -375,4 +375,94 @@ describe("monet retire-source", () => {
       }
     });
   });
+
+  it("purges an orphaned source observation even while a hybrid keeps the store un-disposed", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      // A hybrid, so `hybrids` is non-empty on every run...
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('user-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
+                 'connector-concept', 'local', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      // ...and an ORPHAN whose concept_id is NULL. `NOT IN` yields NULL for it, so it was silently
+      // skipped forever — the hybrid guaranteeing the exclusion path ran on every run.
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('orphan-chunk', 'orphaned file chunk', '[0.1,0.2]', 'source', 'default',
+                 NULL, 'connector', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.close();
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'orphan-chunk'`).get())
+          .toEqual({ n: 0 });
+        // The hybrid is still untouched, both of its observations intact.
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = 'connector-concept'`).get())
+          .toEqual({ n: 2 });
+      } finally {
+        check.close();
+      }
+    });
+  });
+
+  it("keeps the marker columns while a marker-only hybrid still needs them", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      // Connector-owned through `source_identity` alone — an ordinary kind. Dropping the column
+      // would erase the only thing that identifies it as one.
+      port.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                               support_count, dirty, embedding, updated_at, created_at, source_identity)
+         VALUES ('marker-only', 'mo', 'Marker only', 'file text', 'fact', 'active', 0.5, 1,
+                 'default', 1, 0, '[0.1,0.2]', ?, ?, 'source://vault')`,
+      ).run(now, now);
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('mo-chunk', 'file chunk', '[0.1,0.2]', 'source', 'default',
+                 'marker-only', 'connector', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('mo-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
+                 'marker-only', 'local', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.close();
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        const columns = new Set(
+          (check.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>).map((c) => c.name),
+        );
+        expect(columns.has("source_identity")).toBe(true);
+        // ...so a second run still recognises it and still leaves its chunk alone.
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'mo-chunk'`).get())
+          .toEqual({ n: 1 });
+      } finally {
+        check.close();
+      }
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+      const again = new BetterSqlitePort(dbPath);
+      try {
+        expect(again.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'mo-chunk'`).get())
+          .toEqual({ n: 1 });
+      } finally {
+        again.close();
+      }
+    });
+  });
 });

@@ -1196,9 +1196,13 @@ export function registerRecoveryCommands(
         console.log(`Retired ${purged.concepts} concept(s) and ${purged.observations} observation(s).`);
         if (purged.hybrids.length > 0) {
           console.log(`Left untouched: ${purged.hybrids.length} concept(s) hold both file content and evidence you`);
-          console.log("wrote yourself. Nothing about them was changed — detach your own observations and");
-          console.log("re-run to dispose of them, or leave them as they are. This command will keep");
-          console.log("reporting them, because something really is still there.");
+          console.log("wrote yourself. Nothing about them was changed.");
+          console.log("");
+          console.log("To dispose of one, move your own observations to an EXISTING native concept —");
+          console.log("`memory_detach` with a destConceptId — then re-run. Detaching without a");
+          console.log("destination mints a new concept carrying the same kind, which lands you back");
+          console.log("here with one more of them. Or leave them: this command keeps reporting them,");
+          console.log("because something really is still there.");
         }
         if (data.nonemptyTables.length > 0) {
           console.log(`Dropped:  ${data.nonemptyTables.join(", ")} (and the rest of the retired schema).`);
@@ -1226,10 +1230,15 @@ export function registerRecoveryCommands(
         if (purged.staleNativeOwners.length > 0) {
           let embedder: EmbeddingProvider;
           try {
-            if (inspection.pin.status !== "known" || inspection.pin.modelId === null) {
-              throw new Error(`the store's embedder pin is ${inspection.pin.status}`);
+            // RE-READ, not the preflight snapshot. `inspect()` ran before this port took exclusive
+            // ownership, and a migration on a shared store can move the pin in between — loading
+            // the old model would then be rejected by `createCore` against the pin that actually
+            // committed, after the purge.
+            const livePin = dependencies.inspect(dbPath).pin;
+            if (livePin.status !== "known" || livePin.modelId === null) {
+              throw new Error(`the store's embedder pin is ${livePin.status}`);
             }
-            embedder = await dependencies.instantiate(inspection.pin.modelId);
+            embedder = await dependencies.instantiate(livePin.modelId);
           } catch (error) {
             throw new Error(
               `${purged.staleNativeOwners.length} concept(s) still need reprojection, and the ` +

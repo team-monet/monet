@@ -171,7 +171,8 @@ export function staleNativeOwnersOf(db: StoragePort, population: ConnectorPopula
     `SELECT DISTINCT o.concept_id AS id
        FROM observations o
        JOIN concepts c ON c.id = o.concept_id
-      WHERE o.id ${inSet} AND c.id NOT ${inSet} AND c.kind != 'workstream'`,
+      WHERE o.id ${inSet} AND c.id NOT ${inSet}
+        AND c.kind != 'workstream' AND c.status != 'retired'`,
   ).all(JSON.stringify(population.observationIds), JSON.stringify(population.conceptIds)) as Array<{ id: string }>)
     .map((row) => row.id);
 }
@@ -212,6 +213,16 @@ export class RetiredResidueNotEmptyError extends Error {
 }
 
 export function dropRetiredSourceResidue(db: StoragePort, opts: { requireEmpty?: boolean } = {}): void {
+  /*
+   * THE MARKER COLUMNS STAY WHILE A HYBRID DOES.
+   *
+   * A hybrid can be connector-owned through `source_identity` alone, with an ordinary `kind` —
+   * `connectorPopulation` recognises that shape deliberately. Dropping the column would erase the
+   * only thing identifying it, and the next run would see an ordinary native concept whose
+   * `kind='source'` observations look like grafted ones and delete them: exactly the content this
+   * command promised to leave alone. The tables can still go; the classification cannot.
+   */
+  const hybridsRemain = hybridConnectorConcepts(db, connectorPopulation(db).conceptIds).length > 0;
   // ONE WRITE TRANSACTION, AND EACH OBJECT RE-CHECKED INSIDE IT. Concurrent first opens are a
   // supported topology (several `monet start` servers against one store), and a presence check
   // taken outside the write lock is stale by the time the drop runs: both processes see the table,
@@ -244,9 +255,11 @@ export function dropRetiredSourceResidue(db: StoragePort, opts: { requireEmpty?:
     for (const table of tables) {
       db.exec(`DROP TABLE IF EXISTS ${table}`);
     }
-    const columns = conceptColumns(db);
-    for (const column of RETIRED_SOURCE_COLUMNS) {
-      if (columns.has(column)) db.exec(`ALTER TABLE concepts DROP COLUMN ${column}`);
+    if (!hybridsRemain) {
+      const columns = conceptColumns(db);
+      for (const column of RETIRED_SOURCE_COLUMNS) {
+        if (columns.has(column)) db.exec(`ALTER TABLE concepts DROP COLUMN ${column}`);
+      }
     }
   })();
 }
@@ -288,9 +301,13 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
     const doomedIds = conceptIds.filter((id) => !hybrids.has(id));
     // A hybrid's connector evidence stays with it: taking its chunks while leaving its body and
     // title would be the partial state this policy exists to avoid.
+    // `concept_id IS NULL` SPELLED OUT, because `NOT IN` yields NULL for a NULL left-hand side and
+    // quietly drops the row: an orphaned source observation would then be skipped on every run for
+    // as long as any hybrid existed — which is forever, since hybrids are never disposed of here.
     const doomedObservationIds = hybrids.size === 0 ? observationIds : (db.prepare(
       `SELECT id FROM observations
-        WHERE kind = 'source' AND concept_id NOT IN (SELECT value FROM json_each(?))`,
+        WHERE kind = 'source'
+          AND (concept_id IS NULL OR concept_id NOT IN (SELECT value FROM json_each(?)))`,
     ).all(JSON.stringify([...hybrids])) as Array<{ id: string }>).map((row) => row.id);
     const c = JSON.stringify(doomedIds);
     const o = JSON.stringify(doomedObservationIds);
