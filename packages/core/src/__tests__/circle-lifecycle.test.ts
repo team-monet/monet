@@ -639,6 +639,35 @@ describe("archiveCircle / unarchiveCircle", () => {
   });
 
   /**
+   * THE RENAME VARIANT (Codex round 2 on #55). Storing the verdict without the circle it judges was
+   * half a fact: `renameCircle` rewrites `concepts.circle` AND clears the archived flag in one act,
+   * so a replay that restored the frozen `true` while rebuilding the circle from the live row said
+   * "this write landed in 'new', and its destination was archived" — about a circle the write never
+   * touched, which is not archived. Both halves are stored now, so both are recovered together.
+   */
+  it("replays the write-time circle alongside the write-time verdict, after a rename that un-archived the destination", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    core.archiveCircle("old");
+    const first = await core.store("Runbook for the billing service.", { circle: "old", operationId: "op-R" });
+    expect(first.landedInArchivedCircle).toBe(true);
+    expect(first.concept.circle).toBe("old");
+
+    // A rename moves the concept AND clears the archived flag — the two facts that used to drift.
+    core.renameCircle("old", "new");
+    expect(core.circleOf(first.conceptId)).toBe("new");
+    expect(core.listCircles(undefined, { includeArchived: true }).find((c) => c.circle === "new")?.archived).toBe(false);
+
+    const retry = await core.store("a completely different body", { circle: "old", operationId: "op-R" });
+    expect(retry.landedInArchivedCircle).toBe(true);
+    expect(retry.concept.circle).toBe("old");
+    // The MCP envelope reads exactly this circle for both its `circle` field and the guidance
+    // sentence, so the acknowledgement follows by construction. (memory_store exposes no
+    // operationId, so the wire cannot reach a replay at all — this is where it is pinnable.)
+
+    core.close();
+  });
+
+  /**
    * A RECEIPT FROM BEFORE THE COLUMN RECORDED NO VERDICT, and must say so by staying absent. `false`
    * would be the reassuring answer — "your write went somewhere recallable" — invented for a write
    * nobody asked the question about, which is the one direction this disclosure must never fail in.
@@ -650,13 +679,17 @@ describe("archiveCircle / unarchiveCircle", () => {
     expect(first.landedInArchivedCircle).toBe(true);
 
     // Exactly the row shape an older build would have left behind: every other receipt column
-    // present, this one never written.
+    // present, neither of these two ever written.
     const db = (core as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
-    db.prepare(`UPDATE ingest_operations SET landed_in_archived_circle = NULL WHERE operation_id = ?`).run("op-old");
+    db.prepare(`UPDATE ingest_operations SET landed_in_archived_circle = NULL, landed_circle = NULL WHERE operation_id = ?`)
+      .run("op-old");
 
     const replay = await core.store("anything at all", { circle: "shelf", operationId: "op-old" });
     expect(replay.conceptId).toBe(first.conceptId);
     expect(replay).not.toHaveProperty("landedInArchivedCircle");
+    // And the circle keeps the live rehydration such a receipt has always had — no frozen value is
+    // invented for a write that recorded none.
+    expect(replay.concept.circle).toBe("shelf");
 
     core.close();
   });

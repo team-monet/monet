@@ -914,6 +914,11 @@ export interface IngestResult {
    * archived or unarchived in between, breaking the "a repeated write returns its original result"
    * contract. ABSENT, never `false`, on a receipt written before that column existed: no verdict was
    * recorded there, and "not known" must not be answered with the reassuring one.
+   *
+   * THE DESTINATION TRAVELS WITH IT (`ingest_operations.landed_circle`; Codex round 2). `concept
+   * .circle` is what this verdict is ABOUT, so a replay restores that too — otherwise a rename,
+   * which rewrites the concept's circle and clears the archived flag in one act, pairs this frozen
+   * `true` with the name of a circle that is not archived and was never written to.
    */
   landedInArchivedCircle?: boolean;
 }
@@ -3460,6 +3465,24 @@ export class MonetCore {
         if (!message.includes("duplicate column name")) throw error;
       }
     }
+    // THE CIRCLE THAT VERDICT IS ABOUT (Codex round 2 on #55) — the column above without this one
+    // was half a fact. A replay restored the stored verdict but rebuilt the circle from the live
+    // concept row, so `renameCircle` (which also clears the archived flag) made the response say
+    // "the write landed in 'new', and its destination was archived" when the write had landed in
+    // 'old' and 'new' was not archived at all. A verdict and the subject it judges have to be
+    // recovered from the same instant, which means both are stored or neither is.
+    //
+    // NULLABLE for the same reason, and honored the same way: a receipt from before these columns
+    // keeps the live rehydration it has always had, because inventing a frozen destination for a
+    // write that recorded none would be the same fabrication as inventing its verdict.
+    if (!operationCols.some((c) => c.name === "landed_circle")) {
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN landed_circle TEXT`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
+    }
     // aliases: slugs/ids a concept ANSWERS TO after absorbing another on merge — so an asserted
     // reference to a merged-away slug (`supports: #old-slug`) still resolves to the survivor.
     const conceptCols = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
@@ -4741,8 +4764,8 @@ export class MonetCore {
         this.db
           .prepare(
             `INSERT INTO ingest_operations
-               (operation_id, concept_id, observation_id, writer_domain, source_concept_id, action, score, near_match_id, near_match_score, contradiction_id, rule_previous_severity, rule_previous_circle, rule_circle, rule_severity, landed_in_archived_circle)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (operation_id, concept_id, observation_id, writer_domain, source_concept_id, action, score, near_match_id, near_match_score, contradiction_id, rule_previous_severity, rule_previous_circle, rule_circle, rule_severity, landed_in_archived_circle, landed_circle)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             opts.operationId, row.id, obsId, receiptExpectation.domain,
@@ -4764,6 +4787,10 @@ export class MonetCore {
             // Written as 0/1 — a stored `0` is the verdict "the destination was live", which a NULL
             // (no verdict recorded) must never be confused with.
             landedInArchivedCircle ? 1 : 0,
+            // AND THE CIRCLE THAT VERDICT IS ABOUT, written in the same statement so the two can
+            // never be recovered from different instants. This is the RESOLVED destination — the
+            // same value the verdict was computed against — not the caller's own argument.
+            circle,
           );
       }
 
@@ -17331,12 +17358,29 @@ export class MonetCore {
     // type predates them, and a receipt from an older schema simply has nothing here.
     const operationArchivedVerdict =
       (operation as { landed_in_archived_circle?: number | null }).landed_in_archived_circle ?? null;
+    // THE DESTINATION THIS WRITE REACHED, recovered from the receipt rather than from the concept
+    // row, which keeps moving (Codex round 2 on #55). `renameCircle` rewrites `concepts.circle` AND
+    // clears the archived flag, so replaying a write that landed in an archived 'old' rebuilt the
+    // circle as 'new' and paired it with the stored TRUE verdict — a response asserting that 'new'
+    // was archived when the write never touched it and 'new' is not archived. The receipt's own
+    // contract answers it: a retry returns the original result, and the original said 'old'.
+    //
+    // ONLY WHEN THE RECEIPT RECORDED ONE. A receipt from before these columns keeps the live
+    // rehydration it has always had — fabricating a frozen destination for a write that stored none
+    // is the same invention as fabricating its verdict, one field over.
+    const operationLandedCircle =
+      (operation as { landed_circle?: string | null }).landed_circle ?? null;
+    const concept = toConcept(row);
     return {
       action: operation.action,
       conceptId: operation.concept_id,
       observationId: operation.observation_id,
       score: operation.score,
-      concept: toConcept(row),
+      // The concept as it stands, with ONE field restored to what this write recorded: the circle it
+      // landed in. Everything else about a concept is deliberately live here (the receipt is a
+      // pointer set), but the circle is the subject of a frozen verdict two fields down, and a
+      // verdict is only meaningful about the thing it was passed on.
+      concept: operationLandedCircle !== null ? { ...concept, circle: operationLandedCircle } : concept,
       ...(contradiction ? { contradiction: toContradiction(contradiction) } : {}),
       ...(operation.near_match_id !== null
         ? { nearMatchId: operation.near_match_id, nearMatchScore: operation.near_match_score ?? 0 }
