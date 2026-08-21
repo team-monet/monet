@@ -17,8 +17,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore, nonLatinLetterShare, NON_LATIN_LETTER_TOLERANCE, ContentScriptUnsupportedError } from "../engine";
-import { inspectStoredEmbedderState } from "../diagnostics";
+import { inspectNonLatinContent, inspectStoredEmbedderState } from "../diagnostics";
 import { HashingEmbeddingProvider, type EmbeddingProvider } from "../embedding";
+import { BetterSqlitePort } from "../storage";
 
 const dirs: string[] = [];
 const freshDir = (): string => {
@@ -163,6 +164,138 @@ describe("doctor's non-Latin count", () => {
     expect(n.observationCount).toBe(0); // every observation is English
     expect(n.conceptCount).toBe(1);      // the synthesized body is not
     expect(n.sampleIds).toContain(stored.conceptId);
+  });
+
+  it("scans PAST ONE PAGE — the keyset cursor has to advance, or a big store reports a partial count", async () => {
+    /*
+     * The scan reads in id-ordered pages of 500 rather than streaming, so that it can run through a
+     * StoragePort (#14). A cursor that fails to advance loops forever and one that advances wrongly
+     * silently truncates the count — and a fixture under one page can exhibit NEITHER. This seeds
+     * 600 rows by raw INSERT (core.store() would be far slower and adds resolution work that has
+     * nothing to do with paging) with ids chosen so lexical id order interleaves the two scripts,
+     * which is what makes a truncating cursor produce a WRONG count rather than a short one.
+     */
+    const dir = freshDir();
+    const path = join(dir, "monet.db");
+    const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
+    await core.ensureEmbedderPin();
+    await core.store(ENGLISH);
+    const db = (core as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
+    const insert = db.prepare(
+      `INSERT INTO observations (id, content, embedding, author_agent_id) VALUES (?, ?, '[]', 'test')`,
+    );
+    let seededKorean = 0;
+    for (let i = 0; i < 600; i++) {
+      const korean = i % 3 === 0;
+      if (korean) seededKorean++;
+      insert.run(`page-${String(i).padStart(4, "0")}`, korean ? `${KOREAN} ${i}` : `${ENGLISH} ${i}`);
+    }
+    core.close();
+
+    const n = inspectStoredEmbedderState(path).nonLatin;
+    expect(n.status).toBe("known");
+    if (n.status !== "known") return;
+    expect(seededKorean).toBeGreaterThan(500 / 3); // the fixture really does span pages
+    expect(n.observationCount).toBe(seededKorean);
+  });
+
+  it("counts a row whose id is the EMPTY STRING — an id-keyed cursor excluded it from every page", async () => {
+    /*
+     * `id TEXT PRIMARY KEY` carries no CHECK and no NOT NULL, and `graftRows` binds the sync
+     * payload's `row.id` straight into its INSERT with no nonblank validation — so an empty-string
+     * id is reachable through the public sync path, not just by hand-editing the file. Paging with
+     * `WHERE id > ''` dropped such a row from EVERY page, so a store holding non-Latin content
+     * reported zero and the one-way rewrite this guard exists to refuse was waved through
+     * (Codex P2, PR #77).
+     */
+    const dir = freshDir();
+    const path = join(dir, "monet.db");
+    const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
+    await core.ensureEmbedderPin();
+    await core.store(ENGLISH);
+    const db = (core as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
+    db.prepare(`INSERT INTO observations (id, content, embedding, author_agent_id) VALUES ('', ?, '[]', 'test')`)
+      .run(KOREAN);
+    core.close();
+
+    const n = inspectStoredEmbedderState(path).nonLatin;
+    expect(n.status).toBe("known");
+    if (n.status !== "known") return;
+    expect(n.observationCount).toBe(1);
+    expect(n.sampleIds).toContain("");
+  });
+
+  it("survives a FULL PAGE of NULL ids — an id-keyed cursor would have ended the scan there", async () => {
+    /*
+     * SQLite permits NULL in a PRIMARY KEY column on a rowid table, and permits MANY of them, since
+     * uniqueness does not constrain NULLs. Ordered by `id` they sort first, so a full page of them
+     * leaves the cursor NULL and `id > NULL` matches nothing — the scan returns having counted only
+     * that page. The fixture is deliberately 500 NULL-id rows (one whole page) plus a tail: a
+     * smaller one cannot exhibit this at all, because a short page ends the scan legitimately.
+     */
+    const dir = freshDir();
+    const path = join(dir, "monet.db");
+    const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
+    await core.ensureEmbedderPin();
+    const db = (core as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
+    const nullId = db.prepare(
+      `INSERT INTO observations (id, content, embedding, author_agent_id) VALUES (NULL, ?, '[]', 'test')`,
+    );
+    for (let i = 0; i < 500; i++) nullId.run(`${KOREAN} ${i}`);
+    const realId = db.prepare(
+      `INSERT INTO observations (id, content, embedding, author_agent_id) VALUES (?, ?, '[]', 'test')`,
+    );
+    for (let i = 0; i < 10; i++) realId.run(`tail-${i}`, `${KOREAN} tail ${i}`);
+    core.close();
+
+    const n = inspectStoredEmbedderState(path).nonLatin;
+    expect(n.status).toBe("known");
+    if (n.status !== "known") return;
+    // 510, not 500: the ten rows PAST the all-NULL first page have to be reached.
+    expect(n.observationCount).toBe(510);
+  });
+
+  it("reads through a connection that already OWNS the store — a second handle is locked out (#14)", async () => {
+    /*
+     * `repair` re-reads this count after createVerifiedBackup has taken exclusive ownership, so the
+     * read has to be expressible against the owning connection. It used to call
+     * inspectStoredEmbedderState, which opens its own handle; that handle waits out its busy
+     * timeout against its own process's lock and fails SQLITE_BUSY, which deadlocked every
+     * English-only repair target.
+     *
+     * Asserted under REAL exclusive ownership, not merely through a port: ownership is the
+     * condition that broke the old reader, so a test taking it any other way would pass on code
+     * that still cannot run where the check has to run.
+     */
+    const path = await seed(new HashingEmbeddingProvider(), [KOREAN, ENGLISH, MOSTLY_ENGLISH]);
+    const unowned = inspectStoredEmbedderState(path).nonLatin;
+
+    const port = new BetterSqlitePort(path);
+    try {
+      port.acquireExclusiveOwnership();
+      const owned = inspectNonLatinContent(port);
+      expect(owned).toEqual(unowned);
+      expect(owned.status).toBe("known");
+      if (owned.status !== "known") return;
+      expect(owned.observationCount).toBe(1);
+      expect(owned.conceptCount).toBe(1);
+    } finally {
+      port.close();
+    }
+  });
+
+  it("reports an unreadable schema as NOT KNOWN rather than as a zero", () => {
+    // A caller's own connection can be pointed at something that is not a Monet store. "0 non-Latin
+    // rows" and "the scan could not run" send an operator to opposite decisions on a one-way
+    // rewrite, so the shape that cannot be mistaken for a verdict is the only safe one here.
+    const dir = freshDir();
+    const port = new BetterSqlitePort(join(dir, "empty.db"));
+    try {
+      const n = inspectNonLatinContent(port);
+      expect(n.status).toBe("unknown");
+    } finally {
+      port.close();
+    }
   });
 
   it("always names a CONCEPT BODY sample, even when observations already filled the sample budget", async () => {

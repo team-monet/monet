@@ -9,8 +9,11 @@ import {
   OnnxEmbeddingProvider,
   dropRetiredSourceResidue,
   isRetirementDisposed,
+  inspectNonLatinContent,
   inspectStoredEmbedderState,
   instantiateEmbedderForPin,
+  knownModelProfileIds,
+  parseHashingEmbedderPin,
   purgeConnectorPopulation,
   retirementData,
   validateEmbeddingProviderOutput,
@@ -18,6 +21,7 @@ import {
   type EmbeddingMigrationReport,
   type EmbeddingProvider,
   type StoredEmbedderStateInspection,
+  type StoredNonLatinContent,
   type VerifiedBackupResult,
 } from "@team-monet/core";
 import { getDbPath } from "./db/index.js";
@@ -281,6 +285,54 @@ function resolveTargetAlias(target: string): string {
   return normalized;
 }
 
+/*
+ * A STRING THAT SELECTS NO PROFILE IS NOT AN EXACT MODEL ID — IT IS AN UNKNOWN (#15).
+ *
+ * `resolveTargetAlias` returns anything it does not special-case verbatim, and nothing between
+ * there and `migrateEmbeddings` asked whether the result names a space this build describes.
+ * `MODEL_PROFILES` is never consulted on that path at all. Two failures came out of the same gap:
+ * an unregistered id that will not load reports a DOWNLOAD error naming the wrong cause, and an
+ * unregistered id that DOES load rewrites every vector and pins the store, silently, with no error
+ * and exit code 0.
+ *
+ * The second is what this gate is for. Nothing accidental catches it: `dim` cannot, because
+ * instantiateEmbedderForPin measures the warmup vector and adopts its real width by design, and
+ * the identity check cannot, because overriding `dim` alone does not anonymize the provider. What
+ * the store is left with is a permanent pin no profile describes, every vector under fallback
+ * `mean` pooling, resolution driven by thresholds the source itself labels a guess for a different
+ * model — and the one-way non-Latin refusal structurally disabled, because it reads
+ * `readsOnlyLatinScript` and that field is populated only from a profile. For an unregistered
+ * English-only checkpoint the guard cannot fire for exactly the input it exists to catch.
+ *
+ * SO THE GATE IS ON MINTING, NOT ON LOADING. `--target` is the one command that writes a new pin,
+ * and the pin is permanent until another explicit migration. instantiateEmbedderForPin stays as
+ * permissive as it is — a store already pinned to a local path or a legacy hand-pin must keep
+ * serving, and narrowing the loader would strand it. Three things name a describable space:
+ *
+ *   - a MODEL_PROFILES key, which carries pooling, bands, script restriction, budget and floor;
+ *   - a canonical hashing pin, which encodes its whole space in the id and is validated by
+ *     HashingEmbeddingProvider's constructor, so no registry entry could add anything;
+ *   - this store's OWN current pin, which mints nothing. `nextCommandsForInspection` emits exactly
+ *     that command as recovery advice for a store whose provider needs action, and a gate that
+ *     refused it would make the shipped recovery path unrunnable for any store pinned outside the
+ *     registry — a new hole in place of the one being closed.
+ */
+function ensureDescribedTarget(targetModelId: string, inspection: StoredEmbedderStateInspection): void {
+  if (parseHashingEmbedderPin(targetModelId) !== null) return;
+  const described = knownModelProfileIds();
+  if (described.includes(targetModelId)) return;
+  if (inspection.pin.status === "known" && inspection.pin.modelId === targetModelId) return;
+  throw new Error(
+    `--target '${targetModelId}' names no embedding space this build describes, so it is an unknown ` +
+      `rather than an exact model ID. This is NOT a download or network condition. A profile carries ` +
+      `the pooling, the calibrated thresholds, the script restriction and the segment budget that ` +
+      `make a space described rather than merely loadable, and --target mints a PERMANENT pin — none ` +
+      `of it is recoverable once every vector has been rewritten. This build describes: ` +
+      `${described.join(", ")}. A canonical hashing pin (hashing:dim=<width>:tok=<version>) and this ` +
+      `store's own current pin are also accepted.`,
+  );
+}
+
 function integrityLabel(inspection: StoredEmbedderStateInspection): string {
   if (inspection.integrity.status === "ok") return "ok";
   if (inspection.integrity.status === "failed") return `failed (${inspection.integrity.check.join("; ")})`;
@@ -501,7 +553,7 @@ async function applyRepair(
   provider: EmbeddingProvider | undefined,
   providerResult: ProviderResult,
   dependencies: RecoveryCliDependencies,
-  recheckNonEnglish?: (fresh: StoredEmbedderStateInspection) => void,
+  recheckNonEnglish?: (fresh: StoredNonLatinContent) => void,
 ): Promise<{ backup: VerifiedBackupResult; report: EmbeddingMigrationReport | { action: "abandon"; status: "completed" } }> {
   const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
   mkdirSync(path.dirname(destination), { recursive: true });
@@ -514,9 +566,24 @@ async function applyRepair(
     port = dependencies.createPort(dbPath);
     backup = await port.createVerifiedBackup(destination);
     console.error(`backup: ${backup.path}`);
-    // The backup is the point exclusive ownership exists. Anything that must be true of the store
-    // AT REWRITE TIME, rather than at preflight, is checked here.
-    if (recheckNonEnglish) recheckNonEnglish(dependencies.inspect(dbPath));
+    /*
+     * The backup is the point exclusive ownership exists. Anything that must be true of the store
+     * AT REWRITE TIME, rather than at preflight, is checked here.
+     *
+     * READ THROUGH `port`, NEVER `dependencies.inspect` (#14). inspectStoredEmbedderState opens its
+     * own better-sqlite3 handle, and by this line createVerifiedBackup has put THIS connection into
+     * locking_mode = EXCLUSIVE and made the lock effective. The second handle therefore waits out
+     * its 5s busy timeout against a lock held by its own process and fails SQLITE_BUSY — surfaced
+     * as `(locked): database is locked`, which reads as contention with something else when there
+     * is nothing to contend with. Every English-only target deadlocked here, deterministically, and
+     * the only way past was --accept-non-latin-loss: switching off the very guard this recheck
+     * enforces, on the one operation that cannot be undone.
+     *
+     * Reading through the owning connection is not a workaround for the lock, it is the point: a
+     * check that must observe the store under exclusive ownership can only be trusted if it reads
+     * where that ownership holds. `retire-source` reached the same conclusion below.
+     */
+    if (recheckNonEnglish) recheckNonEnglish(inspectNonLatinContent(port));
     core = dependencies.createCore(port, provider);
     if (mode === "abandon") {
       core.abandonEmbedderMigration();
@@ -625,7 +692,17 @@ async function runRepair(options: RepairOptions, dependencies: RecoveryCliDepend
     ensureInspectableForRepair(inspection);
 
     let targetModelId: string | undefined;
-    if (mode === "target") targetModelId = resolveTargetAlias(options.target!);
+    if (mode === "target") {
+      targetModelId = resolveTargetAlias(options.target!);
+      // BEFORE the provider is even loaded, let alone the rewrite: the refusal must name the
+      // unknown-profile condition, and a load attempt first would report a download failure
+      // instead — issue #15's shape (a), which is how the real cost of this was paid.
+      //
+      // NOT applied to `resume`. Its target came from a sentinel an earlier `--target` already
+      // stamped, possibly by a build without this gate; refusing there would strand a
+      // half-rewritten store, which is worse than the unknown pin already committed to.
+      ensureDescribedTarget(targetModelId, inspection);
+    }
     if (mode === "resume") {
       if (inspection.migration.status !== "active") {
         throw new RepairOperationError("No embedder migration sentinel is active; there is nothing to resume.", {
@@ -890,10 +967,13 @@ async function runRepair(options: RepairOptions, dependencies: RecoveryCliDepend
      * wave through the one rewrite that cannot be undone. applyRepair re-reads the count under that
      * ownership and refuses there if it moved; this closure is how the decision reaches it without
      * duplicating the message.
+     *
+     * Takes the COUNT, not a whole inspection (#14). The count is the only field this decision
+     * reads, and it is the only one obtainable from a connection that already owns the store —
+     * asking for the rest is what sent applyRepair to a second handle and deadlocked it.
      */
     const recheckNonEnglish = guardedMode && targetIsEnglishOnly && options.acceptNonLatinLoss !== true
-      ? (fresh: StoredEmbedderStateInspection): void => {
-          const n = fresh.nonLatin;
+      ? (n: StoredNonLatinContent): void => {
           if (n.status !== "known") {
             throw new Error(
               `the non-English content scan stopped working between preflight and the rewrite (${n.reason}). ` +

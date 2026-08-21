@@ -80,7 +80,12 @@ export {
   readStoredVectorPresence,
 } from "./storage";
 export type { VerifiedBackupResult } from "./storage";
-export { inspectStoredEmbedderState, StoredEmbedderStateDiagnosticError, inspectLifecycleEdgeIntegrity } from "./diagnostics";
+export {
+  inspectStoredEmbedderState,
+  inspectNonLatinContent,
+  StoredEmbedderStateDiagnosticError,
+  inspectLifecycleEdgeIntegrity,
+} from "./diagnostics";
 export type {
   StoredDatabaseIntegrity,
   StoredEmbedderDiagnosticFailureReason,
@@ -88,6 +93,8 @@ export type {
   StoredEmbedderPin,
   StoredEmbedderSafetyAssessment,
   StoredEmbedderStateInspection,
+  StoredNonLatinContent,
+  NonLatinReadDb,
   DanglingLifecycleEdge,
   DanglingRatification,
   LifecycleEdgeIntegrityReport,
@@ -239,6 +246,8 @@ export {
   createLocalEmbedder,
   createLocalEmbedderWithProvenance,
   instantiateEmbedderForPin,
+  parseHashingEmbedderPin,
+  knownModelProfileIds,
   UnsatisfiableEmbedderError,
   LEGACY_ONNX_DEFAULT_MODEL_ID,
 } from "./embedding-onnx";
