@@ -11,13 +11,52 @@
  *   - mergeCircle: work threads move losslessly; inbox histories item-merge
  *   - archiveCircle/unarchiveCircle: store-wide search excludes archived (includeArchived restores)
  *   - archiveCircle/unarchiveCircle: listCircles flags, explicit access still works, store-to-archived allowed
+ *   - store-to-archived DISCLOSES (#55): every resolution branch, aliased destinations, and a
+ *     circle archived mid-write; memory_store's acknowledgement carries the sentence
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { MonetCore } from "../engine";
+import { registerMonetCoreTools } from "../mcp-server";
 
 /** Dedup-off core for exercising moves without accidental merges. */
 function freshCore(defaultCircle = "default"): MonetCore {
   return new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, defaultCircle });
+}
+
+const tmpDirs: string[] = [];
+afterEach(() => {
+  while (tmpDirs.length) rmSync(tmpDirs.pop()!, { recursive: true, force: true });
+});
+
+/** A file-backed store, for the tests that need a real SECOND connection to it. */
+function tmpDbPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), "monet-circle-lifecycle-"));
+  tmpDirs.push(dir);
+  return join(dir, "race.db");
+}
+
+/** Boot an in-process MCP server+client pair sharing a MonetCore (same shape as mcp-roster's). */
+async function makeMcpPair(core: MonetCore): Promise<{ client: Client; cleanup: () => Promise<void> }> {
+  const server = new McpServer({ name: "monet-core-test", version: "0.6.0" }, { capabilities: { tools: {} } });
+  registerMonetCoreTools(server, core, { autoPrewarm: false });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  const client = new Client({ name: "test-client", version: "0.0.1" });
+  await client.connect(clientTransport);
+  return { client, cleanup: async () => { await client.close(); core.close(); } };
+}
+
+/** Call memory_store over the wire and parse the acknowledgement envelope. */
+async function storeOverMcp(client: Client, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await client.callTool({ name: "memory_store", arguments: args }) as
+    { content: Array<{ type: string; text: string }> };
+  return JSON.parse(res.content[0].text) as Record<string, unknown>;
 }
 
 // ---- renameCircle -----------------------------------------------------------
@@ -432,6 +471,163 @@ describe("archiveCircle / unarchiveCircle", () => {
     expect(otherNames).not.toContain("archived-side");
 
     core.close();
+  });
+
+  /**
+   * ISSUE #55 — THE DISCLOSURE, NOT A REFUSAL. The write is legitimate (the test above is the
+   * contract: archived = hidden by default, not sealed), so what was broken was the SILENCE: the
+   * acknowledgement let a caller walk away believing it had made something store-wide recallable
+   * when the destination is outside search, the overview and the default circle list.
+   *
+   * ALL THREE RESOLUTION BRANCHES, because all three land somewhere. An attach, a fork and a
+   * creation are equally invisible in an archived circle, and a disclosure that fired on only one
+   * of them would go quiet exactly where the caller had least reason to look. Each branch gets its
+   * own circle — resolution scans per circle, so the three cases cannot contaminate each other —
+   * and the two that need something to resolve against are seeded BEFORE the archive, which is the
+   * realistic shape: a circle that was worked in and later shelved.
+   */
+  it("discloses the archived destination on every resolution branch — created, attached and ambiguous", async () => {
+    const core = new MonetCore(":memory:");
+    const seedPhrase = "We decided to use SQLite as the storage backend for Monet Local.";
+    const seedAttach = await core.store(seedPhrase, { circle: "attic-attach" });
+    const seedFork = await core.store(seedPhrase, { circle: "attic-fork" });
+    // A LIVE circle answers the question too, and answers it `false`: the destination was asked
+    // about and is fine, which is a verdict — not the silence the old acknowledgement gave.
+    expect(seedAttach.landedInArchivedCircle).toBe(false);
+
+    core.archiveCircle("attic-new");
+    core.archiveCircle("attic-attach");
+    core.archiveCircle("attic-fork");
+
+    const created = await core.store("Redis backs the rate limiter.", { circle: "attic-new" });
+    expect(created.action).toBe("created");
+    expect(created.landedInArchivedCircle).toBe(true);
+
+    // Scores ~0.75 against the seed with the hashing embedder — robustly above tauAttach (0.55).
+    const attached = await core.store("Monet Local uses SQLite for its local storage backend.", { circle: "attic-attach" });
+    expect(attached.action).toBe("attached");
+    expect(attached.conceptId).toBe(seedAttach.conceptId);
+    expect(attached.landedInArchivedCircle).toBe(true);
+
+    // Scores ~0.46 — robustly inside the ambiguous band [0.4, 0.55), so this forks.
+    const ambiguous = await core.store("The app uses SQLite for persistence.", { circle: "attic-fork" });
+    expect(ambiguous.action).toBe("ambiguous");
+    expect(ambiguous.conceptId).not.toBe(seedFork.conceptId);
+    expect(ambiguous.landedInArchivedCircle).toBe(true);
+
+    // AND THE CONTRACT IS UNTOUCHED: every one of them is stored, in the circle that was asked for.
+    expect(core.circleOf(created.conceptId)).toBe("attic-new");
+    expect(core.circleOf(attached.conceptId)).toBe("attic-attach");
+    expect(core.circleOf(ambiguous.conceptId)).toBe("attic-fork");
+
+    core.close();
+  });
+
+  /**
+   * THE ALIASED DESTINATION. The caller names a circle that looks perfectly live — it has no
+   * archived row of its own — and the rename alias lands the write in the attic anyway. Keying the
+   * disclosure on the RESOLVED circle is what covers this; keying it on the caller's own string
+   * would be silent on precisely the case where the caller cannot see the problem coming.
+   */
+  it("discloses when an ACTIVE alias resolves onto an archived circle", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await core.store("Deployment runbook for the billing service.", { circle: "old-project" });
+    core.renameCircle("old-project", "new-project");
+    core.archiveCircle("new-project");
+
+    const r = await core.store("Runbook step two for billing.", { circle: "old-project" });
+    expect(core.circleOf(r.conceptId)).toBe("new-project");
+    expect(r.landedInArchivedCircle).toBe(true);
+
+    core.close();
+  });
+
+  /**
+   * THE MIDDLE CASE, against a REAL second connection rather than by inspecting the code shape —
+   * the same discipline gates.test.ts uses for reassignCircle's own archived-destination guard.
+   * `storeInternal` resolves the circle, then awaits an embed and a segmentation pass before it
+   * opens `BEGIN IMMEDIATE`, and one `.monet` file shared by the MCP server and a `monet` CLI call
+   * is a supported topology (storage.ts) — so "the destination was live when we resolved it" is a
+   * fact with a shelf life. Asking before the embed would reproduce #55's own silence through a
+   * narrower window: the write lands in an archived circle and says nothing about it.
+   */
+  it("answers the archived question INSIDE the write reservation, against a second connection archiving mid-write", async () => {
+    const dbPath = tmpDbPath();
+    const a = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const b = new MonetCore(dbPath); // the competing writer: its own connection to the same file
+
+    // Not archived when this one runs, which is the premise of the test.
+    const before = await a.store("The billing service retries failed webhooks.", { circle: "shelf" });
+    expect(before.landedInArchivedCircle).toBe(false);
+
+    type Embedder = { checkedEmbed(text: string, domain: string): Promise<Float32Array> };
+    const original = (Object.getPrototypeOf(a) as Embedder).checkedEmbed;
+    let raced = false;
+    const spy = vi.spyOn(a as unknown as Embedder, "checkedEmbed").mockImplementation(async (text: string, domain: string) => {
+      const emb = await original.call(a as unknown as Embedder, text, domain);
+      if (!raced) {
+        raced = true;
+        b.archiveCircle("shelf"); // a real commit, on a real second connection, mid-window
+      }
+      return emb;
+    });
+
+    const during = await a.store("Webhook retries use exponential backoff.", { circle: "shelf", resolution: "forceNew" });
+    spy.mockRestore();
+
+    // The archive necessarily happened after the resolution above and before the mutation, so only
+    // a read taken under the reservation can be reporting it.
+    expect(raced).toBe(true);
+    expect(during.landedInArchivedCircle).toBe(true);
+    expect(a.circleOf(during.conceptId)).toBe("shelf");
+
+    a.close();
+    b.close();
+  });
+
+  /**
+   * THE REPLAY. `operationId` promises that a retry is indistinguishable from the original call, so
+   * the disclosure has to survive one — a caller told "archived" on the first call and given silence
+   * on the retry would have to guess which answer counts. Rebuilt from the concept's own circle
+   * rather than stored a second time, the same way `resolutionMode` is.
+   */
+  it("keeps the disclosure on an idempotent retry, which returns the original receipt", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    core.archiveCircle("shelved");
+
+    const first = await core.store("The invoice job runs on Sundays.", { circle: "shelved", operationId: "op-55" });
+    expect(first.landedInArchivedCircle).toBe(true);
+
+    const retry = await core.store("a completely different body", { circle: "shelved", operationId: "op-55" });
+    expect(retry).toEqual(first);
+    expect(retry.landedInArchivedCircle).toBe(true);
+
+    core.close();
+  });
+
+  /**
+   * THE WIRE. The engine flag exists to reach the storing agent on the turn it stores, so the
+   * acknowledgement is where the fix is actually delivered — and it stays absent on the ordinary
+   * write, because a key repeating "not archived" forever is payload with no reader.
+   */
+  it("memory_store's acknowledgement carries the archived-circle guidance, and stays silent for a live circle", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    core.archiveCircle("shelved");
+    const { client, cleanup } = await makeMcpPair(core);
+    try {
+      const archived = await storeOverMcp(client, { content: "The nightly export runs at 02:00.", circle: "shelved" });
+      expect(archived.conceptId).toBeDefined();
+      expect(archived.circle).toBe("shelved");
+      expect(archived.guidance).toContain("ARCHIVED CIRCLE");
+      expect(archived.guidance).toContain("shelved");
+      expect(archived.guidance).toContain("memory_circle_manage");
+
+      const live = await storeOverMcp(client, { content: "The nightly export writes to S3.", circle: "current" });
+      expect(live.conceptId).toBeDefined();
+      expect(live).not.toHaveProperty("guidance");
+    } finally {
+      await cleanup();
+    }
   });
 });
 

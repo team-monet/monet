@@ -887,6 +887,30 @@ export interface IngestResult {
    * extracted. The lead runs the battery in conversation and records the outcome via memory_ratify.
    */
   extractionCandidate?: { pairedRuleId: string; score: number };
+  /**
+   * Did this write land in a circle the store has flagged ARCHIVED? Archiving does not seal a circle
+   * — `archiveCircle` accepts explicit reads and writes by contract, and that is unchanged — but it
+   * removes the circle from store-wide search, from the overview and from `listCircles`. So the write
+   * succeeded and the memory is fetchable by naming the circle, while a caller that believes it just
+   * made something store-wide recallable did not: that gap, unreported, is #55.
+   *
+   * READ INSIDE THE WRITE TRANSACTION, for the same reason `ReassignResult.wasCircleLocalLiveDeny`
+   * is. One `.monet` file shared by the MCP server and a `monet` CLI call is a supported topology
+   * (storage.ts), and this method awaits an embed and a segmentation pass between resolving the
+   * circle and mutating anything — so a second connection committing `archiveCircle` inside that
+   * window would reproduce the exact silence this field exists to end, through a narrower gap.
+   * `BEGIN IMMEDIATE` freezes the flag and the write it describes into one instant.
+   *
+   * KEYED ON THE RESOLVED DESTINATION, so an ACTIVE alias pointing at an archived circle discloses
+   * too: the caller named a live-looking circle and still landed in the attic.
+   *
+   * ANSWERED ON EVERY PATH THAT RETURNS A RESULT, `false` included — the write asked, under the
+   * reservation, and both answers are verdicts. An idempotency REPLAY rebuilds it from the concept's
+   * own circle (see getOperationResult) rather than storing a second copy, the same way
+   * `resolutionMode` is: a retry must be indistinguishable from the original call, and "not asked"
+   * on the retry of a call that was asked would be exactly the distinction receipts exist to erase.
+   */
+  landedInArchivedCircle?: boolean;
 }
 
 /**
@@ -4227,6 +4251,8 @@ export class MonetCore {
       ruleSuccession?: RuleSuccession;
       ruleBindingChange?: RuleBindingChange;
       extractionCandidate?: { pairedRuleId: string; score: number };
+      /** Absent on the replay branch below, which returns `prior` already carrying its own answer. */
+      landedInArchivedCircle?: boolean;
       prior?: IngestResult;
       proofToken?: EmbeddingWidthProofToken;
     } => {
@@ -4704,7 +4730,14 @@ export class MonetCore {
       }
 
       const proofToken = this.captureEmbeddingWidthProof(emb.length);
-      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate, proofToken };
+      // THE DISCLOSURE, FROZEN BY THE SAME RESERVATION AS THE WRITE (#55) — see IngestResult's own
+      // field for why it is asked here and not before the embed above, nor at the MCP layer after
+      // the call returns. Asked on EVERY resolution branch because all three land somewhere: an
+      // attach, a fork and a creation are equally invisible to store-wide recall in an archived
+      // circle, and a disclosure that fired on only one of them would be silent exactly where the
+      // caller had least reason to check.
+      const landedInArchivedCircle = this.isArchivedCircle(circle);
+      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate, landedInArchivedCircle, proofToken };
     })();
 
     if (txResult.prior) return txResult.prior;
@@ -4715,7 +4748,7 @@ export class MonetCore {
       this.lastConceptByCircle.set(circle, txResult.row.id);
     }
 
-    const { action, row, observationId, nearMatchId, nearMatchScore, resolutionMode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate } = txResult;
+    const { action, row, observationId, nearMatchId, nearMatchScore, resolutionMode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate, landedInArchivedCircle } = txResult;
 
     // forceNew score is informational nearest-neighbor; attachTo score is cosine(new obs, target concept).
     const returnScore = txResult.score;
@@ -4736,6 +4769,10 @@ export class MonetCore {
       ...(ruleSuccession !== undefined ? { ruleSuccession } : {}),
       ...(ruleBindingChange !== undefined ? { ruleBindingChange } : {}),
       ...(extractionCandidate !== undefined ? { extractionCandidate } : {}),
+      // Carried as the boolean it was answered as, `false` included: this path DID ask, under the
+      // reservation, so both answers are verdicts. The replay branches above return `prior`, which
+      // carries the same field rebuilt from the concept's circle — see getOperationResult.
+      ...(landedInArchivedCircle !== undefined ? { landedInArchivedCircle } : {}),
     };
   }
 
@@ -17270,6 +17307,14 @@ export class MonetCore {
         ? { nearMatchId: operation.near_match_id, nearMatchScore: operation.near_match_score ?? 0 }
         : {}),
       ...(resolution ? { resolutionMode: resolution.mode } : {}),
+      // REHYDRATED, NOT STORED — the same discipline `resolutionMode` follows just above, and for
+      // the same contract: a retry must be indistinguishable from the original call, so a caller
+      // branching on this field cannot be told "not asked" on the second call and `false` on the
+      // first. Read off the concept's own live circle rather than a second copy in the receipt,
+      // because that IS the question — where this memory sits now, and whether recall reaches it.
+      // No write reservation is owed here: a replay mutates nothing, so there is no instant of
+      // mutation for the answer to be frozen against.
+      landedInArchivedCircle: this.isArchivedCircle(row.circle),
       ...this.replayRuleOutcome(operation),
     };
   }

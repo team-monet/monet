@@ -987,7 +987,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_store",
-    'Store durable knowledge. Similar evidence normally attaches to an existing concept; novel, incoherent, species-mismatched, or stage-mismatched evidence creates a concept. The acknowledgement returns `circle`, `action`, and `conceptId`; anomalous forks also return `resolutionMode` and `score`, flagged pairs add `nearMatchId`/`nearMatchScore`, and correction/rule outcomes add `contradiction`, `ruleSuccession`, or `extractionCandidate` only when present. Use `attachTo` only when identity is known, or `resolution="forceNew"` for known-distinct items. Use kind="correction" to challenge prior memory. Use kind="rule" with `rule`; stored rules are advisory because blocking severity is declaration-only in memory_declare. Synthesis happens later on explicit read.',
+    'Store durable knowledge. Similar evidence normally attaches to an existing concept; novel, incoherent, species-mismatched, or stage-mismatched evidence creates a concept. The acknowledgement returns `circle`, `action`, and `conceptId`; anomalous forks also return `resolutionMode` and `score`, flagged pairs add `nearMatchId`/`nearMatchScore`, and correction/rule outcomes add `contradiction`, `ruleSuccession`, or `extractionCandidate` only when present, and a store into an archived circle adds `guidance` naming what recall will not reach. Use `attachTo` only when identity is known, or `resolution="forceNew"` for known-distinct items. Use kind="correction" to challenge prior memory. Use kind="rule" with `rule`; stored rules are advisory because blocking severity is declaration-only in memory_declare. Synthesis happens later on explicit read.',
     {
       content: z
         .string()
@@ -1122,6 +1122,30 @@ export function registerMonetCoreTools(
           // extracting a principle. A flag, not an extraction — the four-test battery and the human
           // ratification stay explicit (memory_ratify).
           ...(r.extractionCandidate ? { extractionCandidate: r.extractionCandidate } : {}),
+          // ARCHIVED DESTINATION (#55). A write into an archived circle is legitimate — archiving
+          // hides a circle, it does not seal it (archiveCircle) — so this discloses rather than
+          // refuses. What it refuses to do is let the caller walk away believing the memory is
+          // store-wide recallable: an archived circle is out of memory_search's default scan, out of
+          // memory_overview and out of the default circle listing, so an agent that stores here and
+          // moves on has recorded something its next session will not find by asking.
+          //
+          // READ OFF THE RESULT, never asked here — the same discipline memory_reassign_circle's
+          // deny disclosure follows. The flag is frozen inside core.store()'s own write reservation,
+          // so the sentence and the write share one instant; asking the store after the call would
+          // put the whole write between the answer and what it describes.
+          //
+          // PRESENT ONLY WHEN IT FIRES, like every other conditional field on this envelope. A key
+          // repeating "not archived" on every ordinary write is payload with no reader, and silence
+          // is the healthy state.
+          ...(r.landedInArchivedCircle
+            ? {
+              guidance:
+                `ARCHIVED CIRCLE: '${scope(circle)}' is archived. This memory is stored and can be ` +
+                `read back by naming that circle, but it stays out of store-wide recall, the ` +
+                `overview and the default circle list. Unarchive the circle with ` +
+                `memory_circle_manage to put it back in default recall.`,
+            }
+            : {}),
         };
         return mutOk(envelope, "memory_store", capturedBlock);
       } catch (e) {
