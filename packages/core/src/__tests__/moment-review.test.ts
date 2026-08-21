@@ -536,3 +536,61 @@ describe("R4 — an interception written before `circle` existed is history, not
     expect(momentCounts(db, spool, "acme-widgets").unattributed).toBe(1);
   });
 });
+
+describe("R5 — governed moments survive a circle MERGE, not only a rename", () => {
+  it("keeps pre-merge history reachable under the surviving name", async () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "old-team", momentSpoolPath: spool });
+    cores.push(core);
+    // Both circles must exist as circles, which means holding something.
+    await core.store("A fact filed under the circle being merged away.", { kind: "fact" });
+    await core.store("A fact in the surviving circle.", { kind: "fact", circle: "new-team" });
+
+    const id = core.openStoreMoment("memory_recall");
+    core.closeStoreMoment(id, "{}", "ok");
+    core.recordRuleReads(null, ["rule-a"], "stage-shared", "old-team");
+    expect(core.momentCounts("old-team").total).toBe(1);
+    expect(core.momentStageReads("old-team").get("stage-shared")).toBe(1);
+
+    await core.mergeCircle("old-team", "new-team");
+
+    // `mergeCircle` publishes the same from -> into alias `renameCircle` does, so BOTH names now
+    // resolve to `new-team`. Without the rows moving, this history sits under a name that nothing
+    // resolves to any more — reachable from neither side.
+    expect(core.momentCounts("new-team").total).toBe(1);
+    expect(core.momentCounts("old-team").total).toBe(1);
+    expect(core.momentStageReads("new-team").get("stage-shared")).toBe(1);
+    expect(core.momentCounts("new-team").unattributed).toBe(0);
+  });
+});
+
+describe("R5 — a REPLICATED alias moves the local moment population too", () => {
+  it("keeps local history reachable after a peer's rename is grafted in", async () => {
+    const dir = mkTmp();
+    // The peer performs the rename; it never sees this machine's moments, which are local-only —
+    // the moment tables appear in no export or graft path by design.
+    const peer = new MonetCore(":memory:", { defaultCircle: "old-team" });
+    cores.push(peer);
+    await peer.store("A fact that makes old-team a real circle.", { kind: "fact" });
+    peer.renameCircle("old-team", "new-team");
+
+    const local = new MonetCore(":memory:", {
+      defaultCircle: "old-team", momentSpoolPath: join(dir, "moments.jsonl"),
+    });
+    cores.push(local);
+    await local.store("This machine's own fact under the same circle name.", { kind: "fact" });
+    const id = local.openStoreMoment("memory_recall");
+    local.closeStoreMoment(id, "{}", "ok");
+    expect(local.momentCounts("old-team").total).toBe(1);
+
+    local.graftRows(peer.exportDelta(0));
+
+    // The alias landed, so BOTH names resolve to `new-team` here. Rows still carrying `old-team`
+    // would be reachable from neither — the same silent orphaning a local merge caused, arriving
+    // over sync instead.
+    expect(local.resolveCircleName("old-team")).toBe("new-team");
+    expect(local.momentCounts("new-team").total).toBe(1);
+    expect(local.momentCounts("old-team").total).toBe(1);
+  });
+});

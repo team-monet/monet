@@ -13426,6 +13426,22 @@ export class MonetCore {
         // ON CONFLICT returns changes=1 for both insert and update paths in SQLite
         if (r.changes > 0) {
           inserted.circle_aliases++;
+          // A REPLICATED ALIAS STRANDS LOCAL ROWS EXACTLY AS A LOCAL ONE DOES — third and last site
+          // of the rule stated at renameCircle/mergeCircle: any path that publishes an active
+          // `from -> into` alias moves this population with it.
+          //
+          // WHY IT REACHES HERE AT ALL: the moment tables are LOCAL-ONLY by design — they appear in
+          // no export or graft payload — so a peer that renames a circle has no idea this machine
+          // holds measurement history under the old name. Once its alias lands, `resolveCircle`
+          // here returns the new name and those rows answer to neither.
+          //
+          // GUARDED ON A REAL REDIRECT. An archived-circle row points a name at ITSELF, so `from`
+          // and `to` are equal and there is nothing to move; only an active rename/merge alias is
+          // a redirect. The move itself is guarded on the tables existing, since a store that has
+          // never recorded a moment does not have them.
+          if (row.status === "active" && row.from_name !== row.to_name) {
+            this.moveMomentCircle(row.from_name, row.to_name);
+          }
           // GateMirror.circleAliases/circles are derived from this table (see gateMirrorCircles,
           // gates.ts) — a landed rename, archive or unarchive is mirror content whether or not any
           // rule lives in the circle it names.
@@ -15836,6 +15852,20 @@ export class MonetCore {
           )
           .run(from, into, into);
         this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(into, from);
+        // THE GOVERNED-MOMENT POPULATION MOVES WITH THE ALIAS, exactly as in renameCircle.
+        //
+        // THE RULE THIS FOLLOWS, since it is now two call sites and no longer an incident: ANY path
+        // that publishes an active `from -> into` alias must move this population in the same
+        // transaction. Once the alias lands, both names resolve to `into`, so rows still carrying
+        // `from` are reachable from NEITHER name — not wrong, worse: silently absent, in a record
+        // whose entire premise is that absence must never be mistaken for coverage. A merge is a
+        // supported operation and was orphaning the moments, conformance history and stage-read
+        // coverage of the circle it consumed.
+        //
+        // The fold's own `resolveCircleAlias` handles the other half — records that keep ARRIVING
+        // under the old name, which they will, since a hook pins its circle in settings.json and
+        // no circle operation rewrites that file. Neither half covers the other's case.
+        this.moveMomentCircle(from, into);
         // NO EXPLICIT bumpGateGeneration(this.db) CALL HERE ANY MORE (removed — Codex round 11, item
         // 3; was added unconditionally at review fix MATERIAL M2). Same reasoning as renameCircle's
         // own removed call, immediately above it in this file: circle_aliases is mirror content
