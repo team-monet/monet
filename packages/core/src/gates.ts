@@ -438,10 +438,12 @@ export function migrateGateColumns(db: StoragePort): void {
     // assigning NULL to a column that was ALREADY NULL. SQLite's own `changes()` counts ROWS THE
     // WHERE CLAUSE MATCHED, not rows whose VALUE actually changed (the identical lesson this file's
     // own INSERT trigger, above, already learned the hard way) — so a store with nothing but
-    // dangling bindings still reported `backfilled.changes > 0` for a write that resolved nothing,
-    // on EVERY open, and this function runs twice per construction. Nothing reads that count today
-    // (the generation counter it fed is gone), but the predicate below is what makes the count
-    // honest if anything reads it again.
+    // dangling bindings reported a changed-row count for a write that resolved nothing, on EVERY
+    // open, and this function runs twice per construction. NOTHING READS THE COUNT ANY MORE — the
+    // generation counter it fed is gone, and the statement's result is deliberately not bound to a
+    // name here rather than bound and ignored. The predicate below is what would make the count
+    // honest again if a reader ever returns; it is kept for the write it performs, not for the
+    // number it would report.
     //
     // THE SAME AUDIT ALSO NAMES THIS STATEMENT: like the two triggers above, this UPDATE copies
     // `concepts.circle` verbatim, so a concept an old build parked in the reserved `'*'` circle
@@ -458,16 +460,14 @@ export function migrateGateColumns(db: StoragePort): void {
     // outcome — it stays NULL because nothing here touches it). Only a binding whose concept EXISTS
     // and carries an ordinary circle is actually resolved and counted, which is the one case this
     // backfill was ever supposed to touch.
-    const backfilled = db
-      .prepare(
-        `UPDATE rule_bindings SET circle = (SELECT c.circle FROM concepts c WHERE c.id = rule_bindings.concept_id)
-          WHERE circle IS NULL
-            AND EXISTS (
-              SELECT 1 FROM concepts c
-               WHERE c.id = rule_bindings.concept_id AND c.circle != '${BREADTH_CIRCLE}'
-            )`,
-      )
-      .run();
+    db.prepare(
+      `UPDATE rule_bindings SET circle = (SELECT c.circle FROM concepts c WHERE c.id = rule_bindings.concept_id)
+        WHERE circle IS NULL
+          AND EXISTS (
+            SELECT 1 FROM concepts c
+             WHERE c.id = rule_bindings.concept_id AND c.circle != '${BREADTH_CIRCLE}'
+          )`,
+    ).run();
   }
   // THE INDEX, LAST — see GATE_SCHEMA_SQL's own comment for why it cannot live there (BLOCKER B1):
   // this line is only reachable once the ALTER above has guaranteed the column exists, under every
@@ -487,24 +487,6 @@ export function migrateGateColumns(db: StoragePort): void {
 export function createGateSchema(db: StoragePort): void {
   createGateTables(db);
   migrateGateColumns(db);
-}
-
-/**
- * Does this concept currently hold ANY live rule binding, of either severity? Deliberately reads
- * the BINDING only: a retire or a supersession changes whether the rule is DELIVERED, and a caller
- * asking this question already knows what it is about to change.
- *
- * BOTH SEVERITIES, deliberately — an advisory rule leaving delivery (retire, supersession, a circle
- * move that merges it away) is the same event as a blocking one leaving it, and a predicate scoped
- * to `severity = 'blocking'` would answer only half the question.
- *
- * NO IN-TREE CALLER TODAY. Its callers were the gate-mirror generation-bump sites, removed
- * 2026-08-22 (see migrateGateColumns' own removal record). It stays exported public API.
- */
-export function hasLiveBinding(db: StoragePort, conceptId: string): boolean {
-  return db
-    .prepare(`SELECT 1 FROM rule_bindings WHERE concept_id = ?`)
-    .get(conceptId) !== undefined;
 }
 
 /**
@@ -795,32 +777,22 @@ export function assertPatternCountWithinCap(patterns: readonly string[] | undefi
 }
 
 /**
- * MATCHING IS ALWAYS OVER THE FULL CONTEXT. There is no cap that silently shortens what gets
- * compared, at any size.
+ * THE LESSON THE CONTEXT BOUNDS LEFT BEHIND, kept because the next thing that matches an action
+ * will be tempted by the same shortcut. Nothing in this module reads an intercepted action any
+ * more — `clampActionContext` and its `MAX_CONTEXT_BYTES` refusal threshold went with the matcher
+ * that consumed them — so this is a constraint on future code, not a description of present code.
  *
- * This had to be learned twice. First a 512-TOKEN cap, then a 64KiB BYTE cap — and both were the
- * same bug at different thresholds: matching ran on a prefix, so a command long enough to push its
- * dangerous part past the cutoff was never compared against anything and the gate reported SILENCE.
- * Silence is the design's signal for "no rule governs this action". Making it also mean "I stopped
- * looking" inverts it precisely where the input is most suspicious, and recording `truncated = 1`
- * in the event row audits the inversion without preventing it. The rule is: SILENCE MUST NEVER MEAN
- * I GAVE UP.
- *
- * So the cap below is not a matching bound. It is a REFUSAL threshold, far beyond any real command
- * line, and crossing it does not produce silence — it produces `overflow: true`, a verdict distinct
- * from both firing and silence, which a host maps to asking the human rather than to allowing.
- * Measured: a 64KiB context costs ~1ms and a 1MiB context ~16ms, all of it reading the string
- * (matching 200 stages against a 4,000-token context is 0.002ms — the context index makes the
- * registry size irrelevant), so full-context matching is affordable across the entire range of
- * inputs that are not already pathological.
+ * MATCHING MUST ALWAYS BE OVER THE FULL CONTEXT. It was learned twice here: first a 512-TOKEN cap,
+ * then a 64KiB BYTE cap, the same bug at two thresholds. Matching ran on a prefix, so a command
+ * long enough to push its dangerous part past the cutoff was never compared against anything and
+ * the answer came back SILENT. Silence means "no rule governs this action". Making it also mean "I
+ * stopped looking" inverts it precisely where the input is most suspicious, and recording the
+ * truncation beside it audits the inversion without preventing it. SILENCE MUST NEVER MEAN I GAVE
+ * UP: a size bound belongs at a REFUSAL threshold — a third verdict a host maps to asking the human
+ * — never at a matching bound. The cost was measured and is not the obstacle: a 64KiB context read
+ * ~1ms and a 1MiB context ~16ms, nearly all of it reading the string, while matching 200 stages
+ * against a 4,000-token context was 0.002ms.
  */
-const MAX_CONTEXT_BYTES = 4 * 1024 * 1024;
-
-/**
- * How much of the raw context the instrumentation row keeps. A STORAGE bound only — it never
- * affects what was matched, which is why it can be small while MAX_CONTEXT_BYTES is large.
- */
-const MAX_RECORDED_CONTEXT_BYTES = 8 * 1024;
 
 /**
  * THE shared comparison form — applied to context tokens on the way out of the tokenizer AND to
@@ -978,15 +950,6 @@ function withIndex(tool: string | null, tokens: string[]): ActionContext {
     else index.set(tokens[i]!, [i]);
   }
   return { tool, tokens, index };
-}
-
-/**
- * Is this context beyond the refusal threshold? Returns the trimmed text either way — nothing here
- * shortens it, because nothing may match a prefix.
- */
-export function clampActionContext(raw: string): { text: string; overflow: boolean } {
-  const text = raw.trim();
-  return { text, overflow: text.length > MAX_CONTEXT_BYTES };
 }
 
 /** A flag-shaped token: `-f`, `--force`, `-auto-approve`. Never a bare `-` or a negative number. */
@@ -1271,9 +1234,9 @@ export const STAGE_LOOKUP_OUTLINE_CAP = 500;
 export const STAGE_INDEX_CAP = 2_000;
 /**
  * Most disputed derivation parents one delivered rule will name (review fix — PR #112 round 5).
- * The disputed-parents scalar rides the mechanical gate path, and derivation rows are append-only
- * with no per-rule cap, so the aggregation is bounded here; the query fetches one extra id as the
- * truncation signal and the mapper delivers at most this many plus `disputedParentsTruncated`.
+ * Derivation rows are append-only with no per-rule cap, so the aggregation is bounded here rather
+ * than trusted to stay small; the query fetches one extra id as the truncation signal and the
+ * mapper delivers at most this many plus `disputedParentsTruncated`.
  * Several simultaneously-disputed parents on one rule is already pathological — the disclosure's
  * job (go mediate) survives a cap comfortably above anything real.
  */
@@ -1855,77 +1818,12 @@ export interface GateStageRef {
   name: string;
 }
 
-export interface GateResult {
-  /**
-   * The first matched stage in deterministic order, or null on silence. `stages` carries the full
-   * set: several stages CAN match one action (a broad `git push` stage and a narrow
-   * `git push --force` one), and the design says nothing about suppressing either, so all of them
-   * fire and their rules union.
-   */
-  stage: GateStageRef | null;
-  stages: GateStageRef[];
-  rules: GateRule[];
-  /**
-   * True only when NO stage matched — "the agent is off the map, and says so". A matched stage with
-   * zero live rules is NOT silence: it is the projection hook ("stage X, no cached rules — skeleton
-   * applies"), and collapsing the two would delete the signal the projection slice consumes.
-   *
-   * NEVER true on overflow. See `overflow`.
-   */
-  silence: boolean;
-  /**
-   * The context was past the refusal threshold and NOTHING was matched against it.
-   *
-   * A THIRD VERDICT, not a flavour of silence, because the two mean opposite things: silence is
-   * "nothing governs this action", overflow is "I could not tell". A host maps this to asking the
-   * human — never to allowing — which is exactly what the two prefix-matching bugs before it made
-   * impossible by reporting a confident silence over an input nobody had finished reading.
-   */
-  overflow: boolean;
-  /** `live` = answered from the store. The only member: the offline `"sidecar"` evaluator was
-   *  removed 2026-08-22, and the mechanical matcher that produced this shape followed it. */
-  source: "live";
-}
-
-export interface GateQueryOptions {
-  /** The raw action the host intercepted, verbatim. */
-  actionContext: string;
-  /** Locality: only rules whose concept lives in this circle fire. */
-  circle: string;
-  /**
-   * WHICH MODEL IS ASKING — the mechanism behind "a new model retires the old model's compensations
-   * automatically" (design of record, *Nothing waits on scheduled review*).
-   *
-   * An `agent`-scoped rule is a compensation for ONE model's failure habits. Delivering it to a
-   * different model is the shackle risk the scope split exists to prevent: the next, better model
-   * inherits the last one's defects as instructions. So when this is supplied, agent-scoped rules
-   * fire only for their own model tag; `domain` rules (true for a perfect agent) always fire.
-   *
-   * OMITTED means every agent-scoped rule still fires. That is deliberate backward compatibility,
-   * not a default policy — a caller that does not know which model it is must not have its rules
-   * silently disappear. The CLI that wires the host hooks always passes it.
-   *
-   * FILTERING IS NOT RETIREMENT. Nothing here retires anything: mismatched rules stop being
-   * DELIVERED and show up in `gateCoverage().retirementCandidates` for curation to act on. Inventing a
-   * model-change detector that retires rules on its own would be a scheduled-review mechanism in
-   * disguise, which the design rules out.
-   */
-  runtimeModelTag?: string;
-  /** Clock seam. Defaults to wall time. */
-  now?: number;
-  /** Sync clock seam for whatever a completed read still owes the store, so it re-exports. */
-  nextSyncTimestamp?: () => number;
-  /** `false` makes this call a PURE READ: asking without it counting. */
-  record?: boolean;
-}
-
 /**
- * `stageLookup`'s own delivery shape: everything `GateRule` carries, plus the capability
- * invocation payload the recognized matcher — and only the recognized matcher — spends the tokens
- * on. A distinct type rather than a widened `GateRule` (design directive): "never the body" stays
- * true for the mechanical gate's own delivery, unconditionally; this is agent-initiated pull at the
- * moment of need, which is where paying for the extra field is right ("capabilities are content too — and the
- * payload is the invocation, not a description").
+ * `stageLookup`'s own delivery shape: everything `GateRule` carries, plus the capability invocation
+ * payload. A distinct type rather than a widened `GateRule` (design directive): the body is paid
+ * for HERE because this is agent-initiated pull at the moment of need ("capabilities are content
+ * too — and the payload is the invocation, not a description"), and `GateRule` stays the shape any
+ * future always-on delivery can use without carrying content it never asked for.
  */
 export interface StageLookupRule extends GateRule {
   /** The rule concept's body when non-blank, else null — the invocation itself, not a description
@@ -1942,36 +1840,50 @@ export interface StageLookupOptions {
    * embedding matching — recognition is the agent's own act against the resident stage index, and
    * this call is a lookup against it, not a search; a third matcher is out of scope by design.
    *
-   * NAME-REACHABILITY SURVIVES A MECHANICAL RE-AIMING (doctrine, ruled). A stage's TRIGGER PATTERNS
-   * are the mechanical matcher's own firing surface — re-authoring them (memory_declare's
-   * `patterns`) reroutes what the mechanical gate matches, nothing else. This lookup resolves by
-   * NAME/id against the stage registry, never by pattern, so a rule bound to this stage — including a
-   * blocking one — stays reachable here exactly as before, until the RULE itself is withdrawn,
-   * downgraded, or superseded, or the stage's own rules all die (stage retirement/inertness). A
-   * pattern change is therefore never a rule-withdrawal lever by itself: it narrows what the agent
-   * is INTERCEPTED into, not what it can still ask for by name. See engine.ts's
-   * `assertPatternReauthoringAcknowledged` doc comment for the mechanical-side rationale this
+   * NAME-REACHABILITY SURVIVES A RE-AIMING OF THE PATTERNS (doctrine, ruled). A stage's TRIGGER
+   * PATTERNS address it to an action shape; re-authoring them (memory_declare's `patterns`)
+   * reroutes what that addressing covers, nothing else. This lookup resolves by NAME/id against the
+   * stage registry, never by pattern, so a rule bound to this stage — including a blocking one —
+   * stays reachable here exactly as before, until the RULE itself is withdrawn, downgraded, or
+   * superseded, or the stage's own rules all die (stage retirement/inertness). A pattern change is
+   * therefore never a rule-withdrawal lever by itself: it narrows what an interceptor would route
+   * here, not what the agent can still ask for by name. See engine.ts's
+   * `assertPatternReauthoringAcknowledged` doc comment for the write-side rationale this
    * complements.
    */
   stage: string;
-  /** Locality: only rules whose concept lives in this circle are delivered — same as the gate. */
+  /** Locality: only rules whose concept lives in this circle are delivered. */
   circle: string;
-  /** Same model-tag filter as GateQueryOptions.runtimeModelTag, applied through the same query. */
+  /**
+   * WHICH MODEL IS ASKING — the mechanism behind "a new model retires the old model's compensations
+   * automatically" (design of record, *Nothing waits on scheduled review*).
+   *
+   * An `agent`-scoped rule is a compensation for ONE model's failure habits. Delivering it to a
+   * different model is the shackle risk the scope split exists to prevent: the next, better model
+   * inherits the last one's defects as instructions. So when this is supplied, agent-scoped rules
+   * are delivered only for their own model tag; `domain` rules (true for a perfect agent) always
+   * are.
+   *
+   * OMITTED means every agent-scoped rule is still delivered. That is deliberate backward
+   * compatibility, not a default policy — a caller that does not know which model it is must not
+   * have its rules silently disappear.
+   *
+   * FILTERING IS NOT RETIREMENT. Nothing here retires anything: mismatched rules stop being
+   * DELIVERED and show up in `gateCoverage().retirementCandidates` for curation to act on. Inventing
+   * a model-change detector that retires rules on its own would be a scheduled-review mechanism in
+   * disguise, which the design rules out.
+   */
   runtimeModelTag?: string;
-  /** Clock seam. Defaults to wall time. */
-  now?: number;
-  /** Sync clock seam for the gate_events row. Omitted = stamped with `now`. */
-  nextSyncTimestamp?: () => number;
-  /** `false` makes this call a pure read: no gate_events row. Mirrors GateQueryOptions.record. */
-  record?: boolean;
 }
 
 export interface StageLookupResult {
   /**
    * True when the named stage exists in the registry — a HIT, whether or not it delivered rules.
    * False = a MISS (no such stage), never conflated with a stage-hit-no-rules: `rules: []` means
-   * two different things depending on `matched`, exactly as GateResult.silence disambiguates the
-   * mechanical side's own stage-hit-no-rules from a true silence.
+   * two different things depending on `matched`. A stage that exists and binds nothing in this
+   * circle is the projection hook ("stage X, no rules — reason from the skeleton"); a name that
+   * resolves to no stage at all is the agent being off the map. Collapsing the two would delete the
+   * signal the projection slice consumes.
    *
    * NIT: a HIT can reach stage-hit-no-rules for TWO different reasons, and this field alone does
    * not distinguish them — the stage genuinely has no rules ANYWHERE, or it has rules bound in
@@ -2059,15 +1971,15 @@ interface BindingJoinRow {
   parent_concept_id: string | null;
   /** 1 when any locally resolved derivation parent is a disputed, still-member principle. */
   parent_disputed: number;
-  /** Comma-joined disputed-member-parent ids, capped and lexically ordered; NULL on the
-   *  mechanical gate path (only the stage_lookup path pays for the aggregation) and when none. */
+  /** Comma-joined disputed-member-parent ids, capped and lexically ordered; NULL when the caller
+   *  did not ask for the aggregation (`withDisputedParentIds: false`) and when there are none. */
   disputed_parent_ids: string | null;
 }
 
 /**
- * THE one disputed-member-parent predicate — shared verbatim by the hot path's EXISTS and the
- * lookup path's id aggregation (rulesForStages), so the flag and the ids can never answer
- * different questions. Status first: the verdict subquery only runs for rows already disputed.
+ * THE one disputed-member-parent predicate — shared verbatim by the flag's EXISTS and the id
+ * aggregation beside it (rulesForStages), so the two can never answer different questions. Status
+ * first: the verdict subquery only runs for rows already disputed.
  */
 const DISPUTED_MEMBER_PARENT_WHERE = `p.family = 'derivation' AND p.dst_concept_id = b.concept_id
                   AND pc.kind = 'principle' AND pc.status = 'disputed'
@@ -2102,7 +2014,7 @@ const RULE_LIVENESS_WHERE = `
           AND c.kind = 'rule'
           -- MODEL-TAG RETIREMENT. A domain rule always fires; an agent rule is a compensation for
           -- one model and fires only for that model. A NULL runtime tag disables the filter
-          -- entirely rather than hiding every agent rule — see GateQueryOptions.runtimeModelTag.
+          -- entirely rather than hiding every agent rule — see StageLookupOptions.runtimeModelTag.
           AND (b.scope != 'agent' OR ? IS NULL OR b.model_tag = ?)
           AND NOT EXISTS (
             SELECT 1 FROM lifecycle_edges e
@@ -2110,25 +2022,29 @@ const RULE_LIVENESS_WHERE = `
           )`;
 
 /**
- * THE shared rules-for-stages selection — every way a rule is fully DELIVERED by EITHER matcher
- * passes through here (refactoring build: this replaces gateInternal's own former inline copy of
- * this query). Same liveness (`RULE_LIVENESS_WHERE`), same circle scope, same model-tag filter,
- * same parent-principle lookup, same ordering (blocking first, then birth order) the mechanical
- * gate has always used; factoring it out means `stageLookup` answers through IDENTICAL chokepoint
- * semantics rather than a second copy of this SQL that could silently drift from this one.
+ * THE shared rules-for-stages selection — every way a rule is fully DELIVERED passes through here.
+ * `evaluateStageLookup` is its only caller today; it was factored out while there were two, and it
+ * stays one function so a second delivery path cannot arrive with its own copy of this SQL and
+ * silently drift from this one. Liveness (`RULE_LIVENESS_WHERE`), circle scope, model-tag filter,
+ * parent-principle lookup and ordering (blocking first, then birth order) are decided here and
+ * nowhere else.
  *
- * `withBody` — SELECT `c.body` or not. gateInternal (the always-on mechanical fire path) passes
- * `false`: it maps every row through `toGateRule`, which never reads body, so fetching and
- * marshalling a concept's full body across the sqlite boundary on every single intercepted action
- * was pure waste — the same class of waste `listMatchableStages` vs `listStages` already exists to
- * avoid ("a narrower SELECT is the whole optimization; there is no cache, so there is no
- * invalidation to get wrong"). Only `evaluateStageLookup` passes `true`, because only
- * `toStageLookupRule` reads the field.
+ * THE FLAGS AND BOUNDS BELOW ARE ALL OPT-IN, and every one of them defaults to the cheaper answer.
+ * That shape is deliberate and outlived the caller it was built for: an always-on delivery path
+ * paid these costs on EVERY intercepted action, so each was made something a caller asks for rather
+ * than something the query always does. Keeping the defaults cheap is what lets a future always-on
+ * caller reuse this query as-is instead of writing a leaner second copy.
+ *
+ * `withBody` — SELECT `c.body` or not. Omitting it skips fetching and marshalling a concept's full
+ * body across the sqlite boundary, the same class of waste `listMatchableStages` vs `listStages`
+ * already exists to avoid ("a narrower SELECT is the whole optimization; there is no cache, so
+ * there is no invalidation to get wrong"). `evaluateStageLookup` passes `true`, because
+ * `toStageLookupRule` reads the field; `toGateRule` never does.
  *
  * `limit`/`bodyMaxChars`/`reasonMaxChars` — OPTIONAL SQL-level bounds (review fix — Codex round 2,
- * extended round 3 to cover `reason`). All omitted (gateInternal's call, and any other future
- * caller with no reason to cap) is BYTE-IDENTICAL to this function's pre-review-round-2 behavior:
- * no LIMIT clause, `c.body`/`b.reason` selected whole. Only `evaluateStageLookup` passes them, at
+ * extended round 3 to cover `reason`). All omitted is BYTE-IDENTICAL to this function's
+ * pre-review-round-2 behavior: no LIMIT clause, `c.body`/`b.reason` selected whole. Only
+ * `evaluateStageLookup` passes them, at
  * `STAGE_LOOKUP_RULES_CAP + 1` / `STAGE_LOOKUP_BODY_CAP + 1` / `STAGE_LOOKUP_REASON_CAP + 1` — see
  * those constants' own comment for the "+1 probe" reasoning. `bodyMaxChars`/`reasonMaxChars`
  * choose `substr` over a bare column reference — still a FIXED literal SQL shape, never
@@ -2186,26 +2102,27 @@ function rulesForStages(
               (SELECT p.src_concept_id FROM lifecycle_edges p
                 WHERE p.family = 'derivation' AND p.dst_concept_id = b.concept_id
                 ORDER BY p.created_at ASC, p.id ASC LIMIT 1) AS parent_concept_id,
-              -- FIRE-TIME DOUBT DISCLOSURE (slice 5-B): ANY derivation parent principle currently
-              -- disputed, not only the earliest parent selected for stable display above.
+              -- DELIVERY-TIME DOUBT DISCLOSURE (slice 5-B): ANY derivation parent principle
+              -- currently disputed, not only the earliest parent selected for stable display above.
               -- MEMBERS ONLY (review fix — PR #112 round 5): the latest-ratification check is the
               -- same latest-wins read the impeachment WRITE side applies — without it, a disputed
               -- parent the human then REJECTED kept appearing as a pending mediation. The EXISTS
               -- short-circuits at the first qualifying row, and its per-edge cost is one status
               -- probe (the verdict subquery runs only on rows the status filter already passed),
-              -- so the mechanical gate pays no aggregation, no DISTINCT, no temp B-tree (review
-              -- fix — PR #112 round 8: the previous shape bounded the RESULT but not the WORK).
+              -- so the FLAG costs no aggregation, no DISTINCT, no temp B-tree (review fix — PR #112
+              -- round 8: the previous shape bounded the RESULT but not the WORK). That is what
+              -- makes it affordable to select unconditionally, unlike the ids below.
               EXISTS (
                 SELECT 1 FROM lifecycle_edges p
                 JOIN concepts pc ON pc.id = p.src_concept_id
                 WHERE ${DISPUTED_MEMBER_PARENT_WHERE}
               ) AS parent_disputed,
-              -- THE IDS, ON THE LOOKUP PATH ONLY (review fixes — PR #112 rounds 2, 7 and 8): the
+              -- THE IDS, ONLY WHEN ASKED FOR (review fixes — PR #112 rounds 2, 7 and 8): the
               -- identity aggregation (DISTINCT + ORDER BY + LIMIT = temp B-tree over the rule's
               -- whole parent set) exists for the RECOVERY path, which is an agent affordance —
-              -- stage_lookup, budget-fitted and latency-tolerant — while the mechanical hook
-              -- renders title + reason and never these ids. So the hot path selects literal NULL
-              -- and only evaluateStageLookup pays for the aggregation, the same caller split
+              -- stage_lookup, budget-fitted and latency-tolerant. A caller that renders only title
+              -- and reason has no use for these ids and should not buy the temp B-tree to get
+              -- them, so the default selects literal NULL and the flag is the same caller split
               -- withBody already draws for the same reason. Ordered before the cap (round 7,
               -- P3) so the capped subset is one deterministic lexical prefix on every replica;
               -- DISTINCT because one parent can hold two edges to the same rule (projection +
@@ -2369,9 +2286,9 @@ function toGateRule(row: BindingJoinRow): GateRule {
     // Scoped to blocking on purpose: an advisory rule without a reason is the ordinary case, and
     // marking those would drown the one population a caller actually has to say something about.
     //
-    // COMPUTED FROM WHATEVER row.reason HOLDS, which is the FULL value for gateInternal's call
-    // (never bounded) but may be substr'd to STAGE_LOOKUP_REASON_CAP + 1 chars for
-    // evaluateStageLookup's (review fix — Codex round 3: reason's own SQL-retrieval bound). For
+    // COMPUTED FROM WHATEVER row.reason HOLDS, which is the FULL value when the caller passed no
+    // `reasonMaxChars` but may be substr'd to STAGE_LOOKUP_REASON_CAP + 1 chars when it did, as
+    // evaluateStageLookup does (review fix — Codex round 3: reason's own SQL-retrieval bound). For
     // every REALISTIC reason (under the cap, which every blocking reason already must be under —
     // one line rarely runs anywhere near 1 200 characters) this is IDENTICAL to computing it on
     // the full value: substr of a short string returns the whole string. The only way this could
@@ -2413,79 +2330,27 @@ function toStageLookupRule(row: BindingJoinRow): StageLookupRule {
 }
 
 /**
- * THE FIRING PATH. Pure SQL and string matching: no model, no network, no embedding, no clock
- * dependence beyond the instrumentation stamp.
+ * WHAT MAKES A RULE LIVE, stated once here because `RULE_LIVENESS_WHERE` above is the only place it
+ * is enforced and three exclusions are each load-bearing:
  *
- * Three exclusions decide which rules are live, and each one is load-bearing:
- *
- *   CIRCLE — a rule is an ordinary concept in an ordinary circle, and gates are scoped to the
- *   invoking circle exactly as sessions are. (Interpretive addition, flagged for review: the design
- *   says circles are "orthogonal locality, unchanged" but never states which locality a gate reads.
- *   Scoping to the caller's circle is the conservative reading — a store-global rule can be added
- *   when evidence demands one, whereas un-scoping later would silently start firing every project's
- *   rules in every project.)
+ *   CIRCLE — a rule is an ordinary concept in an ordinary circle, and delivery is scoped to the
+ *   asking circle exactly as sessions are. (Interpretive addition, flagged for review: the design
+ *   says circles are "orthogonal locality, unchanged" but never states which locality delivery
+ *   reads. Scoping to the caller's circle is the conservative reading — a store-global rule can be
+ *   added when evidence demands one, whereas un-scoping later would silently start delivering every
+ *   project's rules in every project.)
  *
  *   SUPERSESSION — a rule with an outgoing supersession lifecycle edge has been overturned. "The
- *   superseded rule is retained as history, never re-injected", and "a gate never returns two
- *   contradicting rules". The edge is the only thing that says so: the old concept stays active and
+ *   superseded rule is retained as history, never re-injected", and a lookup never returns two
+ *   contradicting rules. The edge is the only thing that says so: the old concept stays active and
  *   searchable on purpose, because it is the impeachment evidence traveling up the parent edge.
  *
  *   STATUS — a retired concept governs nothing.
  *
  * ORDER is severity-blocking-first, then created_at, then id: a deny must be the first thing an
- * agent reads, and everything after it is stable so two machines with the same rules render the
- * same gate.
+ * agent reads, and everything after it is stable so two machines with the same rules deliver the
+ * same answer.
  */
-/** Which matcher produced a pending write. Only `recognized` is produced: the mechanical matcher
- *  was removed 2026-08-22. */
-export type GateMatcher = "mechanical" | "recognized";
-
-/**
- * What a completed gate READ still owes the database. Held as data so the caller decides when — and
- * in what transaction — those writes happen. See `commitGateWrites`.
- */
-export interface PendingGateWrites {
-  actionContext: string;
-  circle: string;
-  now: number;
-  overflow: boolean;
-  latencyUs: number;
-  matchedStageIds: string[];
-  primaryStageId: string | null;
-  ruleCount: number;
-  maxSeverity: RuleSeverity | null;
-  /** evaluateStageLookup always sets 'recognized'; nothing sets 'mechanical' any more. */
-  matcher: GateMatcher;
-}
-
-/**
- * Apply what a gate read owes the store — WHICH IS CURRENTLY NOTHING, and that is stated rather
- * than hidden behind a plausible body.
- *
- * WHAT THIS USED TO DO, in order of removal: insert a `gate_events` row plus its per-stage links
- * (the governed moment replaced it — unlike a verdict row it can name the rules that fired and be
- * joined back to the act that prompted them), and then flip a stage's `verified` flag on its first
- * real fire. `verified` meant "this stage's patterns matched a real action"; with the mechanical
- * matcher gone nothing matches an action, so the flag was unmeasurable and was removed with it.
- *
- * WHY THE SPLIT SURVIVES THE EMPTYING. Doing a read and its writes in one transaction means a
- * DEFERRED read transaction upgrading to a write one, and SQLite can refuse that upgrade with
- * SQLITE_BUSY when another connection committed in between. The consequence would be a lookup
- * THROWING because a bookkeeping row could not be written — the worst trade available: losing one
- * instrumentation row is a rounding error, failing to deliver a rule is the thing this subsystem
- * exists to prevent. `stageLookup`/`MonetCore.stageLookup()` therefore still compute the verdict in
- * their own read transaction and call this in a separate, failure-tolerant one, so the seam is
- * already in place for whatever a read next owes.
- *
- * Safe to skip entirely: no verdict depends on anything here.
- */
-export function commitGateWrites(
-  _db: StoragePort,
-  _pending: PendingGateWrites,
-  _nextSyncTimestamp?: () => number,
-): void {
-  // Intentionally empty — see this function's own comment.
-}
 
 /**
  * `*` is the breadth marker on a rule BINDING (BREADTH_CIRCLE's own comment), never a selectable
@@ -2511,9 +2376,6 @@ function assertQueryableCircle(circle: string): void {
     );
   }
 }
-
-const elapsedUs = (startedAt: bigint | null): number =>
-  startedAt === null ? 0 : Number((process.hrtime.bigint() - startedAt) / 1000n);
 
 // ---- the stage index ---------------------------------------------------------
 
@@ -2595,51 +2457,40 @@ export function liveStageIndex(db: StoragePort, circle: string): LiveStageIndexR
 // ---- the recognized matcher (stageLookup) ------------------------------------
 
 /**
- * THE RECOGNIZED MATCHER, as a pure read — see `commitGateWrites`' own comment for why the read
- * and the write are split (a deferred read transaction upgrading to a write one can be refused
- * with SQLITE_BUSY; splitting them means the worst case is a lost instrumentation row, never a
- * failed lookup). The agent NAMES a stage, so one lookup resolves to at most one stage — there is
- * no trigger-pattern fan-out here, and therefore no `stages`/`matchedStageIds` plural to track.
+ * THE RECOGNIZED MATCHER — A PURE READ, END TO END. The agent NAMES a stage, so one lookup resolves
+ * to at most one stage: no trigger-pattern fan-out, and therefore no plural `stages` to track.
+ *
+ * NOTHING IS WRITTEN HERE, and that is now a property of the function rather than a promise about
+ * one. This used to return the verdict alongside a `PendingGateWrites` describing what the read
+ * still owed the store — a `gate_events` row and a stage's first-fire `verified` flag — and the
+ * caller committed it in a separate `immediateTransaction` so a refused DEFERRED-to-write upgrade
+ * could not make a LOOKUP throw. Both writes are gone (the governed moment replaced the event row;
+ * `verified` was unmeasurable once nothing matched an action), so the payload described nothing and
+ * the second transaction committed nothing. It was not free: an empty `immediateTransaction` still
+ * issues `BEGIN IMMEDIATE`, which holds the store's write lock for the length of the no-op —
+ * measured, a concurrent writer on a second connection takes SQLITE_BUSY while it is open. A read
+ * path that delivers rules has no business taking the write lock, so the seam was removed rather
+ * than kept warm for a write nobody has named. Reinstating one means reinstating the split too, for
+ * the reason above.
  */
-export function evaluateStageLookup(
-  db: StoragePort,
-  opts: StageLookupOptions,
-): { result: StageLookupResult; pending: PendingGateWrites | null } {
+export function evaluateStageLookup(db: StoragePort, opts: StageLookupOptions): StageLookupResult {
   assertQueryableCircle(opts.circle);
-  const startedAt = typeof process !== "undefined" && process.hrtime ? process.hrtime.bigint() : null;
-  const now = opts.now ?? Date.now();
-  const record = opts.record !== false;
   const stage = findStage(db, opts.stage);
 
   if (!stage) {
-    // THE MISS CARRIES THE LIVE INDEX, unconditionally — this is part of the READ result (so a
-    // misremembered name self-repairs in one round trip), not the instrumentation, so it is
-    // computed whether or not `record` asked for a gate_events row.
+    // THE MISS CARRIES THE LIVE INDEX, unconditionally: it is part of the READ result — a
+    // misremembered name self-repairs in one round trip — never instrumentation.
     const stageIndexResult = liveStageIndex(db, opts.circle);
-    const result: StageLookupResult = {
+    return {
       matched: false, stage: null, rules: [],
       stageIndex: stageIndexResult.names,
       ...(stageIndexResult.total !== undefined ? { stageIndexTotal: stageIndexResult.total } : {}),
     };
-    return {
-      result,
-      pending: record
-        ? {
-            // ATTEMPTED RECOGNITIONS ARE THE NUMERATOR a future recognition-rate (scanner-slice)
-            // measure needs, and a miss recorded nowhere would silently drop out of that count —
-            // so a miss is recorded exactly like a hit, action_context = the name actually asked.
-            actionContext: opts.stage, circle: opts.circle, now, overflow: false,
-            latencyUs: elapsedUs(startedAt), matchedStageIds: [],
-            primaryStageId: null, ruleCount: 0, maxSeverity: null, matcher: "recognized",
-          }
-        : null,
-    };
   }
 
-  // SAME CHOKEPOINT SEMANTICS AS THE MECHANICAL GATE: liveness, circle, model-tag filter, parent
-  // principle — rulesForStages is the one query both matchers deliver through. withBody: true — this is the
-  // ONLY caller that needs it, because toStageLookupRule is the only mapper that reads it (the
-  // capability invocation payload).
+  // THE ONE DELIVERY CHOKEPOINT: liveness, circle, model-tag filter, parent principle —
+  // rulesForStages. withBody: true — this is the ONLY caller that needs it, because
+  // toStageLookupRule is the only mapper that reads it (the capability invocation payload).
   //
   // SQL-LEVEL BOUNDS (review fix — Codex round 2, extended round 3 to `reason`): the primary fetch
   // caps how many rows come back (STAGE_LOOKUP_RULES_CAP, +1 as a cheap "were there more" probe —
@@ -2653,8 +2504,8 @@ export function evaluateStageLookup(
   const primaryRows = rulesForStages(
     db, [stage.id], opts.circle, opts.runtimeModelTag, true,
     STAGE_LOOKUP_RULES_CAP + 1, STAGE_LOOKUP_BODY_CAP + 1, STAGE_LOOKUP_REASON_CAP + 1,
-    // The lookup path pays for the disputed-parent ids (PR #112 round 8); the mechanical gate
-    // carries the flag alone — see rulesForStages' own column comment for the split.
+    // This path pays for the disputed-parent ids (PR #112 round 8) — see rulesForStages' own
+    // column comment for why the aggregation is opt-in rather than always selected.
     true,
   );
   const capped = primaryRows.length > STAGE_LOOKUP_RULES_CAP;
@@ -2671,82 +2522,46 @@ export function evaluateStageLookup(
     ? ruleOutlineForStage(db, stage.id, opts.circle, opts.runtimeModelTag, STAGE_LOOKUP_RULES_CAP, STAGE_LOOKUP_OUTLINE_CAP)
     : undefined;
 
-  const result: StageLookupResult = {
+  return {
     matched: true,
     stage: { id: stage.id, name: stage.name },
     rules,
     ...(rulesTotal !== undefined ? { rulesTotal } : {}),
     ...(rulesOutline !== undefined ? { rulesOutline } : {}),
   };
-  return {
-    result,
-    pending: record
-      ? {
-          actionContext: opts.stage, circle: opts.circle, now, overflow: false,
-          latencyUs: elapsedUs(startedAt),
-          matchedStageIds: [],
-          primaryStageId: stage.id,
-          // HONEST INSTRUMENTATION: the true rule count when retrieval was capped, not the
-          // (possibly much smaller) length of what was actually fetched.
-          ruleCount: rulesTotal ?? rules.length,
-          maxSeverity: rules.some((rule) => rule.severity === "blocking") ? "blocking" : rules.length > 0 ? "advisory" : null,
-          matcher: "recognized",
-        }
-      : null,
-  };
 }
 
 /**
  * THE RECOGNIZED MATCHER. The agent NAMES a stage — no trigger-pattern matching, no fuzzy or
  * embedding search: recognition is the agent's own act against the resident stage index, and this
- * is a lookup against it. Delivers through the SAME chokepoint semantics as the mechanical gate
- * (liveness, circle scope, model-tag filtering, parent principle) plus the one payload that gate
- * never carries: each rule's `body`, the capability invocation, spent here because this is agent-
- * initiated pull at the moment of need rather than an always-on injection.
+ * is a lookup against it. Delivers through the one chokepoint (liveness, circle scope, model-tag
+ * filtering, parent principle) plus each rule's `body`, the capability invocation, spent here
+ * because this is agent-initiated pull at the moment of need rather than an always-on injection.
  *
  * ADVISORY-ONLY BY DESIGN: severity is delivered as information — a blocking rule appears with its
- * reason, exactly like an advisory one — and never enforced here. The deny tier stays on the
- * mechanical gate; nothing about calling this can refuse an action.
+ * reason, exactly like an advisory one — and never enforced here. Nothing about calling this can
+ * refuse an action; refusal is the host's to perform.
  *
  * A stage with zero live rules is a HIT with `rules: []` (the stage-hit-no-rules signal — see
- * GateResult.silence for why this is never conflated with a miss). A miss (no such stage) carries
- * the live stage index so a misremembered name self-repairs in one round trip. Every call — hit or
- * miss alike — records one gate_events row with matcher='recognized'; a miss records
- * matched_stage_id NULL and action_context = the name actually asked, because attempted
- * recognitions are the numerator a recognition-rate measure needs and a silently-dropped miss
- * would corrupt exactly that count.
+ * `StageLookupResult.matched` for why this is never conflated with a miss). A miss (no such stage)
+ * carries the live stage index so a misremembered name self-repairs in one round trip.
  *
- * The standalone form — evaluateStageLookup + commitGateWrites in one call, for a caller with no
- * transaction of its own; the split form is `evaluateStageLookup` + `commitGateWrites`.
- * MonetCore.stageLookup() uses the split form directly.
+ * ONE READ TRANSACTION, WHICH IS THE WHOLE OF IT (review fix — Codex round 4, item 3, and now the
+ * only thing that fix's split still protects). Before it, this function — the path a caller with no
+ * transaction of its own actually runs — issued `evaluateStageLookup`'s several reads (findStage,
+ * then rulesForStages, then, only when capped, countLiveRulesForStage/ruleOutlineForStage; or on a
+ * miss liveStageNamesCapped/countLiveStages) as separate, unwrapped statements. A concurrent writer
+ * — the SUPPORTED MCP+CLI topology storage.ts's WAL+busy_timeout setup exists for — landing a rule
+ * bind/retire BETWEEN two of them could make `rulesTotal`/`rulesOutline`/`stageIndexTotal` describe
+ * a DIFFERENT instant than the `rules`/`stageIndex` prefix already returned: an honest-looking total
+ * for a snapshot that never existed. The DEFERRED transaction is what closes that window.
  *
- * TRANSACTION-WRAPPED, mirroring MonetCore.stageLookup() (engine.ts) EXACTLY (review fix — Codex
- * round 4, item 3): that method wraps its own call to `evaluateStageLookup` in
- * `this.db.transaction(...)()` — a single consistent read view — and only THEN, separately,
- * `commitGateWrites` in its own `this.db.immediateTransaction(...)()`, inside a try/catch that
- * swallows the write's failure (see `commitGateWrites`' own comment for why: a deferred read
- * transaction upgrading to a write one can be refused with SQLITE_BUSY, and losing one
- * instrumentation row is the acceptable side of that trade — losing a verdict is not). Before this
- * fix, THIS function — the one path a caller with no transaction of its own actually runs — issued
- * `evaluateStageLookup`'s several reads (findStage, then rulesForStages, then — only when capped —
- * countLiveRulesForStage/ruleOutlineForStage, or on a miss liveStageNamesCapped/countLiveStages) as
- * separate, unwrapped statements. A concurrent writer (the SUPPORTED MCP+CLI topology storage.ts's
- * WAL+busy_timeout setup exists for) landing a rule bind/retire BETWEEN two of those reads could
- * make `rulesTotal`/`rulesOutline`/`stageIndexTotal` describe a DIFFERENT instant than the
- * `rules`/`stageIndex` prefix already returned — an honest-looking total for a snapshot that never
- * existed. Same split as the engine method, same swallow-on-write-failure, just constructed here
- * instead of on `this.db`.
+ * NO WRITE TRANSACTION FOLLOWS IT any more — see `evaluateStageLookup` for what was there, why it
+ * was a separate `immediateTransaction`, and why an empty one was worse than none.
+ * MonetCore.stageLookup() holds the identical shape on `this.db`.
  */
 export function stageLookup(db: StoragePort, opts: StageLookupOptions): StageLookupResult {
-  const { result, pending } = db.transaction(() => evaluateStageLookup(db, opts))();
-  if (pending) {
-    try {
-      db.immediateTransaction(() => commitGateWrites(db, pending, opts.nextSyncTimestamp))();
-    } catch {
-      // Instrumentation only. Deliberately swallowed — see this function's own comment above.
-    }
-  }
-  return result;
+  return db.transaction(() => evaluateStageLookup(db, opts))();
 }
 
 // ---- instrumentation readback -----------------------------------------------
@@ -2802,8 +2617,9 @@ export function gateCoverage(db: StoragePort, opts: GateCoverageOptions): GateCo
   // `unexplainedDenies` (below) both embed `(b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')` —
   // RULE_LIVENESS_WHERE's own collapsed-OR shape, restated inline at each — which degenerates to
   // "global rules only" the instant `opts.circle` itself is `'*'`, per `assertQueryableCircle`'s own
-  // doc comment. Round 6 swept `gateInternal`/`evaluateStageLookup`, every caller of
-  // `RULE_LIVENESS_WHERE` at the time — but `gateCoverage` was written with its own two
+  // doc comment. Round 6 swept every caller of `RULE_LIVENESS_WHERE` there was at the time (the
+  // always-on fire path, since removed, and `evaluateStageLookup`) — but `gateCoverage` was
+  // written with its own two
   // hand-rolled copies of the same predicate rather than the shared constant, so it never appeared
   // in that sweep's own search surface. An unguarded `gateCoverage('*')` silently reported ZERO local
   // retirement candidates and ZERO local unexplained denies for circle '*' — not an empty result

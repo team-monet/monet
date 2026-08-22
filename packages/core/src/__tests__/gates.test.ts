@@ -6680,11 +6680,11 @@ describe("stageLookup — the recognized matcher", () => {
       rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "it destroys teammates' commits", ...AGENT_RULE },
     });
     const db = (c as unknown as { db: StoragePort }).db;
-    // The pure read, the standalone read+commit form, and the MonetCore wrapper are three doors onto
-    // ONE chokepoint. Nothing may differ between them: a caller with its own transaction and a
-    // caller without one must be told the same thing.
-    const viaEvaluate = evaluateStageLookup(db, { stage: "git force push", circle: "default", record: false }).result;
-    const viaStandalone = standaloneStageLookup(db, { stage: "git force push", circle: "default", record: false });
+    // The unwrapped read, the transaction-wrapped standalone form, and the MonetCore wrapper are
+    // three doors onto ONE chokepoint. Nothing may differ between them: a caller with its own
+    // transaction and a caller without one must be told the same thing.
+    const viaEvaluate = evaluateStageLookup(db, { stage: "git force push", circle: "default" });
+    const viaStandalone = standaloneStageLookup(db, { stage: "git force push", circle: "default" });
     const viaCore = c.stageLookup({ stage: "git force push" });
 
     expect(viaCore.matched).toBe(true);
@@ -7635,8 +7635,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
  * order, so a test can assert the SHAPE of the transaction boundaries around a call: not just that
  * "some transaction" existed somewhere (a per-statement `inTransaction()` snapshot cannot tell one
  * merged transaction apart from two sequential ones — every statement in EITHER scenario runs with
- * SOME transaction open), but that the read phase shares exactly one, the write phase shares a
- * SEPARATE one, and the write's begins only after the read's has fully closed.
+ * SOME transaction open), but exactly how many of each kind opened, and in what order.
  */
 class TransactionLoggingStorage extends BetterSqlitePort {
   readonly events: string[] = [];
@@ -7665,7 +7664,26 @@ class TransactionLoggingStorage extends BetterSqlitePort {
 }
 
 describe("stageLookup (standalone) — transaction boundaries", () => {
-  it("wraps the read phase in ONE db.transaction(...), and commitGateWrites in its OWN separate db.immediateTransaction(...) afterward — mirrors MonetCore.stageLookup()'s own split exactly (Codex round 4, item 3). STRUCTURAL ASSERTION chosen over true concurrency: a genuine concurrent-writer race would need a second real connection racing mid-read, which is disproportionate to set up deterministically; this instead proves the CODE SHAPE the race protection depends on.", async () => {
+  /**
+   * WHAT THIS ASSERTED UNTIL 2026-08-22, and what changed: the original (Codex round 4, item 3)
+   * required ONE `db.transaction(...)` for the read phase and ONE SEPARATE
+   * `db.immediateTransaction(...)` for `commitGateWrites` afterward, beginning only after the read
+   * had closed. The first half was the TOCTOU fix and is unchanged below. The second half was
+   * protection for a write that no longer exists: `commitGateWrites` had been emptied when
+   * `gate_events` and the `verified` flag were removed, so the assertion was pinning the SHAPE of a
+   * write phase that committed nothing.
+   *
+   * IT IS NOW THE OPPOSITE ASSERTION, and that is a strengthening rather than a loss. `BEGIN
+   * IMMEDIATE` takes SQLite's write lock whether or not the transaction body does anything —
+   * measured on this build: a concurrent writer on a second connection takes SQLITE_BUSY for the
+   * duration of an EMPTY immediate transaction. So a lookup that opened one was serialising real
+   * writers behind a no-op. ZERO immediate transactions is the property worth holding: a pure read
+   * must never take the write lock. If a gate write is reintroduced, this test should go back to
+   * requiring the SEPARATE-transaction split, for the reason it was written with — a DEFERRED read
+   * transaction upgrading to a write one can be refused with SQLITE_BUSY, and a lookup must not
+   * throw because a bookkeeping row could not be written.
+   */
+  it("wraps every read in ONE db.transaction(...) and opens NO write transaction at all — a pure read must not take the store's write lock. STRUCTURAL ASSERTION chosen over true concurrency: a genuine concurrent-writer race would need a second real connection racing mid-read, which is disproportionate to set up deterministically; this instead proves the CODE SHAPE the race protection depends on.", async () => {
     const dir = mkTmp();
     const path = join(dir, "monet.db");
     const setup = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1 });
@@ -7681,28 +7699,26 @@ describe("stageLookup (standalone) — transaction boundaries", () => {
     setup.close();
 
     const port = new TransactionLoggingStorage(path);
-    const result = standaloneStageLookup(port, { stage: "bulk stage", circle: "default", nextSyncTimestamp: () => Date.now() });
+    const result = standaloneStageLookup(port, { stage: "bulk stage", circle: "default" });
     port.close();
 
     expect(result.matched).toBe(true);
     expect(result.rulesTotal).toBe(RULE_COUNT); // sanity: this really is the capped, multi-read path
 
-    // EXACTLY ONE read transaction, EXACTLY ONE write transaction — the same shape
-    // MonetCore.stageLookup() itself uses (engine.ts), not zero (unwrapped — the bug) and not one
-    // shared transaction spanning both (which would defeat the write's own allowed-to-fail split).
+    // EXACTLY ONE read transaction — not zero (unwrapped: the bug round 4 closed), not several
+    // (which would put the capped-path reads in a different instant from the prefix already
+    // returned). The same shape MonetCore.stageLookup() itself uses (engine.ts).
     expect(port.events.filter((e) => e === "transaction:call")).toHaveLength(1);
-    expect(port.events.filter((e) => e === "immediateTransaction:call")).toHaveLength(1);
+    // AND NO WRITE TRANSACTION, at all.
+    expect(port.events.filter((e) => e === "immediateTransaction:call")).toHaveLength(0);
+    expect(port.events).not.toContain("immediateTransaction:run:start");
 
     const readStart = port.events.indexOf("transaction:run:start");
     const readEnd = port.events.indexOf("transaction:run:end");
-    const writeStart = port.events.indexOf("immediateTransaction:run:start");
-    const writeEnd = port.events.indexOf("immediateTransaction:run:end");
     expect(readStart).toBeGreaterThanOrEqual(0);
     expect(readEnd).toBeGreaterThan(readStart);
-    // THE WRITE BEGINS ONLY AFTER THE READ TRANSACTION FULLY CLOSED: proof these are two SEQUENTIAL
-    // transactions, not one merged one.
-    expect(writeStart).toBeGreaterThan(readEnd);
-    expect(writeEnd).toBeGreaterThan(writeStart);
+    // Nothing runs after the read transaction closes.
+    expect(port.events[port.events.length - 1]).toBe("transaction:run:end");
   }, 30_000);
 });
 

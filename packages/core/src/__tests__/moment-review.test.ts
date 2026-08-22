@@ -245,8 +245,13 @@ describe("P1 — moment counts are scoped to the circle the overview asked for",
 
     const core = new MonetCore(":memory:", { momentSpoolPath: path, defaultCircle: "acme-widgets" });
     cores.push(core);
-    expect(core.momentCounts("acme-widgets").fires).toBe(1);
-    expect(core.momentCounts("other-project").fires).toBe(1);
+    // `total` rather than the removed `fires` (2026-08-22): the scoping is what is under test, and
+    // it is the same WHERE clause on either counter. Both moments are evaluated records, so both
+    // stay out of `ungoverned` — asserted here so the scoping check cannot silently start passing
+    // against a counter that counts everything.
+    expect(core.momentCounts("acme-widgets").total).toBe(1);
+    expect(core.momentCounts("other-project").total).toBe(1);
+    expect(core.momentCounts("acme-widgets").ungoverned).toBe(0);
   });
 
   it("counts a moment whose circle was never known as unattributed, not as this circle's", () => {
@@ -263,7 +268,9 @@ describe("P1 — moment counts are scoped to the circle the overview asked for",
     const core = new MonetCore(":memory:", { momentSpoolPath: path, defaultCircle: "acme-widgets" });
     cores.push(core);
     const counts = core.momentCounts("acme-widgets");
-    expect(counts.fires).toBe(1);
+    // The attributed one lands in this circle; the unattributable one lands in NEITHER circle's
+    // `total` and is reported on its own — which is the whole point of the split.
+    expect(counts.total).toBe(1);
     expect(counts.unattributed).toBe(1);
   });
 });
@@ -631,8 +638,9 @@ describe("R6 — a resolved-but-failed tool result is not an ok outcome", () => 
  * WHAT USED TO SIT HERE TOO: "counts fires and silences from MonetCore.gate()" — the library
  * caller's own interception moment, written by `spoolApiGateMoment`. That method went with
  * `MonetCore.gate()` on 2026-08-22, and with it the last IN-PROCESS producer of a fire or a
- * silence. `momentCounts().fires`/`.silences` are now fed exclusively by an out-of-process
- * interceptor writing its own moment; nothing this library exposes moves them.
+ * silence. The counters themselves followed later the same day: with no writer left anywhere in
+ * this tree, `fires`/`silences`/`delivered` could only report a structurally-fixed zero, which
+ * reads as a measurement and is not one. See `MomentCounts`.
  */
 describe("R6 — the public stageLookup() record for a library caller", () => {
   it("counts stage reads from MonetCore.stageLookup()", async () => {

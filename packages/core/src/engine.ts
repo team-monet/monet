@@ -122,7 +122,6 @@ import {
   evaluateStageLookup,
   findStage,
   formatTriggerPattern,
-  commitGateWrites,
   gateCoverage,
   getRuleBinding,
   hasLineBreak,
@@ -2044,19 +2043,22 @@ export interface MemoryOverview {
     skeleton: number;
   };
   /**
-   * WHAT THE GATE HAS DONE, and what its registry can say about itself.
+   * WHAT IS KNOWN ABOUT THE GOVERNED MOMENTS, and what the rule registry can say about itself.
    *
    * REBUILT ON THE GOVERNED MOMENT. The counts used to come from a `gate_events` row per intercepted
    * action; they now come from the moment record, which unlike a verdict row can name the rules that
    * fired and be joined back to the act. Two shapes changed with it, both deliberately:
    *
    *   - `ungoverned` replaces the old `overflows`, and is wider: it counts every moment NOTHING
-   *     evaluated — an overflow, a surface no interception could read, or a call into the store. The
-   *     split is on whether a gate looked, because `silences` is a claim that one did.
+   *     evaluated — an overflow, a surface no interception could read, or a call into the store.
    *   - `unreadStages` is derived by joining the live stage registry against the stages agents have
    *     actually NAMED through `stage_lookup`, rather than against a per-stage event count. A stage
    *     absent from that set has never been asked for, which is the state indistinguishable from a
    *     healthy quiet one until something says so.
+   *
+   * WHAT IS DELIBERATELY ABSENT: `fires`, `silences` and `delivered`. Nothing in this tree writes
+   * the columns behind them any more, so each would report a structurally-fixed zero — see
+   * `MomentCounts`' own comment for why that is worse than reporting nothing.
    *
    * `conformance` is the fourth fact and the only one no machine produced. `unanswered` and
    * `notAsked` are reported separately and never summed: one is a queue owed to the user, the other
@@ -12127,10 +12129,10 @@ export class MonetCore {
     attachMomentAnswer(this.db, run, { momentId, answer });
   }
 
-  /** What the gate did, across every moment on record. Folds first. */
+  /** What is known about every moment on record. Folds first. */
   momentCounts(circle?: string): MomentCounts {
     if (this.momentSpoolPath === null) {
-      return { fires: 0, silences: 0, ungoverned: 0, delivered: 0, total: 0, unopened: 0, unattributed: 0 };
+      return { ungoverned: 0, total: 0, unopened: 0, unattributed: 0 };
     }
     return momentCounts(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }
@@ -12393,17 +12395,27 @@ export class MonetCore {
    * search. Delivers through the shared chokepoint (liveness, circle, model-tag filter, parent
    * principle), plus each rule's `body` — the capability invocation payload. Advisory-only by
    * design: severity is delivered as information and never enforced here. See gates.ts's own
-   * `stageLookup` doc comment for the full contract (stage-hit-no-rules vs miss, the
-   * live-index-on-miss self-repair, and why every call records an event).
+   * `stageLookup` doc comment for the full contract (stage-hit-no-rules vs miss, and the
+   * live-index-on-miss self-repair).
    *
-   * READ AND WRITE ARE SPLIT: the verdict is computed and returned in its own read transaction,
-   * and the bookkeeping write is a separate one that is allowed to fail silently — see
-   * `commitGateWrites`' own comment for why that trade only fails in the survivable direction.
+   * ONE READ TRANSACTION AND NOTHING ELSE. The lookup writes nothing to the gate substrate — see
+   * `evaluateStageLookup` for the write that used to follow it and why an empty second transaction
+   * was worse than none. The only write this method can still make is the governed-moment READ
+   * record below, which goes through the spool rather than the database.
    */
   stageLookup(opts: {
     stage: string;
     circle?: string;
-    now?: number;
+    /**
+     * `false` makes this call a PURE READ: asking without it counting.
+     *
+     * WHAT IT STILL SUPPRESSES, now that the gate substrate is written on no path: the
+     * governed-moment READ record below, and nothing else. It used to ALSO suppress a stage-event
+     * row, which is why it is distinct from `recordMomentRead` — the two were separable then. They
+     * are not any more, and the pair is kept apart rather than merged because they are asked by
+     * different callers for different reasons: `record: false` is "this lookup is not a real
+     * consultation", `recordMomentRead: false` is "it is, and I will record it more accurately".
+     */
     record?: boolean;
     runtimeModelTag?: string;
     /**
@@ -12413,8 +12425,7 @@ export class MonetCore {
      * EXACTLY ONE CALLER SETS IT, and it must: the MCP adapter fits the returned rules to a
      * response budget, so only IT knows which identities actually reached the agent. Recording
      * here as well would both double-count and re-credit rules the fitter dropped — the defect a
-     * Codex round already closed once. Distinct from `record`, which governs the separate
-     * stage-event instrumentation and whose meaning must not be overloaded.
+     * Codex round already closed once.
      */
     recordMomentRead?: boolean;
   }): StageLookupResult {
@@ -12441,28 +12452,18 @@ export class MonetCore {
   }
 
   private stageLookupUnjournaled(opts: {
-    stage: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
+    stage: string; circle?: string; runtimeModelTag?: string;
   }): StageLookupResult {
     const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
-    const { result, pending } = this.db.transaction(() =>
+    // ONE transaction, deferred, spanning every read the lookup makes — see gates.ts's own
+    // `stageLookup` for the TOCTOU window this closes and why nothing follows it.
+    return this.db.transaction(() =>
       evaluateStageLookup(this.db, {
         stage: opts.stage,
         circle,
-        now: opts.now,
-        record: opts.record,
         runtimeModelTag: opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined,
       }),
     )();
-    if (pending) {
-      try {
-        this.db.immediateTransaction(() =>
-          commitGateWrites(this.db, pending, () => this.nextSyncTimestamp()),
-        )();
-      } catch {
-        // Instrumentation only. Deliberately swallowed — see `commitGateWrites` for why.
-      }
-    }
-    return result;
   }
 
   /** What the gate's own registry can say about itself — the curation lists, never act counts. */

@@ -112,16 +112,21 @@ describe("overview composition + invariants", () => {
     // The counts, the four conformance states, and what the record knows it is missing — and
     // nothing else until there is something actionable to say.
     expect(Object.keys(clean).sort()).toEqual([
-      "conformance", "delivered", "fires", "losses", "silences", "total", "unattributed",
-      "ungoverned", "unopened",
+      "conformance", "losses", "total", "unattributed", "ungoverned", "unopened",
     ].sort());
     // `unopened` is its own key BY DESIGN (F3): debris is excluded from every rate, and excluding
     // it must not make it invisible — a swallowed interception is a real loss.
     // `ungoverned` is NOT a rename of `overflows`: it is wider, and it is its own number precisely
-    // so a moment nothing evaluated cannot be read as a silence.
+    // so a moment nothing evaluated cannot be read as one something looked at.
     expect(clean).not.toHaveProperty("overflows");
     expect(clean).not.toHaveProperty("byStage");
     expect(clean).not.toHaveProperty("unverifiedPatterns");
+    // REMOVED 2026-08-22, and asserted absent rather than merely left out of the list above: with no
+    // writer left for `rule_ids`/`delivered_rule_ids`, each of these could only ever report zero,
+    // and a structurally-fixed zero on a curation surface reads as a finding. See `MomentCounts`.
+    expect(clean).not.toHaveProperty("fires");
+    expect(clean).not.toHaveProperty("silences");
+    expect(clean).not.toHaveProperty("delivered");
     // The two pending states are separate keys and are never summed into one.
     const conformance = clean.conformance as Record<string, unknown>;
     expect(conformance).toHaveProperty("unanswered");

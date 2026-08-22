@@ -863,11 +863,13 @@ export interface MomentConformance {
   /**
    * Delivered, read, and unjudgeable: every read arrived after the action.
    *
-   * NOT A DEFECT AND NOT A QUEUE — a third thing, and it needs its own number because it is the
-   * NORMAL outcome for an advisory on this host. A PreToolUse advisory reaches the model beside the
-   * tool result, so the lookup it prompts cannot precede the act. Without this count those moments
-   * are indistinguishable from advisories nobody engaged with, which is the opposite of what
-   * happened: the agent went and read the rule.
+   * NOT A DEFECT AND NOT A QUEUE — a third thing, and it needs its own number because for one whole
+   * class of record it is the NORMAL outcome rather than a fault. A PreToolUse advisory reaches the
+   * model beside the tool result on this host (moment-spool.ts's header states the finding and how
+   * it was established), so the lookup it prompts cannot precede the act. Monet ships nothing that
+   * delivers at PreToolUse today, so nothing it writes can newly land here; the moments that DO are
+   * host-hook records already folded, and they must not be read as advisories nobody engaged with.
+   * That is the opposite of what happened: the agent went and read the rule.
    *
    * Counted only where NO timely read exists. A moment with one of each is Received on the strength
    * of the timely one and belongs in the ordinary flow.
@@ -927,33 +929,34 @@ export function momentConformance(db: StoragePort, spoolPath: string, circle: st
 }
 
 /**
- * THE RATE COUNTERS, rebuilt on the governed moment.
+ * WHAT THE RECORD CAN SAY ABOUT ITS OWN MOMENTS — populations, not rates.
  *
- * These replace what `gate_events` used to answer, and one distinction had to change to stay honest.
- * The old counters had an `overflows` bucket meaning "the payload was past the threshold and nothing
- * was matched against it". The moment record has a wider version of that fact: `ruleIds IS NULL`
- * means NOTHING EVALUATED THIS MOMENT AT ALL — an overflow, a tool the hook could not read, or a
- * call into the store, which no gate evaluates by design.
+ * THE RATES WERE REMOVED ON 2026-08-22, and the removal is the interesting part. `fires` (a
+ * rule was bound), `silences` (nothing was bound) and `delivered` (a rule's identity reached the
+ * agent) all read `rule_ids`/`delivered_rule_ids`, and every one of those was written by the
+ * mechanical matcher at interception. That matcher is gone. The only writer of a governed moment
+ * left in this tree is `MonetCore.openStoreMoment`, which hard-codes `ruleIds: null` and
+ * `disposition: 'ungoverned'` and never writes `delivered_rule_ids` at all — so on anything this
+ * build produces, all three counters were pinned at zero by construction.
  *
- * SO THE SPLIT IS ON WHETHER A GATE LOOKED, not on the disposition word alone. `fires` and
- * `silences` are both claims about an evaluation that happened, so both are scoped to moments where
- * one did; lumping the never-evaluated moments into `silences` would report "nothing governs this"
- * for actions no rule set was ever consulted about — the substitution this whole record exists to
- * prevent, and the reason `ungoverned` is its own number rather than folded into either.
+ * A STRUCTURALLY-FIXED ZERO IS THE WORST SHAPE THIS RECORD CAN TAKE. "0 fired, 0 delivered" reads
+ * as a measurement — an agent ignoring its rules, a delivery path that broke — when it is in fact
+ * the absence of any measuring at all, which is precisely the substitution of a verdict for a
+ * not-known that this whole record exists to prevent. Reporting nothing is the honest state; the
+ * counters return when something writes the columns again, and they should return with their split
+ * intact (see below).
  *
- * `delivered` counts moments where at least one rule's IDENTITY reached the agent. An advisory
- * delivers stage names and no rule id, so it is deliberately not counted here — receipt cannot be
- * claimed for an identity that was never sent.
+ * THE SPLIT THEY ENCODED, kept here because the next interceptor will have to rebuild it. `ruleIds`
+ * distinguishes three states, not two: `['r1']` is "something was bound", `[]` is "a matcher looked
+ * and bound nothing", and NULL is "nothing evaluated this moment at all". Only the first two are
+ * claims about an evaluation. Lumping the third into a silence count reports "nothing governs this"
+ * for an action no rule set was ever consulted about, which is why `ungoverned` is its own number
+ * and never folded into either. Receipt is a fourth state again: an advisory that delivers stage
+ * names and no rule id has not delivered an identity, and cannot be counted as if it had.
  */
 export interface MomentCounts {
-  /** A gate evaluated, and at least one rule was bound. */
-  fires: number;
-  /** A gate evaluated, and nothing was bound. Silence is a value. */
-  silences: number;
   /** Nothing evaluated this moment: an overflow, an unreadable surface, or a call into the store. */
   ungoverned: number;
-  /** Moments where at least one rule id actually reached the agent. */
-  delivered: number;
   /** Every governed moment on record in this circle. Debris is excluded and counted below. */
   total: number;
   /**
@@ -975,7 +978,7 @@ export interface MomentCounts {
   unopened: number;
 }
 
-/** Counts every moment by what the gate did. Folds first. */
+/** Counts every moment on record, by what is known about it. Folds first. */
 export function momentCounts(db: StoragePort, spoolPath: string, circle: string): MomentCounts {
   foldMomentSpool(db, spoolPath);
   const one = (sql: string): number => (db.prepare(sql).get(circle) as { n: number }).n;
@@ -984,15 +987,8 @@ export function momentCounts(db: StoragePort, spoolPath: string, circle: string)
   // unreadable surface, or a call into the store" — debris is none of those, and counting it there
   // put a fourth, undocumented population inside a number a human reads.
   // SCOPED, because the spool is shared across projects and this store folded all of it.
-  const EVALUATED = `opened = 1 AND circle = ? AND rule_ids IS NOT NULL`;
   return {
-    fires: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE ${EVALUATED} AND rule_ids != '[]'`),
-    silences: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE ${EVALUATED} AND rule_ids = '[]'`),
     ungoverned: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 1 AND circle = ? AND rule_ids IS NULL`),
-    delivered: one(
-      `SELECT COUNT(*) AS n FROM governed_moments
-        WHERE opened = 1 AND circle = ? AND delivered_rule_ids IS NOT NULL AND delivered_rule_ids != '[]'`,
-    ),
     total: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 1 AND circle = ?`),
     // NOT circle-scoped, deliberately: debris has no interception, so it has no circle either.
     unopened: oneNoArg(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 0`),

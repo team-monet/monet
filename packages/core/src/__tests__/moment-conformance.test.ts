@@ -339,12 +339,22 @@ describe("the signal that tells the agent it owes a question", () => {
 });
 
 /**
- * THE RATE COUNTERS, rebuilt on the moment. These replace what gate_events used to answer, and the
- * one thing that must not regress is the split: `silences` is a claim that a gate LOOKED and found
- * nothing bound, so a moment nothing evaluated may never land in it.
+ * THE MOMENT COUNTERS. `fires`, `silences` and `delivered` were removed on 2026-08-22 with the
+ * matcher that wrote the columns behind them, so the two cases that asserted their VALUES are gone
+ * with their subject (see `MomentCounts`' own comment for why a structurally-fixed zero is worse
+ * than reporting nothing). The fixture and the property underneath them are kept here, because the
+ * property is the one that must not regress whatever gets counted next.
+ *
+ * THE SPLIT IS ON WHETHER ANYTHING EVALUATED THE MOMENT, never on the disposition word. `ungoverned`
+ * is scoped to `rule_ids IS NULL` — nothing looked — and an evaluated moment must stay out of it,
+ * whether that evaluation bound a rule or deliberately bound none. Widening `ungoverned` to "every
+ * moment", now that the evaluated population happens to be empty in anything this build writes,
+ * would silently redefine it into `total` and lose exactly this distinction the day a spool with
+ * real evaluations is folded — which is not hypothetical: the spool is home-level and shared, and a
+ * fresh store folds every line already on disk.
  */
-describe("what the gate did, counted", () => {
-  it("keeps 'nothing evaluated this' out of 'nothing governs this'", () => {
+describe("what is known about a moment, counted", () => {
+  it("keeps 'nothing evaluated this' apart from 'something evaluated this', across all four record shapes", () => {
     const path = join(mkTmp(), "moments.jsonl");
     const db = mkDb();
     seq = 0;
@@ -356,33 +366,18 @@ describe("what the gate did, counted", () => {
         deliveredRuleIds: delivered,
       });
     };
-    moment("fired", ["rule-a"], "advised", []);
-    moment("blocked", ["rule-b"], "blocked", ["rule-b"]);
-    moment("quiet", [], "silent", []);
+    moment("fired", ["rule-a"], "advised", []); // bound, but no identity sent
+    moment("blocked", ["rule-b"], "blocked", ["rule-b"]); // bound, identity sent
+    moment("quiet", [], "silent", []); // looked, bound nothing — a VALUE, not an absence
     moment("store-call", null, "ungoverned", null); // no gate evaluates a call into the store
 
     const counts = momentCounts(db, path, "acme-widgets");
-    expect(counts).toEqual({
-      fires: 2, silences: 1, ungoverned: 1, delivered: 1, total: 4, unopened: 0, unattributed: 0,
-    });
-    // The store call is NOT a silence: reporting it as one would say "nothing governs this action"
-    // about an action no rule set was ever consulted about.
-    expect(counts.silences).toBe(1);
-  });
-
-  it("does not count an advisory as delivered, because no rule id was sent", () => {
-    const path = join(mkTmp(), "moments.jsonl");
-    const db = mkDb();
-    seq = 0;
-    line(path, {
-      kind: "interception", momentId: "advised-one", at: "2026-08-19T00:00:00.000Z", toolUseId: null, circle: "acme-widgets",
-      sessionId: null, surface: "Bash", actionSha256: "a".repeat(64), actionRendering: "x",
-      actionChars: 1, actionClipped: false, stageId: "s1", ruleIds: ["rule-a"],
-      disposition: "advised", deliveredRuleIds: [],
-    });
-    const counts = momentCounts(db, path, "acme-widgets");
-    expect(counts.fires).toBe(1);
-    // Receipt cannot be claimed for an identity that was never sent.
-    expect(counts.delivered).toBe(0);
+    expect(counts).toEqual({ ungoverned: 1, total: 4, unopened: 0, unattributed: 0 });
+    // ONLY the store call. The three evaluated moments — including the silent one — stay out:
+    // counting `quiet` as ungoverned would say "nothing looked at this" about a moment where
+    // something looked and bound nothing, and counting `fired`/`blocked` there would be absurd.
+    // This is also why `ungoverned` and `total` are NOT the same number, however equal they happen
+    // to be on a store holding only what this build writes.
+    expect(counts.ungoverned).not.toBe(counts.total);
   });
 });
