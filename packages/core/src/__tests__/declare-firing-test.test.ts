@@ -3,6 +3,12 @@
  * "a pattern is admitted with at least one example action context it matches, verified at declare
  * time by the same evaluator the gate runs."
  *
+ * THE EVALUATOR IS NOW THE ONLY ONE. The mechanical matcher that intercepted actions was removed
+ * 2026-08-22, so there is no second firing path to disagree with this check. What the two
+ * end-to-end tests below still close is the other half of the same loop: the check validates the
+ * pattern `seedTriggerPattern` WOULD store, and they re-run the matcher against the pattern that
+ * was ACTUALLY stored on the row.
+ *
  * The trap it exists to catch, in the design's own words: "a `Bash:` pattern can never match a
  * `Task:` context — and after §0, tool names are known to be host variables, not constants."
  * Before this check, such a pattern was accepted in silence and simply never fired, which is the
@@ -13,6 +19,7 @@ import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore } from "../engine";
+import { matchesTriggerPattern, parseActionContext } from "../gates";
 import type { DeclareAdvisory } from "../engine";
 
 const dirs: string[] = [];
@@ -66,10 +73,10 @@ describe("declare-time firing test: the tool-prefix trap", () => {
     expect(kinds(result)).toEqual([]);
   });
 
-  // The check must use the SAME matcher the gate fires with, or it could pass on a pattern the gate
-  // then fails to fire — a worse lie than no check. Asserted end to end rather than by inspection:
-  // the declaration passes the firing test, and the real gate then really fires on that context.
-  it("agrees with the gate itself: a pattern that passes here fires there", async () => {
+  // The check validates the pattern `seedTriggerPattern` WOULD store; this asserts the pattern
+  // actually PERSISTED on the row matches the same context, so a check that passed cannot be
+  // followed by a stored pattern that does not match — end to end rather than by inspection.
+  it("agrees with the stored pattern: one that passes here matches when read back", async () => {
     const core = new MonetCore(":memory:", { defaultCircle: "acme" });
     const result = await core.declare({
       species: "rule",
@@ -83,15 +90,18 @@ describe("declare-time firing test: the tool-prefix trap", () => {
     });
     expect(kinds(result)).toEqual([]);
 
-    const fired = core.gate({ actionContext: "Task:verifier confirm the migration path" });
+    const context = parseActionContext("Task:verifier confirm the migration path");
+    const stored = core.stages().find((stage) => stage.name === "worker delegation")!;
+    // The rule really is bound at that stage, and the stage's own stored pattern really matches.
+    expect(core.stageLookup({ stage: "worker delegation" }).rules.map((rule) => rule.conceptId))
+      .toContain((result as { conceptId: string }).conceptId);
     core.close();
-    expect(fired.silence).toBe(false);
-    expect(fired.rules.map((rule) => rule.conceptId)).toContain((result as { conceptId: string }).conceptId);
+    expect(stored.patterns.some((pattern) => matchesTriggerPattern(pattern, context))).toBe(true);
   });
 
   // ...and the converse, which is the property that actually protects anyone: the check's warning
-  // is not pessimism, the gate really does stay silent.
-  it("agrees with the gate itself: a pattern that fails here fires nowhere", async () => {
+  // is not pessimism, the stored pattern really does fail to match.
+  it("agrees with the stored pattern: one that fails here matches nothing when read back", async () => {
     const core = new MonetCore(":memory:", { defaultCircle: "acme" });
     const result = await core.declare({
       species: "rule",
@@ -105,9 +115,11 @@ describe("declare-time firing test: the tool-prefix trap", () => {
     });
     expect(kinds(result)).toContain("pattern_matches_no_example");
 
-    const fired = core.gate({ actionContext: "Task:verifier confirm the migration path" });
+    const context = parseActionContext("Task:verifier confirm the migration path");
+    const stored = core.stages().find((stage) => stage.name === "worker delegation")!;
     core.close();
-    expect(fired.silence).toBe(true); // exactly what the advisory predicted
+    // Exactly what the advisory predicted: nothing this stage stores matches that context.
+    expect(stored.patterns.some((pattern) => matchesTriggerPattern(pattern, context))).toBe(false);
   });
 });
 
@@ -145,8 +157,7 @@ describe("declare-time firing test: sovereignty, and rationing", () => {
   /**
    * RATIONED. "Patterns given, no example" is deliberately NOT advised: it would fire on nearly
    * every pattern declaration ever made, and an advisory that fires every time is the unrationed,
-   * zero-yield noise the residency law exists to prevent. That signal already has two homes —
-   * gateCoverage().unverifiedPatterns.
+   * zero-yield noise the residency law exists to prevent.
    */
   it("says nothing when no example was supplied — silence is not an oversight here", async () => {
     const core = new MonetCore(":memory:", { defaultCircle: "acme" });
@@ -157,19 +168,4 @@ describe("declare-time firing test: sovereignty, and rationing", () => {
     expect(kinds(result)).toEqual([]);
   });
 
-  /**
-   * DOES NOT COUNTERFEIT `verified`. That flag means "these patterns matched a REAL action at least
-   * once", and a real fire proves a HOST produced that context; an author's example proves only
-   * that they wrote a matching string. The Agent: trap is precisely a pair of matching fictions.
-   */
-  it("leaves the stage unverified even when the example matches", async () => {
-    const core = new MonetCore(":memory:", { defaultCircle: "acme" });
-    await core.declare({
-      species: "stage", stage: "worker delegation",
-      patterns: ["Task:verifier"], instance: "Task:verifier confirm the path",
-    });
-    const stage = core.stages().find((s) => s.name === "worker delegation")!;
-    core.close();
-    expect(stage.verified).toBe(false);
-  });
 });

@@ -120,11 +120,9 @@ export type {
   RatificationVerdict,
   RecordRatificationInput,
 } from "./lifecycle-edges";
-/** The gate substrate: stages, rule bindings, and the deterministic firing path. The pattern
- *  matcher is exported deliberately — the host-side CLI that reads the gate mirror has to match
- *  with the SAME code the store matches with, or the offline answer and the live answer disagree.
- *  `evaluateGateFromMirror` is that offline answer itself: the pure, no-db evaluator a 4b-C CLI
- *  stands on. */
+/** The gate substrate: stages, rule bindings, and the recognized matcher (`stageLookup`). The
+ *  trigger-pattern matcher is still exported — nothing intercepts an action with it any more, but
+ *  it is what authors and validates a stage's patterns, and one implementation is the point. */
 export {
   GATE_SCHEMA_SQL,
   MODEL_TAG_MAX_CHARS,
@@ -144,7 +142,6 @@ export {
   createGateSchema,
   formatTriggerPattern,
   commitGateWrites,
-  evaluateGate,
   evaluateStageLookup,
   gateCoverage,
   hasLiveBinding,

@@ -123,7 +123,6 @@ import {
   findStage,
   formatTriggerPattern,
   commitGateWrites,
-  evaluateGate,
   gateCoverage,
   getRuleBinding,
   hasLineBreak,
@@ -150,7 +149,6 @@ import {
 } from "./gates";
 import type {
   GateDeps,
-  GateResult,
   GateCoverage,
   RuleBindingOrigin,
   RuleBindingRow,
@@ -1213,8 +1211,6 @@ export interface StageView {
   name: string;
   patterns: TriggerPattern[];
   origin: StageOrigin;
-  /** False until these patterns have matched a real action at least once, anywhere. */
-  verified: boolean;
   createdAt: number;
 }
 
@@ -2522,7 +2518,7 @@ export class MonetCore {
    */
   private momentRun: MomentRun | null = null;
   /**
-   * Which model this runtime is serving — the default `gate()`/`stageLookup()`/`gateCoverage()` all
+   * Which model this runtime is serving — the default `stageLookup()`/`gateCoverage()` both
    * fall back to when a call omits an explicit `runtimeModelTag`. Set at construction (the
    * `runtimeModelTag` option) or later via `setRuntimeModelTag` — see that method's own comment for
    * why a setter exists at all: it is what lets a host wire this ONCE, after the fact, so every
@@ -11878,10 +11874,10 @@ export class MonetCore {
    * "a pattern is admitted with at least one example action context it matches, verified at declare
    * time by the same evaluator the gate runs."
    *
-   * SAME EVALUATOR, NOT A SECOND ONE. `seedTriggerPattern` (exactly what upsertStage will store),
-   * `parseActionContext` and `matchesTriggerPattern` (exactly what gateInternal fires with). A
-   * declare-time check that used its own matching machinery could pass while the gate fails, which
-   * would be a worse lie than no check — it would say "verified" about a pattern that never fires.
+   * ONE EVALUATOR, NOT A SECOND ONE. `seedTriggerPattern` (exactly what upsertStage will store),
+   * `parseActionContext` and `matchesTriggerPattern` — the store's only trigger-pattern matcher.
+   * A declare-time check that used its own matching machinery could pass while the real one fails,
+   * which would be a worse lie than no check — it would vouch for a pattern that matches nothing.
    * The stage-shaped advisory below already set this precedent; this reuses the same three.
    *
    * THE EXAMPLE IS `instance`, and no new field is added for it. `instance` already means "the
@@ -11896,16 +11892,14 @@ export class MonetCore {
    * sovereignty replaces the battery. There is no extraction-quality pattern write to refuse, so no
    * refusal path is built for one; if such an entrance is ever added, this is where its refusal goes.
    *
-   * WHAT THIS DELIBERATELY DOES NOT DO: flip the stage's `verified` flag. That flag means "these
-   * patterns matched a REAL action at least once, anywhere", and a real fire proves a HOST actually
-   * produced that context. An author-supplied example proves only that the author wrote a string
-   * that matches their own pattern — the `Agent:` trap is exactly a pair of matching fictions.
-   * Letting an example counterfeit a fire would weaken an existing safety property to decorate a
-   * new one.
+   * WHAT THIS PROVES, AND WHAT IT DOES NOT. An author-supplied example proves only that the author
+   * wrote a string matching their own pattern — the `Agent:` trap is exactly a pair of matching
+   * fictions. It is not evidence that any host ever produced such a context, and nothing here
+   * records it as if it were.
    *
    * RATIONED, per the residency law that governs advisories. "Patterns given, no example" is NOT
    * advised: it would fire on nearly every pattern declaration there has ever been, and that signal
-   * already has two homes — `gateCoverage().unverifiedPatterns`, and the governed-moment record.
+   * already has a home in the governed-moment record.
    */
   private patternFiringAdvisories(input: DeclareInput): DeclareAdvisory[] {
     // Everything echoed below is CALLER TEXT, and the MCP schema bounds neither `instance` nor a
@@ -12307,15 +12301,13 @@ export class MonetCore {
       name: row.name,
       patterns: parseTriggerPatterns(row.trigger_patterns),
       origin: row.origin,
-      verified: row.verified === 1,
       createdAt: row.created_at,
     };
   }
 
   /**
-   * Set which model this runtime is serving, AFTER construction. THE single place `gate()`,
-   * `stageLookup()` and `gateCoverage()` all resolve `this.runtimeModelTag` from when a call omits an
-   * explicit tag (see `gate()`'s own comment for that fallback chain).
+   * Set which model this runtime is serving, AFTER construction. THE single place `stageLookup()`
+   * and `gateCoverage()` both resolve `this.runtimeModelTag` from when a call omits an explicit tag.
    *
    * WHY A SETTER, not just the constructor option: `MonetCore` is typically constructed by one
    * piece of code (e.g. scripts/mcp-cli.ts) and handed to another that knows the runtime's model
@@ -12379,139 +12371,34 @@ export class MonetCore {
    * path). Capture handlers (`memory_store`'s rule capture, `memory_declare`) used to stamp a NEW
    * agent-scoped rule's `modelTag` from a CLOSURE-CAPTURED copy of the tag taken once at MCP
    * registration time — so a live tag switch (`setRuntimeModelTag` called later, e.g. a host that
-   * changes which model it is running mid-session) was honored for DELIVERY (`gate()`/
-   * `stageLookup()` already read `this.runtimeModelTag` live) but NOT for CAPTURE: a rule written
+   * changes which model it is running mid-session) was honored for DELIVERY (`stageLookup()`
+   * already read `this.runtimeModelTag` live) but NOT for CAPTURE: a rule written
    * after the switch was stamped for the OLD model and immediately filtered out by the NEW one —
    * captured, then instantly invisible, with no error and no obvious cause. This getter gives
    * capture handlers the SAME live read delivery already had, so both directions of "which model is
    * this" resolve from the one place `setRuntimeModelTag` writes.
    *
    * Returns `undefined` (not `null`) to match every other external presentation of this field
-   * (`gate()`'s own `opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined` chain) — `null` is
-   * this class's internal "unset" representation, `undefined` is what every consumer already
-   * expects an omitted/absent tag to look like.
+   * (`stageLookup()`'s own `opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined` chain) —
+   * `null` is this class's internal "unset" representation, `undefined` is what every consumer
+   * already expects an omitted/absent tag to look like.
    */
   getRuntimeModelTag(): string | undefined {
     return this.runtimeModelTag ?? undefined;
   }
 
   /**
-   * THE GATE. Ask what governs this action, deterministically: pure SQL and string matching, no
-   * model, no network, no embedding — "silence when nothing matches".
-   *
-   * Writes, despite reading like a query: one instrumentation row per call (the fire-precision and
-   * silence-rate measures the design asks for), and the first match verifies a stage's pattern.
-   */
-
-  gate(opts: {
-    actionContext: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
-  }): GateResult {
-    // At the mouth: before the circle is resolved, because resolveCircle can throw and a call that
-    // died on an unqueryable circle is an arrival that must not vanish.
-    const result = this.gateUnjournaled(opts);
-    // AND THE MOMENT, because THIS is the public gate. An out-of-process interceptor writes its own
-    // moment — it is the only party that holds the host's tool-call identity — and wiring the moment
-    // there alone left every embedder that configures a spool and calls this method recording no
-    // fires and no silences at all, while `record: false` still advertised itself as the way to opt
-    // out of counting. Recording silently off for a supported configuration is the failure this
-    // whole subsystem exists to end, and here it also breaks a documented contract.
-    if (opts.record !== false) this.spoolApiGateMoment(opts.actionContext, opts.circle, result);
-    return result;
-  }
-
-  /**
-   * The interception for a gate call made through the library rather than by a host interceptor.
-   *
-   * NO OUTCOME, EVER, and that is honest rather than incomplete: nothing here observes whether the
-   * caller went on to act. A host interceptor closes its moments because the host fires a second
-   * event; a library caller returns into code this store cannot see. So these moments count toward
-   * fires, silences and delivery, and never toward conformance — which needs an outcome.
-   *
-   * NO MOMENT ID IS RETURNED, deliberately: adding one would change this method's public return
-   * type, and a library caller has no channel to carry it back on a read anyway. Fact 3 is
-   * therefore unreachable here for the same structural reason it is for an advisory, not because
-   * anything failed.
-   */
-  private spoolApiGateMoment(actionContext: string, circle: string | undefined, result: GateResult): void {
-    if (this.momentSpoolPath === null) return;
-    try {
-      if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
-      const ruleIds = result.rules.map((rule) => rule.conceptId);
-      spoolInterception(this.momentRun, {
-        momentId: mintMomentId(),
-        at: new Date().toISOString(),
-        toolUseId: null,
-        circle: this.resolveCircle(circle ?? this.defaultCircle),
-        sessionId: null,
-        // The surface is the action context's own `Tool:` prefix — derived, never passed, so it
-        // cannot disagree with what was matched. A context with no prefix yields null rather than
-        // an invented surface name.
-        surface: actionContext.indexOf(":") > 0 ? actionContext.slice(0, actionContext.indexOf(":")) : null,
-        action: actionContext,
-        stageId: result.stage?.id ?? null,
-        // NULL ON OVERFLOW, never [] — the gate short-circuits before matching, so an empty array
-        // here would claim it looked and found nothing bound. Same rule the CLI writer follows.
-        ruleIds: result.overflow ? null : ruleIds,
-        disposition: result.overflow
-          ? "ungoverned"
-          : result.silence || ruleIds.length === 0
-            ? "silent"
-            : result.rules.some((rule) => rule.severity === "blocking")
-              ? "blocked"
-              : "advised",
-        // EVERY identity, unlike the CLI's blocking-only set, and the difference is real rather
-        // than an inconsistency: the deny payload names only blocking rules, whereas this method
-        // hands the caller the entire GateResult. Delivery is what actually reached the receiver.
-        deliveredRuleIds: result.overflow ? null : ruleIds,
-      });
-    } catch {
-      // Instrumentation is owed to the record, never to the caller's operation.
-    }
-  }
-
-  private gateUnjournaled(opts: {
-    actionContext: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
-  }): GateResult {
-    const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
-    // THE READ, in its own deferred transaction, which ends before anything is written.
-    const { result, pending } = this.db.transaction(() =>
-      evaluateGate(this.db, {
-        actionContext: opts.actionContext,
-        circle,
-        now: opts.now,
-        record: opts.record,
-        runtimeModelTag: opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined,
-      }),
-    )();
-    // THE WRITES, separately, and ALLOWED TO FAIL. A deferred read transaction upgrading to a write
-    // one can be refused with SQLITE_BUSY when another connection commits in between — which, if
-    // the two were one transaction, would make a gate lookup THROW because an event row could not
-    // be inserted. That trade is unacceptable in the direction it fails: losing one instrumentation
-    // row costs a rounding error on a rate, and failing to deliver a deny costs the thing this
-    // subsystem exists for. The verdict is already computed and is returned either way.
-    if (pending) {
-      try {
-        this.db.immediateTransaction(() =>
-          commitGateWrites(this.db, pending, () => this.nextSyncTimestamp()),
-        )();
-      } catch {
-        // Instrumentation only. Deliberately swallowed — see above.
-      }
-    }
-    return result;
-  }
-
-  /**
    * THE RECOGNIZED MATCHER. The agent NAMES a stage it recognizes itself to be at (from the stage
    * index `agent_context`/`prewarm` carries) — no trigger-pattern matching, no fuzzy or embedding
-   * search. Delivers through the SAME chokepoint semantics as gate() (liveness, circle, model-tag
-   * filter, parent principle), plus each rule's `body` — the capability invocation payload gate()
-   * never carries. Advisory-only by design: severity is delivered as information and never
-   * enforced here. See gates.ts's own `stageLookup` doc comment for the full contract (stage-hit-
-   * no-rules vs miss, the live-index-on-miss self-repair, and why every call records an event).
+   * search. Delivers through the shared chokepoint (liveness, circle, model-tag filter, parent
+   * principle), plus each rule's `body` — the capability invocation payload. Advisory-only by
+   * design: severity is delivered as information and never enforced here. See gates.ts's own
+   * `stageLookup` doc comment for the full contract (stage-hit-no-rules vs miss, the
+   * live-index-on-miss self-repair, and why every call records an event).
    *
-   * Same read/write transaction split as gate(), for the same reason: the verdict is computed and
-   * returned first, and the bookkeeping write is separate and allowed to fail silently.
+   * READ AND WRITE ARE SPLIT: the verdict is computed and returned in its own read transaction,
+   * and the bookkeeping write is a separate one that is allowed to fail silently — see
+   * `commitGateWrites`' own comment for why that trade only fails in the survivable direction.
    */
   stageLookup(opts: {
     stage: string;
@@ -12572,7 +12459,7 @@ export class MonetCore {
           commitGateWrites(this.db, pending, () => this.nextSyncTimestamp()),
         )();
       } catch {
-        // Instrumentation only. Deliberately swallowed — see gate()'s own comment for why.
+        // Instrumentation only. Deliberately swallowed — see `commitGateWrites` for why.
       }
     }
     return result;
@@ -14109,7 +13996,7 @@ export class MonetCore {
         // Scoped as narrowly as the risk: only when the patterns ACTUALLY DIFFER (byte comparison
         // is exact here — both sides serialize through serializeTriggerPatterns, so an identical
         // pattern set is an identical string) and only when live denies are bound. Identical-pattern
-        // rows, verified-OR convergence and advisory-only stages all flow untouched.
+        // rows and advisory-only stages flow untouched.
         if (
           current !== undefined &&
           row.trigger_patterns !== current.trigger_patterns &&
@@ -14122,9 +14009,9 @@ export class MonetCore {
         const r = this.db
           .prepare(
             `INSERT INTO stages
-               (id, name, trigger_patterns, origin, verified, created_at, sync_updated_at,
+               (id, name, trigger_patterns, origin, created_at, sync_updated_at,
                 sync_revision, sync_writer)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name,
                trigger_patterns = excluded.trigger_patterns,
@@ -14136,16 +14023,14 @@ export class MonetCore {
                     AND excluded.sync_writer > COALESCE(stages.sync_writer, ''))`,
           )
           .run(
-            row.id, row.name, row.trigger_patterns, row.origin, row.verified ? 1 : 0,
+            row.id, row.name, row.trigger_patterns, row.origin,
             row.created_at, relayAt, revision, writer,
           );
-        // `verified` CONVERGES OUTSIDE THE REVISION CONTEST, as a monotonic OR. It is not an
-        // opinion two replicas can disagree about — it records that this pattern matched a real
-        // action SOMEWHERE, which is a fact that can only accumulate. Folding it into the guarded
-        // upsert would let a peer who has never fired the stage un-verify it by winning an
-        // unrelated pattern edit, and would make the dead-pattern watchlist lie in the dangerous
-        // direction (a live pattern reported dead).
-        if (row.verified) this.db.prepare(`UPDATE stages SET verified = 1 WHERE id = ?`).run(row.id);
+        // A `verified` FLAG USED TO CONVERGE HERE, outside the revision contest, as a monotonic OR.
+        // It recorded that a stage's patterns had matched a real intercepted action somewhere. The
+        // mechanical matcher that could produce such a match is gone, so the flag was unmeasurable
+        // and went with it. A pre-2026-08-22 peer still sends the column; the INSERT above names
+        // its columns explicitly, so the extra property is simply not read.
         if (r.changes > 0) {
           inserted.stages++;
         } else skipped.stages++;

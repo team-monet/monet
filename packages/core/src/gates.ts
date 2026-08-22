@@ -93,13 +93,12 @@
  *      dangerous shape and stay silent on the safe sibling. A run that would end up ALL FLAGS is
  *      refused: `--force` alone fires on `rm -rf --force` and on every other command that happens
  *      to carry that flag, which is a stage that means nothing. Such a stage is born PATTERN-LESS
- *      and inert, appears in `unverifiedPatterns`, and must be armed by declaration.
+ *      and inert, and must be armed by declaration.
  *
  * Seeding is a heuristic over one observed instance and is expected to be wrong sometimes. That is
- * survivable BY CONSTRUCTION and not by care: a pattern that never fires shows up in
- * `gateCoverage().unverifiedPatterns` (stages carry `verified`, flipped on first live fire), and
- * DECLARATION replaces a stage's patterns outright. The failure mode of a bad seed is a dead
- * pattern surfaced in curation, never a wrong deny — blocking severity is declaration-only.
+ * survivable BY CONSTRUCTION and not by care: DECLARATION replaces a stage's patterns outright, and
+ * the failure mode of a bad seed is a stage nobody recognizes, never a wrong deny — blocking
+ * severity is declaration-only.
  */
 
 import type { StoragePort } from "./storage";
@@ -203,8 +202,6 @@ export interface StageRow {
   /** JSON array of TriggerPattern. Replaced wholesale by declaration; never appended to blindly. */
   trigger_patterns: string;
   origin: StageOrigin;
-  /** 0 until this stage's patterns have matched a real action at least once, anywhere. */
-  verified: number;
   created_at: number;
   sync_updated_at: number;
   sync_revision: number;
@@ -255,11 +252,6 @@ export interface RuleBindingRow {
  * locality. One registry, many circles' rules — plus the one reserved breadth marker that means
  * every circle.
  *
- * WHY `verified` EXISTS. Declaration- and import-born stages author their patterns from a NAME
- * rather than from an observed instance, so nothing proves the pattern matches anything real. The
- * flag is the proof, and the gate-fire is what supplies it: "flagged unverified until its first
- * fire; the gate-fire-rate measure catches dead patterns."
- *
  * WHY THE BLOCKING CHECK IS IN THE TABLE. "Blocking is declaration-only: no agent, and no
  * projection, can self-assign deny power" is a SAFETY BOUNDARY, and a safety boundary enforced only
  * by the code paths that currently exist is enforced until someone adds a path. Expressible in SQL,
@@ -271,14 +263,12 @@ export const GATE_SCHEMA_SQL = `
     name TEXT NOT NULL UNIQUE,
     trigger_patterns TEXT NOT NULL,   -- JSON array of {tool: string|null, tokens: string[]}
     origin TEXT NOT NULL CHECK (origin IN ('correction','declaration','import')),
-    verified INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0, 1)),
     created_at INTEGER NOT NULL,
     sync_updated_at INTEGER NOT NULL,
     -- Convergence clock for the mutable columns (trigger_patterns, origin). A bare sync_updated_at
     -- comparison cannot decide these: the local value is the receiver's relay watermark and the
     -- incoming value is the sender's, two incomparable clock domains. (revision, writer) is the
     -- house pattern for mutable row convergence — circle_aliases, first_block, lifecycle_edges.
-    -- verified is deliberately OUTSIDE that contest: it is grow-only (see the graft path).
     sync_revision INTEGER NOT NULL DEFAULT 0,
     sync_writer TEXT
   );
@@ -1040,8 +1030,8 @@ export function seedTriggerPattern(instance: string): TriggerPattern {
   // that means "some command, somewhere, with this flag" is noise wearing a gate's clothes, and
   // noise is the fastest way to kill gate trust. Extend the window to reach the first non-flag
   // token if the segment has one; if it has NONE, emit an empty run, which never matches (see
-  // matchesTriggerPattern). The stage is then born inert and surfaces in `unverifiedPatterns`,
-  // where a declaration can arm it with a pattern a human actually meant.
+  // matchesTriggerPattern). The stage is then born inert, until a declaration arms it with a
+  // pattern a human actually meant.
   if (!chosen.slice(0, keep).some((token) => !isFlagToken(token))) {
     const firstWord = chosen.findIndex((token) => !isFlagToken(token));
     keep = firstWord === -1 ? 0 : Math.max(keep, firstWord + 1);
@@ -1349,26 +1339,25 @@ export function listStages(db: StoragePort): StageRow[] {
   return db.prepare(`SELECT * FROM stages ORDER BY created_at ASC, id ASC`).all() as StageRow[];
 }
 
-/** Exactly the four columns the matcher reads. See `listMatchableStages` for why that matters. */
+/** Exactly the three columns the matcher reads. See `listMatchableStages` for why that matters. */
 export interface MatchableStage {
   id: string;
   name: string;
   trigger_patterns: string;
-  verified: number;
 }
 
 /**
- * The firing path's own projection, deliberately NOT `listStages`.
+ * The pattern-matching path's own projection, deliberately NOT `listStages`.
  *
- * Every gate lookup reads EVERY stage — that is what "no index can help, so keep the row cheap"
- * means here — and the five columns the matcher never looks at (origin, the two clocks, the
- * revision, the writer) are pure marshalling cost paid once per stage per action. Measured at 200
- * stages: dropping them takes a silent lookup from ~0.25ms to ~0.15ms. A narrower SELECT is the
- * whole optimization; there is no cache, so there is no invalidation to get wrong.
+ * A pattern sweep reads EVERY stage — that is what "no index can help, so keep the row cheap"
+ * means here — and the columns the matcher never looks at (origin, the two clocks, the revision,
+ * the writer) are pure marshalling cost paid once per stage per sweep. Measured at 200 stages:
+ * dropping them takes a silent lookup from ~0.25ms to ~0.15ms. A narrower SELECT is the whole
+ * optimization; there is no cache, so there is no invalidation to get wrong.
  */
 export function listMatchableStages(db: StoragePort): MatchableStage[] {
   return db
-    .prepare(`SELECT id, name, trigger_patterns, verified FROM stages ORDER BY created_at ASC, id ASC`)
+    .prepare(`SELECT id, name, trigger_patterns FROM stages ORDER BY created_at ASC, id ASC`)
     .all() as MatchableStage[];
 }
 
@@ -1408,11 +1397,6 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
     db.prepare(
       `UPDATE stages
           SET trigger_patterns = ?, origin = ?, sync_updated_at = ?,
-              -- VERIFIED RESETS. The flag means "these patterns matched something real"; after a
-              -- replacement they are not those patterns any more, and carrying the proof across
-              -- would make the dead-pattern watchlist vouch for a pattern nothing has ever matched
-              -- — the one thing it exists to detect.
-              verified = 0,
               sync_revision = sync_revision + 1, sync_writer = ?
         WHERE id = ?`,
     ).run(nextPatterns, input.origin, syncAt, deps.syncDeviceId, existing.id);
@@ -1437,7 +1421,7 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
 
   // Seeding precedence: explicit declared patterns, else the observed instance, else the stage name
   // itself. The last is the import/declaration case the design calls out — "their trigger pattern is
-  // authored at import from the rule's named action and flagged unverified until its first fire".
+  // authored at import from the rule's named action".
   const seeds = declaredPatterns ?? [seedTriggerPattern(input.instance ?? input.stage)];
   const syncAt = deps.nextSyncTimestamp();
   const row: StageRow = {
@@ -1445,18 +1429,17 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
     name: normalizedName,
     trigger_patterns: serializeTriggerPatterns(seeds),
     origin: input.origin,
-    verified: 0,
     created_at: syncAt,
     sync_updated_at: syncAt,
     sync_revision: 0,
     sync_writer: deps.syncDeviceId,
   };
   db.prepare(
-    `INSERT INTO stages (id, name, trigger_patterns, origin, verified, created_at, sync_updated_at,
+    `INSERT INTO stages (id, name, trigger_patterns, origin, created_at, sync_updated_at,
                          sync_revision, sync_writer)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    row.id, row.name, row.trigger_patterns, row.origin, row.verified,
+    row.id, row.name, row.trigger_patterns, row.origin,
     row.created_at, row.sync_updated_at, row.sync_revision, row.sync_writer,
   );
   return row;
@@ -1899,9 +1882,9 @@ export interface GateResult {
    * impossible by reporting a confident silence over an input nobody had finished reading.
    */
   overflow: boolean;
-  /** `live` = answered from the store, which is the only answer there is: the offline `"sidecar"`
-   *  evaluator was removed 2026-08-22 and nothing produces that value any more. */
-  source: "live" | "sidecar";
+  /** `live` = answered from the store. The only member: the offline `"sidecar"` evaluator was
+   *  removed 2026-08-22, and the mechanical matcher that produced this shape followed it. */
+  source: "live";
 }
 
 export interface GateQueryOptions {
@@ -1930,16 +1913,9 @@ export interface GateQueryOptions {
   runtimeModelTag?: string;
   /** Clock seam. Defaults to wall time. */
   now?: number;
-  /** Sync clock seam for the `verified` flip, so it re-exports. Omitted = flip stamped with `now`. */
+  /** Sync clock seam for whatever a completed read still owes the store, so it re-exports. */
   nextSyncTimestamp?: () => number;
-  /**
-   * `false` makes this call a PURE READ: no instrumentation row, and no `verified` flip either.
-   *
-   * The flip used to happen regardless, so a benchmark or a preview marked patterns as
-   * battle-tested without any real action having been intercepted — the dead-pattern watchlist,
-   * whose entire job is to say "this has never matched anything real", was being silenced by
-   * measurement. `record: false` now means exactly one thing: asking without it counting.
-   */
+  /** `false` makes this call a PURE READ: asking without it counting. */
   record?: boolean;
 }
 
@@ -2334,7 +2310,7 @@ function countLiveRulesForStage(
  * never a subset). Review fix — Codex round 3: this REPLACES a former two-step approach
  * (`listStages` fetching every column of every stage — including each one's serialized
  * `trigger_patterns` blob — then filtering in JS against a separate live-id Set) with ONE JOINed,
- * `SELECT DISTINCT s.name` query: no trigger_patterns, no origin, no verified flag, no clocks,
+ * `SELECT DISTINCT s.name` query: no trigger_patterns, no origin, no clocks,
  * materialized for EVERY stage on EVERY `agent_context` call, every `prewarm`, and every
  * `stageLookup` miss, just to keep a handful of names — exactly the always-on retrieval cost the
  * rules/body/reason SQL bounds elsewhere in this file exist to close. Shares `RULE_LIVENESS_WHERE`
@@ -2460,12 +2436,13 @@ function toStageLookupRule(row: BindingJoinRow): StageLookupRule {
  * agent reads, and everything after it is stable so two machines with the same rules render the
  * same gate.
  */
-/** Which matcher produced a gate_events row. See that column's own comment in GATE_SCHEMA_SQL. */
+/** Which matcher produced a pending write. Only `recognized` is produced: the mechanical matcher
+ *  was removed 2026-08-22. */
 export type GateMatcher = "mechanical" | "recognized";
 
 /**
  * What a completed gate READ still owes the database. Held as data so the caller decides when — and
- * in what transaction — those writes happen. See `evaluateGate`.
+ * in what transaction — those writes happen. See `commitGateWrites`.
  */
 export interface PendingGateWrites {
   actionContext: string;
@@ -2474,54 +2451,40 @@ export interface PendingGateWrites {
   overflow: boolean;
   latencyUs: number;
   matchedStageIds: string[];
-  /** Stages whose `verified` flag this fire would flip. Empty when nothing needs flipping. */
-  verifyStageIds: string[];
   primaryStageId: string | null;
   ruleCount: number;
   maxSeverity: RuleSeverity | null;
-  /** gateInternal always sets 'mechanical'; evaluateStageLookup always sets 'recognized'. */
+  /** evaluateStageLookup always sets 'recognized'; nothing sets 'mechanical' any more. */
   matcher: GateMatcher;
 }
 
 /**
- * THE GATE, AS A PURE READ. Returns the verdict plus the instrumentation the caller still owes.
+ * Apply what a gate read owes the store — WHICH IS CURRENTLY NOTHING, and that is stated rather
+ * than hidden behind a plausible body.
  *
- * WHY THE SPLIT EXISTS. Doing the read and the writes in one transaction means a DEFERRED read
- * transaction upgrading to a write one, and SQLite can refuse that upgrade with SQLITE_BUSY when
- * another connection committed in between — the snapshot the reader holds is no longer the head.
- * The consequence would be a gate lookup THROWING because an event row could not be inserted,
- * which is the worst possible trade: losing one instrumentation row is a rounding error on a rate,
- * and failing to deliver a deny is the thing this whole subsystem exists to prevent.
+ * WHAT THIS USED TO DO, in order of removal: insert a `gate_events` row plus its per-stage links
+ * (the governed moment replaced it — unlike a verdict row it can name the rules that fired and be
+ * joined back to the act that prompted them), and then flip a stage's `verified` flag on its first
+ * real fire. `verified` meant "this stage's patterns matched a real action"; with the mechanical
+ * matcher gone nothing matches an action, so the flag was unmeasurable and was removed with it.
  *
- * So the verdict is computed and returned first; the writes are the caller's separate, short,
- * failure-tolerant transaction — MonetCore.gate() wraps it in try/catch and swallows a failure
- * outright. That tolerance is what actually carries this, not exclusivity: storage.ts's own
- * constructor sets WAL + busy_timeout precisely so the MCP server and a `monet` CLI call can share
- * one `.monet` DB, and `locking_mode=EXCLUSIVE` is a narrow, opt-in, released state used elsewhere in
- * this codebase (acquireExclusiveOwnership) — not the steady one. A second writer really can commit
- * between this read and that write; the split exists so that when it does, the verdict already
- * returned is unaffected and the lost write is a rounding error, not a thrown gate lookup.
- */
-export function evaluateGate(db: StoragePort, opts: GateQueryOptions): { result: GateResult; pending: PendingGateWrites | null } {
-  return gateInternal(db, opts);
-}
-
-/**
- * Apply what a gate read owes: the `verified` flip, and nothing else any more.
- *
- * WHAT THIS USED TO ALSO DO: insert a `gate_events` row plus its per-stage links. That table is
- * gone — the governed moment replaced it, and unlike a verdict row it can name the rules that
- * fired and be joined back to the act that prompted them. The flip stays because `verified` is not
- * instrumentation: it is what arms a declaration-born pattern, and `unverifiedPatterns` reads it.
+ * WHY THE SPLIT SURVIVES THE EMPTYING. Doing a read and its writes in one transaction means a
+ * DEFERRED read transaction upgrading to a write one, and SQLite can refuse that upgrade with
+ * SQLITE_BUSY when another connection committed in between. The consequence would be a lookup
+ * THROWING because a bookkeeping row could not be written — the worst trade available: losing one
+ * instrumentation row is a rounding error, failing to deliver a rule is the thing this subsystem
+ * exists to prevent. `stageLookup`/`MonetCore.stageLookup()` therefore still compute the verdict in
+ * their own read transaction and call this in a separate, failure-tolerant one, so the seam is
+ * already in place for whatever a read next owes.
  *
  * Safe to skip entirely: no verdict depends on anything here.
  */
-export function commitGateWrites(db: StoragePort, pending: PendingGateWrites, nextSyncTimestamp?: () => number): void {
-  if (pending.verifyStageIds.length > 0) {
-    const stamp = nextSyncTimestamp ? nextSyncTimestamp() : pending.now;
-    const flip = db.prepare(`UPDATE stages SET verified = 1, sync_updated_at = ? WHERE id = ?`);
-    for (const id of pending.verifyStageIds) flip.run(stamp, id);
-  }
+export function commitGateWrites(
+  _db: StoragePort,
+  _pending: PendingGateWrites,
+  _nextSyncTimestamp?: () => number,
+): void {
+  // Intentionally empty — see this function's own comment.
 }
 
 /**
@@ -2535,9 +2498,9 @@ export function commitGateWrites(db: StoragePort, pending: PendingGateWrites, ne
  * or any caller passing '*' straight through): `resolveCircle` can never PRODUCE '*' from an ordinary
  * circle name post-migration (round 4, item 4 — no alias can ever hold '*' on either side once a
  * store has been through it), so this is not a resolution bug to fix upstream, it is an input this
- * layer must refuse outright rather than silently misinterpret. Called from gateInternal and
- * evaluateStageLookup — the two shared internals `evaluateGate`, the exported `stageLookup`, and
- * MonetCore's own gate()/stageLookup() all funnel through, so checking here covers every entrance.
+ * layer must refuse outright rather than silently misinterpret. Called from evaluateStageLookup —
+ * the exported `stageLookup` and MonetCore.stageLookup() both funnel through it, so checking here
+ * covers every entrance.
  */
 function assertQueryableCircle(circle: string): void {
   if (circle === BREADTH_CIRCLE) {
@@ -2547,95 +2510,6 @@ function assertQueryableCircle(circle: string): void {
         `rule already delivers everywhere on its own, with no need to ask for it by this name.`,
     );
   }
-}
-
-function gateInternal(db: StoragePort, opts: GateQueryOptions): { result: GateResult; pending: PendingGateWrites | null } {
-  assertQueryableCircle(opts.circle);
-  const startedAt = typeof process !== "undefined" && process.hrtime ? process.hrtime.bigint() : null;
-  const now = opts.now ?? Date.now();
-  const record = opts.record !== false;
-  const clamped = clampActionContext(opts.actionContext);
-
-  // OVERFLOW SHORT-CIRCUITS BEFORE ANY MATCHING, and reports a verdict that is not silence. Matching
-  // a prefix here is the bug this replaces; reporting silence here is the same bug wearing the
-  // honest-looking half of it.
-  if (clamped.overflow) {
-    const result: GateResult = { stage: null, stages: [], rules: [], silence: false, overflow: true, source: "live" };
-    return {
-      result,
-      pending: record
-        ? {
-            actionContext: clamped.text, circle: opts.circle, now, overflow: true,
-            latencyUs: elapsedUs(startedAt), matchedStageIds: [], verifyStageIds: [],
-            primaryStageId: null, ruleCount: 0, maxSeverity: null, matcher: "mechanical",
-          }
-        : null,
-    };
-  }
-
-  const context = parseActionContext(clamped.text);
-
-  const matched: MatchableStage[] = [];
-  for (const stage of listMatchableStages(db)) {
-    const patterns = parseTriggerPatterns(stage.trigger_patterns);
-    if (patterns.some((pattern) => matchesTriggerPattern(pattern, context))) matched.push(stage);
-  }
-
-  let rules: GateRule[] = [];
-  let unverified: string[] = [];
-  if (matched.length > 0) {
-    // THE CHOKEPOINT'S SHARED SELECTION (rulesForStages) — see that function's own comment. This
-    // used to be an inline query here; factored out so stageLookup answers through the identical
-    // liveness/scope/model-tag predicate rather than a second copy that could drift. withBody:
-    // false — toGateRule never reads a rule's body, so the mechanical fire path (the always-on,
-    // per-intercepted-action one) must not pay to fetch and marshal it either.
-    rules = rulesForStages(db, matched.map((stage) => stage.id), opts.circle, opts.runtimeModelTag, false).map(toGateRule);
-
-    // FIRST FIRE VERIFIES THE PATTERN, whether or not it delivered a rule: what the flag records is
-    // that the pattern matched something real, which is exactly what an authored-from-a-name
-    // pattern has never proved. Gated on `record` for that same reason — a measured or previewed
-    // match is not a real action, and letting it verify would silence the dead-pattern watchlist
-    // with the very calls made to inspect it. Only sync_updated_at moves: `verified` is grow-only
-    // and converges outside the (revision, writer) contest, so bumping the revision here would let
-    // a local fire outrank a peer's genuine pattern edit.
-    unverified = record ? matched.filter((stage) => stage.verified === 0).map((stage) => stage.id) : [];
-  }
-
-  const stages = matched.map((stage) => ({ id: stage.id, name: stage.name }));
-  /**
-   * THE STAGE THAT ANSWERED is the one that contributed the highest-severity rule, not the oldest
-   * one that happened to match. When a broad advisory stage and a narrow blocking stage both fire,
-   * naming the advisory one — purely because it was created first — points every reader of this
-   * field (the deny message, the curation log, the 4b hook) at the wrong stage while a deny is in
-   * effect. Falls back to the oldest matched stage when nothing was delivered, which is the
-   * projection-hook case where there is no severity to rank by.
-   */
-  const primaryStageId = rules[0]?.stageId ?? stages[0]?.id ?? null;
-  const result: GateResult = {
-    stage: stages.find((stage) => stage.id === primaryStageId) ?? null,
-    stages,
-    rules,
-    silence: matched.length === 0,
-    overflow: false,
-    source: "live",
-  };
-
-  return {
-    result,
-    pending: record
-      ? {
-          actionContext: clamped.text, circle: opts.circle, now, overflow: false,
-          latencyUs: elapsedUs(startedAt),
-          matchedStageIds: matched.map((stage) => stage.id),
-          verifyStageIds: unverified,
-          primaryStageId: result.stage?.id ?? null,
-          ruleCount: rules.length,
-          maxSeverity: rules.some((rule) => rule.severity === "blocking") ? "blocking"
-            : rules.length > 0 ? "advisory" : null,
-          matcher: "mechanical",
-        }
-      : null,
-  };
 }
 
 const elapsedUs = (startedAt: bigint | null): number =>
@@ -2721,12 +2595,11 @@ export function liveStageIndex(db: StoragePort, circle: string): LiveStageIndexR
 // ---- the recognized matcher (stageLookup) ------------------------------------
 
 /**
- * THE RECOGNIZED MATCHER, as a pure read — see `evaluateGate`'s own comment for why the read and
- * the write are split (a deferred read transaction upgrading to a write one can be refused with
- * SQLITE_BUSY; splitting them means the worst case is a lost instrumentation row, never a failed
- * lookup). The agent NAMES a stage, so unlike gateInternal one lookup can resolve to at most one
- * stage — there is no trigger-pattern fan-out here, and therefore no `stages`/`matchedStageIds`
- * plural to track.
+ * THE RECOGNIZED MATCHER, as a pure read — see `commitGateWrites`' own comment for why the read
+ * and the write are split (a deferred read transaction upgrading to a write one can be refused
+ * with SQLITE_BUSY; splitting them means the worst case is a lost instrumentation row, never a
+ * failed lookup). The agent NAMES a stage, so one lookup resolves to at most one stage — there is
+ * no trigger-pattern fan-out here, and therefore no `stages`/`matchedStageIds` plural to track.
  */
 export function evaluateStageLookup(
   db: StoragePort,
@@ -2756,7 +2629,7 @@ export function evaluateStageLookup(
             // measure needs, and a miss recorded nowhere would silently drop out of that count —
             // so a miss is recorded exactly like a hit, action_context = the name actually asked.
             actionContext: opts.stage, circle: opts.circle, now, overflow: false,
-            latencyUs: elapsedUs(startedAt), matchedStageIds: [], verifyStageIds: [],
+            latencyUs: elapsedUs(startedAt), matchedStageIds: [],
             primaryStageId: null, ruleCount: 0, maxSeverity: null, matcher: "recognized",
           }
         : null,
@@ -2811,10 +2684,7 @@ export function evaluateStageLookup(
       ? {
           actionContext: opts.stage, circle: opts.circle, now, overflow: false,
           latencyUs: elapsedUs(startedAt),
-          // A NAME lookup proves nothing about trigger-PATTERN realism, so unlike gateInternal this
-          // never populates verifyStageIds — `verified` stays exactly what it has always meant:
-          // this pattern matched a real intercepted action, not merely a name a human typed back.
-          matchedStageIds: [], verifyStageIds: [],
+          matchedStageIds: [],
           primaryStageId: stage.id,
           // HONEST INSTRUMENTATION: the true rule count when retrieval was capped, not the
           // (possibly much smaller) length of what was actually fetched.
@@ -2847,15 +2717,14 @@ export function evaluateStageLookup(
  * would corrupt exactly that count.
  *
  * The standalone form — evaluateStageLookup + commitGateWrites in one call, for a caller with no
- * transaction of its own; the split form is `evaluateStageLookup` + `commitGateWrites`, exactly as
- * the mechanical gate splits into `evaluateGate` + `commitGateWrites`.
- * MonetCore.stageLookup() uses the split form directly, for the same reason MonetCore.gate() does.
+ * transaction of its own; the split form is `evaluateStageLookup` + `commitGateWrites`.
+ * MonetCore.stageLookup() uses the split form directly.
  *
  * TRANSACTION-WRAPPED, mirroring MonetCore.stageLookup() (engine.ts) EXACTLY (review fix — Codex
  * round 4, item 3): that method wraps its own call to `evaluateStageLookup` in
  * `this.db.transaction(...)()` — a single consistent read view — and only THEN, separately,
  * `commitGateWrites` in its own `this.db.immediateTransaction(...)()`, inside a try/catch that
- * swallows the write's failure (see MonetCore.gate()'s own comment for why: a deferred read
+ * swallows the write's failure (see `commitGateWrites`' own comment for why: a deferred read
  * transaction upgrading to a write one can be refused with SQLITE_BUSY, and losing one
  * instrumentation row is the acceptable side of that trade — losing a verdict is not). Before this
  * fix, THIS function — the one path a caller with no transaction of its own actually runs — issued
@@ -2895,12 +2764,13 @@ export function stageLookup(db: StoragePort, opts: StageLookupOptions): StageLoo
  * WHAT REMAINS IS EVERYTHING THAT READS `stages` AND `rule_bindings` — facts about what is
  * DECLARED, not about what happened. Those never depended on the event table and are unchanged.
  *
- * `unverifiedPatterns` is deliberately STORE-GLOBAL rather than circle-scoped: a stage is a registry
- * entry with no circle, and "this pattern has never matched anything anywhere" is the question a
- * dead pattern needs asked of it.
+ * `unverifiedPatterns` IS GONE TOO, with the mechanical matcher that fed it. It listed stages whose
+ * `verified` flag was still 0 — "these patterns have never matched a real action". Nothing matches
+ * an action any more, so every stage would have qualified, forever: a not-known rendered as a
+ * verdict. `malformedPatterns` survives because it asks a question the registry can still answer —
+ * whether a stage's stored patterns are readable at all.
  */
 export interface GateCoverage {
-  unverifiedPatterns: Array<{ stageId: string; stageName: string; origin: StageOrigin; patterns: string[] }>;
   malformedPatterns: Array<{ stageId: string; stageName: string; malformed: number; readable: string[] }>;
   retirementCandidates: Array<{ conceptId: string; title: string; modelTag: string; stageName: string }>;
   /** True number omitted after the source cap; absent when the list is complete. */
@@ -2957,9 +2827,6 @@ export function gateCoverage(db: StoragePort, opts: GateCoverageOptions): GateCo
         ORDER BY s.name ASC`,
     )
     .all(opts.circle, opts.runtimeModelTag ?? null, opts.runtimeModelTag ?? null) as GateCoverage["liveStages"];
-  const unverified = db
-    .prepare(`SELECT id, name, origin, trigger_patterns FROM stages WHERE verified = 0 ORDER BY created_at ASC, id ASC`)
-    .all() as Array<{ id: string; name: string; origin: StageOrigin; trigger_patterns: string }>;
   const malformedPatterns: GateCoverage["malformedPatterns"] = [];
   for (const stage of db
     .prepare(`SELECT id, name, trigger_patterns FROM stages ORDER BY created_at ASC, id ASC`)
@@ -3036,12 +2903,6 @@ export function gateCoverage(db: StoragePort, opts: GateCoverageOptions): GateCo
     : unexplainedDeniesAll.slice(0, exceptionLimit);
   return {
     liveStages,
-    unverifiedPatterns: unverified.map((stage) => ({
-      stageId: stage.id,
-      stageName: stage.name,
-      origin: stage.origin,
-      patterns: parseTriggerPatterns(stage.trigger_patterns).map(formatTriggerPattern),
-    })),
     malformedPatterns,
     retirementCandidates,
     ...(retirementCandidatesOmitted > 0 ? { retirementCandidatesOmitted } : {}),

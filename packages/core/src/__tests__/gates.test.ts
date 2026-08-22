@@ -99,18 +99,23 @@ type RawDb = { prepare(sql: string): { run(...p: unknown[]): unknown; get(...p: 
 const raw = (c: MonetCore): RawDb => (c as unknown as { db: RawDb }).db;
 
 /**
- * Flip a stage's `verified` bit as a RAW FIXTURE — byte for byte what `commitGateWrites`' own verify
- * flip writes (`UPDATE stages SET verified = 1, sync_updated_at = <sync clock>`), stamped off the
- * SAME persisted sync clock (`sync_meta.last_mutation_at`, advanced exactly as `nextSyncTimestamp()`
- * advances it) so the row exports and grafts like any other engine write. A fixture rather than a
- * real interception because the subject of the tests that use it is what SYNC does with the bit, not
- * who set it.
+ * Bump a stage row's sync revision WITHOUT touching its patterns — a RAW FIXTURE, because no engine
+ * path produces this shape: `upsertStage` returns early when the serialized patterns are unchanged
+ * ("no-op: nothing to bump for"), so an identical-pattern row never gets a revision of its own.
+ *
+ * WHY IT HAS TO EXIST. A pattern-identical relay otherwise always LOSES the (revision, writer)
+ * contest and lands in `skipped` — whether the re-aim guard refused it or the upsert simply found
+ * nothing to change. Those two are indistinguishable at the counter, which is exactly the ambiguity
+ * a test of the guard's scoping must remove. Stamped off the SAME persisted sync clock
+ * (`sync_meta.last_mutation_at`, advanced exactly as `nextSyncTimestamp()` advances it) so the row
+ * exports and grafts like any other engine write.
  */
-function markStageVerified(c: MonetCore, stageId: string): void {
+function bumpStageRevision(c: MonetCore, stageId: string): void {
   const db = raw(c);
   db.prepare(`UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at + 1, ?) WHERE singleton = 1`).run(Date.now());
   const stamp = (db.prepare(`SELECT last_mutation_at AS t FROM sync_meta WHERE singleton = 1`).get() as { t: number }).t;
-  db.prepare(`UPDATE stages SET verified = 1, sync_updated_at = ? WHERE id = ?`).run(stamp, stageId);
+  db.prepare(`UPDATE stages SET sync_revision = sync_revision + 1, sync_updated_at = ? WHERE id = ?`)
+    .run(stamp, stageId);
 }
 
 const tmpDirs: string[] = [];
@@ -362,7 +367,7 @@ describe("rule capture", () => {
     // creation, and its pattern comes from the instance that was visible at that moment.
     const stages = c.stages();
     expect(stages).toHaveLength(1);
-    expect(stages[0]).toMatchObject({ name: "git force push", origin: "correction", verified: false });
+    expect(stages[0]).toMatchObject({ name: "git force push", origin: "correction" });
     expect(stages[0]!.patterns).toEqual([{ tool: "bash", tokens: ["git", "push", "--force"] }]);
     expect(stored.concept.kind).toBe("rule");
     c.close();
@@ -429,13 +434,14 @@ describe("rule capture", () => {
       kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
     });
     // A named attach whose rule options name a DIFFERENT action keeps the incumbent binding — and
-    // used to leave the newly named stage behind, unbound: it fires nothing, can never fire
-    // anything, and sits on the dead-pattern watchlist forever.
+    // used to leave the newly named stage behind, unbound: it delivers nothing and can never
+    // deliver anything, a permanent dead entry in the registry.
     await c.store("Never force-push to a shared branch.", {
       kind: "rule", attachTo: first.conceptId, rule: { stage: "some other gate", instance: "Bash:rm -rf", ...AGENT_RULE },
     });
     expect(c.stages().map((s) => s.name)).toEqual(["git force push"]);
-    expect(c.gateCoverage().unverifiedPatterns.map((u) => u.stageName)).toEqual(["git force push"]);
+    // The registry's own live-stage list is the surviving witness: one stage, and it is the bound one.
+    expect(c.gateCoverage().liveStages.map((s) => s.stageName)).toEqual(["git force push"]);
     expect(c.ruleBinding(first.conceptId)!.stage_id).toBe(c.stages()[0]!.id);
 
     // A DECLARATION still moves the address, stage and all — that is the sovereign path.
@@ -629,7 +635,7 @@ describe("declaration — the sovereign entrance", () => {
     const c = core();
     const stage = await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
     expect(stage).toMatchObject({ species: "stage" });
-    expect(c.stages()[0]).toMatchObject({ name: "terraform apply", origin: "declaration", verified: false });
+    expect(c.stages()[0]).toMatchObject({ name: "terraform apply", origin: "declaration" });
     expect(c.stages()[0]!.patterns).toEqual([{ tool: null, tokens: ["terraform", "apply"] }]);
 
     // Re-declaration REPLACES: this is how a mis-seeded pattern is fixed.
@@ -3666,19 +3672,7 @@ describe("circle '*' is refused as query input, everywhere a gate query can be s
   });
 });
 
-describe("gateQuery", () => {
-  it("silence when nothing matches, and a stage with no rules is NOT silence", async () => {
-    const c = core();
-    expect(c.gate({ actionContext: "Bash:git status" })).toMatchObject({ stage: null, stages: [], rules: [], silence: true, source: "live" });
-
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-    const empty = c.gate({ actionContext: "Bash:terraform apply -auto-approve" });
-    // The projection hook: "stage X, no cached rules — skeleton applies."
-    expect(empty).toMatchObject({ silence: false, rules: [] });
-    expect(empty.stage).toMatchObject({ name: "terraform apply" });
-    c.close();
-  });
-
+describe("rule delivery through stageLookup", () => {
   it("delivers the rule with the reason that earns compliance", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
@@ -3708,27 +3702,32 @@ describe("gateQuery", () => {
     c.close();
   });
 
-  it("unions the rules of EVERY matched stage, blocking first then oldest first", async () => {
+  /**
+   * THE DELIVERY ORDER, which is one SQL clause shared by every delivery path:
+   * `ORDER BY (b.severity = 'blocking') DESC, b.created_at ASC, b.concept_id ASC` (rulesForStages).
+   *
+   * This used to be asserted on the mechanical gate's multi-stage fan-out. That fan-out is gone —
+   * a lookup resolves ONE stage by name — but the ordering is not: several rules routinely share
+   * one stage, and both halves of the clause still decide what the agent reads first. A deny must
+   * lead, and among equals the OLDEST leads, so delivery does not reshuffle under the reader as
+   * rules accumulate.
+   */
+  it("orders one stage's rules blocking first, then oldest first", async () => {
     const c = core();
-    // A broad stage and a narrow one that both match the same action.
-    await c.declare({ species: "stage", stage: "git push", patterns: ["git push"] });
-    await c.declare({ species: "stage", stage: "git force push", patterns: ["git push --force"] });
-    const broad = await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", ...AGENT_RULE } });
-    const narrow = await c.store("Never force-push to a shared branch.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
+    const older = await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
+    const newer = await c.store("Never force-push to a shared branch.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
     const deny = await c.declare({
       species: "rule", stage: "git force push", content: "Never force-push to main.", severity: "blocking",
       reason: "a rewritten history cannot be recovered from a teammate's clone", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
 
-    const fired = c.gate({ actionContext: "Bash:git push --force origin main" });
-    expect(fired.stages.map((s) => s.name)).toEqual(["git push", "git force push"]);
-    // Blocking first — a deny must be the first thing an agent reads — then birth order.
-    expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId, broad.conceptId, narrow.conceptId]);
+    const fired = c.stageLookup({ stage: "git force push" });
+    // The deny leads despite being the LAST one written — severity outranks birth order.
+    expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId, older.conceptId, newer.conceptId]);
     expect(fired.rules[0]!.severity).toBe("blocking");
-
-    // The narrow stage alone answers the narrow action's sibling.
-    expect(c.gate({ actionContext: "Bash:git push origin main" }).rules.map((r) => r.conceptId)).toEqual([broad.conceptId]);
+    // And among the two equal-severity rules, the older one leads.
+    expect(fired.rules.slice(1).map((r) => r.severity)).toEqual(["advisory", "advisory"]);
     c.close();
   });
 
@@ -3776,56 +3775,6 @@ describe("gateQuery", () => {
     c.close();
   });
 
-  it("flips a stage from unverified to verified on its FIRST fire, rules or not", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-    expect(c.stages()[0]!.verified).toBe(false);
-    c.gate({ actionContext: "Bash:terraform plan" });
-    expect(c.stages()[0]!.verified).toBe(false); // no match, no proof
-    c.gate({ actionContext: "Bash:terraform apply -auto-approve" });
-    expect(c.stages()[0]!.verified).toBe(true); // the pattern matched something real
-    c.close();
-  });
-
-  it("lists the dead patterns — a stage authored from a name that has never matched anything", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "some action nobody performs", patterns: ["frobnicate --hard"] });
-    const stats = c.gateCoverage();
-    expect(stats.unverifiedPatterns).toEqual([{
-      stageId: c.stages()[0]!.id,
-      stageName: "some action nobody performs",
-      origin: "declaration",
-      patterns: ["*: frobnicate --hard"],
-    }]);
-    c.close();
-  });
-
-  it("record:false does not flip `verified` — a previewed match is not a real one", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-    const fired = c.gate({ actionContext: "Bash:terraform apply -auto-approve", record: false });
-    expect(fired.stages).toHaveLength(1); // it really did match
-    // The dead-pattern watchlist exists to say "this has never matched anything REAL". A measured
-    // or previewed match is not a real action, so it must not silence the watchlist.
-    expect(c.stages()[0]!.verified).toBe(false);
-    expect(c.gateCoverage().unverifiedPatterns).toHaveLength(1);
-
-    c.gate({ actionContext: "Bash:terraform apply -auto-approve" });
-    expect(c.stages()[0]!.verified).toBe(true);
-    c.close();
-  });
-
-  it("keeps overview READ-ONLY: reading the gate's own coverage fires no gate", async () => {
-    const c = core();
-    await c.store("Never force-push.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
-    c.overview("default");
-    c.overview("default");
-    // Reading a curation surface must not look like an intercepted action. `verified` is the
-    // observable that would move if it did: it flips on a stage's first REAL fire, and a reader
-    // that flipped it would silence the dead-pattern watchlist by being read.
-    expect(c.stages().every((stage) => stage.verified === false)).toBe(true);
-    c.close();
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3861,36 +3810,6 @@ describe("gate substrate sync", () => {
 
     // ...and the receiver re-exports them onward.
     expect(dst.exportDelta(0).stages?.map((s) => s.name)).toEqual(["git force push"]);
-    src.close();
-    dst.close();
-  });
-
-  /**
-   * A GRAFTED DERIVATION EDGE IS MIRROR CONTENT TOO (review fix — Codex 5-B round 2, R2-1).
-   * `GateMirrorEntry` carries `projectedFromPrincipleId` as of slice 5-B (D4), so an edge landing on
-   * an ALREADY-BOUND rule changes what the mirror would write while nothing about the binding moves.
-   * The three LOCAL entrances into the derivation family (addLifecycleEdge, recordProjectionEdge,
-   * ratifySkeletonMembership) all bump for that; the graft loop bumped only for `supersession`, so a
-   * relayed projection/ratification edge left graftRows' closing `refreshGateSidecar()` treating a
-   * parentless mirror as current while the live gate reported the parent.
-   */
-  it("converges `verified` as a grow-only fact: a peer who never fired cannot un-verify", async () => {
-    const src = core({ syncDeviceId: "machine-a" });
-    const dst = core({ syncDeviceId: "machine-b" });
-    await src.store("Never force-push.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    const unfired = src.exportDelta(0);
-    await dst.graftRows(unfired);
-    expect(dst.stages()[0]!.verified).toBe(false);
-
-    markStageVerified(src, src.stages()[0]!.id);
-    await dst.graftRows(src.exportDelta(0));
-    expect(dst.stages()[0]!.verified).toBe(true);
-
-    // Replaying the OLD (unverified) payload must not take the proof back.
-    await dst.graftRows(unfired);
-    expect(dst.stages()[0]!.verified).toBe(true);
     src.close();
     dst.close();
   });
@@ -4683,22 +4602,11 @@ describe("deny power cannot be removed by accident", () => {
     expect(disarmed.patterns).toEqual([]);
     // DISARMED, read off the row itself: the stage has no firing surface left at all.
     expect(c.stages().find((s) => s.name === "rm -rf")!.patterns).toEqual([]);
-    // An inert stage is visible in curation rather than quietly gone.
-    expect(c.gateCoverage().unverifiedPatterns.map((u) => u.stageName)).toContain("rm -rf");
-    c.close();
-  });
-
-  it("PATH 2 — replacing patterns resets verified, so the watchlist stops vouching for them", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-    markStageVerified(c, c.stages()[0]!.id);
-    expect(c.stages()[0]!.verified).toBe(true);
-
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform destroy"] });
-    // The proof belonged to the OLD patterns. Carrying it across would have the dead-pattern
-    // watchlist vouch for a replacement nothing has ever matched.
-    expect(c.stages()[0]!.verified).toBe(false);
-    expect(c.gateCoverage().unverifiedPatterns.map((u) => u.patterns)).toEqual([["*: terraform destroy"]]);
+    // An inert stage is visible in curation rather than quietly gone — it still holds a live rule,
+    // so it stays in the live-stage registry and stays reachable by NAME. Disarming its patterns
+    // removed a firing surface, not the stage.
+    expect(c.gateCoverage().liveStages.map((st) => st.stageName)).toContain("rm -rf");
+    expect(c.stageLookup({ stage: "rm -rf" }).matched).toBe(true);
     c.close();
   });
 
@@ -5479,16 +5387,14 @@ describe("the chokepoint: every door is a call site", () => {
     expect(dst.stages().find((st) => st.name === "git push")!.patterns)
       .toEqual([{ tool: "bash", tokens: ["git", "push", "--all"] }]);
 
-    // A pattern-IDENTICAL row on a blocking-bound stage still converges, including verified-OR:
-    // there is no re-aim in it, so there is nothing to refuse.
-    // The verified flag is the proof: the guard `continue`s BEFORE the monotonic-OR update, so the
-    // flag arriving at all means the row was not refused. (The row counts as skipped either way —
-    // an unchanged replay loses the revision contest — which is why the counter cannot be the
-    // assertion here.)
-    expect(dst.stages().find((st) => st.name === "rm -rf")!.verified).toBe(false);
-    markStageVerified(src, src.stages().find((st) => st.name === "rm -rf")!.id); // verified on the sender
-    dst.graftRows(src.exportDelta(0));
-    expect(dst.stages().find((st) => st.name === "rm -rf")!.verified).toBe(true);
+    // A pattern-IDENTICAL row on a blocking-bound stage still converges: there is no re-aim in it,
+    // so the guard has nothing to refuse. The guard `continue`s BEFORE the upsert, so a row that
+    // LANDS proves it was never refused — and landing is only observable on a row that can win the
+    // (revision, writer) contest, which is what `bumpStageRevision` manufactures. An unchanged
+    // replay loses that contest and counts as skipped whether the guard refused it or not, which is
+    // why the counter alone cannot carry this assertion.
+    bumpStageRevision(src, src.stages().find((st) => st.name === "rm -rf")!.id);
+    expect(dst.graftRows(src.exportDelta(0)).inserted.stages).toBe(1);
     src.close();
     dst.close();
   });

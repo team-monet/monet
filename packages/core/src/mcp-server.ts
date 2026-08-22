@@ -1363,7 +1363,7 @@ export function registerMonetCoreTools(
               .join(" ");
             guidance = disclosures !== ""
               ? disclosures
-              : "The rule is bound. It will be returned at that gate the next time the action is intercepted; its patterns show as unverified until the first real fire.";
+              : "The rule is bound. It will be returned the next time that stage is looked up by name.";
           }
           return mutOk(
             {

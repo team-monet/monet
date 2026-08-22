@@ -269,16 +269,16 @@ export interface SyncRatificationRow {
  * `git push --force` is the same action in every project, so the registry replicates whole while
  * the RULES bound to it stay in their own circles.
  *
- * `verified` is GROW-ONLY across replicas (see the graft path): a pattern that has fired anywhere
- * has proved it matches something real, and that proof cannot be un-made by a peer who has not seen
- * it yet.
+ * A PRE-2026-08-22 PEER STILL SENDS `verified`, and that is fine: the field went with the
+ * mechanical matcher that was the only thing able to set it, the graft's INSERT names its columns
+ * explicitly, and an extra property on the wire is simply not read. Nothing rejects it and nothing
+ * needs it.
  */
 export interface SyncStageRow {
   id: string;
   name: string;
   trigger_patterns: string; // JSON array of {tool, tokens}
   origin: string;
-  verified: number;
   created_at: number;
   sync_updated_at: number;
   /** Convergence clock for the mutable columns (trigger_patterns, origin). */
