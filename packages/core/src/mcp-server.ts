@@ -195,6 +195,45 @@ const ASK_SIGNAL_MAX_MOMENTS = 8;
 const CONFORMANCE_INSTRUCTION =
   "After you act, ask the user whether the action followed these rules — conformance_ask with this momentId when you put the question, then conformance_answer with their reply.";
 
+/**
+ * WHERE A `not-followed` GOES NEXT — the one line that rides on `conformance_answer` and only when
+ * the user's answer was `not-followed`.
+ *
+ * WHO CONSUMES IT — the agent, and nobody else. ON WHICH TURN — the turn a `not-followed` is
+ * recorded, and no other. WHAT BREAKS WITHOUT IT — the record gains a `not-followed` tally entry
+ * and the loop stops there: nothing says which of the moment's rules was broken, and the one thing
+ * that should come of a rule being broken repeatedly — changing it, or retiring it — has no
+ * prompt and no home.
+ *
+ * NOT A NOTE FIELD BESIDE THE ANSWER. The owner ruled that out: the result of a rule not being
+ * followed belongs on the RULE, whose record already carries authorship, succession and
+ * retirement. A `why` column here would be a dead end nothing reads and nothing acts on.
+ *
+ * ONLY ON `not-followed`, WHICH IS WHY IT IS NOT PART OF `CONFORMANCE_INSTRUCTION`. A `followed`
+ * answer has nothing to follow up, and asking anyway is pure context cost on the arm that is
+ * supposed to be silent. Minimization: the signal's absence is itself the signal.
+ *
+ * IT ASKS WHICH RULE, IT DOES NOT GUESS. A moment's `rule_reads` normally holds several rules, so
+ * neither this response nor the agent can tell which one the user meant; recording against all of
+ * them would manufacture a verdict against rules that were followed. The user names it.
+ *
+ * THE WORDING KEEPS THE SAME DISCIPLINE as `CONFORMANCE_INSTRUCTION`: it says the action did not
+ * follow the rule, never that the rule failed to cause it — causation is unobservable and is not
+ * what this measures.
+ *
+ * NO TOOL NAMES, DELIBERATELY, unlike `CONFORMANCE_INSTRUCTION`'s two. There the tools ARE the
+ * instruction — no other surface records the fourth fact. Here the destination is a rule's own
+ * record, which the agent already knows how to reach; a call sequence baked in would be a copy of
+ * a procedure that rots the first time the surface moves.
+ *
+ * SIZE: this response has no fit loop and needs none. Every field on it is statically bounded —
+ * `recorded` is a literal, `answer` is a two-value enum, `momentId` is capped at
+ * MOMENT_ID_MAX_CHARS, and this line is a compile-time constant — so the whole envelope is a few
+ * hundred characters against RESULT_MAX_CHARS (40 000) and cannot grow with the store.
+ */
+const NOT_FOLLOWED_INSTRUCTION =
+  "Ask the user which of the rules read at this moment was not followed, and record what comes of that — a change to the rule, or its retirement — on that rule's own record.";
+
 const RESULT_TRUNCATE_NOTE = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
 const RECALL_EMPTY_LINE = "Nothing matched.";
 /** Circle names are routing identifiers, not prose; bound every caller-controlled echo before writes. */
@@ -1824,7 +1863,16 @@ export function registerMonetCoreTools(
     async ({ momentId, answer }) => {
       try {
         core.recordMomentAnswer(momentId, answer);
-        return ok({ recorded: "answer", momentId, answer });
+        // THE FOLLOW-UP RIDES THE ANSWER THAT NEEDS ONE, AND ONLY THAT ONE. Spread rather than a
+        // ternary field so a `followed` response is byte-identical to what it was before this
+        // existed — the silent arm stays silent, and its own key is never serialized as null.
+        // See NOT_FOLLOWED_INSTRUCTION for why the destination is the rule and not a field here.
+        return ok({
+          recorded: "answer",
+          momentId,
+          answer,
+          ...(answer === "not-followed" ? { instruction: NOT_FOLLOWED_INSTRUCTION } : {}),
+        });
       } catch (e) {
         return err(`conformance_answer failed: ${msg(e)}`);
       }
