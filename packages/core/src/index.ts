@@ -121,8 +121,12 @@ export type {
   RecordRatificationInput,
 } from "./lifecycle-edges";
 /** The gate substrate: stages, rule bindings, and the recognized matcher (`stageLookup`). The
- *  trigger-pattern matcher is still exported — nothing intercepts an action with it any more, but
- *  it is what authors and validates a stage's patterns, and one implementation is the point. */
+ *  trigger-pattern matcher itself is gone (gates.ts's module header carries the retreat record).
+ *  What is still exported of that machinery is its TOKENIZER — `parseActionContext`,
+ *  `normalizeMatchToken`, `COMMAND_BOUNDARY` — which `declareAdvisories` reads to notice that a
+ *  declared principle is command-SHAPED, and one implementation is the point.
+ *  `RETIRED_TRIGGER_PATTERNS` is the tombstone value every new stage row writes into the retired
+ *  `stages.trigger_patterns` column. */
 export {
   GATE_SCHEMA_SQL,
   MODEL_TAG_MAX_CHARS,

@@ -79,38 +79,14 @@ describe("client core bootstrap", () => {
     expect(selectEmbedder).toHaveBeenCalledWith(dbPath);
   });
 
-  // ── #75: the gate journal — the served core is the one writer surface for the MCP mouths ───────
-
-  it("a served core constructed WITHOUT gateJournalPath writes no journal (today's behavior, unchanged for any caller that omits it)", async () => {
-    const journalPath = join(dir, "gate-journal.jsonl");
-    const core = await openServedCore(
-      ":memory:",
-      {
-        scopeContext: dir,
-        defaultCircle: "test-circle",
-        // gateJournalPath deliberately omitted — the no-default stance that keeps a test or a
-        // one-off script from appending into a real store.
-      },
-      async () => new HashingEmbeddingProvider(),
-    );
-    await core.declare({
-      species: "rule",
-      stage: "git force push",
-      content: "Never force-push to main.",
-      severity: "blocking",
-      scope: "domain",
-      reason: "a rewritten history cannot be recovered from a teammate's clone",
-    });
-    core.stageLookup({ stage: "git force push" });
-    core.close();
-    expect(existsSync(journalPath)).toBe(false);
-  });
 });
 
-// ── #75: the shipped server never wired the gate journal, so every MCP-originated gate call went
-// unrecorded — and there are TWO launch paths of that one server, so wiring either alone leaves
-// journaling dependent on which one a host happens to spawn ─────────────────────────────────────
-describe("FIX 1: served core store/mirror project pairing", () => {
+// ── #75: ONE server, TWO launch paths, and a store that must follow the project either way. The
+// original defect was a served core whose own dbPath did not follow the resolved project dir that
+// a sibling path already did, so which project a session wrote to depended on how it was spawned.
+// The sibling was the gate mirror, removed with the gate; the pairing it exposed is the subject
+// that survives, and it is a property of dbPath alone now ───────────────────────────────────────
+describe("FIX 1: a served core's store follows its project dir", () => {
   let dirA: string;
   let dirB: string;
 
@@ -127,10 +103,9 @@ describe("FIX 1: served core store/mirror project pairing", () => {
   it("a declaration through a served core whose store is rooted at a project dir lands in that project's store only — a DIFFERENT project's store stays untouched", async () => {
     // Simulates: MONET_PROJECT_DIR=dirA, cwd=dirB, both with their own project-local .monet dirs
     // (the coordinator's own test shape) — dbPathA/dbPathB stand in for what getDbPath(dirA) and
-    // getDbPath(dirB) would each resolve to; mirrorPathA for getGateMirrorPath(dirA). The FIX
-    // (cli.ts:61/index.ts:28) is that the served core's OWN dbPath argument now follows the SAME
-    // resolved project dir the mirror path already did — reproduced directly here by passing BOTH
-    // rooted at dirA, never mixing in dirB anywhere in this core's own construction.
+    // getDbPath(dirB) would each resolve to. The FIX (cli.ts/index.ts) is that the served core's
+    // OWN dbPath argument follows the resolved project dir — reproduced directly here by passing
+    // it rooted at dirA, never mixing in dirB anywhere in this core's own construction.
     const dbPathA = join(dirA, "monet.db");
     const dbPathB = join(dirB, "monet.db");
 

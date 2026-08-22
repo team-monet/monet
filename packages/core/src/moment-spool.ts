@@ -36,8 +36,8 @@ import { dirname } from "node:path";
  * accident.
  *
  * NEVER SYNCED, NEVER SEARCHED, NEVER DELIVERED. Local instrumentation, for the same reason
- * `gate_events` is excluded from sync (`sync-types.ts`): replicating a local action stream merges
- * two machines' timelines and makes every rate computed from it a lie.
+ * `resolution_events` is excluded from sync (`sync-types.ts`): replicating a local action stream
+ * merges two machines' timelines and makes every rate computed from it a lie.
  */
 
 /**

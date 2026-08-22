@@ -3499,8 +3499,8 @@ describe("breadth inherits into the recognized surfaces", () => {
     expect(home.names).toEqual(expect.arrayContaining(["docker system prune --all", "eslint --fix all"]));
 
     // stageLookup (the recognized matcher): from a circle with nothing local on this stage, the
-    // global deny alone still delivers — matching gateQuery's own union contract exactly, just
-    // reached by name instead of by pattern.
+    // global deny alone still delivers — the same circle-or-breadth union every delivery query in
+    // gates.ts embeds (`RULE_LIVENESS_WHERE`), reached by name.
     const recognizedElsewhere = c.stageLookup({ stage: "docker system prune --all", circle: "a-circle-with-nothing-of-its-own" });
     expect(recognizedElsewhere.matched).toBe(true);
     expect(recognizedElsewhere.rules.map((r) => r.conceptId)).toEqual([globalDeny.conceptId]);
@@ -3838,7 +3838,7 @@ describe("gate substrate sync", () => {
    * `UPDATE` away. SQLite stores whatever a writer hands the column, so a malformed peer could leave
    * a NUMBER in `reason`; `hasNoReason` then called `.trim()` on it and threw, taking out the
    * matching gate query, the sidecar rebuild and the gate-stats read together — live AND offline
-   * delivery for that rule, which is precisely the pair the mirror exists to keep independent.
+   * delivery for that rule, which was precisely the pair the mirror existed to keep independent.
    */
   const corruptReason = (c: MonetCore, conceptId: string, value: unknown) =>
     raw(c).prepare(`UPDATE rule_bindings SET reason = ? WHERE concept_id = ?`).run(value, conceptId);
@@ -6623,28 +6623,17 @@ describe("stageLookup — the recognized matcher", () => {
 // createGateSchema — concurrent-migrator race (Codex round 3, item 5)
 // ---------------------------------------------------------------------------
 
-/**
- * Simulates the documented race's STALE READ: a second migrator's PRAGMA probe, taken before a
- * first migrator's ALTER committed, reports the `matcher` column absent — regardless of what the
- * REAL table underneath already has. Only `.all()` is ever called on the intercepted statement by
- * createGateSchema, so only it needs the faked answer; every other statement (including the ALTER
- * this stale answer provokes) passes straight through to the real connection, so the resulting
- * error is REAL SQLite output, not a fabricated one.
- */
-class StaleMatcherProbeStorage extends BetterSqlitePort {
-  private probeConsumed = false;
-
-  override prepare(sql: string): Statement {
-    const statement = super.prepare(sql);
-    if (this.probeConsumed || !/^\s*PRAGMA table_info\(gate_events\)/.test(sql)) return statement;
-    this.probeConsumed = true;
-    return {
-      run: (...params: unknown[]) => statement.run(...params),
-      get: (...params: unknown[]) => statement.get(...params),
-      all: () => [],
-    };
-  }
-}
+// THE STALE `matcher`-COLUMN PROBE FIXTURE WAS REMOVED HERE (2026-08-22), with its subject.
+//
+// `StaleMatcherProbeStorage` faked a stale `PRAGMA table_info(gate_events)` answer so that
+// createGateSchema's guarded ALTER for that table's `matcher` column would hit a REAL
+// duplicate-column error. `gate_events` is gone, the PRAGMA it intercepted is a statement nothing
+// in the tree issues, and the class had no instantiation left — a fixture that could no longer
+// exhibit the effect it was written to certify. THE PROPERTY ITSELF IS STILL PINNED, TWICE: the
+// stale-probe race by `StaleIngestOperationsColumnProbeStorage` just below, against the guarded
+// ALTERs that survive; and the uncoordinated two-migrator race by the "TWO MIGRATORS RACING"
+// section of the circle-column block further down, which uses two real connections and no fake
+// probe at all.
 
 class StaleIngestOperationsColumnProbeStorage extends BetterSqlitePort {
   private probeConsumed = false;
@@ -6677,15 +6666,16 @@ describe("MonetCore construction — ingest_operations receipt-column concurrent
     const path = join(dir, "monet.db");
 
     // FIRST MIGRATOR: an ordinary construction against a brand-new file. `ingest_operations`' own
-    // CREATE TABLE does NOT declare any of the four receipt columns inline (unlike gate_events'
-    // `matcher`) — so even this FIRST, uncontested construction reaches all four guarded ALTERs, and
-    // is the WINNER of the race regardless of file freshness.
+    // CREATE TABLE does NOT declare any of the four receipt columns inline (unlike
+    // `rule_bindings.circle`, which a fresh install gets from its own CREATE TABLE) — so even this
+    // FIRST, uncontested construction reaches all four guarded ALTERs, and is the WINNER of the
+    // race regardless of file freshness.
     const winner = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1 });
     winner.close();
 
     // SECOND MIGRATOR: a fresh connection to the SAME (already-migrated) file, but its own PRAGMA
-    // probe is stale — the SAME supported MCP+CLI-sharing-one-`.monet`-DB topology
-    // `StaleMatcherProbeStorage`'s own comment names — and reports all four columns absent. Every one
+    // probe is stale — the SAME supported MCP+CLI-sharing-one-`.monet`-DB topology `storage.ts`'s
+    // own WAL + busy_timeout setup exists for — and reports all four columns absent. Every one
     // of the four guarded ALTERs proceeds exactly as the real guard would, and each hits SQLite's
     // real "duplicate column name" error against the real, already-migrated table. BEFORE this
     // round's fix, the FIRST of the four to throw aborted this process's entire construction —
@@ -7007,13 +6997,14 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
   /**
    * ROUND 2's OWN SEAM REPRODUCED B1's CLASS ONE LAYER UP (Codex round 3, item 1). A genuine
    * pre-gate 1.3.1 store has NO gate tables at all — not just no `circle` column, no `stages`,
-   * `rule_bindings`, `gate_events`, or `gate_meta` whatsoever. Round 2 ran the legacy-star migration
-   * BEFORE `createGateSchema` (which creates `gate_meta`), so its own `bumpGateGeneration` call
+   * `rule_bindings`, `gate_events`, or `gate_meta` whatsoever (the last two have since been dropped
+   * from the schema outright; only the first two are still created). Round 2 ran the legacy-star
+   * migration BEFORE `createGateSchema`, which then created `gate_meta`, so its `bumpGateGeneration`
    * threw "no such table: gate_meta" — AFTER the concept had already moved (no explicit transaction
    * wraps `moveCircleScopedTables`) — aborting construction on the FIRST open and succeeding only on
    * a retry, because the second attempt found nothing left to migrate. This is the exact scenario:
    * no DROP-and-rebuild-the-legacy-DDL fixture (nothing to preserve — this store never had gate
-   * tables to begin with), just the four gate tables genuinely absent.
+   * tables to begin with), just the gate tables genuinely absent.
    */
   it("legacy-star migration preserves colliding workstreams and leaves no same-slug duplicates (#101)", async () => {
     const dir = mkTmp();
@@ -7058,10 +7049,11 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     legacy.exec(`DROP INDEX IF EXISTS idx_rule_bindings_circle`);
     // The compatibility triggers this fixture used to have to drop by hand are gone from the
     // schema entirely (see migrateGateColumns' own removal record), so there is nothing left here
-    // but the tables themselves.
+    // but the tables themselves. `DROP TABLE IF EXISTS gate_events` went the same way (2026-08-22):
+    // the builder above no longer creates that table, so the line could only ever be a no-op here —
+    // it read as coverage of a shape this fixture cannot produce.
     legacy.exec(`DROP TABLE IF EXISTS rule_bindings`);
     legacy.exec(`DROP TABLE IF EXISTS stages`);
-    legacy.exec(`DROP TABLE IF EXISTS gate_events`);
     legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
     legacy.close();
 
@@ -7380,7 +7372,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
    * edges, then normative rows, then the source registry, then aliases, then the generation bump —
    * so a crash between any two of them left a HALF-MOVED store: exactly the "concepts moved,
    * sources/aliases not, or worse" shape this item names. Injected via a probe StoragePort (matching
-   * this describe block's own StaleMatcherProbeStorage precedent), throwing partway through
+   * this file's own StaleIngestOperationsColumnProbeStorage precedent), throwing partway through
    * moveCircleScopedTables itself — after concepts/observations/edges/normative rows have already
    * been touched, before knowledge_sources, entities, first_block, alias cleanup, or the generation
    * bump ever run — the worst-shaped partial failure available, not merely a clean early one.

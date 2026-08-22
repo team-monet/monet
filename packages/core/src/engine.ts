@@ -3282,7 +3282,8 @@ export class MonetCore {
     // Idempotency keys are writer-domain scoped. A native retry must never claim a connector
     // receipt (and vice versa), even if a caller accidentally reuses the same operation id.
     const operationCols = this.db.prepare(`PRAGMA table_info(ingest_operations)`).all() as Array<{ name: string }>;
-    // Same duplicate-column catch as the receipt columns below (and the matcher-column precedent):
+    // Same duplicate-column catch as the receipt columns below (and `migrateGateColumns`' own
+    // circle-column precedent, gates.ts):
     // two processes first-opening a pre-column store concurrently can both cache `operationCols`
     // before either ALTER lands — the loser must treat "duplicate column name" as someone else's
     // success, not its own failure to construct.
@@ -3305,7 +3306,7 @@ export class MonetCore {
     // THE SEVERITY/CIRCLE RECEIPT COLUMNS (four, added across three earlier rounds) NOW USE THE
     // IDEMPOTENT-BY-CATCH PATTERN (post-merge review round, P2 — found by review, not
     // self-discovered): each ALTER below used to be a bare `if (!has-column) exec(ALTER)`, with no
-    // catch — exactly the shape `migrateGateColumns`'s own matcher-column guard (gates.ts) already
+    // catch — exactly the shape `migrateGateColumns`'s own circle-column guard (gates.ts) already
     // documents the danger of: the MCP server and a `monet` CLI call are a SUPPORTED topology
     // sharing one `.monet` DB (storage.ts's own WAL + busy_timeout setup exists for this), so two
     // processes can both open a pre-column store at once, both see a column absent via the SAME
@@ -14889,11 +14890,11 @@ export class MonetCore {
    *     the opposite either, and moveCircleScopedTables already moves them unconditionally alongside
    *     whatever concepts move — they never determine the destination independently.
    *   - EXCLUDED, instrumentation-only (stated reason, per this round's own suggestion):
-   *     `gate_events` and `resolution_events`. Both carry a `circle` column, but both are explicitly
-   *     documented local, append-only logs of what happened, not identity anything else depends on —
-   *     resolution_events' own doc comment: "An instrumentation row must not perturb the thing it
-   *     instruments." A collision here would misattribute some historical metrics to the wrong
-   *     circle in a report, never conflate real content or identity.
+   *     `resolution_events` (and `gate_events`, until that table was dropped). It carries a `circle`
+   *     column, but it is explicitly documented a local, append-only log of what happened, not
+   *     identity anything else depends on — resolution_events' own doc comment: "An instrumentation
+   *     row must not perturb the thing it instruments." A collision here would misattribute some
+   *     historical metrics to the wrong circle in a report, never conflate real content or identity.
    *
    * GUARDED ON TABLE EXISTENCE ONLY WHERE IT CAN ACTUALLY BE MISSING AT THIS POINT IN CONSTRUCTION:
    * `circle_aliases` (Codex round 4, item 4 fallout) and `knowledge_sources` (round 5, item 2) both
@@ -15130,7 +15131,7 @@ export class MonetCore {
     const { destination, moved, deletedStarSource, repointedStarTargets } = committed;
     // DISCLOSURE, AFTER COMMIT (Codex round 7, item 1: moved out of the transaction — see this
     // method's own doc comment for why). No prior migration in this codebase leaves a trace of its
-    // own (the `matcher` column, the original `circle` column itself: both silent, self-healing) —
+    // own (`rule_bindings.circle`'s own guarded ALTER and backfill, gates.ts: silent, self-healing) —
     // this one earns a line because it silently RENAMES pre-existing user content, not merely a
     // schema shape. `console.error`, matching the ONE disclosure convention this codebase already has
     // for a notable-but-recovered condition (embedding-onnx.ts's model-load fallback, store-

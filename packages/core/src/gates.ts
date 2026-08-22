@@ -1528,18 +1528,17 @@ export interface StageLookupOptions {
    * The stage name (or id) the agent recognizes itself to be at. Resolved via `findStage`: exact
    * id, else exact/normalized (trimmed, whitespace-collapsed, case-insensitive) name. NO fuzzy or
    * embedding matching — recognition is the agent's own act against the resident stage index, and
-   * this call is a lookup against it, not a search; a third matcher is out of scope by design.
+   * this call is a lookup against it, not a search; a fuzzy or embedding matcher here is out of
+   * scope by design.
    *
-   * NAME-REACHABILITY SURVIVES A RE-AIMING OF THE PATTERNS (doctrine, ruled). A stage's TRIGGER
-   * PATTERNS address it to an action shape; re-authoring them (memory_declare's `patterns`)
-   * reroutes what that addressing covers, nothing else. This lookup resolves by NAME/id against the
-   * stage registry, never by pattern, so a rule bound to this stage — including a blocking one —
-   * stays reachable here exactly as before, until the RULE itself is withdrawn, downgraded, or
-   * superseded, or the stage's own rules all die (stage retirement/inertness). A pattern change is
-   * therefore never a rule-withdrawal lever by itself: it narrows what an interceptor would route
-   * here, not what the agent can still ask for by name. See engine.ts's
-   * `assertPatternReauthoringAcknowledged` doc comment for the write-side rationale this
-   * complements.
+   * REACHABILITY IS A PROPERTY OF THE RULE, NOT OF ANY ADDRESSING (doctrine, ruled — the surviving
+   * half). This lookup resolves by NAME/id against the stage registry, so a rule bound to this
+   * stage — including a blocking one — stays reachable here until the RULE itself is withdrawn,
+   * downgraded, or superseded, or the stage's own rules all die (stage retirement/inertness). No
+   * other act can take it away. The doctrine's other half was about re-aiming a stage's TRIGGER
+   * PATTERNS, and it went with them (2026-08-22 — see this module's own retreat record): there is
+   * no addressing left to re-aim, and the write-side guard this note used to point at
+   * (`assertPatternReauthoringAcknowledged`, engine.ts) was removed with the act it governed.
    */
   stage: string;
   /** Locality: only rules whose concept lives in this circle are delivered. */

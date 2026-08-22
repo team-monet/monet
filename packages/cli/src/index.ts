@@ -34,27 +34,29 @@ async function main() {
   // See circle.ts for details.
   process.env.MONET_CALLER_ID = deriveCallerId();
   process.env.MONET_PROJECT_ID = deriveProjectId(projectDir);
-  // COMPONENT B (4b-D), extended here too: this is the SAME long-running serving process as
-  // cli.ts's `start` action, just a second launch path (this file's own generated config is not
-  // what `monet config` emits today — see this slice's report — but the two are equivalent
-  // servers and leaving this one without mirror maintenance would silently depend on WHICH launch
-  // path a host happens to use, exactly the kind of divergence this slice exists to close).
+  // THE SECOND LAUNCH PATH, AND IT MUST NOT DIVERGE FROM THE FIRST: this is the SAME long-running
+  // serving process as cli.ts's `start` action (this file's own generated config is not what
+  // `monet config` emits today — see this slice's report — but the two are equivalent servers).
+  // Anything wired at only one of them makes behavior depend on WHICH launch path a host happens
+  // to use, which is the divergence every fix below exists to close.
+  //
+  // THE GATE MIRROR (COMPONENT B, 4b-D) AND THE GATE JOURNAL (monet-client#75) were both wired
+  // here for exactly that reason, and both are gone — the mirror with `materializeGateMirror` (see
+  // atomic-write.ts's own provenance note), the journal with the hook it fed. What this call still
+  // has to keep in step with cli.ts is the store root and the spool, and nothing else.
   //
   // FIX 1 (Codex round 2 on PR #42): getDbPath(projectDir), matching cli.ts's own `start` action
   // fix exactly — see that file's comment for the full wrong-project-class explanation. Bare
-  // getDbPath() would open the served store at cwd while gateSidecarPath already materialized the
-  // mirror at projectDir; a declaration made through this session would land in the wrong store's
-  // mirror. Same fix, same reasoning, second launch path.
-  // JOURNAL (monet-client#75), extended here too for the SAME reason the mirror above is: this is
-  // the second launch path of the one long-running serving process, and wiring only cli.ts's
-  // `start` action would make gate journaling depend on WHICH launch path a host happens to use —
-  // exactly the divergence the mirror comment above already refuses.
+  // getDbPath() resolves through getMonetDir()'s own process.cwd() default, so with
+  // MONET_PROJECT_DIR set and cwd elsewhere the session's writes would land in a different store
+  // than every other project-derived answer here — the `deriveCircle` call above included. Same
+  // fix, same reasoning, second launch path.
   //
-  // Deliberately NOT rooted at `projectDir` the way the store and the mirror on the lines below
-  // are: the moment spool is ONE stream shared with the hook wrapper and `monet gate`, neither of
-  // which runs in this process, and a per-project spool would be a different file from the one
-  // those writers append to — see db/index.ts's getMomentSpoolPath for the two rungs it settles on
-  // and why they must match the generated wrapper's own.
+  // Deliberately NOT rooted at `projectDir` the way the store on the line below is: the moment
+  // spool is ONE stream whose format admits writers that do not run in this process at all, and
+  // the fold's per-run sequence only proves completeness if every writer appends to the same file.
+  // NO SUCH OUT-OF-PROCESS WRITER SHIPS TODAY — see db/index.ts's getMomentSpoolPath, which holds
+  // the two rungs it settles on and states plainly what does and does not hold them up.
   const core = await openServedCore(getDbPath(projectDir), {
     scopeContext: projectDir,
     defaultCircle: circle,

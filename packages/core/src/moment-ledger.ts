@@ -41,22 +41,24 @@ import { readMomentSpool, spoolAnswer, spoolAsk } from "./moment-spool";
  * that cannot say "unavailable" reports its own blind spots as findings.
  *
  * LOCAL AND UNSYNCED. These tables are absent from the sync envelope (`sync-types.ts`) for the same
- * reason `gate_events` is: replicating a local action stream merges two machines' timelines and
- * makes every rate computed from it a lie. `action_rendering` is the privacy-sensitive column here —
- * it holds a bounded rendering of a real command or prompt — and it is covered automatically by the
- * schema-driven scrub closure, which walks every TEXT column at runtime rather than enumerating
- * columns by name.
+ * reason `resolution_events` is: replicating a local action stream merges two machines' timelines
+ * and makes every rate computed from it a lie. `action_rendering` is the privacy-sensitive column
+ * here — it holds a bounded rendering of a real command or prompt — and it is covered
+ * automatically by the schema-driven scrub closure, which walks every TEXT column at runtime
+ * rather than enumerating columns by name.
  */
 
 /**
  * Every table the ledger owns. `IF NOT EXISTS` throughout, so `createMomentTables` is idempotent and
  * safe to call on every fold.
  *
- * NO SECONDARY INDEXES SHIP HERE, deliberately. Nothing queries these tables by anything but their
- * primary keys yet, and this repository's own history says an index added on intuition is the wrong
- * move — the one index on `gate_events` that does exist was added only after its cost was measured
- * over a synthetic store at three sizes. When a real read exists, measure it and add the index that
- * read needs.
+ * NO INDEX SHIPS HERE ON INTUITION. Each of the two below names a read that already exists and is
+ * scoped to it — `idx_governed_moments_tool_use` for the fold's own outcome lookup (its own comment:
+ * "the query exists and is named before the index is"), `idx_moment_reads_named_stage` for
+ * `momentStageReads`. Nothing else here is queried by anything but its primary key, and nothing else
+ * gets an index. The precedent this note used to argue from — the one measured index on
+ * `gate_events` — went with that table, so the discipline now stands on the two indexes below
+ * instead. When a real read exists, measure it and add the index that read needs.
  */
 export const MOMENT_SCHEMA_SQL = `
   /*
