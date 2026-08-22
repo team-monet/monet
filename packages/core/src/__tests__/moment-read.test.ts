@@ -322,6 +322,61 @@ describe("a stage_lookup carries its own moment through the whole chain", () => 
     expect(Object.keys(moment?.ruleReads ?? {}).sort()).toEqual([...delivered].sort());
   });
 
+  it("hands the key over with one line saying what it is for, on the FIRST lookup of a fresh store", async () => {
+    const spoolPath = join(mkTmp(), "moments.jsonl");
+    // A fresh store, a fresh server, one lookup. Nothing has been read and acted on yet, so nothing
+    // owes a question — which is precisely the turn the ask signal CANNOT speak on, since it fires
+    // on a debt that does not exist yet. If the what-to-do rode only there, this response would hand
+    // the agent a key with nothing telling it what the key is for, and no standing text covers it.
+    const { response } = await lookupOnce(spoolPath, "terraform apply");
+    expect(response.momentId).toEqual(expect.any(String));
+
+    const instruction = response.instruction as string;
+    expect(instruction).toEqual(expect.any(String));
+    // BOTH tools named. Naming only `conformance_answer` would leave an obedient agent's `asked_at`
+    // null and count it as a defect it never committed — the ask is its own event with its own owner.
+    expect(instruction).toContain("conformance_ask");
+    expect(instruction).toContain("conformance_answer");
+    // ...and it names the key it ships beside, so the agent knows which id those calls take.
+    expect(instruction).toContain("momentId");
+    // WHETHER THE ACTION FOLLOWED THE RULE — never whether the rule caused it. Causation is
+    // unobservable and is not what this measures; the ask signal holds the same line.
+    expect(instruction).toContain("followed these rules");
+    expect(instruction.toLowerCase()).not.toContain("because");
+    expect(instruction.toLowerCase()).not.toContain("caused");
+    // ONE LINE. It ships on every lookup that has a moment, so its cost is paid over and over.
+    expect(instruction).not.toContain("\n");
+  });
+
+  it("omits the instruction exactly where it omits the key — no spool, no moment, nothing to name", async () => {
+    // An instruction to quote a key that is not on the response is worse than silence: it asks for a
+    // conformance call that could attach to nothing. With no spool the wrapper opens no moment, so
+    // the two are omitted together.
+    const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets" });
+    cores.push(core);
+    await core.declare({
+      species: "rule", stage: "terraform apply", patterns: ["Bash:terraform apply"],
+      content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
+    });
+    const server = new McpServer({ name: "t", version: "1" }, { capabilities: { tools: {} } });
+    registerMonetCoreTools(server, core, { autoPrewarm: false });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.connect(st);
+    const client = new Client({ name: "c", version: "1" });
+    await client.connect(ct);
+    try {
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "terraform apply", circle: "acme-widgets" } });
+      const first = (result as { content: Array<{ type: string; text?: string }> }).content[0];
+      const response = JSON.parse(first.text ?? "{}") as Record<string, unknown>;
+      // The rules still deliver — this is a working lookup, just an unrecordable one.
+      expect((response.rules as unknown[]).length).toBeGreaterThan(0);
+      expect(response.momentId).toBeUndefined();
+      expect(response.instruction).toBeUndefined();
+    } finally {
+      await client.close();
+    }
+  });
+
   it("lands the self-read as TIMELY, not late — the ordering the design depends on", async () => {
     const spoolPath = join(mkTmp(), "moments.jsonl");
     const db = mkDb();

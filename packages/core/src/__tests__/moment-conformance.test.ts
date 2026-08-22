@@ -315,20 +315,59 @@ describe("the signal that tells the agent it owes a question", () => {
       const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
       const signal = texts(result).find((text) => text.includes("Monet: you read a rule"));
       expect(signal).toBeDefined();
-      // An instruction naming a moment...
+      // A signal naming a moment...
       expect(signal).toContain("owed-one");
-      // BOTH tools named: the ask is its own event, and a signal that omits it produces the F2 defect
-    // where an obedient agent is counted as having never asked.
-    expect(signal).toContain("conformance_ask");
-    expect(signal).toContain("conformance_answer");
+      // BOTH tools are still named on this response — on the `instruction` field that now ships
+      // beside the key on every lookup, rather than in the signal that used to be the only thing
+      // saying either. The naming had to survive that move, not be dropped by it: the ask is its own
+      // event, and an instruction that omits it produces the F2 defect where an obedient agent is
+      // counted as having never asked.
+      const instruction = (JSON.parse(texts(result)[0]) as { instruction?: string }).instruction;
+      expect(instruction).toContain("conformance_ask");
+      expect(instruction).toContain("conformance_answer");
       // ...and NOT a payload carrying it. The agent already has the action in its own transcript;
       // re-sending it would be paying context to tell the model what it just did.
       expect(signal).not.toContain("terraform apply");
       expect(signal).not.toContain("rule-a");
       // And the wording asks whether the action FOLLOWED the rule — never whether the rule caused
-      // it, which is unobservable and is not what this measures.
-      expect(signal).toContain("follow the rule");
+      // it, which is unobservable and is not what this measures. The signal keeps the same line for
+      // its own half of the sentence: read a rule, then acted.
+      expect(instruction).toContain("followed these rules");
+      expect(instruction?.toLowerCase()).not.toContain("because of");
       expect(signal?.toLowerCase()).not.toContain("because of");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("says each thing once when the standing instruction and the debt signal ride the same response", async () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const core = coreWithSpool(path);
+    seq = 0;
+    readAndActed(path, "owed-one");
+    const { client, cleanup } = await pair(core);
+    try {
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
+      const parts = texts(result);
+      // BOTH halves are on this one response: the standing instruction, which ships with the key on
+      // every lookup, and the debt signal, which fires only because a moment is outstanding.
+      const instruction = (JSON.parse(parts[0]) as { instruction?: string }).instruction;
+      expect(instruction).toContain("conformance_ask");
+      const signal = parts.find((text) => text.includes("Monet: you read a rule"));
+      expect(signal).toContain("owed-one");
+
+      // AND NEITHER IS A SECOND COPY OF THE OTHER. They carry different facts — what asking means,
+      // and which earlier ids still need it — so the tool names, the key, and the question each
+      // appear exactly ONCE across the whole payload. Two overlapping notices would be the same
+      // context cost paid twice on the one response that already carries the most.
+      const payload = parts.join("\n");
+      const occurrences = (needle: string): number => payload.split(needle).length - 1;
+      expect(occurrences("conformance_ask")).toBe(1);
+      expect(occurrences("conformance_answer")).toBe(1);
+      expect(occurrences("followed these rules")).toBe(1);
+      // Stated from the signal's side too, so a failure says which half grew the duplicate.
+      expect(signal).not.toContain("conformance_ask");
+      expect(signal).not.toContain("conformance_answer");
     } finally {
       await cleanup();
     }

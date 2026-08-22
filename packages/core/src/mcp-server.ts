@@ -170,6 +170,31 @@ const MOMENT_ID_MAX_CHARS = 36;
  */
 const ASK_SIGNAL_MAX_MOMENTS = 8;
 
+/**
+ * WHAT THE KEY IS FOR — the one line that rides beside `momentId` on every `stage_lookup` response
+ * that has one.
+ *
+ * WHO CONSUMES IT — the agent, and nobody else. ON WHICH TURN — every `stage_lookup` that returns a
+ * `momentId`, including the first of a session. WHAT BREAKS WITHOUT IT — the response hands over a
+ * key with nothing saying what to do with it. The ask signal cannot cover this: it fires only once a
+ * moment already owes a question, so a first lookup carries the key and no instruction at all, and
+ * no standing text mentions this loop either.
+ *
+ * UNCONDITIONAL, WHICH THE SIGNAL IS NOT. The signal is debt-driven and names ids; this says what
+ * the ids are for. That split is why the two do not overlap — the signal states a fact (these
+ * moments still owe the question), this states the instruction (what asking and recording means),
+ * and neither repeats the other.
+ *
+ * IT ASKS WHETHER THE ACTION FOLLOWED THE RULE, never whether the rule CAUSED it — causation is
+ * unobservable and is not what this measures. Same discipline as the ask signal's own wording.
+ *
+ * ONE LINE, AND BOTH TOOLS NAMED. It ships on every lookup, so every word is paid for repeatedly:
+ * what to do, the two tools, the key they take, and nothing else. Naming only `conformance_answer`
+ * would leave an obedient agent's `asked_at` null and count it as a defect it did not commit.
+ */
+const CONFORMANCE_INSTRUCTION =
+  "After you act, ask the user whether the action followed these rules — conformance_ask with this momentId when you put the question, then conformance_answer with their reply.";
+
 const RESULT_TRUNCATE_NOTE = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
 const RECALL_EMPTY_LINE = "Nothing matched.";
 /** Circle names are routing identifiers, not prose; bound every caller-controlled echo before writes. */
@@ -919,9 +944,11 @@ export function registerMonetCoreTools(
    * the first turn, and this signal is the backstop for a debt it did not clear, not the only way
    * it learns the key.
    *
-   * IT NAMES MOMENTS; IT NEVER CARRIES THEIR CONTENT. Ids and one instruction. The agent already has
-   * the action in its own transcript — re-sending a rendering of it would be paying context to tell
-   * the model what it just did.
+   * IT NAMES MOMENTS; IT NEVER CARRIES THEIR CONTENT. Ids, and the fact that they are outstanding —
+   * the what-to-do lives in the response's own `instruction` field (see CONFORMANCE_INSTRUCTION),
+   * which ships on every lookup that has a `momentId`, so this no longer restates it. The agent
+   * already has the action in its own transcript — re-sending a rendering of it would be paying
+   * context to tell the model what it just did.
    *
    * REPEATED WHILE THE DEBT STANDS, and that is a correction. This used to announce each moment
    * exactly once, reasoning that a banner reappearing every turn is standing text by another name
@@ -952,14 +979,20 @@ export function registerMonetCoreTools(
     if (fresh.length === 0) return "";
     const ids = fresh.join(", ");
     const noun = fresh.length === 1 ? "action" : "actions";
-    // ONE SENTENCE. It names what is owed and the tool that records it, and nothing else — the
-    // wording deliberately asks whether the action FOLLOWED the rule, never whether the rule caused
-    // it, which is unobservable and is not what this measures.
-    // NAMES BOTH TOOLS, and that is a correction rather than a wording preference. This used to name
-    // only `conformance_answer`, so an agent obeying it literally — ask out loud, record the reply —
-    // left `asked_at` null and the moment was counted as an agent defect it had not committed. The
-    // ask is its own event with its own owner; an instruction that omits it asks for the wrong shape.
-    return `Monet: you read a rule and then acted, for ${fresh.length} ${noun} (${ids}). For each: call conformance_ask when you put the question to the user, then conformance_answer with their reply — did the action follow the rule it read?`;
+    // A FACT, NOT A SECOND COPY OF THE INSTRUCTION. It used to carry both — what is owed AND what to
+    // do about it — because it was the only thing on any response that said either. The response's
+    // own `instruction` field now carries the what-to-do on every lookup that has a `momentId`, so
+    // repeating it here would say the same thing twice in one payload. What is left is the half only
+    // this can know: WHICH earlier moments are still outstanding. The two compose — content[0] says
+    // what asking means, this says which ids still need it — and neither is readable as the other's
+    // duplicate.
+    //
+    // THE ORDER SURVIVES A DEGRADED HOST. The instruction rides in content[0], which every host
+    // exposes; this rides as a later content item, which some drop. The half that can go missing is
+    // the id list, never the instruction — the reverse split would lose the what-to-do entirely.
+    //
+    // The wording still says the action FOLLOWED a rule it read, never that the rule caused it.
+    return `Monet: you read a rule and then acted, for ${fresh.length} ${noun} (${ids}) — each still owes that question.`;
   }
 
   function wrapSuccess(
@@ -1842,8 +1875,12 @@ export function registerMonetCoreTools(
           //
           // IN `fixedFields` SO THE SIZE-FIT BELOW COUNTS IT. Every budget check serializes this
           // envelope; a field added after the loop would be paid for out of a budget that never
-          // knew about it.
-          ...(momentId !== null ? { momentId } : {}),
+          // knew about it. The instruction is counted the same way, for the same reason.
+          //
+          // THE KEY AND ITS INSTRUCTION SHIP TOGETHER, in one spread, so neither can appear without
+          // the other. A key with nothing saying what it is for was the state this closes; an
+          // instruction to name a key that is not on the response would be worse than silence.
+          ...(momentId !== null ? { momentId, instruction: CONFORMANCE_INSTRUCTION } : {}),
         };
         const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
 
