@@ -234,8 +234,10 @@ pointing at an artifact that was never created leads nowhere.
 
 **And the entrance the sort will need most, which is not the sort at all:** later, in real work,
 they will correct you — and that correction *is* a rule being born, at the moment its evidence
-exists. `memory_store` with `kind: "rule"` captures it on the spot: the `stage` it belongs to, the
-`instance` that just went wrong, and the `reason` naming the failure it prevents. Rules captured
+exists. `memory_store` with `kind: "rule"` captures it on the spot: the correction itself as the
+`content`, the `stage` it belongs to, and the `reason` naming the failure it prevents. What went
+wrong rides in the content and nowhere else — a field the schema does not name is dropped without an
+error, so let the tool's own schema, never this page, be the list of fields that exist. Rules captured
 this way are **advisory**; only their declaration can make one blocking, which is the right
 asymmetry — an agent may notice a rule, but only the user may make one the agent cannot depart from.
 

@@ -552,12 +552,19 @@ export function runUninstall(options: UninstallOptions, hooks: UninstallHooks = 
     );
   }
 
+  // A TARGET THIS RUN LEFT UNFINISHED — refused before it could be read, or refused at the write to
+  // protect a concurrent edit. THE TWO REASONS ARE INTERCHANGEABLE TO EVERY CLAIM BELOW, because
+  // each sentence down here generalizes over "the files above" and neither state can be spoken for:
+  // a conflicted file is KNOWN to still hold entries, and an unreadable one is simply UNKNOWN.
+  // Withholding on only one of them was the bug — an unknown reported as a verdict.
+  const unfinished = refused + conflicted;
+
   if (removedTotal === 0) {
     // SAID PLAINLY, because "nothing happened" is the answer for everyone who never ran the old
-    // install, and it must not read like a failure. NOT SAID AT ALL when a file was refused for
-    // conflict: entries WERE found there, and calling that "nothing to remove" would be the one
-    // reading of this run that is simply false.
-    if (conflicted === 0) {
+    // install, and it must not read like a failure. NOT SAID AT ALL when a target was left
+    // unfinished: that run did not establish there is nothing to remove, and the line below says
+    // what it actually knows instead.
+    if (unfinished === 0) {
       console.error(`monet uninstall: no Monet hook entries found — nothing to remove.`);
     }
     if (refused > 0) {
@@ -571,15 +578,19 @@ export function runUninstall(options: UninstallOptions, hooks: UninstallHooks = 
 
   // THE FOOTER DESCRIBES THE RUN THAT ACTUALLY HAPPENED. Under `--dry-run` the loop above wrote
   // nothing, so every past-tense claim here was false on that path: there is no change to restart
-  // for, and the wrapper is referenced by exactly the entries that are still on disk.
+  // for, and the wrapper is referenced by exactly the entries that are still on disk. This line is
+  // reached only with entries actually removed, so it holds regardless of `unfinished`: a target
+  // left behind does not make the change to the others need less of a restart.
   console.error(
     options.dryRun
       ? `monet uninstall: nothing was written — rerun without --dry-run to apply, then restart Claude Code.`
       : `monet uninstall: restart Claude Code for the change to take effect.`,
   );
-  // AND NOT CLAIMED AT ALL WHEN A FILE WAS REFUSED: that file still holds an entry naming the
-  // wrapper, so "unreferenced by the files above" would be wrong in the one case it matters.
-  if (conflicted > 0) return;
+  // AND THE WRAPPER CLAIM IS NOT MADE AT ALL WHEN A TARGET WAS LEFT UNFINISHED: that file can still
+  // hold an entry naming the wrapper, so "unreferenced by the files above" would be wrong in the one
+  // case it matters. A user who deletes the wrapper on that advice converts an inert hook into a
+  // host-visible missing-file failure on every tool call — strictly worse than what they had.
+  if (unfinished > 0) return;
   for (const wrapperPath of wrapperPaths.filter((candidate) => existsSync(candidate))) {
     // NAMED, NOT DELETED — see `registerUninstallCommand`'s own comment for why.
     console.error(

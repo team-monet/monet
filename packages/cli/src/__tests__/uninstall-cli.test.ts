@@ -354,6 +354,29 @@ describe("monet uninstall", () => {
     expect(result.stderr).toContain("changed after it was read");
   });
 
+  it("withholds the deletion advice for a file refused as unreadable, not only for a conflict", () => {
+    const f = fixture();
+    writeInstalledFixture(f);
+    // ONE SCOPE CLEANED, ONE UNREADABLE. The reason it was left alone differs from a concurrent
+    // edit; what that means for the wrapper does not — the file may name it on every Bash call.
+    writeFileSync(f.projectSettings, "{ this is not json");
+    mkdirSync(join(f.home, ".monet"), { recursive: true });
+    writeFileSync(f.wrapperPath, "// the generated wrapper");
+
+    const result = runCli(f, ["uninstall"]);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("removed 3 hook entries");
+    expect(result.stderr).toContain("is not valid JSON");
+    // THE BUG THIS PINS: withholding was wired to the CONFLICT count alone, so a run with removals
+    // and an unreadable file still told the user the wrapper was unreferenced and safe to delete. A
+    // user who follows that advice converts an inert hook into a host-reported missing-file failure
+    // on every tool call — strictly worse than the state they started in.
+    expect(result.stderr).not.toContain("unreferenced");
+    // AND THE SIBLING LINE IS NOT WITHHELD, which is the distinction: entries really were removed
+    // from the file that could be read, so that change really does need the restart.
+    expect(result.stderr).toContain("restart Claude Code for the change to take effect");
+  });
+
   it("is idempotent, and says plainly when there is nothing to remove", () => {
     const f = fixture();
     writeInstalledFixture(f);
@@ -423,9 +446,10 @@ describe("monet uninstall", () => {
     // A half-understood rewrite of the user's settings is worse than an unremoved hook — which the
     // shim has already made harmless. So the bytes are still exactly as found...
     expect(readFileSync(f.userSettings, "utf8")).toBe("{ this is not json");
-    // ...and the user is told a file was skipped, so "nothing to remove" cannot be mistaken for
-    // "nothing was there".
+    // ...and what the user is told is only what this run established: a file was skipped, and the
+    // entry may be in it. NOT "nothing to remove" — that is a verdict on a file nothing could read.
     expect(result.stderr).toContain("remove its entry by hand");
+    expect(result.stderr).not.toContain("nothing to remove");
   });
 });
 
