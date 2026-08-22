@@ -12,7 +12,9 @@ import { basename, dirname, join } from "node:path";
  * caller in the tree, and it omits `mode` (the preserve-existing branch) and supplies
  * `verifyBeforeRename`. The reasoning is retained because the FUNCTION's contract is unchanged —
  * forced-vs-preserved mode, symlink write-through, tmp cleanup — only the callers that motivated
- * each clause are historical now.
+ * each clause are historical now. The core-side twin it used to cite as the shape it mirrors
+ * (`materializeGateMirror`, gates.ts) went with the gate mirror; the mechanism it described is
+ * stated here directly instead.
  */
 
 /**
@@ -22,16 +24,12 @@ import { basename, dirname, join } from "node:path";
  * moment, could see a partially-written, invalid file: a truncated settings.json the NEXT hook
  * invocation chokes on, or a half-written wrapper script.
  *
- * Mirrors @team-monet/core's own `materializeGateMirror` atomic-write shape EXACTLY (gates.ts,
- * around its own `const tmp = join(dir, \`.${basename(path)}.${process.pid}.${Date.now()}.
- * ${randomUUID()}.tmp\`)` / `writeFileSync(tmp, data, { flag: "wx", ... })` / `renameSync(tmp,
- * path)` sequence) — the identical write-then-rename mechanism this client's own gate mirror
- * already depends on, for the identical reason: a hidden, pid+timestamp+UUID-suffixed tmp file in
- * the SAME directory as the final RESOLVED target (same-directory is what makes the rename atomic
- * — a cross-filesystem rename is not one), created with EXCLUSIVE creation (`wx` — fails on any
- * existing path at that name, without following a symlink), then renamed onto the final path. A
- * rename is a single filesystem operation: a reader sees either the OLD complete file or the NEW
- * complete file, never a partial write.
+ * THE MECHANISM: a hidden, pid+timestamp+UUID-suffixed tmp file in the SAME directory as the final
+ * RESOLVED target (same-directory is what makes the rename atomic — a cross-filesystem rename is
+ * not one), created with EXCLUSIVE creation (`wx` — fails on any existing path at that name,
+ * without following a symlink), then renamed onto the final path. A rename is a single filesystem
+ * operation: a reader sees either the OLD complete file or the NEW complete file, never a partial
+ * write.
  *
  * P2-5 (Codex round 3 on PR #42) — SYMLINK-AWARE: if `targetPath` is a symlink, resolve it via
  * `realpathSync` FIRST and write through to the LINK TARGET instead — both the tmp file's own
@@ -98,8 +96,8 @@ export function atomicWriteFile(
     try {
       unlinkSync(tmp);
     } catch {
-      // best-effort cleanup — matches materializeGateMirror's own posture; the ORIGINAL error is
-      // what the caller needs to see, not a secondary cleanup failure.
+      // best-effort cleanup — the ORIGINAL error is what the caller needs to see, not a secondary
+      // cleanup failure.
     }
     throw error;
   }

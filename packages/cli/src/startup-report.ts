@@ -8,8 +8,8 @@ import { getDbPath, getStartupFailurePath } from "./db/index.js";
  * ONE FUNCTION FOR BOTH LAUNCH PATHS. `monet start` (cli.ts) and the bare stdio entry (index.ts)
  * are the same long-running server reached two ways, and this file exists so the diagnosis does not
  * depend on which one a host happens to spawn — the same argument bootstrap.ts's own
- * `gateSidecarPath`/`momentSpoolPath` comments make about the mirror and the spool, applied to the
- * one record written when the server never gets far enough to maintain either.
+ * `momentSpoolPath` comment makes about the spool, applied to the one record written when the
+ * server never gets far enough to maintain it.
  *
  * STDERR IS NOT DROPPED, IT IS SUPPLEMENTED. The existing stderr message stays exactly where it is
  * — it is what an operator running `monet start` in a terminal reads, and it is what Claude Code

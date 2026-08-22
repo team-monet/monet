@@ -32,7 +32,6 @@ import {
   BREADTH_CIRCLE,
   COMMAND_BOUNDARY,
   createGateSchema,
-  evaluateGate,
   evaluateStageLookup,
   formatTriggerPattern,
   gateCoverage,
@@ -98,6 +97,21 @@ class ConstantEmbeddingProvider implements EmbeddingProvider {
 
 type RawDb = { prepare(sql: string): { run(...p: unknown[]): unknown; get(...p: unknown[]): unknown; all(...p: unknown[]): unknown[] } };
 const raw = (c: MonetCore): RawDb => (c as unknown as { db: RawDb }).db;
+
+/**
+ * Flip a stage's `verified` bit as a RAW FIXTURE — byte for byte what `commitGateWrites`' own verify
+ * flip writes (`UPDATE stages SET verified = 1, sync_updated_at = <sync clock>`), stamped off the
+ * SAME persisted sync clock (`sync_meta.last_mutation_at`, advanced exactly as `nextSyncTimestamp()`
+ * advances it) so the row exports and grafts like any other engine write. A fixture rather than a
+ * real interception because the subject of the tests that use it is what SYNC does with the bit, not
+ * who set it.
+ */
+function markStageVerified(c: MonetCore, stageId: string): void {
+  const db = raw(c);
+  db.prepare(`UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at + 1, ?) WHERE singleton = 1`).run(Date.now());
+  const stamp = (db.prepare(`SELECT last_mutation_at AS t FROM sync_meta WHERE singleton = 1`).get() as { t: number }).t;
+  db.prepare(`UPDATE stages SET verified = 1, sync_updated_at = ? WHERE id = ?`).run(stamp, stageId);
+}
 
 const tmpDirs: string[] = [];
 function mkTmp(): string {
@@ -463,7 +477,7 @@ describe("rule capture", () => {
     expect(rule.conceptId).not.toBe(fact.conceptId);
     expect(rule.action).toBe("created");
     expect(rule.concept.kind).toBe("rule");
-    expect(c.gate({ actionContext: "Bash:terraform apply -auto-approve" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "terraform apply" }).rules).toHaveLength(1);
     // The near-match is not discarded: the pair goes to the same curation surface every other
     // non-merge goes to.
     expect(rule.nearMatchId).toBe(fact.conceptId);
@@ -486,7 +500,7 @@ describe("rule capture", () => {
       kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     expect(recaptured.conceptId).not.toBe(original.conceptId);
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId))
       .toContain(recaptured.conceptId);
 
     // And naming the dead rule explicitly is a caller error, not something to route around quietly.
@@ -728,16 +742,16 @@ describe("declaration — the sovereign entrance", () => {
     // The incumbent is exactly as it was found — including its own (absent) reason, which the
     // refused declaration did not get to overwrite.
     expect(c.ruleBinding(first.conceptId)).toMatchObject({ severity: "advisory", reason: null });
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]!.severity).toBe("advisory");
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]!.severity).toBe("advisory");
 
-    // With the reason supplied the same upgrade goes through, and the gate delivers it alongside.
+    // With the reason supplied the same upgrade goes through, and delivery carries it alongside.
     const upgraded = await c.declare({
       species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (upgraded.species !== "rule") throw new Error("unreachable");
     expect(upgraded.conceptId).toBe(first.conceptId);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
       .toMatchObject({ severity: "blocking", reason: "there is no undo" });
     c.close();
   });
@@ -766,8 +780,8 @@ describe("declaration — the sovereign entrance", () => {
     if (again.species !== "rule") throw new Error("unreachable");
     expect(again.conceptId).toBe(deny.conceptId);
     expect(c.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", reason: "there is no undo" });
-    // ...and the gate still DELIVERS it, which is the only form of survival that matters.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+    // ...and it is still DELIVERED, which is the only form of survival that matters.
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
       .toMatchObject({ severity: "blocking", reason: "there is no undo" });
 
     // The same holds one severity down, where no guard is involved at all — preservation is a
@@ -903,7 +917,7 @@ describe("declaration — the sovereign entrance", () => {
       severity: "blocking", reason: "there is no undo\nand no backup", ...AGENT_RULE,
     })).rejects.toThrow(/must be ONE LINE/);
     // The incumbent is untouched — not flattened, not replaced.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
       .toMatchObject({ severity: "blocking", reason: "there is no undo" });
 
     // The error names what arrived, so the caller can see which field it has to restate.
@@ -931,7 +945,7 @@ describe("declaration — the sovereign entrance", () => {
       species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
       reason: "there is no undo\nDENIED BY ADMIN", ...AGENT_RULE,
     })).rejects.toThrow(/must be ONE LINE/);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
       .toMatchObject({ severity: "blocking", reason: "there is no undo" });
     c.close();
   });
@@ -1214,11 +1228,11 @@ describe("declaration — the sovereign entrance", () => {
         if (declared.species !== "principle") throw new Error("unreachable");
         expect(declared.conceptId).not.toBe(deny.conceptId);
 
-        // NO FOREIGN RATIFICATION on the rule, and the deny still fires exactly as before.
+        // NO FOREIGN RATIFICATION on the rule, and the deny is still delivered exactly as before.
         expect(c.getRatifications(deny.conceptId)).toHaveLength(0);
         expect(raw(c).prepare(`SELECT kind FROM concepts WHERE id = ?`).get(deny.conceptId))
           .toMatchObject({ kind: "rule" });
-        expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+        expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
           .toMatchObject({ severity: "blocking", reason: "there is no undo" });
         c.close();
       });
@@ -1648,8 +1662,8 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     })).toThrow(/does not stand where the incumbent stands/);
     expect(c.getLifecycleEdges(incumbent.conceptId, { direction: "out", family: "supersession" })).toEqual([]);
     expect(openImpeachments(c, principle)).toEqual([]);
-    // The incumbent still fires at its own gate — nothing was removed without a replacement.
-    expect(c.gate({ actionContext: "Bash:cross-stage", record: false }).rules.map((r) => r.conceptId)).toContain(incumbent.conceptId);
+    // The incumbent still stands at its own gate — nothing was removed without a replacement.
+    expect(c.stageLookup({ stage: "cross-stage gate", record: false }).rules.map((r) => r.conceptId)).toContain(incumbent.conceptId);
     c.close();
   });
 
@@ -2177,7 +2191,7 @@ describe("5-B: the projection write path", () => {
 
     // "A firing projected rule announces its provenance" — the whole reason projection needs no
     // approval gate is that a wrong one misfires in front of the human.
-    const fired = c.gate({ actionContext: "Bash:helm delete my-release" });
+    const fired = c.stageLookup({ stage: "helm delete" });
     expect(fired.rules[0]).toMatchObject({ conceptId: projected.conceptId, projectedFromPrincipleId: principle, origin: "projection" });
     // Nothing is disputed yet, so no doubt is announced (D5's own field, omitted rather than false).
     expect(fired.rules[0]!.parentDisputed).toBeUndefined();
@@ -2248,7 +2262,7 @@ describe("5-B: the projection write path", () => {
       family: "derivation", srcConceptId: legalParent, dstConceptId: legalRule.conceptId,
       bornOf: "projection", eventRef: legalRule.observationId,
     });
-    expect(c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0])
+    expect(c.stageLookup({ stage: "helm delete", record: false }).rules[0])
       .toMatchObject({ conceptId: legalRule.conceptId, projectedFromPrincipleId: legalParent });
 
     const project = (srcConceptId: string, dstConceptId: string) => () => c.addLifecycleEdge({
@@ -2333,7 +2347,7 @@ describe("5-B: the projection write path", () => {
     // AND THE HUMAN'S RULING IS STILL THE ONE DELIVERY NAMES — the parent pick is a correlated
     // scalar ordered oldest-first with LIMIT 1, so two acts still report exactly one parent, and
     // walkDerivation is DISTINCT, so the principle's member list does not repeat the rule.
-    expect(c.gate({ actionContext: "Bash:helm list", record: false }).rules[0])
+    expect(c.stageLookup({ stage: "helm announce", record: false }).rules[0])
       .toMatchObject({ conceptId: other.conceptId, projectedFromPrincipleId: principle });
     expect(c.walkDerivation(principle, "out").filter((id) => id === other.conceptId)).toEqual([other.conceptId]);
     c.close();
@@ -2428,7 +2442,7 @@ describe("5-B: the projection write path", () => {
     ).all(principle, projected.conceptId) as Array<{ born_of: string }>;
     expect(bornOf.map((e) => e.born_of)).toEqual(["projection", "ratification"]);
     // The rule is projection-born either way — a human agreeing does not un-manufacture the support.
-    expect(c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0])
+    expect(c.stageLookup({ stage: "helm delete", record: false }).rules[0])
       .toMatchObject({ conceptId: projected.conceptId, projectedFromPrincipleId: principle, origin: "projection" });
     c.close();
   });
@@ -3281,8 +3295,8 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
     const stageOf = (name: string) => c.stages().find((s) => s.name === name)!.id;
     expect(c.ruleBinding(first.conceptId)!.stage_id).toBe(stageOf("docker build"));
     expect(c.ruleBinding(second.conceptId)!.stage_id).toBe(stageOf("npm install"));
-    expect(c.gate({ actionContext: "Bash:npm install" }).rules.map((r) => r.conceptId)).toEqual([second.conceptId]);
-    expect(c.gate({ actionContext: "Bash:docker build ." }).rules.map((r) => r.conceptId)).toEqual([first.conceptId]);
+    expect(c.stageLookup({ stage: "npm install" }).rules.map((r) => r.conceptId)).toEqual([second.conceptId]);
+    expect(c.stageLookup({ stage: "docker build" }).rules.map((r) => r.conceptId)).toEqual([first.conceptId]);
 
     // ...AND THE PAIR IS EXTRACTION EVIDENCE, which is the whole reason the fork is worth having.
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
@@ -3354,13 +3368,13 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
     expect(second.conceptId).not.toBe(first.conceptId);
     // The stage is born with the forked rule, exactly as any other rule birth births its stage.
     expect(c.stages().map((s) => s.name).sort()).toEqual(["docker build", "terraform apply"]);
-    expect(c.gate({ actionContext: "Bash:terraform apply" }).rules.map((r) => r.conceptId)).toEqual([second.conceptId]);
+    expect(c.stageLookup({ stage: "terraform apply" }).rules.map((r) => r.conceptId)).toEqual([second.conceptId]);
     c.close();
   });
 });
 
 describe("5-B: fire-time doubt disclosure", () => {
-  it("a projected rule whose parent is under impeachment says so — on the gate and on the wire", async () => {
+  it("a projected rule whose parent is under impeachment says so — on delivery and on the wire", async () => {
     const c = core();
     const declared = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
     if (declared.species !== "principle") throw new Error("unreachable");
@@ -3370,7 +3384,6 @@ describe("5-B: fire-time doubt disclosure", () => {
       rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
     });
     // BEFORE: a parent in good standing announces provenance and nothing else.
-    expect(c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!.parentDisputed).toBeUndefined();
     expect(c.stageLookup({ stage: "helm delete" }).rules[0]!.parentDisputed).toBeUndefined();
 
     // A SECOND rule under the same principle is corrected — that is what impeaches the parent, and
@@ -3384,19 +3397,15 @@ describe("5-B: fire-time doubt disclosure", () => {
     });
     expect((await c.getConcept(principle))!.status).toBe("disputed");
 
-    // AFTER: same rule, same severity, still delivered — plus the disclosure.
-    const fired = c.gate({ actionContext: "Bash:helm delete my-release", record: false });
+    // AFTER: same rule, same severity, still delivered — plus the disclosure. The MCP wire shaping
+    // of that same disclosure is pinned separately, in the MCP surface block below.
+    const fired = c.stageLookup({ stage: "helm delete", record: false });
     expect(fired.rules).toHaveLength(1);
     expect(fired.rules[0]).toMatchObject({
       conceptId: projected.conceptId,
       severity: "advisory",
       projectedFromPrincipleId: principle,
       parentDisputed: true,
-    });
-    // The recognized surface carries it identically — the MCP wire shaping is pinned separately,
-    // in the MCP surface block below.
-    expect(c.stageLookup({ stage: "helm delete" }).rules[0]).toMatchObject({
-      conceptId: projected.conceptId, parentDisputed: true,
     });
     c.close();
   });
@@ -3421,15 +3430,11 @@ describe("5-B: fire-time doubt disclosure", () => {
     });
     expect((await c.getConcept(earliest.conceptId))!.status).toBe("active");
     expect((await c.getConcept(later.conceptId))!.status).toBe("disputed");
-    const firing = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
-    expect(firing.projectedFromPrincipleId).toBe(earliest.conceptId);
-    expect(firing.parentDisputed).toBe(true);
-    // THE PATH SPLIT (PR #112 round 8): the mechanical gate carries the flag alone — the hook
-    // renders title + reason and never these ids, so the hot path pays no identity aggregation.
-    expect(firing.disputedParentIds).toBeUndefined();
-    // The recovery path the flag advertises (PR #112 round 2): WHICH parent, not just "one of
-    // them" — delivered where the recovery lives, on the budget-fitted lookup path.
+    // The display parent stays the EARLIEST one, and the doubt is disclosed alongside it. The
+    // recovery path the flag advertises (PR #112 round 2): WHICH parent, not just "one of them" —
+    // delivered where the recovery lives, on the budget-fitted lookup path.
     const looked = c.stageLookup({ stage: "helm delete" }).rules[0]!;
+    expect(looked.projectedFromPrincipleId).toBe(earliest.conceptId);
     expect(looked.parentDisputed).toBe(true);
     expect(looked.disputedParentIds).toEqual([later.conceptId]);
 
@@ -3437,7 +3442,7 @@ describe("5-B: fire-time doubt disclosure", () => {
       `SELECT id FROM contradictions WHERE concept_id = ? AND kind = 'impeachment' AND status = 'open'`,
     ).get(later.conceptId) as { id: string }).id;
     c.resolveContradiction(impeachmentId, { decision: "dismiss", by: "john" });
-    const mediated = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    const mediated = c.stageLookup({ stage: "helm delete", record: false }).rules[0]!;
     expect(mediated.projectedFromPrincipleId).toBe(earliest.conceptId);
     expect(mediated.parentDisputed).toBeUndefined();
     expect(mediated.disputedParentIds).toBeUndefined();
@@ -3468,7 +3473,7 @@ describe("5-B: fire-time doubt disclosure", () => {
     const rejected = await c.ratify({ candidateId: parent.conceptId, verdict: "reject", ratifiedBy: "john" });
     expect(rejected.impeachmentsClosed).toBe(1);
     expect((await c.getConcept(parent.conceptId))!.status).toBe("active");
-    const afterReject = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    const afterReject = c.stageLookup({ stage: "helm delete", record: false }).rules[0]!;
     expect(afterReject.conceptId).toBe(child.conceptId);
     expect(afterReject.parentDisputed).toBeUndefined();
 
@@ -3476,17 +3481,16 @@ describe("5-B: fire-time doubt disclosure", () => {
     // a settled membership question — the read side must not direct anyone to mediate it as doubt.
     c.flagContradiction(parent.conceptId, { detail: "content dispute, not an impeachment" });
     expect((await c.getConcept(parent.conceptId))!.status).toBe("disputed");
-    const stillSettled = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    const stillSettled = c.stageLookup({ stage: "helm delete", record: false }).rules[0]!;
     expect(stillSettled.parentDisputed).toBeUndefined();
     expect(stillSettled.disputedParentIds).toBeUndefined();
     c.close();
   });
 
   /**
-   * BOUNDED ON THE HOT PATH (review fix — PR #112 round 5): the disputed-parents scalar rides the
-   * mechanical gate, derivation rows are append-only with no per-rule cap, so the aggregation
-   * fetches at most DISPUTED_PARENTS_CAP + 1 ids and the mapper delivers the cap plus a
-   * truncation signal.
+   * BOUNDED AT DELIVERY (review fix — PR #112 round 5): derivation rows are append-only with no
+   * per-rule cap, so the aggregation fetches at most DISPUTED_PARENTS_CAP + 1 ids and the mapper
+   * delivers the cap plus a truncation signal.
    */
   it("caps disputedParentIds and signals truncation past the cap", async () => {
     const c = core();
@@ -3501,11 +3505,7 @@ describe("5-B: fire-time doubt disclosure", () => {
       c.flagContradiction(p.conceptId, { kind: "impeachment", detail: `impeachment evidence for parent ${i}` });
       parents.push(p.conceptId);
     }
-    // The mechanical gate carries the flag alone (PR #112 round 8's path split)…
-    const firing = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
-    expect(firing.parentDisputed).toBe(true);
-    expect(firing.disputedParentIds).toBeUndefined();
-    // …and the lookup path pays for — and caps — the identity aggregation.
+    // The lookup path pays for — and caps — the identity aggregation.
     const looked = c.stageLookup({ stage: "helm delete" }).rules[0]!;
     expect(looked.parentDisputed).toBe(true);
     expect(looked.disputedParentIds).toHaveLength(8);
@@ -3521,7 +3521,7 @@ describe("5-B: fire-time doubt disclosure", () => {
     const plain = await c.store("Never force-push to a shared branch.", {
       kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", scope: "domain" },
     });
-    const rule = c.gate({ actionContext: "Bash:git push --force", record: false }).rules[0]!;
+    const rule = c.stageLookup({ stage: "git force push", record: false }).rules[0]!;
     expect(rule.conceptId).toBe(plain.conceptId);
     expect(rule.projectedFromPrincipleId).toBeUndefined();
     expect(rule.parentDisputed).toBeUndefined();
@@ -3541,14 +3541,14 @@ describe("5-B: fire-time doubt disclosure", () => {
       kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: declared.conceptId },
     });
     await c.store("Snapshot the volume AND drain the node first.", { kind: "correction", attachTo: sibling.conceptId });
-    expect(c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!.parentDisputed).toBe(true);
+    expect(c.stageLookup({ stage: "helm delete", record: false }).rules[0]!.parentDisputed).toBe(true);
 
     const contradictionId = (raw(c).prepare(
       `SELECT id FROM contradictions WHERE concept_id = ? AND kind = 'impeachment'`,
     ).get(declared.conceptId) as { id: string }).id;
     c.resolveContradiction(contradictionId, { decision: "dismiss", by: "john" });
 
-    const after = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    const after = c.stageLookup({ stage: "helm delete", record: false }).rules[0]!;
     expect(after.conceptId).toBe(projected.conceptId);
     expect(after.projectedFromPrincipleId).toBe(declared.conceptId);
     expect(after.parentDisputed).toBeUndefined();
@@ -3612,21 +3612,21 @@ describe("breadth inherits into the recognized surfaces", () => {
 // ---------------------------------------------------------------------------
 /**
  * CIRCLE '*' IS NOT A QUERYABLE CIRCLE, AT ANY ENTRANCE (Codex round 6, item 2, closing batch).
- * `RULE_LIVENESS_WHERE`'s own `(b.circle = ? OR b.circle = '*')` — and evaluateGateFromMirror's
- * identical JS-side twin — degenerates to matching ONLY global rules the instant `?` itself is bound
- * to '*': both halves of the OR become the identical clause, silently dropping every LOCAL rule the
- * caller actually meant to ask about, including a local DENY. Reachable only via a direct argument
- * (a pre-breadth `MONET_CIRCLE=*` config, or any caller passing '*' straight through) — `resolveCircle`
- * can never PRODUCE '*' from an ordinary circle name post-migration (round 4, item 4: no alias can
- * ever hold '*' on either side once a store has been through it — verified, not assumed, by reading
- * resolveCircle's own single-hop lookup and confirming no write path can create such a row anymore).
- * `MonetCore.gate()`/`stageLookup()` carry no guard of their own — checked directly: both resolve
- * their circle and pass it straight into evaluateGate/evaluateStageLookup unchanged, so the SHARED
- * chokepoint one layer down (assertQueryableCircle, gates.ts) is what actually refuses for them too,
- * proven here by calling the wrappers themselves, not only the functions they funnel through.
+ * `RULE_LIVENESS_WHERE`'s own `(b.circle = ? OR b.circle = '*')` degenerates to matching ONLY global
+ * rules the instant `?` itself is bound to '*': both halves of the OR become the identical clause,
+ * silently dropping every LOCAL rule the caller actually meant to ask about, including a local DENY.
+ * Reachable only via a direct argument (a pre-breadth `MONET_CIRCLE=*` config, or any caller passing
+ * '*' straight through) — `resolveCircle` can never PRODUCE '*' from an ordinary circle name
+ * post-migration (round 4, item 4: no alias can ever hold '*' on either side once a store has been
+ * through it — verified, not assumed, by reading resolveCircle's own single-hop lookup and confirming
+ * no write path can create such a row anymore). `MonetCore.stageLookup()` carries no guard of its own
+ * — checked directly: it resolves its circle and passes it straight into evaluateStageLookup
+ * unchanged, so the SHARED chokepoint one layer down (assertQueryableCircle, gates.ts) is what
+ * actually refuses for it too, proven here by calling the wrapper itself, not only the function it
+ * funnels through.
  */
 describe("circle '*' is refused as query input, everywhere a gate query can be scoped", () => {
-  it("refuses at every entrance — evaluateGate, MonetCore.gate(), evaluateStageLookup, stageLookup (standalone), and MonetCore.stageLookup() — each naming the same repair", async () => {
+  it("refuses at every entrance — evaluateStageLookup, stageLookup (standalone), and MonetCore.stageLookup() — each naming the same repair", async () => {
     const c = core();
     await c.declare({
       species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
@@ -3635,11 +3635,8 @@ describe("circle '*' is refused as query input, everywhere a gate query can be s
     const db = (c as unknown as { db: StoragePort }).db;
     const message = /circle '\*' is not a queryable circle.*reserved global-breadth marker.*Name a real circle/s;
 
-    // THE LIVE GATE FAMILY — the pure functions, then the MonetCore wrapper that funnels through them.
-    expect(() => evaluateGate(db, { actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
-    expect(() => c.gate({ actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
-
-    // THE RECOGNIZED-MATCHER FAMILY — same shape, same three levels.
+    // THE RECOGNIZED-MATCHER FAMILY — the pure function, the standalone form, then the MonetCore
+    // wrapper that funnels through them.
     expect(() => evaluateStageLookup(db, { stage: "npm install", circle: BREADTH_CIRCLE })).toThrow(message);
     expect(() => standaloneStageLookup(db, { stage: "npm install", circle: BREADTH_CIRCLE })).toThrow(message);
     expect(() => c.stageLookup({ stage: "npm install", circle: BREADTH_CIRCLE })).toThrow(message);
@@ -3660,9 +3657,9 @@ describe("circle '*' is refused as query input, everywhere a gate query can be s
     expect(() => c.overview(BREADTH_CIRCLE)).toThrow(message);
 
     // AN ORDINARY CIRCLE IS UNAFFECTED — the refusal is specific to '*', not a general regression.
-    // Stages are store-global (matched regardless of circle), so the stage itself still hits — the
-    // circle scoping shows up in `rules`, not `silence` (the stage-hit-no-rules case, not a miss).
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "an-ordinary-circle" })).toMatchObject({ silence: false, rules: [] });
+    // Stages are store-global (resolved regardless of circle), so the stage itself still hits — the
+    // circle scoping shows up in `rules`, not `matched` (the stage-hit-no-rules case, not a miss).
+    expect(c.stageLookup({ stage: "npm install", circle: "an-ordinary-circle" })).toMatchObject({ matched: true, rules: [] });
     expect(() => c.gateCoverage("an-ordinary-circle")).not.toThrow();
     expect(() => c.prewarm("an-ordinary-circle")).not.toThrow();
     c.close();
@@ -3688,9 +3685,13 @@ describe("gateQuery", () => {
       kind: "rule",
       rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "it destroys teammates' commits", ...AGENT_RULE },
     });
-    const fired = c.gate({ actionContext: "Bash:cd /repo && git push --force origin dev" });
-    expect(fired.silence).toBe(false);
-    expect(fired.rules).toEqual([{
+    const fired = c.stageLookup({ stage: "git force push" });
+    expect(fired.matched).toBe(true);
+    expect(fired.rules).toHaveLength(1);
+    // `body` is stripped so the rest can be pinned exactly; it has its own test in the recognized
+    // matcher's own block.
+    const { body: _body, ...delivered } = fired.rules[0]!;
+    expect(delivered).toEqual({
       conceptId: rule.conceptId,
       text: "Never force-push to a shared branch",
       reason: "it destroys teammates' commits",
@@ -3703,7 +3704,7 @@ describe("gateQuery", () => {
       modelTag: "test-model-1",
       origin: "correction",
       stageId: c.ruleBinding(rule.conceptId)!.stage_id,
-    }]);
+    });
     c.close();
   });
 
@@ -3736,11 +3737,11 @@ describe("gateQuery", () => {
     const inA = await c.store("Never force-push to a shared branch.", {
       circle: "a", kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
     });
-    // The STAGE is store-global — the same action in both circles — but the RULE is not.
-    expect(c.gate({ actionContext: "Bash:git push --force", circle: "a" }).rules.map((r) => r.conceptId)).toEqual([inA.conceptId]);
-    const inB = c.gate({ actionContext: "Bash:git push --force", circle: "b" });
+    // The STAGE is store-global — the same moment in both circles — but the RULE is not.
+    expect(c.stageLookup({ stage: "git force push", circle: "a" }).rules.map((r) => r.conceptId)).toEqual([inA.conceptId]);
+    const inB = c.stageLookup({ stage: "git force push", circle: "b" });
     expect(inB.rules).toEqual([]);
-    expect(inB.silence).toBe(false); // the stage still matched; only the rule is elsewhere
+    expect(inB.matched).toBe(true); // the stage still resolved; only the rule is elsewhere
     c.close();
   });
 
@@ -3749,12 +3750,12 @@ describe("gateQuery", () => {
     const rule = await c.store("Never force-push to a shared branch.", {
       kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
     });
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
+    expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
 
     const successor = await c.store("Force-push is fine on your own branch; never on a shared one.", {
       kind: "correction", attachTo: rule.conceptId,
     });
-    const after = c.gate({ actionContext: "Bash:git push --force" });
+    const after = c.stageLookup({ stage: "git force push" });
     expect(after.rules.map((r) => r.conceptId)).toEqual([successor.conceptId]);
     // The old rule is still there, still findable — it is the history and the impeachment evidence.
     expect((await c.getConcept(rule.conceptId))!.status).toBe("active");
@@ -3768,10 +3769,10 @@ describe("gateQuery", () => {
       kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle.conceptId, dstConceptId: rule.conceptId, bornOf: "extraction" });
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules[0]!.projectedFromPrincipleId).toBe(principle.conceptId);
+    expect(c.stageLookup({ stage: "git force push" }).rules[0]!.projectedFromPrincipleId).toBe(principle.conceptId);
 
     c.retireConcept(rule.conceptId);
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules).toEqual([]);
+    expect(c.stageLookup({ stage: "git force push" }).rules).toEqual([]);
     c.close();
   });
 
@@ -3848,8 +3849,8 @@ describe("gate substrate sync", () => {
     expect(result.inserted.stages).toBe(1);
     expect(result.inserted.rule_bindings).toBe(1);
 
-    // The gate answers identically on the receiver — the whole point of replicating the registry.
-    const fired = dst.gate({ actionContext: "Bash:git push --force origin main" });
+    // The receiver answers identically — the whole point of replicating the registry.
+    const fired = dst.stageLookup({ stage: "git force push" });
     expect(fired.rules).toMatchObject([{ conceptId: rule.conceptId, reason: "destroys commits", severity: "advisory" }]);
 
     const replay = await dst.graftRows(payload);
@@ -3883,7 +3884,7 @@ describe("gate substrate sync", () => {
     await dst.graftRows(unfired);
     expect(dst.stages()[0]!.verified).toBe(false);
 
-    src.gate({ actionContext: "Bash:git push --force origin main" });
+    markStageVerified(src, src.stages()[0]!.id);
     await dst.graftRows(src.exportDelta(0));
     expect(dst.stages()[0]!.verified).toBe(true);
 
@@ -3908,7 +3909,7 @@ describe("gate substrate sync", () => {
     const result = await b.graftRows(payload);
     expect(result.inserted.rule_bindings).toBe(1);
     // It arrives dangling and simply never fires — the endpoint is not there to be governed.
-    expect(b.gate({ actionContext: "Bash:git push --force origin main" }).rules).toEqual([]);
+    expect(b.stageLookup({ stage: "git force push" }).rules).toEqual([]);
     a.close();
     b.close();
   });
@@ -3955,7 +3956,7 @@ describe("gate substrate sync", () => {
 
     // ...and it GUARDS. A deny that landed but did not fire would be the same protection loss by a
     // quieter route.
-    const fired = dst.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    const fired = dst.stageLookup({ stage: "rm -rf" });
     expect(fired.rules).toHaveLength(1);
     expect(fired.rules[0]).toMatchObject({
       conceptId, severity: "blocking", reason: null, reasonMissing: true,
@@ -4001,7 +4002,7 @@ describe("gate substrate sync", () => {
       // has to ask the same question rather than trusting the column to be canonical.
       expect(dst.ruleBinding(conceptId)!.reason).toBe(blank);
 
-      expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+      expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: true });
       expect(dst.gateCoverage("default").unexplainedDenies).toMatchObject([{ conceptId, stageName: "rm -rf" }]);
       const rendered = renderOverview(dst.overview("default"), { color: false });
       expect(rendered).toContain("repair [");
@@ -4042,7 +4043,7 @@ describe("gate substrate sync", () => {
 
       // THE DENY STILL FIRES. Not throwing is the whole point — a rule whose read path raises is a
       // rule that stops governing.
-      const fired = c.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+      const fired = c.stageLookup({ stage: "rm -rf" });
       expect(fired.rules).toHaveLength(1);
       expect(fired.rules[0]).toMatchObject({ severity: "blocking", reasonMissing: true });
 
@@ -4071,7 +4072,7 @@ describe("gate substrate sync", () => {
     // case above.
     corruptReason(c, deny.conceptId, 42);
     expect(c.ruleBinding(deny.conceptId)!.reason).toBe("42.0");
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({
       severity: "blocking", reason: "42.0", reasonMissing: false,
     });
     expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
@@ -4104,7 +4105,7 @@ describe("gate substrate sync", () => {
     });
     if (repaired.species !== "rule") throw new Error("unreachable");
     expect(repaired.conceptId).toBe(deny.conceptId);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({
       severity: "blocking", reason: "there is genuinely no undo", reasonMissing: false,
     });
     expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
@@ -4134,7 +4135,7 @@ describe("gate substrate sync", () => {
 
     // null still relays — absence is legal, and refusing it would drop a deny the peer has.
     dst.graftRows({ ...payload, ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, reason: null })) });
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: true });
     src.close();
     dst.close();
   });
@@ -4272,7 +4273,7 @@ describe("gate substrate sync", () => {
     expect(dst.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", reason: null });
 
     // DELIVERY says it does not exist...
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
+    expect(dst.stageLookup({ stage: "rm -rf" })).toMatchObject({ matched: false, rules: [] });
     // ...so DISCLOSURE must not say it does. Naming it here told the user to redeclare a rule whose
     // redeclaration would CREATE the missing stage and change what the store does — a repair queue
     // giving advice that alters behaviour rather than restoring it.
@@ -4281,7 +4282,7 @@ describe("gate substrate sync", () => {
 
     // And once the stage lands, the SAME binding is a live reasonless deny on every surface at once.
     dst.graftRows(payload);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: true });
     expect(dst.gateCoverage("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
     src.close();
     dst.close();
@@ -4293,7 +4294,7 @@ describe("gate substrate sync", () => {
     // a reason: it renders, it explains the deny, and marking it would put a rule on the repair
     // queue that has nothing to repair.
     const { src, conceptId } = await relayReasonlessDeny(dst, { reason: "  there is no undo  " });
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({
       reason: "  there is no undo  ", reasonMissing: false,
     });
     expect(dst.gateCoverage("default").unexplainedDenies).toEqual([]);
@@ -4306,7 +4307,7 @@ describe("gate substrate sync", () => {
   it("REPAIRS a relayed reasonless deny through an ordinary local declaration", async () => {
     const dst = new MonetCore(":memory:", { syncDeviceId: "machine-b" });
     const { src, conceptId } = await relayReasonlessDeny(dst);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: true });
 
     // No migration and no backfill: the repair is a human stating the sentence they owe, through
     // the same declaration surface as any other. `resolvingCore`-style resolution lands it on the
@@ -4320,7 +4321,7 @@ describe("gate substrate sync", () => {
 
     // Severity was never named and is preserved — the repair supplies the reason WITHOUT the human
     // having to re-assert deny power they never withdrew.
-    const fired = dst.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    const fired = dst.stageLookup({ stage: "rm -rf" });
     expect(fired.rules[0]).toMatchObject({
       severity: "blocking", reason: "there is no undo", reasonMissing: false,
     });
@@ -4393,7 +4394,7 @@ describe("gate substrate sync", () => {
     // An advisory rule with no reason is the ordinary case, not a broken promise — marking it would
     // bury the one population a caller has to say something about.
     await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE } });
-    expect(c.gate({ actionContext: "Bash:git push" }).rules[0]).toMatchObject({
+    expect(c.stageLookup({ stage: "git push" }).rules[0]).toMatchObject({
       severity: "advisory", reason: null, reasonMissing: false,
     });
     expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
@@ -4404,7 +4405,7 @@ describe("gate substrate sync", () => {
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: false });
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: false });
     expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
     c.close();
   });
@@ -4497,7 +4498,7 @@ describe("deny power cannot be removed by accident", () => {
     expect(again.binding.severity).toBe("blocking");
     expect(again.binding.reason).toBe("there is genuinely no undo");
     expect(again.downgraded).toBeUndefined();
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]!.severity).toBe("blocking");
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]!.severity).toBe("blocking");
     c.close();
   });
 
@@ -4511,7 +4512,7 @@ describe("deny power cannot be removed by accident", () => {
     if (downgraded.species !== "rule") throw new Error("unreachable");
     expect(downgraded.conceptId).toBe(deny.conceptId);
     expect(downgraded).toMatchObject({ downgraded: true, from: "blocking" });
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]!.severity).toBe("advisory");
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]!.severity).toBe("advisory");
 
     // Sovereignty runs both ways: the upgrade path is unchanged and reports no downgrade.
     const restored = await c.declare({
@@ -4535,7 +4536,7 @@ describe("deny power cannot be removed by accident", () => {
    * for the MCP-side half (tested separately, in "MCP surface", since it is a DIFFERENT bug from a
    * DIFFERENT layer).
    */
-  it("PATH 1 — breadth — re-declaring a global rule WITHOUT naming a circle preserves it, on the live gate and every circle", async () => {
+  it("PATH 1 — breadth — re-declaring a global rule WITHOUT naming a circle preserves it, on delivery and in every circle", async () => {
     const c = new MonetCore(":memory:", {});
     const CONTENT = "Never install without a lockfile present.";
     const first = await c.declare({
@@ -4557,9 +4558,9 @@ describe("deny power cannot be removed by accident", () => {
     expect(again.narrowedFromBreadth).toBeUndefined();
     expect(again.previousCircle).toBeUndefined();
 
-    // LIVE GATE: fires from a circle the fixture never otherwise touches — the reach is the
+    // LIVE DELIVERY: reaches a circle the fixture never otherwise touches — the reach is the
     // marker's, not an accident of overlap with some other circle.
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
       .toEqual([first.conceptId]);
     c.close();
   });
@@ -4582,8 +4583,8 @@ describe("deny power cannot be removed by accident", () => {
     expect(narrowed.binding.circle).toBe("default");
     // THE DISCLOSURE — legal (the owner's recorded act), never silent.
     expect(narrowed).toMatchObject({ narrowedFromBreadth: true, previousCircle: BREADTH_CIRCLE });
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "some-other-circle" }).rules).toEqual([]);
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "default" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "some-other-circle" }).rules).toEqual([]);
+    expect(c.stageLookup({ stage: "npm install", circle: "default" }).rules.map((r) => r.conceptId))
       .toEqual([first.conceptId]);
 
     // Sovereignty runs both ways here too: re-widening is unchanged and reports no narrowing.
@@ -4612,15 +4613,17 @@ describe("deny power cannot be removed by accident", () => {
   it("PATH 2 — re-authoring a stage that carries a deny is REFUSED until the denies are named", async () => {
     const c = core();
     const deny = await declareDeny(c);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
 
     // D0-D2: one ordinary agent-callable declaration used to reroute the deny's firing surface —
     // deny fires, pattern edit, silence, and the binding still reads `blocking`.
     await expect(
       c.declare({ species: "stage", stage: "rm -rf", patterns: ["Bash:something-else"] }),
     ).rejects.toThrow(new RegExp(`would change what 1 blocking rule\\(s\\) deny.*${deny.conceptId}`, "s"));
-    // Refused means UNCHANGED: the deny still fires on the action it was declared for.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
+    // Refused means UNCHANGED: the deny is still bound, and the stage still aims where it was
+    // declared to aim — the firing surface the refused declaration tried to move.
+    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
+    expect(c.stages().find((s) => s.name === "rm -rf")!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
 
     // Acknowledged: the human has seen the deny and is re-aiming it deliberately.
     const reaimed = await c.declare({
@@ -4630,7 +4633,9 @@ describe("deny power cannot be removed by accident", () => {
     if (reaimed.species !== "stage") throw new Error("unreachable");
     expect(reaimed.previousPatterns).toEqual(["bash: rm -rf"]);
     expect(reaimed.patterns).toEqual(["bash: rm -rf", "bash: rm -fr"]);
-    expect(c.gate({ actionContext: "Bash:rm -fr /tmp/x" }).rules).toHaveLength(1);
+    // The re-aim moved the MECHANICAL surface and took nothing away: the deny is still bound to the
+    // stage and still delivered by name (doctrine — a pattern change is not a withdrawal lever).
+    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
     c.close();
   });
 
@@ -4650,7 +4655,8 @@ describe("deny power cannot be removed by accident", () => {
     expect(() => upsertStage(deps, { stage: "rm -rf", patterns: ["Bash:something-else"], origin: "declaration" }))
       .toThrow(new RegExp(`would change what 1 blocking rule\\(s\\) deny.*${declared.conceptId}`, "s"));
     // The deny still points where it was declared to point.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
+    expect(c.stages().find((s) => s.name === "rm -rf")!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
 
     // Acknowledged at the mutation layer succeeds, which proves both checks read one predicate.
     expect(() => upsertStage(deps, {
@@ -4667,14 +4673,16 @@ describe("deny power cannot be removed by accident", () => {
     // obviously aimed at disarming a gate slipped past the guard entirely.
     await expect(c.declare({ species: "stage", stage: "rm -rf", patterns: [] }))
       .rejects.toThrow(/would change what 1 blocking rule/);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
+    expect(c.stages().find((s) => s.name === "rm -rf")!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
 
     const disarmed = await c.declare({
       species: "stage", stage: "rm -rf", patterns: [], acknowledgeBlockingRules: [deny.conceptId],
     });
     if (disarmed.species !== "stage") throw new Error("unreachable");
     expect(disarmed.patterns).toEqual([]);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).silence).toBe(true);
+    // DISARMED, read off the row itself: the stage has no firing surface left at all.
+    expect(c.stages().find((s) => s.name === "rm -rf")!.patterns).toEqual([]);
     // An inert stage is visible in curation rather than quietly gone.
     expect(c.gateCoverage().unverifiedPatterns.map((u) => u.stageName)).toContain("rm -rf");
     c.close();
@@ -4683,7 +4691,7 @@ describe("deny power cannot be removed by accident", () => {
   it("PATH 2 — replacing patterns resets verified, so the watchlist stops vouching for them", async () => {
     const c = core();
     await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-    c.gate({ actionContext: "Bash:terraform apply -auto-approve" });
+    markStageVerified(c, c.stages()[0]!.id);
     expect(c.stages()[0]!.verified).toBe(true);
 
     await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform destroy"] });
@@ -4748,13 +4756,13 @@ describe("deny power cannot be removed by accident", () => {
   it("PATH 5 — flagging a rule as contradicted is refused; it was a deny-removal path", async () => {
     const c = core();
     const deny = await declareDeny(c);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
 
-    // flagContradiction sets status='disputed', and the gate delivers only ACTIVE concepts — so the
+    // flagContradiction sets status='disputed', and delivery carries only ACTIVE concepts — so the
     // standard MCP tool removed a deny with no declaration anywhere in sight.
     expect(() => c.flagContradiction(deny.conceptId, { detail: "I disagree" }))
       .toThrow(/'dispute \(contradiction\)' would remove the blocking rule/);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
     expect((await c.getConcept(deny.conceptId))!.status).toBe("active");
 
     // UNIFORM across severities: the refusal is about what a rule IS, not about how hard it bites.
@@ -4779,7 +4787,7 @@ describe("deny power cannot be removed by accident", () => {
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "origin" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf", circle: "origin" }).rules).toHaveLength(1);
 
     const moved = c.reassignCircle(deny.conceptId, "target")!;
     // MOVED, not merged: the concept survives with its identity and its binding.
@@ -4787,7 +4795,7 @@ describe("deny power cannot be removed by accident", () => {
     expect(moved.conceptId).toBe(deny.conceptId);
     expect(c.ruleBinding(deny.conceptId)!.severity).toBe("blocking");
     // ...and the deny follows it into the new circle.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "target" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf", circle: "target" }).rules).toHaveLength(1);
     // The near-match is not discarded — it reaches curation as a pair, the forceNew-shaped answer.
     expect(c.overview("target").possibleDuplicates.length).toBeGreaterThan(0);
     c.close();
@@ -5125,8 +5133,9 @@ describe("the chokepoint: every door is a call site", () => {
     if (r.species !== "rule") throw new Error("unreachable");
     return r;
   }
+  /** How many DENIES this store still delivers at the battery's one stage, in `circle`. */
   const fires = (c: MonetCore, circle?: string): number =>
-    c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle }).rules.filter((rule) => rule.severity === "blocking").length;
+    c.stageLookup({ stage: "rm -rf", circle }).rules.filter((rule) => rule.severity === "blocking").length;
 
   it("refuses every LOCAL operation that would remove a live deny, and the deny survives each", async () => {
     const c = resolvingCore();
@@ -5415,7 +5424,7 @@ describe("the chokepoint: every door is a call site", () => {
     // The deny still fires under its ORIGINAL scope semantics — for the model it was declared for,
     // and (the attempted rewrite's target) not for the one the forged row tried to re-tag it to.
     const denies = (tag: string): string[] => dst
-      .gate({ actionContext: "Bash:rm -rf /tmp/x", runtimeModelTag: tag })
+      .stageLookup({ stage: "rm -rf", runtimeModelTag: tag })
       .rules.filter((r) => r.severity === "blocking").map((r) => r.conceptId);
     expect(denies(AGENT_RULE.modelTag)).toEqual([deny.conceptId]);
     expect(denies("some-other-model")).toEqual([]);
@@ -5436,7 +5445,7 @@ describe("the chokepoint: every door is a call site", () => {
       }],
     });
     expect(reaim.skipped.stages).toBeGreaterThan(0);
-    // The deny still fires on the patterns it was DECLARED against.
+    // The deny still stands, and on the patterns it was DECLARED against.
     expect(fires(dst)).toBe(1);
     expect(dst.stages().find((st) => st.id === stageId)!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
 
@@ -5477,7 +5486,7 @@ describe("the chokepoint: every door is a call site", () => {
     // an unchanged replay loses the revision contest — which is why the counter cannot be the
     // assertion here.)
     expect(dst.stages().find((st) => st.name === "rm -rf")!.verified).toBe(false);
-    src.gate({ actionContext: "Bash:rm -rf /tmp/x" }); // verifies the stage on the sender
+    markStageVerified(src, src.stages().find((st) => st.name === "rm -rf")!.id); // verified on the sender
     dst.graftRows(src.exportDelta(0));
     expect(dst.stages().find((st) => st.name === "rm -rf")!.verified).toBe(true);
     src.close();
@@ -5763,13 +5772,61 @@ describe("DOOR 13: the breadth graft surface", () => {
     dst.graftRows(oldProtocol as never);
     expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("default");
 
-    const fired = dst.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    const fired = dst.stageLookup({ stage: "rm -rf" });
     expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
     expect(fired.rules[0]).toMatchObject({ severity: "blocking", reasonMissing: true });
 
     expect(dst.gateCoverage("default").unexplainedDenies).toEqual([
       { conceptId: deny.conceptId, title: "Never delete a tree unattended", stageName: "rm -rf" },
     ]);
+    src.close();
+    dst.close();
+  });
+
+  /**
+   * A DANGLING BINDING GUARDS NOTHING AND MUST NOT BE OFFERED AS IF IT DID. The row is legal — it
+   * arrived ahead of its own concept — but until the concept lands there is no rule for it to name,
+   * so nothing may deliver it. The stage itself DOES land with the payload, so the empty answer
+   * below is a genuine stage-hit-no-rules rather than a lookup miss papering over the question.
+   */
+  it("13.6 a still-dangling NULL-circle binding is never delivered", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const rule = await src.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    const full = src.exportDelta(0);
+    // Old-protocol: `circle` never existed on this wire — the one shape that actually leaves the
+    // binding NULL when its concept is withheld. A current-protocol row carries an explicit circle
+    // always, which resolves the binding immediately via EFFECTIVE CIRCLE's own fallback regardless
+    // of whether the concept exists yet — there would be nothing dangling to exclude.
+    const oldProtocol = {
+      ...full,
+      ruleBindings: full.ruleBindings!.map((b) => {
+        if (b.concept_id !== rule.conceptId) return b;
+        const copy: Record<string, unknown> = { ...b };
+        delete copy.circle;
+        return copy;
+      }),
+    };
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows({ ...oldProtocol, concepts: [], observations: [] } as never);
+    expect(
+      (raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null }).circle,
+    ).toBeNull();
+
+    // Dangling right now: the row exists (it holds and guards nothing yet), and delivery excludes
+    // it — at the exact moment it matters.
+    const stale = dst.stageLookup({ stage: "rm -rf" });
+    expect(stale.matched).toBe(true);
+    expect(stale.rules).toEqual([]);
+
+    // ...and the moment the concept lands, in the SAME store, it is admitted (BLOCKER B3) — proving
+    // the exclusion above was the dangling row being genuinely absent, not a bug hiding it forever.
+    dst.graftRows(oldProtocol as never);
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
     src.close();
     dst.close();
   });
@@ -5789,7 +5846,7 @@ describe("DOOR 13: the breadth graft surface", () => {
       circle: BREADTH_CIRCLE, severity: "blocking", origin: "declaration",
     });
 
-    const fired = dst.gate({ actionContext: "Bash:npm install", circle: "a-circle-the-receiver-never-configured" });
+    const fired = dst.stageLookup({ stage: "npm install", circle: "a-circle-the-receiver-never-configured" });
     expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
     src.close();
     dst.close();
@@ -5842,7 +5899,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     const result = dst.graftRows(payload);
     expect(result.skipped.rule_bindings).toBe(0);
     expect(dst.ruleBinding(corrected.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE, origin: "correction" });
-    expect(dst.gate({ actionContext: "Bash:npm install", circle: "a-circle-dst-never-configured" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "npm install", circle: "a-circle-dst-never-configured" }).rules.map((r) => r.conceptId))
       .toEqual([corrected.conceptId]);
 
     // FORGED: an ordinary unrelated local rule, relayed with a hand-forged circle:'*'/
@@ -5938,7 +5995,7 @@ describe("DOOR 13: the breadth graft surface", () => {
 
     // NOTHING DELIVERS TWICE: src's own successor is the one live global rule, everywhere —
     // including a circle this fixture never otherwise configured.
-    expect(src.gate({ actionContext: "Bash:npm install", circle: "a-circle-src-never-configured" }).rules.map((r) => r.conceptId))
+    expect(src.stageLookup({ stage: "npm install", circle: "a-circle-src-never-configured" }).rules.map((r) => r.conceptId))
       .toEqual([successorA.conceptId]);
 
     // CONVERGENCE, VERIFIED: grafting src's delta back into challenger does NOT retroactively
@@ -5951,7 +6008,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     expect(reverseResult.skipped.lifecycle_edges).toBeGreaterThan(0);
     expect(reverseResult.skipped.rule_bindings).toBeGreaterThan(0);
     expect(challenger.ruleBinding(successorA.conceptId)).toBeNull();
-    expect(challenger.gate({ actionContext: "Bash:npm install", circle: "a-circle-challenger-never-configured" }).rules.map((r) => r.conceptId))
+    expect(challenger.stageLookup({ stage: "npm install", circle: "a-circle-challenger-never-configured" }).rules.map((r) => r.conceptId))
       .toEqual([successorB.conceptId]);
 
     origin.close(); src.close(); challenger.close();
@@ -6082,9 +6139,9 @@ describe("DOOR 13: the breadth graft surface", () => {
     expect(dst.ruleBinding(rule.conceptId)!.circle).toBe("y");
     // And it delivers from 'y', never from 'x' — the divergence would otherwise silently move the
     // rule's delivery to a circle its own concept never actually lived in on this store.
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "y" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "y" }).rules.map((r) => r.conceptId))
       .toContain(rule.conceptId);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "x" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "x" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
 
     src.close();
@@ -6132,7 +6189,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     // '*' (current?.circle, which would silently neutralize the very narrowing just admitted).
     const stillDangling = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
     expect(stillDangling.circle).toBeNull();
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
 
     // A CONCURRENT MOVE WINS ELSEWHERE, before the concept ever reaches B: it lands at
@@ -6144,9 +6201,9 @@ describe("DOOR 13: the breadth graft surface", () => {
     // HEALS TO 'actual-circle' — the concept's own real circle — never 'claimed-by-narrow'.
     const healed = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
     expect(healed.circle).toBe("actual-circle");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "actual-circle" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "actual-circle" }).rules.map((r) => r.conceptId))
       .toContain(rule.conceptId);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
 
     src.close();
@@ -6192,13 +6249,13 @@ describe("correcting a global rule inherits its breadth, not just its content", 
     expect(edge).toMatchObject({ src_concept_id: original.conceptId, dst_concept_id: corrected.conceptId, family: "supersession" });
     // THE SUCCESSOR INHERITS BREADTH — the fix itself.
     expect(c.ruleBinding(corrected.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE, origin: "correction", severity: "advisory" });
-    // FIRES EVERYWHERE, including a circle this fixture never otherwise touches.
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+    // DELIVERS EVERYWHERE, including a circle this fixture never otherwise touches.
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
       .toEqual([corrected.conceptId]);
     // THE OLD RULE IS HISTORY — active, searchable, never injected again (existing doctrine,
     // unaffected by this fix — confirmed still true for a GLOBAL predecessor specifically).
     expect((await c.getConcept(original.conceptId))!.status).toBe("active");
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "default" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "default" }).rules.map((r) => r.conceptId))
       .toEqual([corrected.conceptId]); // the OLD concept id never appears
     c.close();
   });
@@ -6231,9 +6288,9 @@ describe("correcting a global rule inherits its breadth, not just its content", 
     await expect(
       c.store("A challenger observation.", { kind: "correction", attachTo: deny.conceptId }),
     ).rejects.toThrow(/blocking rule.*cannot be corrected/s);
-    // UNCHANGED: still blocking, still global, still firing — the refusal left it exactly as it was.
+    // UNCHANGED: still blocking, still global, still delivered — the refusal left it exactly as it was.
     expect(c.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", circle: BREADTH_CIRCLE });
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId]);
     c.close();
   });
@@ -6284,9 +6341,9 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
     expect((raw(dst).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle)
       .toBe("circle-a");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId]);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-b" }).rules).toEqual([]);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-b" }).rules).toEqual([]);
     src.close();
     dst.close();
   });
@@ -6309,9 +6366,9 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     const result = dst.graftRows(payload);
     expect(result.skipped.rule_bindings).toBe(0);
     expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-b");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-b" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-b" }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId]);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules).toEqual([]);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules).toEqual([]);
     src.close();
     dst.close();
   });
@@ -6337,7 +6394,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     });
     expect(result.skipped.rule_bindings).toBe(0);
     expect(dst.ruleBinding(rule.conceptId)!.circle).toBe("circle-a");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules.map((r) => r.conceptId))
       .toEqual([rule.conceptId]);
     src.close();
     dst.close();
@@ -6373,7 +6430,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     // NULL, not 'claimed' — the fix itself (was `row.circle` before this round).
     const dangling = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
     expect(dangling.circle).toBeNull();
-    expect(dst.gate({ actionContext: "Bash:npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
 
     // A CONCURRENT MOVE WINS ELSEWHERE, before the receiver ever sees the concept at all.
@@ -6387,9 +6444,9 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     // HEALS TO 'actual' — the concept's own real circle — never 'claimed', the row's stale guess.
     const healed = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
     expect(healed.circle).toBe("actual");
-    expect(dst.gate({ actionContext: "Bash:npm install", circle: "actual" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "npm install", circle: "actual" }).rules.map((r) => r.conceptId))
       .toContain(rule.conceptId);
-    expect(dst.gate({ actionContext: "Bash:npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
     src.close();
     dst.close();
@@ -6425,7 +6482,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     expect(result.skipped.rule_bindings).toBe(0);
     expect(result.inserted.rule_bindings).toBe(1);
     expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-renamed");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-renamed" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-renamed" }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId]);
     src.close();
     dst.close();
@@ -6433,30 +6490,6 @@ describe("relayed circle divergence: the concept is authoritative", () => {
 });
 
 describe("silence never means I gave up", () => {
-  it("matches a governed command hidden behind 64KiB of padding, where two prefix caps reported silence", () => {
-    const c = core();
-    void c.declare({ species: "stage", stage: "git force push", patterns: ["Bash:git push --force"] });
-    const padded = `Bash:${"x".repeat(64 * 1024)} && git push --force origin main`;
-    const fired = c.gate({ actionContext: padded });
-    expect(fired.silence).toBe(false);
-    expect(fired.overflow).toBe(false);
-    expect(fired.stages.map((st) => st.name)).toEqual(["git force push"]);
-    c.close();
-  });
-
-  it("reports OVERFLOW, not silence, past the refusal threshold", () => {
-    const c = core();
-    void c.declare({ species: "stage", stage: "git force push", patterns: ["Bash:git push --force"] });
-    const absurd = `Bash:${"x".repeat(4 * 1024 * 1024 + 16)} && git push --force`;
-    const result = c.gate({ actionContext: absurd });
-    // The two are opposite claims: silence means "nothing governs this", overflow means "I could
-    // not tell". A host maps the second to asking the human, never to allowing.
-    expect(result.overflow).toBe(true);
-    expect(result.silence).toBe(false);
-    expect(result.rules).toEqual([]);
-    c.close();
-  });
-
   it("does not let a token run cross a command boundary — a newline ends a command", () => {
     const pattern = seedTriggerPattern("Bash:git push --force origin main");
     // `echo git` on one line and `push --force` on the next is two commands; matching across them
@@ -6532,13 +6565,13 @@ describe("model-tag retirement", () => {
 
     // No tag supplied: nothing is filtered. A caller that does not know which model it is must not
     // have its rules silently vanish.
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId).sort())
+    expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId).sort())
       .toEqual([forOld.conceptId, domain.conceptId].sort());
     // The model it was captured for still gets it.
-    expect(c.gate({ actionContext: "Bash:git push --force", runtimeModelTag: "model-1" }).rules.map((r) => r.conceptId).sort())
+    expect(c.stageLookup({ stage: "git force push", runtimeModelTag: "model-1" }).rules.map((r) => r.conceptId).sort())
       .toEqual([forOld.conceptId, domain.conceptId].sort());
     // A DIFFERENT model does not inherit the last model's defects as instructions...
-    const next = c.gate({ actionContext: "Bash:git push --force", runtimeModelTag: "model-2" });
+    const next = c.stageLookup({ stage: "git force push", runtimeModelTag: "model-2" });
     expect(next.rules.map((r) => r.conceptId)).toEqual([domain.conceptId]);
 
     // ...and the filtered rule surfaces for curation rather than being retired by machinery.
@@ -6557,7 +6590,7 @@ describe("model-tag retirement", () => {
     const forOld = await c.store("A compensation for the old model.", {
       kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-1" },
     });
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules).toEqual([]);
+    expect(c.stageLookup({ stage: "git force push" }).rules).toEqual([]);
     expect(c.gateCoverage().retirementCandidates.map((r) => r.conceptId)).toEqual([forOld.conceptId]);
     c.close();
   });
@@ -6613,11 +6646,9 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
     // STORED CANONICAL, not padded — bindRule trims before writing, the same canonical-form
     // discipline normalizeStageName already enforces for stage names.
     expect(c.ruleBinding(stored.conceptId)!.model_tag).toBe(trimmed);
-    // DELIVERS under the TRIMMED runtime tag, on BOTH matchers — setRuntimeModelTag already trims
-    // the RUNTIME side (round 4), so this only round-trips if storage now agrees on the same
-    // canonical form; the SQL comparison (RULE_LIVENESS_WHERE) is exact, never trimmed at read time.
-    expect(c.gate({ actionContext: "Bash:git push --force", runtimeModelTag: trimmed }).rules.map((r) => r.conceptId))
-      .toEqual([stored.conceptId]);
+    // DELIVERS under the TRIMMED runtime tag — setRuntimeModelTag already trims the RUNTIME side
+    // (round 4), so this only round-trips if storage now agrees on the same canonical form; the SQL
+    // comparison (RULE_LIVENESS_WHERE) is exact, never trimmed at read time.
     expect(c.stageLookup({ stage: "git force push", runtimeModelTag: trimmed }).rules.map((r) => r.conceptId))
       .toEqual([stored.conceptId]);
     c.close();
@@ -6712,7 +6743,7 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
     dst.close();
   });
 
-  it("an EXACTLY-at-max modelTag passes end to end: store(), delivered via gate() AND stageLookup(), and grafts cleanly", async () => {
+  it("an EXACTLY-at-max modelTag passes end to end: store(), delivered via stageLookup(), and grafts cleanly", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const atMax = "m".repeat(MODEL_TAG_MAX_CHARS);
@@ -6721,8 +6752,6 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
       rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: atMax },
     });
     expect(src.ruleBinding(stored.conceptId)!.model_tag).toBe(atMax);
-    expect(src.gate({ actionContext: "Bash:git push --force", runtimeModelTag: atMax }).rules.map((r) => r.conceptId))
-      .toEqual([stored.conceptId]);
     expect(src.stageLookup({ stage: "git force push", runtimeModelTag: atMax }).rules.map((r) => r.conceptId))
       .toEqual([stored.conceptId]);
 
@@ -6738,27 +6767,29 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
 // the recognized matcher
 // ---------------------------------------------------------------------------
 describe("stageLookup — the recognized matcher", () => {
-  it("delivers the same rules gateQuery delivers for that stage — parity through the chokepoint", async () => {
+  it("delivers identically through all three entrances — evaluateStageLookup, the standalone form, and MonetCore.stageLookup()", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
       kind: "rule",
       rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "it destroys teammates' commits", ...AGENT_RULE },
     });
-    const viaGate = c.gate({ actionContext: "Bash:cd /repo && git push --force origin dev" });
-    const viaLookup = c.stageLookup({ stage: "git force push" });
+    const db = (c as unknown as { db: StoragePort }).db;
+    // The pure read, the standalone read+commit form, and the MonetCore wrapper are three doors onto
+    // ONE chokepoint. Nothing may differ between them: a caller with its own transaction and a
+    // caller without one must be told the same thing.
+    const viaEvaluate = evaluateStageLookup(db, { stage: "git force push", circle: "default", record: false }).result;
+    const viaStandalone = standaloneStageLookup(db, { stage: "git force push", circle: "default", record: false });
+    const viaCore = c.stageLookup({ stage: "git force push" });
 
-    expect(viaGate.rules).toHaveLength(1);
-    expect(viaLookup.matched).toBe(true);
-    expect(viaLookup.rules).toHaveLength(1);
-    // Same delivery in every field gateQuery also carries — the one field stageLookup adds on top
-    // (`body`) is stripped before the comparison, so this pins the shared chokepoint fields exactly.
-    const { body: _body, ...deliveredWithoutBody } = viaLookup.rules[0]!;
-    expect(deliveredWithoutBody).toEqual(viaGate.rules[0]);
-    expect(viaLookup.rules[0]!.conceptId).toBe(rule.conceptId);
+    expect(viaCore.matched).toBe(true);
+    expect(viaCore.rules).toHaveLength(1);
+    expect(viaCore.rules[0]!.conceptId).toBe(rule.conceptId);
+    expect(viaStandalone).toEqual(viaEvaluate);
+    expect(viaCore).toEqual(viaEvaluate);
     c.close();
   });
 
-  it("excludes a foreign-model agent-scoped rule on BOTH surfaces alike", async () => {
+  it("excludes a foreign-model agent-scoped rule", async () => {
     const c = core();
     const forOld = await c.store("Old model forgets to quote paths.", {
       kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-1" },
@@ -6767,10 +6798,8 @@ describe("stageLookup — the recognized matcher", () => {
       kind: "rule", rule: { stage: "git force push", scope: "domain" },
     });
 
-    const gateResult = c.gate({ actionContext: "Bash:git push --force", runtimeModelTag: "model-2" });
     const lookupResult = c.stageLookup({ stage: "git force push", runtimeModelTag: "model-2" });
 
-    expect(gateResult.rules.map((r) => r.conceptId)).toEqual([domain.conceptId]);
     expect(lookupResult.rules.map((r) => r.conceptId)).toEqual([domain.conceptId]);
     expect(forOld.conceptId).not.toBe(domain.conceptId); // sanity: the excluded rule really exists
     c.close();
@@ -6814,7 +6843,7 @@ describe("stageLookup — the recognized matcher", () => {
     c.close();
   });
 
-  it("delivers body when non-blank; gateQuery's GateRule never carries the field at all", async () => {
+  it("delivers body when non-blank", async () => {
     const c = core();
     const rule = await c.store("Run the review watcher.", {
       kind: "rule", rule: { stage: "starting a review pass", ...AGENT_RULE },
@@ -6826,14 +6855,6 @@ describe("stageLookup — the recognized matcher", () => {
     );
     const r = c.stageLookup({ stage: "starting a review pass" });
     expect(r.rules[0]!.body).toBe("watch-reviews team-monet/monet-core --interval 5m");
-
-    // gateQuery's own delivery type carries no `body` field at all — pin the SHAPE, not just a value.
-    await c.declare({ species: "stage", stage: "trigger it mechanically", patterns: ["Bash:review-pass"] });
-    await c.store("Run the review watcher, mechanically triggered.", {
-      kind: "rule", rule: { stage: "trigger it mechanically", ...AGENT_RULE },
-    });
-    const viaGate = c.gate({ actionContext: "Bash:review-pass" });
-    expect(viaGate.rules[0]).not.toHaveProperty("body");
     c.close();
   });
 
@@ -6848,7 +6869,7 @@ describe("stageLookup — the recognized matcher", () => {
     c.close();
   });
 
-  it("re-aiming a stage's patterns reroutes the MECHANICAL matcher only — recognized delivery is unaffected (doctrine, item 7)", async () => {
+  it("re-aiming a stage's patterns moves the MECHANICAL firing surface only — recognized delivery is unaffected (doctrine, item 7)", async () => {
     const c = core();
     const deny = await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
@@ -6856,7 +6877,7 @@ describe("stageLookup — the recognized matcher", () => {
       ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
+    expect(c.stages().find((st) => st.name === "rm -rf")!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
     expect(c.stageLookup({ stage: "rm -rf" }).rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
 
     // Re-aim the stage's MECHANICAL firing surface to a shape that no longer matches the old
@@ -6866,8 +6887,9 @@ describe("stageLookup — the recognized matcher", () => {
       acknowledgeBlockingRules: [deny.conceptId],
     });
 
-    // MECHANICAL reachability changed: the deny no longer fires on the old action shape.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
+    // MECHANICAL reachability changed: the stage no longer aims at the old action shape at all.
+    expect(c.stages().find((st) => st.name === "rm -rf")!.patterns)
+      .toEqual([{ tool: "bash", tokens: ["something-else-entirely"] }]);
     // RECOGNIZED reachability did NOT change: the SAME deny is still delivered by name, severity
     // and all — pattern re-aiming is not a rule-withdrawal lever on either matcher (doctrine).
     const stillReachable = c.stageLookup({ stage: "rm -rf" });
@@ -7088,10 +7110,10 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     }
     expect(postUpgrade.find((r) => r.concept_id === "ghost-concept")?.circle).toBeNull();
 
-    // Gate delivery actually works post-upgrade, in every circle involved, including the moved one.
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "alpha" }).rules).toHaveLength(1);
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "gamma" }).rules).toHaveLength(1);
-    expect(upgraded.gate({ actionContext: "Bash:npm install", circle: "beta" }).rules).toHaveLength(1);
+    // Delivery actually works post-upgrade, in every circle involved, including the moved one.
+    expect(upgraded.stageLookup({ stage: "rm -rf", circle: "alpha" }).rules).toHaveLength(1);
+    expect(upgraded.stageLookup({ stage: "rm -rf", circle: "gamma" }).rules).toHaveLength(1);
+    expect(upgraded.stageLookup({ stage: "npm install", circle: "beta" }).rules).toHaveLength(1);
 
     // The CHECK constraint the guarded ALTER carried is actually enforced on the upgraded table —
     // not merely present in the DDL text. 'projection' rather than 'correction' (review fix — Codex
@@ -7174,7 +7196,8 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     // The backfill ran clean afterward: opening at all (a fresh MonetCore always runs
     // createGateSchema's full sequence — rename, guarded ALTER, backfill, index) completed without
     // throwing, and an ordinary gate query in the new circle is a plain, correct miss.
-    expect(upgraded.gate({ actionContext: "Bash:anything", circle: LEGACY_STAR_CIRCLE }).silence).toBe(true);
+    expect(upgraded.stageLookup({ stage: "anything", circle: LEGACY_STAR_CIRCLE }))
+      .toMatchObject({ matched: false, stage: null, rules: [] });
     upgraded.close();
   });
 
@@ -7213,10 +7236,10 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       expect(bindingRow.circle, id).toBe(LEGACY_STAR_CIRCLE); // NEVER '*' — never silently breadth
       expect(bindingRow.origin, id).toBe(expectedOrigin); // unchanged — this was never a breadth mint
     }
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: LEGACY_STAR_CIRCLE }).rules.map((r) => r.conceptId))
+    expect(upgraded.stageLookup({ stage: "rm -rf", circle: LEGACY_STAR_CIRCLE }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId, advisory.conceptId]);
-    // ...and it never fires as though either were global.
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "some-other-circle-entirely" }).rules).toEqual([]);
+    // ...and it never delivers as though either were global.
+    expect(upgraded.stageLookup({ stage: "rm -rf", circle: "some-other-circle-entirely" }).rules).toEqual([]);
     upgraded.close();
   });
 
@@ -7335,7 +7358,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       scope: "domain",
     });
     if (rule.species !== "rule") throw new Error("unreachable");
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
+    expect(upgraded.stageLookup({ stage: "rm -rf" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
     upgraded.close();
   });
 
@@ -7371,7 +7394,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       scope: "domain",
     });
     if (rule.species !== "rule") throw new Error("unreachable");
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
+    expect(upgraded.stageLookup({ stage: "rm -rf" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
     upgraded.close();
   });
 
@@ -7514,9 +7537,9 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       // THE PAYOFF: querying through "project" delivers BOTH the migrated local rule and the global
       // one — union, not global-only. A second, untouched circle proves the global rule alone is not
       // what is doing the work here (it would fire there too, with or without this fix).
-      expect(upgraded.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId).sort())
+      expect(upgraded.stageLookup({ stage: "npm install", circle: "project" }).rules.map((r) => r.conceptId).sort())
         .toEqual([globalRule.conceptId, localRule.conceptId].sort());
-      expect(upgraded.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+      expect(upgraded.stageLookup({ stage: "npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
         .toEqual([globalRule.conceptId]);
 
       // DISCLOSURE counts both cleaned rows (1 deleted + 1 repointed = 2).
@@ -7572,8 +7595,8 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     expect(
       (raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(futureRule.conceptId) as { circle: string | null }).circle,
     ).toBeNull();
-    // Correctly invisible — a NULL circle matches no query's filter, live or offline.
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
+    // Correctly invisible — a NULL circle matches no query's filter.
+    expect(c.stageLookup({ stage: "npm install", circle: "project" }).rules.map((r) => r.conceptId))
       .not.toContain(futureRule.conceptId);
 
     // THE CONCEPT ARRIVES — via graft, BLOCKER B3's own trigger condition ("this concept landing IS
@@ -7581,7 +7604,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     c.graftRows(conceptOnlyPayload as never);
     const healed = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(futureRule.conceptId) as { circle: string | null };
     expect(healed.circle).toBe("project");
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "project" }).rules.map((r) => r.conceptId))
       .toContain(futureRule.conceptId);
 
     peer.close(); c.close();
@@ -8201,7 +8224,7 @@ describe("MCP surface", () => {
     });
     expect(declared.isError).toBe(false);
     expect(declared.json).toMatchObject({ species: "rule" });
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ severity: "blocking" });
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ severity: "blocking" });
 
     await client.close();
     c.close();
@@ -8596,10 +8619,10 @@ describe("MCP surface", () => {
     expect(moved.isError).toBe(false);
     expect(moved.json.action).toBe("moved");
     expect(moved.json.message as string).not.toContain("DENY RELOCATED");
-    // Because nothing about its delivery changed: the binding stayed global, and the deny still
-    // fires in the circle its concept just left.
+    // Because nothing about its delivery changed: the binding stayed global, and the deny is still
+    // delivered in the circle its concept just left.
     expect(c.ruleBinding(deny.conceptId)!.circle).toBe(BREADTH_CIRCLE);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules
+    expect(c.stageLookup({ stage: "rm -rf", circle: "default" }).rules
       .filter((r) => r.severity === "blocking")).toHaveLength(1);
 
     // BATCH MODE, same question — the field is absent entirely rather than present and empty.
@@ -8683,10 +8706,10 @@ describe("MCP surface", () => {
     // THE LIE THAT MUST NOT BE TOLD: "it now denies only in live-dest" about a rule that denies
     // nowhere. A mandatory disclosure stating the opposite of the truth is worse than an absent one.
     expect(moved.json.message as string).not.toContain("DENY RELOCATED");
-    // ...and the silence is accurate: advisory now, and no deny fires in either circle.
+    // ...and the silence is accurate: advisory now, and no deny is delivered in either circle.
     expect(a.ruleBinding(deny.conceptId)!.severity).toBe("advisory");
     for (const circle of ["default", "live-dest"]) {
-      expect(a.gate({ actionContext: "Bash:rm -rf /tmp/x", circle }).rules
+      expect(a.stageLookup({ stage: "rm -rf", circle }).rules
         .filter((r) => r.severity === "blocking")).toHaveLength(0);
     }
     // The ordinary guidance is untouched — silence is about the disclosure, not the response.
@@ -8731,9 +8754,9 @@ describe("MCP surface", () => {
     expect(message).toContain("it now denies only in live-dest");
     // ...and the disclosure is accurate: a real deny stopped covering `default` and covers live-dest.
     expect(a.ruleBinding(rule.conceptId)).toMatchObject({ severity: "blocking", circle: "live-dest" });
-    expect(a.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules
+    expect(a.stageLookup({ stage: "rm -rf", circle: "default" }).rules
       .filter((r) => r.severity === "blocking")).toHaveLength(0);
-    expect(a.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "live-dest" }).rules
+    expect(a.stageLookup({ stage: "rm -rf", circle: "live-dest" }).rules
       .filter((r) => r.severity === "blocking")).toHaveLength(1);
 
     spy.mockRestore();
@@ -8849,7 +8872,7 @@ describe("MCP surface", () => {
     // session default the moment `circle` was omitted from the wire call.
     expect(c.ruleBinding(firstConceptId)!.circle).toBe(BREADTH_CIRCLE);
     expect(againJson.narrowedFromBreadth).toBeUndefined();
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-this-test-never-otherwise-touches" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-this-test-never-otherwise-touches" }).rules.map((r) => r.conceptId))
       .toEqual([firstConceptId]);
 
     await client.close();
@@ -8886,7 +8909,7 @@ describe("MCP surface", () => {
 
     // THE RULING still reaches declare() as '*' — round 2's own fix, unweakened by this one.
     expect(c.ruleBinding(conceptId)!.circle).toBe(BREADTH_CIRCLE);
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-this-test-never-configured" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-this-test-never-configured" }).rules.map((r) => r.conceptId))
       .toEqual([conceptId]);
 
     // THE RESPONSE'S OWN `circle` FIELD names the HOME circle, honestly — where the CONCEPT
@@ -8946,7 +8969,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c, { modelTag: "model-a" });
     // A host that changes which model it is running mid-session calls setRuntimeModelTag directly
     // — registration ran ONCE, at server start, and its closure-captured copy of "model-a" must not
-    // be what capture stamps from here on. gate()/stageLookup() already read this live; capture did
+    // be what capture stamps from here on. stageLookup() already reads this live; capture did
     // not, before this fix.
     c.setRuntimeModelTag("model-b");
 
@@ -8956,12 +8979,10 @@ describe("MCP surface", () => {
     });
     expect(stored.isError).toBe(false);
     expect(c.ruleBinding(stored.json.conceptId as string)!.model_tag).toBe("model-b");
-    // IMMEDIATELY deliverable via BOTH read paths, with no explicit runtimeModelTag override — both
+    // IMMEDIATELY deliverable on the read path, with no explicit runtimeModelTag override — the read
     // already resolved `this.runtimeModelTag` live before this fix; what was missing is CAPTURE
-    // catching up to them. Before the fix this rule was stamped "model-a" and would be silently
-    // filtered out of both calls below (captured, then instantly invisible).
-    expect(c.gate({ actionContext: "Bash:git push --force origin main" }).rules.map((r) => r.conceptId))
-      .toContain(stored.json.conceptId);
+    // catching up to it. Before the fix this rule was stamped "model-a" and would be silently
+    // filtered out of the call below (captured, then instantly invisible).
     expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId))
       .toContain(stored.json.conceptId);
 
@@ -9260,8 +9281,8 @@ describe("MCP surface", () => {
     });
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/blocking rule requires `reason`/);
-    // And the refusal was total: no stage was addressed, so nothing fires.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
+    // And the refusal was total: no stage was addressed, so there is nothing to look up.
+    expect(c.stageLookup({ stage: "rm -rf" })).toMatchObject({ matched: false, rules: [] });
     await client.close();
     c.close();
   });
@@ -9305,7 +9326,6 @@ describe("MCP surface", () => {
         kind: "rule", resolution: "forceNew", rule: { stage: "git force push", scope: "agent", modelTag: "other-model" },
       });
       expect(forA.conceptId).not.toBe(forOther.conceptId); // sanity: the excluded rule really exists
-      expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId)).toEqual([forA.conceptId]);
       expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId)).toEqual([forA.conceptId]);
 
       // CAPTURE is not poisoned either: an agent-scoped write with no explicit modelTag stamps the
@@ -9336,7 +9356,6 @@ describe("MCP surface", () => {
       const stored = await c.store("A compensation.", {
         kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "some-model" },
       });
-      expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId)).toEqual([stored.conceptId]);
       expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId)).toEqual([stored.conceptId]);
 
       // CAPTURE: unconfigured behavior — identical to no MONET_MODEL_TAG at all (see "falls back to
@@ -10495,7 +10514,7 @@ describe("MCP surface", () => {
 // ---------------------------------------------------------------------------
 // the performance contract
 // ---------------------------------------------------------------------------
-describe("gate performance", () => {
+describe("trigger-matcher performance", () => {
   /**
    * WHY THIS TEST IS CALIBRATED AND RATIO-BASED RATHER THAN ABSOLUTE.
    *
@@ -10504,33 +10523,10 @@ describe("gate performance", () => {
    * scheduler NOISE but cannot remove a slower CPU, so an absolute millisecond bound in a portable
    * test measures the machine and calls it a regression.
    *
-   * The product contract is still sub-millisecond on reference hardware, and it is stated where it
-   * belongs — in the module docs, against named numbers. What a PORTABLE test can prove is what
-   * actually rots when this code regresses:
-   *
-   *   1. SCALING, asserted unconditionally and hardware-independently. A slower machine scales both
-   *      sides of a ratio, so the ratios hold everywhere. These are the assertions that catch the
-   *      real failure mode — an O(stages x context) matcher — with orders of magnitude of margin.
-   *   2. AN ABSOLUTE BOUND CALIBRATED IN-PROCESS: a baseline primitive measured on the same machine
-   *      in the same run, with the gate held to a generous multiple of it, plus a hard ceiling that
-   *      only fires on catastrophe.
+   * What a PORTABLE test can prove is SCALING, asserted hardware-independently: a slower machine
+   * scales both sides of a ratio, so the ratio holds everywhere. That is the assertion that catches
+   * the real failure mode — an O(patterns x context) matcher — with orders of magnitude of margin.
    */
-
-  /**
-   * The calibration primitive: prepared-statement round trips and short string scans, which is
-   * what a gate lookup is made of. Deliberately NOT a gate call — it has to move with the hardware
-   * without moving with the code under test.
-   */
-  function baselineOnce(db: RawDb): void {
-    const q = db.prepare("SELECT 1 AS one");
-    let acc = 0;
-    for (let i = 0; i < 200; i++) {
-      q.get();
-      const text = `Bash:tool${i} run --flag${i} operand`;
-      for (let ch = 0; ch < text.length; ch++) acc += text.charCodeAt(ch);
-    }
-    if (acc < 0) throw new Error("unreachable");
-  }
 
   /** Best-of-batches p95 — batches absorb the runner's scheduler, the minimum picks a clean one. */
   function bestP95(fn: () => void, iters: number, batches = 8): number {
@@ -10549,7 +10545,7 @@ describe("gate performance", () => {
     return Math.min(...out);
   }
 
-  it("does not scale with stage count times context length — the matcher stays indexed", () => {
+  it("does not scale with pattern count times context length — the matcher stays indexed", () => {
     // THE ALGORITHMIC GUARD, and the one that needs no hardware assumptions at all. It exercises the
     // pure matcher, so there is no DB, no clock and no I/O in the measurement.
     //
@@ -10572,92 +10568,4 @@ describe("gate performance", () => {
     expect(longCost, `match 200 patterns: short=${shortCost.toFixed(5)}ms long=${longCost.toFixed(5)}ms`)
       .toBeLessThan(Math.max(shortCost * 20, 0.05));
   });
-
-  /**
-   * ONE fixture for the whole block, built ONCE.
-   *
-   * This is a CI-COURTESY measure as much as a speed one, and the lesson cost a red build: vitest
-   * runs test FILES in parallel workers, so a benchmark that pins a core for twelve seconds does
-   * not merely measure a two-core runner — it STARVES the other workers, and an unrelated file
-   * (gather.test.ts, on vitest's default 5s timeout) failed with a worker RPC timeout while this
-   * one was busy. A perf test that makes its neighbours fail is a worse test than no perf test.
-   *
-   * Three changes bought back ~85% of it, in order of size:
-   *
-   *   - `resolution: "forceNew"` and `graphEnabled: false` when BUILDING. Both the nomination scan
-   *     and edge derivation compare an incoming concept against every other concept in the circle,
-   *     so building the fixture through the ordinary path is quadratic and dwarfed everything being
-   *     measured. The gate reads stages, rule_bindings, concepts and lifecycle_edges — never
-   *     memory_edge, never an observation vector — so the shape it measures is identical.
-   *   - ONE fixture for the block instead of one per test.
-   *   - A fixture SCALE the test can afford. See below.
-   *
-   * WHY THE TEST'S SCALE IS SMALLER THAN THE CONTRACT'S. The stated contract is 200 stages / 1,000
-   * rules, and gate latency really does move with the rules DELIVERED per fire (measured: 1 rule
-   * 0.24ms, 2 rules 0.27ms, 5 rules 0.48ms), so a smaller fixture measures a smaller number — this
-   * is not a scale-free quantity and pretending otherwise would be the dishonest version of this
-   * fix. What the test is FOR, though, is regression detection, and every assertion here is a ratio
-   * or a calibrated multiple that holds at any scale. The contract NUMBER is verified out of band
-   * against the full 1,000-rule shape (scripts-free harness, re-run and reported every review
-   * round) and stated in the gates.ts module docs against named reference hardware. A CI job is the
-   * wrong place to defend a millisecond; it is the right place to defend a slope.
-   */
-  const PERF_STAGES = 200;
-  const PERF_RULES = 400;
-  let fixture: MonetCore;
-  beforeAll(async () => {
-    fixture = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, graphEnabled: false });
-    for (let s = 0; s < PERF_STAGES; s++) {
-      await fixture.declare({ species: "stage", stage: `stage-${s}`, patterns: [`Bash:tool${s} run --flag${s}`] });
-    }
-    for (let r = 0; r < PERF_RULES; r++) {
-      await fixture.store(`Rule number ${r} for stage ${r % PERF_STAGES}.`, {
-        kind: "rule", resolution: "forceNew", rule: { stage: `stage-${r % PERF_STAGES}`, ...AGENT_RULE },
-      });
-    }
-  }, 180_000);
-  afterAll(() => fixture?.close());
-
-  it("answers within a calibrated budget at scale, and silence costs less than a fire", () => {
-    const c = fixture;
-    expect(c.stages()).toHaveLength(PERF_STAGES);
-    expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM rule_bindings`).get()).toEqual({ n: PERF_RULES });
-    const db = raw(c);
-
-    const baseline = bestP95(() => baselineOnce(db), 100, 5);
-    const fire = bestP95(() => { c.gate({ actionContext: "Bash:tool7 run --flag7 with some operands", record: false }); }, 100, 5);
-    const silence = bestP95(() => { c.gate({ actionContext: "Bash:git status", record: false }); }, 100, 5);
-    const midChain = bestP95(() => { c.gate({ actionContext: "Bash:cd /x && tool199 run --flag199 now", record: false }); }, 100, 5);
-    const report =
-      `baseline=${baseline.toFixed(4)}ms fire=${fire.toFixed(4)}ms (${(fire / baseline).toFixed(1)}x) ` +
-      `silence=${silence.toFixed(4)}ms midChain=${midChain.toFixed(4)}ms`;
-
-    // RATIO: a silence does strictly less work than a fire — no binding join, no rule marshalling.
-    // If that inverts, something is doing per-stage work that should be per-match.
-    expect(silence, report).toBeLessThan(fire);
-    // CALIBRATED ABSOLUTE. Locally the gate is ~13x the baseline primitive; 60x is generous enough
-    // that no plausible hardware trips it and tight enough that an algorithmic regression (which
-    // moves this by orders of magnitude, not tens of percent) still does.
-    expect(fire, report).toBeLessThan(baseline * 60);
-    expect(midChain, report).toBeLessThan(baseline * 60);
-    // CATASTROPHE CEILING: an absolute number that says nothing about hardware and everything about
-    // whether the gate is still usable on the critical path of an action.
-    expect(fire, report).toBeLessThan(10);
-  }, 60_000);
-
-  it("matches a 64KiB context in full, and stays linear rather than multiplying by stage count", () => {
-    const c = fixture;
-    // THE POINT OF THE WHOLE ITEM: a governed command hidden behind 64KiB of padding still FIRES.
-    // Under either of the two prefix-matching caps this reported silence.
-    const big = `Bash:${"x".repeat(64 * 1024)} && tool42 run --flag42`;
-    expect(c.gate({ actionContext: big, record: false }).rules.length).toBeGreaterThan(0);
-
-    const fire = bestP95(() => { c.gate({ actionContext: "Bash:tool7 run --flag7 operand", record: false }); }, 80, 5);
-    const bigCost = bestP95(() => { c.gate({ actionContext: big, record: false }); }, 20, 5);
-    const report = `fire=${fire.toFixed(4)}ms 64KiB=${bigCost.toFixed(4)}ms (${(bigCost / fire).toFixed(1)}x)`;
-    // Linear in the string's length, NOT in stages x length: locally 64KiB is ~1.5x a normal fire.
-    // 40x leaves room for a slow runner's memory bandwidth while still failing loudly if the
-    // per-stage rescan ever comes back (which would put this in the hundreds).
-    expect(bigCost, report).toBeLessThan(Math.max(fire * 40, 0.5));
-  }, 60_000);
 });

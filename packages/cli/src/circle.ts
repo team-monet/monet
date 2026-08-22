@@ -6,7 +6,7 @@ import { canonicalRemoteKey, defaultNameFromRemote, getOriginRemote } from "./re
 
 // Re-exported for backward compatibility: these two were public API of this module before the P1
 // fix (Codex round 2 on PR #40) extracted all three pure remote helpers into remote-circle.ts, so
-// gate-cli.ts's offline resolver could depend on them without dragging `better-sqlite3` into its
+// a store-less caller could depend on them without dragging `better-sqlite3` into its
 // graph. `getOriginRemote` was already module-private here and stays internal-only from this
 // file's own point of view (imported above, not re-exported) — remote-circle.ts is its new public
 // home for callers that need it directly.
@@ -67,11 +67,12 @@ export { canonicalRemoteKey, defaultNameFromRemote };
  * Never throws — any store/git failure degrades to the folder-hash fallback so the MCP server
  * still starts.
  *
- * `opts.readOnly` — FIX 4 (Codex round 2 on PR #42), `monet install --dry-run`'s preview mode.
- * `--dry-run` claims "nothing written", but a plain call here opens the store READ-WRITE (CREATE
- * TABLE IF NOT EXISTS remote_circle_map on a store that doesn't have it yet) and can INSERT a
- * mapping via the Class A/B `writeMap` path — a real, persistent side effect from a command that
- * promises it makes none. `readOnly: true` instead:
+ * `opts.readOnly` — FIX 4 (Codex round 2 on PR #42), for a caller that must resolve a circle
+ * WITHOUT writing anything. A plain call here opens the store READ-WRITE (CREATE TABLE IF NOT
+ * EXISTS remote_circle_map on a store that doesn't have it yet) and can INSERT a mapping via the
+ * Class A/B `writeMap` path — a real, persistent side effect from a caller that may promise it
+ * makes none. The caller this was built for was `monet install --dry-run`'s preview, which no
+ * longer exists; no in-tree caller passes the flag today. `readOnly: true` instead:
  *   (a) skips the store connection ENTIRELY when the db file does not exist yet (no directory or
  *       file gets created just to answer a preview) — falls straight to the same pure fallback
  *       chain (remote-derived default, or folder-hash with no remote) a genuinely fresh repo with
@@ -163,7 +164,7 @@ export function deriveCircle(projectDir: string, opts: { readOnly?: boolean; sto
         return defaultNameFromRemote(remote);
       }
       // Class A or Class B: mapping depends on local store state and must sync across machines.
-      // FIX 4: readOnly (--dry-run's preview) never persists — the resolution VALUE above is
+      // FIX 4: readOnly never persists — the resolution VALUE above is
       // identical either way; only whether it gets WRITTEN differs.
       if (!readOnly) writeMap(raw, key, circle);
       return circle;
@@ -210,10 +211,9 @@ export function deriveCircle(projectDir: string, opts: { readOnly?: boolean; sto
  * from where `createSource` actually writes) — every caller of `deriveCircle` in this codebase,
  * its IDENTITY root (`projectDir` — what the remote lookup and folder-hash are computed FROM) and
  * its STORE root (`storeDir`, defaulting to `projectDir` when omitted):
- *   - `cli.ts`'s `start` action, `index.ts`'s stdio entry, `install-cli.ts`'s `runInstall`: both
- *     roots = the SAME resolved `projectDir` (`resolveProjectDir()` or `target.projectDir`) —
- *     unchanged, no divergence exists for any of these three (the process being identified IS the
- *     process whose store it opens).
+ *   - `cli.ts`'s `start` action and `index.ts`'s stdio entry: both roots = the SAME resolved
+ *     `projectDir` (`resolveProjectDir()`) — unchanged, no divergence exists for either (the
+ *     process being identified IS the process whose store it opens).
  *   - `source-cli.ts`'s two git-md branches: both roots = `projectDir` (the invoking project) —
  *     unchanged; a git-md source has no separate worktree concept to diverge from.
  *   - `source-cli.ts`'s two repo-md/worktree branches (`resolveGitWorktreeRoot`-derived

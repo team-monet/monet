@@ -2,14 +2,16 @@ import { execFileSync } from "node:child_process";
 
 /**
  * Pure git-remote helpers, with NO sqlite/db imports in this module's graph — the project-dir.ts
- * precedent, extended. Extracted from circle.ts (P1 fix, Codex round 2 on PR #40) so that
- * gate-cli.ts's offline `--circle` resolver can compute the SAME remote-derived circle name a
- * live session would, without dragging `better-sqlite3` into the offline hook's dependency graph
- * (circle.ts's own `deriveCircle` opens the store directly — exactly what the gate command must
- * never do). circle.ts re-imports these three and re-exports `canonicalRemoteKey`/
- * `defaultNameFromRemote` from itself unchanged, so this is a pure extraction: ONE implementation,
- * two call sites, no behavior change. Moved, not rewritten — every doc comment below is verbatim
- * from circle.ts.
+ * precedent, extended. Extracted from circle.ts (P1 fix, Codex round 2 on PR #40) so that a
+ * store-less caller could compute the SAME remote-derived circle name a live session would, without
+ * dragging `better-sqlite3` into its dependency graph (circle.ts's own `deriveCircle` opens the
+ * store directly). That store-less caller — the offline gate resolver — no longer exists, and
+ * circle.ts is this module's only importer today, so the separation currently buys nothing; it
+ * costs nothing either, and the boundary is worth keeping the next time something must resolve a
+ * circle name without a store. circle.ts re-imports these three and re-exports
+ * `canonicalRemoteKey`/`defaultNameFromRemote` from itself unchanged, so this stays a pure
+ * extraction: ONE implementation, no behavior change. Moved, not rewritten — every doc comment
+ * below is verbatim from circle.ts.
  */
 
 /** `git -C <dir> remote get-url origin` — empty string on any failure (no throw). */

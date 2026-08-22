@@ -100,27 +100,6 @@
  * `gateCoverage().unverifiedPatterns` (stages carry `verified`, flipped on first live fire), and
  * DECLARATION replaces a stage's patterns outright. The failure mode of a bad seed is a dead
  * pattern surfaced in curation, never a wrong deny — blocking severity is declaration-only.
- *
- * ────────────────────────────────────────────────────────────────────────────────────────────────
- * THE GATE MIRROR IS A MIRROR, NOT A COPY
- * ────────────────────────────────────────────────────────────────────────────────────────────────
- *
- * `materializeGateMirror` writes every LIVE RULE — advisory and blocking alike — plus the full
- * stage registry to a local JSON file, so a host CLI can answer the WHOLE gate without reaching the
- * server, not only the offline-deny case ("one artifact, one staleness contract... answerable with
- * the server down" — the `monet gate` contract). The design's own
- * distinction applies verbatim: a source's copy competes with the file as truth, while a MIRROR is
- * a build artifact with an unambiguous master. The store is master. The file is regenerated at
- * every declaration — never edited, never read back as authority, and safe to delete (the next
- * declaration rebuilds it, and `engine.materializeGateMirror(path)` rebuilds it on demand).
- *
- * RULED 2026-07-28 (slice 4b-B): this artifact began as the "blocking sidecar" (slice 4a) — blocking
- * rules only, deliberately kept small for the offline-deny case. That scope is superseded: extending
- * the SAME artifact to carry every live rule (not shipping a second file) keeps one staleness
- * contract instead of two, and is what makes `monet gate` answerable offline in full — per the
- * boundary statement's own dated supersession clause. The on-disk path and the
- * `gateSidecarPath` config key are unchanged; only the entries widened and the names stopped saying
- * "blocking" for an artifact that no longer only carries blocking rules.
  */
 
 import type { StoragePort } from "./storage";
@@ -272,8 +251,9 @@ export interface RuleBindingRow {
  * "the union of corrected actions", and `git push --force` is the same action whichever project you
  * are standing in. Locality lives on the BINDING (`rule_bindings.circle`, added for breadth —
  * see BREADTH_CIRCLE's own comment), normally kept equal to its rule's own concept circle, so
- * `gateQuery` scopes by the binding directly rather than joining to the concept for locality. One
- * registry, many circles' rules — plus the one reserved breadth marker that means every circle.
+ * `RULE_LIVENESS_WHERE` scopes by the binding directly rather than joining to the concept for
+ * locality. One registry, many circles' rules — plus the one reserved breadth marker that means
+ * every circle.
  *
  * WHY `verified` EXISTS. Declaration- and import-born stages author their patterns from a NAME
  * rather than from an observed instance, so nothing proves the pattern matches anything real. The
@@ -346,7 +326,7 @@ export const GATE_SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_rule_bindings_stage ON rule_bindings(stage_id);
   CREATE INDEX IF NOT EXISTS idx_rule_bindings_sync ON rule_bindings(sync_updated_at);
-  -- The sidecar regeneration query and the "is deny power in play" probe both scan this predicate.
+  -- The "is deny power in play" probe scans this predicate.
   CREATE INDEX IF NOT EXISTS idx_rule_bindings_blocking ON rule_bindings(severity)
     WHERE severity = 'blocking';
   -- idx_rule_bindings_circle is NOT here (review fix, BLOCKER B1). This whole string execs
@@ -461,10 +441,6 @@ export function migrateGateColumns(db: StoragePort): void {
     // only in which file states it: legacy-star move → THEN this column backfill, still true,
     // enforced by call order rather than by both steps living in one function.
     //
-    // BELOW EVERY TRIGGER IN THIS FUNCTION NOW (Codex round 11, item 4) — see the reordering
-    // comment at the top of this same `if` block for why: the trigger that reacts to THIS backfill's
-    // own shape (an old build's raw, pre-circle-column INSERT) must already exist before this
-    // backfill runs, not after, so a concurrent old writer during this exact window is caught too.
     // RESTRICTED TO BINDINGS WITH A RESOLVABLE, SAFE CONCEPT (Codex round 12, P2 — review found;
     // closes two problems in the SAME predicate). BEFORE: `WHERE circle IS NULL` alone matched every
     // dangling binding too — one whose `concept_id` names NO row in `concepts` at all (the
@@ -472,12 +448,10 @@ export function migrateGateColumns(db: StoragePort): void {
     // assigning NULL to a column that was ALREADY NULL. SQLite's own `changes()` counts ROWS THE
     // WHERE CLAUSE MATCHED, not rows whose VALUE actually changed (the identical lesson this file's
     // own INSERT trigger, above, already learned the hard way) — so a store with nothing but
-    // dangling bindings still reported `backfilled.changes > 0` and bumped the generation for a
-    // write that resolved nothing. Combined with round 11, item 3's own second `migrateGateColumns`
-    // call (this same function now runs twice per construction), a store in that shape bumped TWICE
-    // on EVERY open, rewriting the mirror on a read-only open with no delivery change at all — a
-    // report-only process now leaves other readers looking at a spuriously stale-flagged mirror for
-    // no reason.
+    // dangling bindings still reported `backfilled.changes > 0` for a write that resolved nothing,
+    // on EVERY open, and this function runs twice per construction. Nothing reads that count today
+    // (the generation counter it fed is gone), but the predicate below is what makes the count
+    // honest if anything reads it again.
     //
     // THE SAME AUDIT ALSO NAMES THIS STATEMENT: like the two triggers above, this UPDATE copies
     // `concepts.circle` verbatim, so a concept an old build parked in the reserved `'*'` circle
@@ -526,19 +500,16 @@ export function createGateSchema(db: StoragePort): void {
 }
 
 /**
- * Does this concept currently hold ANY live rule binding, of either severity? The predicate every
- * retire/supersede/move bump site consults, so "does touching this concept change the mirror" is
- * decided in ONE place rather than re-derived per call site. Deliberately reads the BINDING only:
- * a retire or a supersession changes whether the rule is DELIVERED, and the caller bumping for
- * those already knows a binding exists.
+ * Does this concept currently hold ANY live rule binding, of either severity? Deliberately reads
+ * the BINDING only: a retire or a supersession changes whether the rule is DELIVERED, and a caller
+ * asking this question already knows what it is about to change.
  *
- * WAS `hasBlockingBinding`, scoped to `severity = 'blocking'` alone — correct while the mirror was
- * blocking-only (slice 4a), and systematically wrong once it widened (slice 4b-B): an ADVISORY rule
- * leaving the mirror (retire, supersession, a circle move that merges it away) changes
- * `GateMirror.entries` exactly as a blocking one leaving it does, since entries now carries both
- * severities. Renamed rather than merely widened, for the same reason `BlockingSidecar` became
- * `GateMirror` — a predicate that decides bump timing for BOTH severities must not still say
- * "Blocking" in its name.
+ * BOTH SEVERITIES, deliberately — an advisory rule leaving delivery (retire, supersession, a circle
+ * move that merges it away) is the same event as a blocking one leaving it, and a predicate scoped
+ * to `severity = 'blocking'` would answer only half the question.
+ *
+ * NO IN-TREE CALLER TODAY. Its callers were the gate-mirror generation-bump sites, removed
+ * 2026-08-22 (see migrateGateColumns' own removal record). It stays exported public API.
  */
 export function hasLiveBinding(db: StoragePort, conceptId: string): boolean {
   return db
@@ -547,7 +518,7 @@ export function hasLiveBinding(db: StoragePort, conceptId: string): boolean {
 }
 
 /**
- * THE CHOKEPOINT. Every way a rule can leave `gateQuery`'s result set passes through here.
+ * THE CHOKEPOINT. Every way a rule can leave the gate's own result set passes through here.
  *
  * WHY THIS EXISTS AS ONE FUNCTION. Deny power was made unforgeable to MINT in a single place — a
  * schema CHECK — and it held against every attempt. Removing it was guarded door by door, and
@@ -557,7 +528,7 @@ export function hasLiveBinding(db: StoragePort, conceptId: string): boolean {
  * N call sites is defended until someone writes the N+1th, and the search for doors terminates only
  * when the guard is structural.
  *
- * So: `gateQuery` delivers a rule when its concept is active, is kind='rule', has a blocking
+ * So: the gate delivers a rule when its concept is active, is kind='rule', has a blocking
  * binding, and carries no supersession edge. Anything that changes any of those for a live deny is
  * a removal, and every such path calls this. A NEW MUTATION PATH THAT SKIPS THIS GUARD IS BY
  * CONSTRUCTION A NEW DOOR — add the call.
@@ -647,9 +618,10 @@ export interface BlockingRuleGuardVerdict {
 
 /**
  * THE ONE DEFINITION OF "LIVE BLOCKING RULE" in this codebase: a blocking binding whose concept is
- * active, is kind='rule', and carries no supersession edge — gateQuery's own delivery conditions,
- * minus locality. Returns the rule's title, so the guard can name it in an error a human can act on,
- * and the BINDING's own circle, which is what decides whether a given operation takes delivery away
+ * active, is kind='rule', and carries no supersession edge — the gate's own delivery conditions
+ * (`RULE_LIVENESS_WHERE`), minus locality. Returns the rule's title, so the guard can name it in an
+ * error a human can act on, and the BINDING's own circle, which decides whether a given operation
+ * takes delivery away
  * from anywhere at all (RULE_LIVENESS_WHERE reads `b.circle`, never the concept's).
  *
  * Extracted so the chokepoint and every caller that merely needs to KNOW a deny is at stake (the
@@ -1078,8 +1050,8 @@ export function seedTriggerPattern(instance: string): TriggerPattern {
 }
 
 /**
- * Render a pattern as the line a human reads in curation, the sidecar and the gate response. The
- * rendering is the CONTRACT the module header describes — `Bash: git push --force` means "tool
+ * Render a pattern as the line a human reads in curation and in the gate response. The rendering
+ * is the CONTRACT the module header describes — `Bash: git push --force` means "tool
  * Bash, these three words in this order, anywhere in the command".
  */
 export function formatTriggerPattern(pattern: TriggerPattern): string {
@@ -1444,9 +1416,6 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
               sync_revision = sync_revision + 1, sync_writer = ?
         WHERE id = ?`,
     ).run(nextPatterns, input.origin, syncAt, deps.syncDeviceId, existing.id);
-    // NO GENERATION BUMP HERE ANY MORE: the counter and its trigger family are gone (see
-    // migrateGateColumns' own removal record). Every stage is mirror content — GateMirror.stages
-    // carries the full registry, not only stages with a live rule bound.
     return db.prepare(`SELECT * FROM stages WHERE id = ?`).get(existing.id) as StageRow;
   }
 
@@ -1490,10 +1459,6 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
     row.id, row.name, row.trigger_patterns, row.origin, row.verified,
     row.created_at, row.sync_updated_at, row.sync_revision, row.sync_writer,
   );
-  // NO GENERATION BUMP HERE ANY MORE: the counter and its trigger family are gone (see
-  // migrateGateColumns' own removal record). A brand-new stage is still mirror content the moment
-  // it exists — GateMirror.stages carries the full registry regardless of whether any rule is bound
-  // yet (a rule-less stage still MATCHES and still answers stage-hit-no-rules).
   return row;
 }
 
@@ -1766,9 +1731,9 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
 /**
  * Does this stored reason amount to no reason at all?
  *
- * ONE DEFINITION, shared by the gate, the sidecar and the stats, because a disclosure that three
- * surfaces compute differently is worse than one they all omit. `bindRule` normalizes a blank to
- * NULL on the way in, so locally these are the same question — but a relayed row is written
+ * ONE DEFINITION, shared by the gate, the curation view and the stats, because a disclosure that
+ * three surfaces compute differently is worse than one they all omit. `bindRule` normalizes a blank
+ * to NULL on the way in, so locally these are the same question — but a relayed row is written
  * straight through by graft and can arrive carrying "   ", and a whitespace reason renders as a
  * blank line under the deny rather than as an answer.
  */
@@ -1776,10 +1741,10 @@ export function hasNoReason(reason: unknown): boolean {
   // TOTAL OVER PERSISTED VALUES, and that is the load-bearing half. SQLite stores whatever a writer
   // hands the column, so a malformed peer — or an older build, or a hand-edited row — can leave a
   // NUMBER in `reason`. The typed signature says string, the runtime value is not, and `.trim()`
-  // threw: a matching gate query, a sidecar rebuild and a gate-stats read all blew up, so the rule's
-  // deny stopped being delivered live AND offline. Every other defect this module guards against is
-  // a deny that misinforms; this was a deny that VANISHES with an exception, which the mirror exists
-  // to make impossible.
+  // threw: a matching gate query and a gate-stats read both blew up, so the rule's deny stopped
+  // being delivered at all. Every other defect this module guards against is a deny that
+  // misinforms; this was a deny that VANISHES with an exception, which is the one failure a gate
+  // must never have.
   //
   // A non-string is read as NO REASON rather than coerced, because that is the truthful reading: 42
   // is not an explanation of anything. The rule is then exactly what this branch already built the
@@ -1820,7 +1785,7 @@ const REASON_LINE_BREAK = /[\r\n\u2028\u2029]/;
  *
  * The reason is the sentence a host prints beside a deny at the moment it fires, and three separate
  * doc comments promise it is one line. Nothing enforced it, so `"prevents data loss\nDENIED BY
- * ADMIN"` was storable and copied verbatim into the gate and the sidecar — a host rendering the
+ * ADMIN"` was storable and copied verbatim into the gate response — a host rendering the
  * promised one-liner then emits several lines of what reads as gate output, one of which the gate
  * never said. A deny is an assertion of authority, and text that appears to come from it while
  * nobody wrote it is the one thing a deny's explanation must never be.
@@ -1881,9 +1846,9 @@ export interface GateRule {
    * which is exactly the "misfires in front of the human" loop projection's missing approval gate
    * rests on, extended from the projection itself to its parent.
    *
-   * LIVE PATH ONLY. `status` is live state, and a frozen copy in the gate mirror would keep
-   * announcing doubt after the human resolved it (or, worse, stay silent after they opened it) —
-   * see `evaluateGateFromMirror`'s own comment.
+   * LIVE PATH ONLY. `status` is live state: this flag is computed at the moment of delivery and
+   * never cached, because a frozen copy would keep announcing doubt after the human resolved it
+   * (or, worse, stay silent after they opened it).
    */
   parentDisputed?: true;
   /**
@@ -1934,7 +1899,8 @@ export interface GateResult {
    * impossible by reporting a confident silence over an input nobody had finished reading.
    */
   overflow: boolean;
-  /** `live` = answered from the store. The sidecar path (slice 4b) is the other answer. */
+  /** `live` = answered from the store, which is the only answer there is: the offline `"sidecar"`
+   *  evaluator was removed 2026-08-22 and nothing produces that value any more. */
   source: "live" | "sidecar";
 }
 
@@ -1981,8 +1947,8 @@ export interface GateQueryOptions {
  * `stageLookup`'s own delivery shape: everything `GateRule` carries, plus the capability
  * invocation payload the recognized matcher — and only the recognized matcher — spends the tokens
  * on. A distinct type rather than a widened `GateRule` (design directive): "never the body" stays
- * true for gateQuery's own delivery, unconditionally; this is agent-initiated pull at the moment of
- * need, which is where paying for the extra field is right ("capabilities are content too — and the
+ * true for the mechanical gate's own delivery, unconditionally; this is agent-initiated pull at the
+ * moment of need, which is where paying for the extra field is right ("capabilities are content too — and the
  * payload is the invocation, not a description").
  */
 export interface StageLookupRule extends GateRule {
@@ -2002,8 +1968,8 @@ export interface StageLookupOptions {
    *
    * NAME-REACHABILITY SURVIVES A MECHANICAL RE-AIMING (doctrine, ruled). A stage's TRIGGER PATTERNS
    * are the mechanical matcher's own firing surface — re-authoring them (memory_declare's
-   * `patterns`) reroutes what `gateQuery` matches, nothing else. This lookup resolves by NAME/id
-   * against the stage registry, never by pattern, so a rule bound to this stage — including a
+   * `patterns`) reroutes what the mechanical gate matches, nothing else. This lookup resolves by
+   * NAME/id against the stage registry, never by pattern, so a rule bound to this stage — including a
    * blocking one — stays reachable here exactly as before, until the RULE itself is withdrawn,
    * downgraded, or superseded, or the stage's own rules all die (stage retirement/inertness). A
    * pattern change is therefore never a rule-withdrawal lever by itself: it narrows what the agent
@@ -2012,7 +1978,7 @@ export interface StageLookupOptions {
    * complements.
    */
   stage: string;
-  /** Locality: only rules whose concept lives in this circle are delivered — same as gateQuery. */
+  /** Locality: only rules whose concept lives in this circle are delivered — same as the gate. */
   circle: string;
   /** Same model-tag filter as GateQueryOptions.runtimeModelTag, applied through the same query. */
   runtimeModelTag?: string;
@@ -2100,14 +2066,14 @@ interface BindingJoinRow {
   origin: RuleBindingOrigin;
   reason: string | null;
   title: string;
-  /** The rule concept's full body. gateQuery's own mapper (toGateRule) never reads this field;
+  /** The rule concept's full body. The gate's own mapper (toGateRule) never reads this field;
    *  only stageLookup's (toStageLookupRule) does — selected unconditionally here rather than by a
    *  second query, because the only thing that differs between the two matchers' delivery is which
    *  fields their own mapper reads off the SAME row, and the chokepoint predicate below must not
    *  have two copies to keep in sync. */
   /**
    * The rule concept's full body, or `null` when the caller asked `rulesForStages` NOT to select
-   * it (`withBody: false`). gateQuery's own mapper (toGateRule) never reads this field regardless
+   * it (`withBody: false`). The gate's own mapper (toGateRule) never reads this field regardless
    * of what it holds; only stageLookup's (toStageLookupRule) does, which is why ONLY that caller
    * passes `withBody: true`. See rulesForStages' own comment for why this is a column-selection
    * flag rather than always fetching it and discarding it in the mapper.
@@ -2171,9 +2137,9 @@ const RULE_LIVENESS_WHERE = `
  * THE shared rules-for-stages selection — every way a rule is fully DELIVERED by EITHER matcher
  * passes through here (refactoring build: this replaces gateInternal's own former inline copy of
  * this query). Same liveness (`RULE_LIVENESS_WHERE`), same circle scope, same model-tag filter,
- * same parent-principle lookup, same ordering (blocking first, then birth order) gateQuery has
- * always used; factoring it out means `stageLookup` answers through IDENTICAL chokepoint semantics
- * rather than a second copy of this SQL that could silently drift from this one.
+ * same parent-principle lookup, same ordering (blocking first, then birth order) the mechanical
+ * gate has always used; factoring it out means `stageLookup` answers through IDENTICAL chokepoint
+ * semantics rather than a second copy of this SQL that could silently drift from this one.
  *
  * `withBody` — SELECT `c.body` or not. gateInternal (the always-on mechanical fire path) passes
  * `false`: it maps every row through `toGateRule`, which never reads body, so fetching and
@@ -2413,7 +2379,7 @@ function countLiveStages(db: StoragePort, circle: string): number {
   return row.n;
 }
 
-/** gateQuery's own delivery shape: title + reason, NEVER the body — see GateRule's own comment. */
+/** The gate's own delivery shape: title + reason, NEVER the body — see GateRule's own comment. */
 function toGateRule(row: BindingJoinRow): GateRule {
   return {
     conceptId: row.concept_id,
@@ -2561,18 +2527,17 @@ export function commitGateWrites(db: StoragePort, pending: PendingGateWrites, ne
 /**
  * `*` is the breadth marker on a rule BINDING (BREADTH_CIRCLE's own comment), never a selectable
  * circle a QUERY can be scoped to — refused at every gate-query entrance (Codex round 6, item 2), one
- * shared message so the three call sites cannot drift apart. `RULE_LIVENESS_WHERE`'s own
- * `(b.circle = ? OR b.circle = '*')` (and evaluateGateFromMirror's identical JS-side twin) degenerates
- * to matching ONLY global rules the instant `?` itself is bound to '*' — both halves of the OR become
+ * shared message so the call sites cannot drift apart. `RULE_LIVENESS_WHERE`'s own
+ * `(b.circle = ? OR b.circle = '*')` degenerates to matching ONLY global rules the instant `?`
+ * itself is bound to '*' — both halves of the OR become
  * the identical clause — silently dropping every LOCAL rule the caller actually meant to ask about,
  * including a local DENY. Reachable only via a direct argument (a pre-breadth `MONET_CIRCLE=*` config,
  * or any caller passing '*' straight through): `resolveCircle` can never PRODUCE '*' from an ordinary
  * circle name post-migration (round 4, item 4 — no alias can ever hold '*' on either side once a
  * store has been through it), so this is not a resolution bug to fix upstream, it is an input this
  * layer must refuse outright rather than silently misinterpret. Called from gateInternal and
- * evaluateStageLookup (both exported wrappers — gateQuery/stageLookup — and MonetCore's own
- * gate()/stageLookup() funnel through these unchanged, so checking here covers all of them) and from
- * evaluateGateFromMirror directly (the offline evaluator has no shared internal to funnel through).
+ * evaluateStageLookup — the two shared internals `evaluateGate`, the exported `stageLookup`, and
+ * MonetCore's own gate()/stageLookup() all funnel through, so checking here covers every entrance.
  */
 function assertQueryableCircle(circle: string): void {
   if (circle === BREADTH_CIRCLE) {
@@ -2702,11 +2667,11 @@ export interface LiveStageIndexResult {
  * the design requires, and reached through the SAME chokepoint rather than a parallel liveness
  * predicate.
  *
- * NOT model-tag filtered, unlike gateQuery/stageLookup's actual rule DELIVERY: the index is a
+ * NOT model-tag filtered, unlike the gate's and stageLookup's actual rule DELIVERY: the index is a
  * stable map ("recognizing which named moment you are in"), and making stage NAMES flicker with
  * whichever model happens to be running would defeat the one property recognition depends on —
  * that the map does not move under the agent. `liveStageNamesCapped`'s own `null` model-tag params
- * are exactly gateQuery's own documented meaning for an omitted runtime tag ("every agent-scoped
+ * are exactly the gate's own documented meaning for an omitted runtime tag ("every agent-scoped
  * rule still fires"), used here as the deliberate, permanent choice for the index rather than a
  * caller's fallback.
  *
@@ -2798,8 +2763,8 @@ export function evaluateStageLookup(
     };
   }
 
-  // SAME CHOKEPOINT SEMANTICS AS gateQuery: liveness, circle, model-tag filter, parent principle —
-  // rulesForStages is the one query both matchers deliver through. withBody: true — this is the
+  // SAME CHOKEPOINT SEMANTICS AS THE MECHANICAL GATE: liveness, circle, model-tag filter, parent
+  // principle — rulesForStages is the one query both matchers deliver through. withBody: true — this is the
   // ONLY caller that needs it, because toStageLookupRule is the only mapper that reads it (the
   // capability invocation payload).
   //
@@ -2864,9 +2829,9 @@ export function evaluateStageLookup(
 /**
  * THE RECOGNIZED MATCHER. The agent NAMES a stage — no trigger-pattern matching, no fuzzy or
  * embedding search: recognition is the agent's own act against the resident stage index, and this
- * is a lookup against it. Delivers through the SAME chokepoint semantics as gateQuery (liveness,
- * circle scope, model-tag filtering, parent principle) plus the one payload gateQuery never
- * carries: each rule's `body`, the capability invocation, spent here because this is agent-
+ * is a lookup against it. Delivers through the SAME chokepoint semantics as the mechanical gate
+ * (liveness, circle scope, model-tag filtering, parent principle) plus the one payload that gate
+ * never carries: each rule's `body`, the capability invocation, spent here because this is agent-
  * initiated pull at the moment of need rather than an always-on injection.
  *
  * ADVISORY-ONLY BY DESIGN: severity is delivered as information — a blocking rule appears with its
@@ -2882,7 +2847,8 @@ export function evaluateStageLookup(
  * would corrupt exactly that count.
  *
  * The standalone form — evaluateStageLookup + commitGateWrites in one call, for a caller with no
- * transaction of its own (same relationship gateQuery has to evaluateGate/commitGateWrites).
+ * transaction of its own; the split form is `evaluateStageLookup` + `commitGateWrites`, exactly as
+ * the mechanical gate splits into `evaluateGate` + `commitGateWrites`.
  * MonetCore.stageLookup() uses the split form directly, for the same reason MonetCore.gate() does.
  *
  * TRANSACTION-WRAPPED, mirroring MonetCore.stageLookup() (engine.ts) EXACTLY (review fix — Codex
@@ -2966,8 +2932,8 @@ export function gateCoverage(db: StoragePort, opts: GateCoverageOptions): GateCo
   // `unexplainedDenies` (below) both embed `(b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')` —
   // RULE_LIVENESS_WHERE's own collapsed-OR shape, restated inline at each — which degenerates to
   // "global rules only" the instant `opts.circle` itself is `'*'`, per `assertQueryableCircle`'s own
-  // doc comment. Round 6 swept `gateInternal`/`evaluateStageLookup`/`evaluateGateFromMirror`, every
-  // caller of `RULE_LIVENESS_WHERE` at the time — but `gateCoverage` was written with its own two
+  // doc comment. Round 6 swept `gateInternal`/`evaluateStageLookup`, every caller of
+  // `RULE_LIVENESS_WHERE` at the time — but `gateCoverage` was written with its own two
   // hand-rolled copies of the same predicate rather than the shared constant, so it never appeared
   // in that sweep's own search surface. An unguarded `gateCoverage('*')` silently reported ZERO local
   // retirement candidates and ZERO local unexplained denies for circle '*' — not an empty result
@@ -3081,19 +3047,19 @@ export function gateCoverage(db: StoragePort, opts: GateCoverageOptions): GateCo
     ...(retirementCandidatesOmitted > 0 ? { retirementCandidatesOmitted } : {}),
     // Deliberately NOT filtered by runtime model tag: a compensation for another model still holds
     // deny power the moment that model runs, and a count that hid it would report zero on exactly
-    // the machine best placed to repair it. Same liveness predicate the gate and the sidecar use.
+    // the machine best placed to repair it. Same liveness predicate the gate uses.
     // THE PREDICATE IS NOT IN THE SQL, on purpose. It was, as `TRIM(b.reason) = ''` — and SQLite's
     // one-argument TRIM strips ORDINARY SPACES ONLY, while `hasNoReason` uses JS trim() and catches
     // tabs and newlines. A peer relaying "\t\n" therefore produced `reasonMissing: true` on the
-    // delivered rule and on the sidecar entry while this list stayed EMPTY and the overview's repair
-    // section stayed suppressed: a bare deny firing with nothing telling the human it exists. That
+    // delivered rule while this list stayed EMPTY and the overview's repair section stayed
+    // suppressed: a bare deny firing with nothing telling the human it exists. That
     // is exactly the cross-surface disagreement `hasNoReason` was introduced to prevent, reappearing
     // in the one surface that had not been made to share it.
     //
     // So SQL narrows to the live denies and TypeScript asks the question — ONE implementation, no
     // equivalence to maintain between two dialects' idea of whitespace. The scan is bounded by the
-    // blocking population, which is the same set materializeGateMirror already walks (as a subset of
-    // every live rule) on every declaration, so this is not a new order of work.
+    // blocking population — a strict subset of the live rules the gate already walks — so this is
+    // not a new order of work.
     unexplainedDenies,
     ...(unexplainedDeniesAll.length > unexplainedDenies.length
       ? { unexplainedDeniesOmitted: unexplainedDeniesAll.length - unexplainedDenies.length }

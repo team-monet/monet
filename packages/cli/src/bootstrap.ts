@@ -10,12 +10,11 @@ export interface ServedCoreOptions {
   defaultCircle: string;
   /**
    * Where the governed-moment spool is appended — the append-only record every writer can reach,
-   * including the standalone hook wrapper, which can open no store.
+   * including one that opens no store at all.
    *
-   * OPTIONAL for the same reason `gateSidecarPath` above is, and on the same terms:
-   * `MonetCoreOptions.momentSpoolPath` has NO DEFAULT in engine.ts, deliberately, so that no core
-   * built by a test or a one-off script appends into a real store. A caller that omits it gets a
-   * no-op; the two callers of THIS function pass it UNCONDITIONALLY.
+   * OPTIONAL, on deliberate terms: `MonetCoreOptions.momentSpoolPath` has NO DEFAULT in engine.ts,
+   * deliberately, so that no core built by a test or a one-off script appends into a real store. A
+   * caller that omits it gets a no-op; the two callers of THIS function pass it UNCONDITIONALLY.
    *
    * WHY IT MUST BE DECLARED HERE, and this is not a formality (monet-client#75): `openServedCore`
    * spreads this interface into `new MonetCore(...)`, so an option ABSENT FROM THIS TYPE never
