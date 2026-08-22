@@ -9,8 +9,7 @@ import {
 } from "@team-monet/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openServedCore, openStatusCore } from "../bootstrap";
-import { ensureMonetDir, getDbPath, getGateMirrorPath } from "../db/index";
-import { defaultGateCliDependencies } from "../gate-cli";
+import { ensureMonetDir, getDbPath } from "../db/index";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
@@ -80,122 +79,14 @@ describe("client core bootstrap", () => {
     expect(selectEmbedder).toHaveBeenCalledWith(dbPath);
   });
 
-  // ── Component B (4b-D): mirror freshness — the served core is the one writer surface ─────────
-
-  it("a served core constructed with gateSidecarPath materializes the mirror after a declare", async () => {
-    const savedStorageDir = process.env.MONET_STORAGE_DIR;
-    // getGateMirrorPath()'s default resolution (db/index.ts) checks MONET_STORAGE_DIR first —
-    // the most direct lever to point it at this test's own tmp dir without touching the real
-    // ~/.monet, matching circle.test.ts's own established convention for this exact override.
-    process.env.MONET_STORAGE_DIR = dir;
-    try {
-      const mirrorPath = getGateMirrorPath();
-      expect(mirrorPath).toBe(join(dir, "gate-mirror.json"));
-      expect(existsSync(mirrorPath)).toBe(false);
-
-      // A fake, fast selectEmbedder — matching this file's OWN established pattern (see
-      // "served bootstrap surfaces the typed fresh-store fallback error" above): the REAL
-      // default (chooseStoreEmbedder) attempts to load the actual MiniLM model, which is slow
-      // and environment-dependent (network/model-cache), not what this test is about.
-      const core = await openServedCore(
-        ":memory:",
-        { scopeContext: dir, defaultCircle: "test-circle", gateSidecarPath: mirrorPath },
-        async () => new HashingEmbeddingProvider(),
-      );
-      // CONSTRUCTION ITSELF already refreshes the mirror (core's own generation-bump contract —
-      // this test only supplies WHERE): a fresh store's mirror is "missing" per inspectSidecar,
-      // which is stale, so the core writes an EMPTY mirror immediately rather than waiting for
-      // the first mutation. That is correct and desirable — starting `monet start` alone now
-      // establishes a mirror (even an empty one) instead of leaving none until something is
-      // declared — so this test pins THAT too, not just the post-declare content.
-      expect(existsSync(mirrorPath)).toBe(true);
-      const empty = JSON.parse(readFileSync(mirrorPath, "utf8")) as { entries: unknown[] };
-      expect(empty.entries).toEqual([]);
-
-      await core.declare({
-        species: "rule",
-        stage: "git force push",
-        patterns: ["Bash:git push --force"],
-        content: "Never force-push to main.",
-        severity: "blocking",
-        scope: "domain",
-        reason: "a rewritten history cannot be recovered from a teammate's clone",
-      });
-      core.close();
-
-      expect(existsSync(mirrorPath)).toBe(true);
-      const mirror = JSON.parse(readFileSync(mirrorPath, "utf8")) as {
-        entries: Array<{ text: string; severity: string; reason: string | null }>;
-      };
-      expect(mirror.entries).toHaveLength(1);
-      expect(mirror.entries[0]).toMatchObject({
-        text: "Never force-push to main",
-        severity: "blocking",
-        reason: "a rewritten history cannot be recovered from a teammate's clone",
-      });
-    } finally {
-      if (savedStorageDir !== undefined) process.env.MONET_STORAGE_DIR = savedStorageDir;
-      else delete process.env.MONET_STORAGE_DIR;
-    }
-  });
-
-  it("a served core constructed WITHOUT gateSidecarPath never writes a mirror (today's behavior, unchanged for any caller that omits it)", async () => {
-    const mirrorPath = join(dir, "gate-mirror.json");
-    const core = await openServedCore(
-      ":memory:",
-      {
-        scopeContext: dir,
-        defaultCircle: "test-circle",
-        // gateSidecarPath deliberately omitted.
-      },
-      async () => new HashingEmbeddingProvider(),
-    );
-    await core.declare({
-      species: "rule",
-      stage: "git force push",
-      patterns: ["Bash:git push --force"],
-      content: "Never force-push to main.",
-      severity: "blocking",
-      scope: "domain",
-      reason: "a rewritten history cannot be recovered from a teammate's clone",
-    });
-    core.close();
-    expect(existsSync(mirrorPath)).toBe(false);
-  });
-
-  // ── #75: the gate journal — the served core is the one writer surface for the MCP mouths ───────
-
-  it("a served core constructed WITHOUT gateJournalPath writes no journal (today's behavior, unchanged for any caller that omits it)", async () => {
-    const journalPath = join(dir, "gate-journal.jsonl");
-    const core = await openServedCore(
-      ":memory:",
-      {
-        scopeContext: dir,
-        defaultCircle: "test-circle",
-        // gateJournalPath deliberately omitted — the no-default stance that keeps a test or a
-        // one-off script from appending into a real store.
-      },
-      async () => new HashingEmbeddingProvider(),
-    );
-    await core.declare({
-      species: "rule",
-      stage: "git force push",
-      patterns: ["Bash:git push --force"],
-      content: "Never force-push to main.",
-      severity: "blocking",
-      scope: "domain",
-      reason: "a rewritten history cannot be recovered from a teammate's clone",
-    });
-    core.stageLookup({ stage: "git force push" });
-    core.close();
-    expect(existsSync(journalPath)).toBe(false);
-  });
 });
 
-// ── #75: the shipped server never wired the gate journal, so every MCP-originated gate call went
-// unrecorded — and there are TWO launch paths of that one server, so wiring either alone leaves
-// journaling dependent on which one a host happens to spawn ─────────────────────────────────────
-describe("FIX 1: served core store/mirror project pairing", () => {
+// ── #75: ONE server, TWO launch paths, and a store that must follow the project either way. The
+// original defect was a served core whose own dbPath did not follow the resolved project dir that
+// a sibling path already did, so which project a session wrote to depended on how it was spawned.
+// The sibling was the gate mirror, removed with the gate; the pairing it exposed is the subject
+// that survives, and it is a property of dbPath alone now ───────────────────────────────────────
+describe("FIX 1: a served core's store follows its project dir", () => {
   let dirA: string;
   let dirB: string;
 
@@ -209,16 +100,14 @@ describe("FIX 1: served core store/mirror project pairing", () => {
     rmSync(dirB, { recursive: true, force: true });
   });
 
-  it("a declaration through a served core whose store AND mirror are BOTH rooted at the same project dir lands in that project's mirror only — a DIFFERENT project's store stays untouched", async () => {
+  it("a declaration through a served core whose store is rooted at a project dir lands in that project's store only — a DIFFERENT project's store stays untouched", async () => {
     // Simulates: MONET_PROJECT_DIR=dirA, cwd=dirB, both with their own project-local .monet dirs
     // (the coordinator's own test shape) — dbPathA/dbPathB stand in for what getDbPath(dirA) and
-    // getDbPath(dirB) would each resolve to; mirrorPathA for getGateMirrorPath(dirA). The FIX
-    // (cli.ts:61/index.ts:28) is that the served core's OWN dbPath argument now follows the SAME
-    // resolved project dir the mirror path already did — reproduced directly here by passing BOTH
-    // rooted at dirA, never mixing in dirB anywhere in this core's own construction.
+    // getDbPath(dirB) would each resolve to. The FIX (cli.ts/index.ts) is that the served core's
+    // OWN dbPath argument follows the resolved project dir — reproduced directly here by passing
+    // it rooted at dirA, never mixing in dirB anywhere in this core's own construction.
     const dbPathA = join(dirA, "monet.db");
     const dbPathB = join(dirB, "monet.db");
-    const mirrorPathA = join(dirA, "gate-mirror.json");
 
     // B's store: created and left with zero concepts, to prove A's session never reaches it.
     const coreB = await openServedCore(
@@ -228,25 +117,18 @@ describe("FIX 1: served core store/mirror project pairing", () => {
     );
     coreB.close();
 
-    // A's served core: dbPath AND gateSidecarPath BOTH rooted at dirA — the fix, exercised
-    // directly.
+    // A's served core: dbPath rooted at dirA — the fix, exercised directly.
     const coreA = await openServedCore(
       dbPathA,
-      { scopeContext: dirA, defaultCircle: "circle-a", gateSidecarPath: mirrorPathA },
+      { scopeContext: dirA, defaultCircle: "circle-a" },
       async () => new HashingEmbeddingProvider(),
     );
     await coreA.declare({
-      species: "rule", stage: "git force push", patterns: ["Bash:git push --force"],
+      species: "rule", stage: "git force push",
       content: "Never force-push to main.", severity: "blocking", scope: "domain",
       reason: "declared through A's served core — must land in A's mirror, never B's store",
     });
     coreA.close();
-
-    // A's mirror carries the declaration (materialized FROM A's own store).
-    expect(existsSync(mirrorPathA)).toBe(true);
-    const mirror = JSON.parse(readFileSync(mirrorPathA, "utf8")) as { entries: Array<{ text: string }> };
-    expect(mirror.entries).toHaveLength(1);
-    expect(mirror.entries[0].text).toBe("Never force-push to main");
 
     // B's store: still zero concepts — A's session never touched it (opened fresh, independent
     // connection, to prove this from a clean read rather than trusting coreB's own in-memory state).
@@ -367,12 +249,10 @@ describe("P1-1: ensureMonetDir(baseDir) roots the CREATED directory at baseDir, 
     }
   });
 
-  it("source regression guard: cli.ts's `start` action, index.ts's stdio entry, and install-cli.ts's runInstall all call ensureMonetDir WITH the resolved project dir, never bare, at their own fixed call site", () => {
+  it("source regression guard: cli.ts's `start` action and index.ts's stdio entry both call ensureMonetDir WITH the resolved project dir, never bare, at their own fixed call site", () => {
     const cliSource = readFileSync(join(REPO_ROOT, "src/cli.ts"), "utf8");
     const indexSource = readFileSync(join(REPO_ROOT, "src/index.ts"), "utf8");
-    const installSource = readFileSync(join(REPO_ROOT, "src/install-cli.ts"), "utf8");
     expect(cliSource).toContain("ensureMonetDir(projectDir);");
     expect(indexSource).toContain("ensureMonetDir(projectDir);");
-    expect(installSource).toContain("deps.ensureMonetDir(target.projectDir);");
   });
 });

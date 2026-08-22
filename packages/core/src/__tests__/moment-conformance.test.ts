@@ -20,7 +20,7 @@ import { MonetCore } from "../engine";
 import { registerMonetCoreTools } from "../mcp-server";
 import { BetterSqlitePort } from "../storage";
 import type { StoragePort } from "../storage";
-import { UnknownMomentError, momentConformance, momentCounts, momentsOwingAQuestion } from "../moment-ledger";
+import { UnknownMomentError, momentConformance, momentsOwingAQuestion } from "../moment-ledger";
 
 const dirs: string[] = [];
 const ports: StoragePort[] = [];
@@ -73,6 +73,25 @@ function coreWithSpool(spoolPath: string): MonetCore {
   const core = new MonetCore(":memory:", { momentSpoolPath: spoolPath, defaultCircle: "acme-widgets" });
   cores.push(core);
   return core;
+}
+
+/**
+ * One live rule at `stage`, so a `stage_lookup` of that stage DELIVERS something.
+ *
+ * The key and its instruction ship only on a response that actually carried a rule (mcp-server.ts),
+ * so a test asserting on either has to look up a stage that has one. The rule's own wording stays
+ * clear of every needle the assertions count — `conformance_ask`, `followed these rules` — because
+ * one of them counts occurrences across the whole payload, and rule text lands in that payload.
+ */
+async function declareRuleAt(core: MonetCore, stage: string): Promise<void> {
+  await core.declare({
+    species: "rule",
+    stage,
+    content: "Check with the branch owner first.",
+    severity: "advisory",
+    scope: "domain",
+    circle: "acme-widgets",
+  });
 }
 
 describe("the four states, kept apart", () => {
@@ -240,6 +259,11 @@ describe("the ask and the answer attach to a moment that exists", () => {
  *
  * So these tests are as much about what it does NOT say as what it does: no rule content, no action
  * rendering, nothing on the overwhelming majority of responses, and never twice for one moment.
+ *
+ * THEY DRIVE `stage_lookup`, NOT `memory_search`, AND THAT IS THE POINT OF ONE OF THEM. The signal
+ * used to ride every tool response; it now rides the ONE response that hands the agent rules,
+ * because that is the only place the instruction has context to attach to. Written against
+ * `memory_search`, these tests would now be asserting silence and calling it delivery.
  */
 describe("the signal that tells the agent it owes a question", () => {
   async function pair(core: MonetCore): Promise<{ client: Client; cleanup: () => Promise<void> }> {
@@ -260,12 +284,49 @@ describe("the signal that tells the agent it owes a question", () => {
   it("says nothing at all when nothing is owed", async () => {
     const path = join(mkTmp(), "moments.jsonl");
     const core = coreWithSpool(path);
+    // A DELIVERING LOOKUP, for the same reason the key-and-instruction round already moved its
+    // sibling below off an arbitrary miss: the signal now ships only where the instruction that
+    // explains it ships, and that is a lookup that actually handed over a rule. Asserted on a miss,
+    // this would be silent whatever the debt was — silence proving nothing, which is the exact
+    // green-that-cannot-fail these tests are written against.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
-      const result = await client.callTool({ name: "memory_search", arguments: { query: "anything" } });
+      // Asserted on the surface that CAN speak. On any other tool this would be trivially silent
+      // and would prove nothing about the debt being empty.
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       // SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so the ordinary
       // response carries no Monet instruction whatsoever.
       expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("rides stage_lookup and no other tool, even with a debt standing", async () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const core = coreWithSpool(path);
+    seq = 0;
+    readAndActed(path, "owed-one");
+    // DELIVERING, not a miss — see the first test in this block.
+    await declareRuleAt(core, "git force push");
+    const { client, cleanup } = await pair(core);
+    try {
+      // The debt is real and unpaid — the same fixture the next test finds the signal for.
+      expect(core.momentsOwingAQuestion(10)).toEqual(["owed-one"]);
+      // ...and an ordinary tool response still says nothing about it. The agent is told to collect
+      // confirmations where it is being handed rules; on a `memory_search` reply there is no rule
+      // in front of it and the instruction is an interruption with nothing to attach to.
+      for (const call of [
+        { name: "memory_search", arguments: { query: "anything" } },
+        { name: "memory_overview", arguments: {} },
+      ]) {
+        const result = await client.callTool(call);
+        expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
+      }
+      // The same debt, on the one surface that carries it.
+      const lookup = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
+      expect(texts(lookup).some((text) => text.includes("owed-one"))).toBe(true);
     } finally {
       await cleanup();
     }
@@ -276,25 +337,74 @@ describe("the signal that tells the agent it owes a question", () => {
     const core = coreWithSpool(path);
     seq = 0;
     readAndActed(path, "owed-one");
+    // A DELIVERING LOOKUP, because the key and its instruction only ship when the response actually
+    // carried a rule. This used to look up "nothing-here" — an arbitrary miss — and still expect the
+    // instruction, which was the defect: the agent was told to ask about "these rules" when none
+    // were on the response, and the `conformance_ask` it named would have been refused outright.
+    // The miss was never this test's subject; the debt it asserts on comes from `readAndActed`
+    // above, not from the lookup.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
-      const result = await client.callTool({ name: "memory_search", arguments: { query: "anything" } });
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       const signal = texts(result).find((text) => text.includes("Monet: you read a rule"));
       expect(signal).toBeDefined();
-      // An instruction naming a moment...
+      // A signal naming a moment...
       expect(signal).toContain("owed-one");
-      // BOTH tools named: the ask is its own event, and a signal that omits it produces the F2 defect
-    // where an obedient agent is counted as having never asked.
-    expect(signal).toContain("conformance_ask");
-    expect(signal).toContain("conformance_answer");
+      // BOTH tools are still named on this response — on the `instruction` field that now ships
+      // beside the key on every lookup, rather than in the signal that used to be the only thing
+      // saying either. The naming had to survive that move, not be dropped by it: the ask is its own
+      // event, and an instruction that omits it produces the F2 defect where an obedient agent is
+      // counted as having never asked.
+      const instruction = (JSON.parse(texts(result)[0]) as { instruction?: string }).instruction;
+      expect(instruction).toContain("conformance_ask");
+      expect(instruction).toContain("conformance_answer");
       // ...and NOT a payload carrying it. The agent already has the action in its own transcript;
       // re-sending it would be paying context to tell the model what it just did.
       expect(signal).not.toContain("terraform apply");
       expect(signal).not.toContain("rule-a");
       // And the wording asks whether the action FOLLOWED the rule — never whether the rule caused
-      // it, which is unobservable and is not what this measures.
-      expect(signal).toContain("follow the rule");
+      // it, which is unobservable and is not what this measures. The signal keeps the same line for
+      // its own half of the sentence: read a rule, then acted.
+      expect(instruction).toContain("followed these rules");
+      expect(instruction?.toLowerCase()).not.toContain("because of");
       expect(signal?.toLowerCase()).not.toContain("because of");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("says each thing once when the standing instruction and the debt signal ride the same response", async () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const core = coreWithSpool(path);
+    seq = 0;
+    readAndActed(path, "owed-one");
+    // Delivering, for the reason the previous test states: both halves can only ride one response
+    // if the response is one that carries a rule at all.
+    await declareRuleAt(core, "git force push");
+    const { client, cleanup } = await pair(core);
+    try {
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
+      const parts = texts(result);
+      // BOTH halves are on this one response: the standing instruction, which ships with the key on
+      // every lookup, and the debt signal, which fires only because a moment is outstanding.
+      const instruction = (JSON.parse(parts[0]) as { instruction?: string }).instruction;
+      expect(instruction).toContain("conformance_ask");
+      const signal = parts.find((text) => text.includes("Monet: you read a rule"));
+      expect(signal).toContain("owed-one");
+
+      // AND NEITHER IS A SECOND COPY OF THE OTHER. They carry different facts — what asking means,
+      // and which earlier ids still need it — so the tool names, the key, and the question each
+      // appear exactly ONCE across the whole payload. Two overlapping notices would be the same
+      // context cost paid twice on the one response that already carries the most.
+      const payload = parts.join("\n");
+      const occurrences = (needle: string): number => payload.split(needle).length - 1;
+      expect(occurrences("conformance_ask")).toBe(1);
+      expect(occurrences("conformance_answer")).toBe(1);
+      expect(occurrences("followed these rules")).toBe(1);
+      // Stated from the signal's side too, so a failure says which half grew the duplicate.
+      expect(signal).not.toContain("conformance_ask");
+      expect(signal).not.toContain("conformance_answer");
     } finally {
       await cleanup();
     }
@@ -305,11 +415,13 @@ describe("the signal that tells the agent it owes a question", () => {
     const core = coreWithSpool(path);
     seq = 0;
     readAndActed(path, "owed-one");
+    // DELIVERING on both calls — see the first test in this block.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
-      const first = await client.callTool({ name: "memory_search", arguments: { query: "a" } });
+      const first = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       expect(texts(first).some((t) => t.includes("owed-one"))).toBe(true);
-      const second = await client.callTool({ name: "memory_search", arguments: { query: "b" } });
+      const second = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       // ANNOUNCE-ONCE WAS WRONG, and this assertion is its reversal. The signal rides as a secondary
       // content item; a host that exposes only content[0] shows it to nobody, and marking it
       // delivered anyway then counting the silence as `notAsked` is the conflation between "ignored
@@ -327,62 +439,22 @@ describe("the signal that tells the agent it owes a question", () => {
     const core = coreWithSpool(path);
     seq = 0;
     readAndActed(path, "owed-one");
+    // DELIVERING, and here that is the whole premise rather than a detail. This test is named for an
+    // IGNORED signal, so a miss lookup — which no longer carries one — would leave it asserting that
+    // a signal nobody was shown was ignored: true, and about nothing.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
-      await client.callTool({ name: "memory_search", arguments: { query: "a" } });
+      const shown = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
+      // THE SIGNAL WAS SHOWN, asserted rather than assumed — and then the agent did not act on it.
+      expect(texts(shown).some((t) => t.includes("owed-one"))).toBe(true);
     } finally {
       await cleanup();
     }
-    // Announcing once is safe precisely BECAUSE ignoring it is mechanically detectable.
-    expect(momentConformance(db, path, "acme-widgets").notAsked).toBe(1);
-  });
-});
-
-/**
- * THE RATE COUNTERS, rebuilt on the moment. These replace what gate_events used to answer, and the
- * one thing that must not regress is the split: `silences` is a claim that a gate LOOKED and found
- * nothing bound, so a moment nothing evaluated may never land in it.
- */
-describe("what the gate did, counted", () => {
-  it("keeps 'nothing evaluated this' out of 'nothing governs this'", () => {
-    const path = join(mkTmp(), "moments.jsonl");
-    const db = mkDb();
-    seq = 0;
-    const moment = (id: string, ruleIds: string[] | null, disposition: string, delivered: string[] | null): void => {
-      line(path, {
-        kind: "interception", momentId: id, at: "2026-08-19T00:00:00.000Z", toolUseId: null, circle: "acme-widgets",
-        sessionId: null, surface: "Bash", actionSha256: "a".repeat(64), actionRendering: "x",
-        actionChars: 1, actionClipped: false, stageId: null, ruleIds, disposition,
-        deliveredRuleIds: delivered,
-      });
-    };
-    moment("fired", ["rule-a"], "advised", []);
-    moment("blocked", ["rule-b"], "blocked", ["rule-b"]);
-    moment("quiet", [], "silent", []);
-    moment("store-call", null, "ungoverned", null); // no gate evaluates a call into the store
-
-    const counts = momentCounts(db, path, "acme-widgets");
-    expect(counts).toEqual({
-      fires: 2, silences: 1, ungoverned: 1, delivered: 1, total: 4, unopened: 0, unattributed: 0,
-    });
-    // The store call is NOT a silence: reporting it as one would say "nothing governs this action"
-    // about an action no rule set was ever consulted about.
-    expect(counts.silences).toBe(1);
-  });
-
-  it("does not count an advisory as delivered, because no rule id was sent", () => {
-    const path = join(mkTmp(), "moments.jsonl");
-    const db = mkDb();
-    seq = 0;
-    line(path, {
-      kind: "interception", momentId: "advised-one", at: "2026-08-19T00:00:00.000Z", toolUseId: null, circle: "acme-widgets",
-      sessionId: null, surface: "Bash", actionSha256: "a".repeat(64), actionRendering: "x",
-      actionChars: 1, actionClipped: false, stageId: "s1", ruleIds: ["rule-a"],
-      disposition: "advised", deliveredRuleIds: [],
-    });
-    const counts = momentCounts(db, path, "acme-widgets");
-    expect(counts.fires).toBe(1);
-    // Receipt cannot be claimed for an identity that was never sent.
-    expect(counts.delivered).toBe(0);
+    // TWO, and both are the same defect: the seeded debt the agent ignored, plus this lookup's own
+    // moment, which delivered a rule and was likewise never asked about. The count is what makes
+    // ignoring the signal mechanically detectable, which is what lets the signal be a notice rather
+    // than an enforcement.
+    expect(momentConformance(db, path, "acme-widgets").notAsked).toBe(2);
   });
 });

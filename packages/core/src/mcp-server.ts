@@ -170,14 +170,75 @@ const MOMENT_ID_MAX_CHARS = 36;
  */
 const ASK_SIGNAL_MAX_MOMENTS = 8;
 
+/**
+ * WHAT THE KEY IS FOR — the one line that rides beside `momentId` on every `stage_lookup` response
+ * that has one.
+ *
+ * WHO CONSUMES IT — the agent, and nobody else. ON WHICH TURN — every `stage_lookup` that returns a
+ * `momentId`, including the first of a session. WHAT BREAKS WITHOUT IT — the response hands over a
+ * key with nothing saying what to do with it. The ask signal cannot cover this: it fires only once a
+ * moment already owes a question, so a first lookup carries the key and no instruction at all, and
+ * no standing text mentions this loop either.
+ *
+ * UNCONDITIONAL, WHICH THE SIGNAL IS NOT. The signal is debt-driven and names ids; this says what
+ * the ids are for. That split is why the two do not overlap — the signal states a fact (these
+ * moments still owe the question), this states the instruction (what asking and recording means),
+ * and neither repeats the other.
+ *
+ * IT ASKS WHETHER THE ACTION FOLLOWED THE RULE, never whether the rule CAUSED it — causation is
+ * unobservable and is not what this measures. Same discipline as the ask signal's own wording.
+ *
+ * ONE LINE, AND BOTH TOOLS NAMED. It ships on every lookup, so every word is paid for repeatedly:
+ * what to do, the two tools, the key they take, and nothing else. Naming only `conformance_answer`
+ * would leave an obedient agent's `asked_at` null and count it as a defect it did not commit.
+ */
+const CONFORMANCE_INSTRUCTION =
+  "After you act, ask the user whether the action followed these rules — conformance_ask with this momentId when you put the question, then conformance_answer with their reply.";
+
+/**
+ * WHERE A `not-followed` GOES NEXT — the one line that rides on `conformance_answer` and only when
+ * the user's answer was `not-followed`.
+ *
+ * WHO CONSUMES IT — the agent, and nobody else. ON WHICH TURN — the turn a `not-followed` is
+ * recorded, and no other. WHAT BREAKS WITHOUT IT — the record gains a `not-followed` tally entry
+ * and the loop stops there: nothing says which of the moment's rules was broken, and the one thing
+ * that should come of a rule being broken repeatedly — changing it, or retiring it — has no
+ * prompt and no home.
+ *
+ * NOT A NOTE FIELD BESIDE THE ANSWER. The owner ruled that out: the result of a rule not being
+ * followed belongs on the RULE, whose record already carries authorship, succession and
+ * retirement. A `why` column here would be a dead end nothing reads and nothing acts on.
+ *
+ * ONLY ON `not-followed`, WHICH IS WHY IT IS NOT PART OF `CONFORMANCE_INSTRUCTION`. A `followed`
+ * answer has nothing to follow up, and asking anyway is pure context cost on the arm that is
+ * supposed to be silent. Minimization: the signal's absence is itself the signal.
+ *
+ * IT ASKS WHICH RULE, IT DOES NOT GUESS. A moment's `rule_reads` normally holds several rules, so
+ * neither this response nor the agent can tell which one the user meant; recording against all of
+ * them would manufacture a verdict against rules that were followed. The user names it.
+ *
+ * THE WORDING KEEPS THE SAME DISCIPLINE as `CONFORMANCE_INSTRUCTION`: it says the action did not
+ * follow the rule, never that the rule failed to cause it — causation is unobservable and is not
+ * what this measures.
+ *
+ * NO TOOL NAMES, DELIBERATELY, unlike `CONFORMANCE_INSTRUCTION`'s two. There the tools ARE the
+ * instruction — no other surface records the fourth fact. Here the destination is a rule's own
+ * record, which the agent already knows how to reach; a call sequence baked in would be a copy of
+ * a procedure that rots the first time the surface moves.
+ *
+ * SIZE: this response has no fit loop and needs none. Every field on it is statically bounded —
+ * `recorded` is a literal, `answer` is a two-value enum, `momentId` is capped at
+ * MOMENT_ID_MAX_CHARS, and this line is a compile-time constant — so the whole envelope is a few
+ * hundred characters against RESULT_MAX_CHARS (40 000) and cannot grow with the store.
+ */
+const NOT_FOLLOWED_INSTRUCTION =
+  "Ask the user which of the rules read at this moment was not followed, and record what comes of that — a change to the rule, or its retirement — on that rule's own record.";
+
 const RESULT_TRUNCATE_NOTE = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
 const RECALL_EMPTY_LINE = "Nothing matched.";
 /** Circle names are routing identifiers, not prose; bound every caller-controlled echo before writes. */
 export const CIRCLE_NAME_MAX_CHARS = 256;
 const WRITE_ACK_LIST_MAX = 25;
-const STAGE_ACK_PATTERNS_MAX = 8;
-const STAGE_ACK_TOKEN_MAX_CHARS = 80;
-const STAGE_ACK_PATTERN_MAX_CHARS = 300;
 const WRITE_ACK_TEXT_MAX_CHARS = 1_000;
 const ANOMALOUS_STORE_RESOLUTION_MODES = new Set([
   "ambiguous-fork",
@@ -203,65 +264,13 @@ function fitRuleSuccessionForAck(succession: RuleSuccession): Record<string, unk
   };
 }
 
-function fitStageViewForAck(stage: StageView): Record<string, unknown> {
-  const fitted = stage.patterns.slice(0, STAGE_ACK_PATTERNS_MAX).map((pattern) => ({
-    tool: pattern.tool === null ? null : clip(pattern.tool, STAGE_ACK_TOKEN_MAX_CHARS).text,
-    tokens: pattern.tokens.map((token) => clip(token, STAGE_ACK_TOKEN_MAX_CHARS).text),
-  }));
-  return {
-    ...stage,
-    name: clip(stage.name, WRITE_ACK_TEXT_MAX_CHARS).text,
-    patterns: fitted,
-    ...(stage.patterns.length > fitted.length ? { patternsOmitted: stage.patterns.length - fitted.length } : {}),
-  };
-}
-
 /**
- * The declare-time firing test's finding, rendered for the one channel a caller cannot skim past
- * (monet-client#59).
- *
- * WHY THIS IS GUIDANCE AND NOT JUST AN ADVISORY ENTRY: the write went through — sovereignty, and
- * that is correct — so the only thing standing between the author and a gate that never fires is
- * whether they read this. A rule the user believes protects them and does not is the same class of
- * surprise as a silently removed deny, and the downgrade disclosure right beside this one already
- * settled how that class is handled: say it plainly, in band, at the moment it happens.
- *
- * Returns null when nothing fired, so an ordinary declaration reads exactly as it did before.
+ * A stage, bounded for the acknowledgement envelope. Only the NAME is caller text now — the pattern
+ * array and its three caps (STAGE_ACK_PATTERNS_MAX / _TOKEN_MAX_CHARS / _PATTERN_MAX_CHARS) went
+ * with trigger patterns on 2026-08-22, and nothing else on a StageView is caller-controlled.
  */
-function firingWarning(advisories: readonly { kind: string; message: string }[] | undefined): string | null {
-  const inert = (advisories ?? []).filter((advisory) => advisory.kind === "pattern_never_matches");
-  const mismatch = (advisories ?? []).filter((advisory) => advisory.kind === "pattern_matches_no_example");
-  if (inert.length === 0 && mismatch.length === 0) return null;
-
-  // TWO DIFFERENT FINDINGS, SAID DIFFERENTLY (Codex P2 on PR #144, and it was right). One wording
-  // covered both and overstated the weaker one: a pattern that misses its example may still govern
-  // other action contexts perfectly well, and telling the author it "governs nothing" invites them
-  // to replace a good pattern when the EXAMPLE was the wrong thing. Only a pattern that seeds to an
-  // empty token run is inert everywhere, and only that one gets the absolute claim.
-  const parts: string[] = [];
-  if (inert.length > 0) {
-    parts.push(
-      `PATTERN WILL NOT FIRE: it matches no action at all, so the gate it addresses is inert. It is ` +
-        `written anyway — you declared it — but it governs nothing until the patterns are fixed. ` +
-        `Tell the user plainly. ${inert.map((advisory) => advisory.message).join(" ")}`,
-    );
-  }
-  if (mismatch.length > 0) {
-    parts.push(
-      `EXAMPLE MISMATCH: checked with the gate's own matcher, these patterns did not match the ` +
-        `example you gave — so this gate would not have fired on the very action it was authored ` +
-        `from. They may still match other actions; what is established is that the pattern and the ` +
-        `example disagree, and one of the two is wrong. Tell the user plainly. ` +
-        `${mismatch.map((advisory) => advisory.message).join(" ")}`,
-    );
-  }
-  return parts.join(" ");
-}
-
-function fitRenderedPatternsForAck(patterns: readonly string[]): { items: string[]; omitted: number } {
-  const fitted = patterns.slice(0, STAGE_ACK_PATTERNS_MAX)
-    .map((pattern) => clip(pattern, STAGE_ACK_PATTERN_MAX_CHARS).text);
-  return { items: fitted, omitted: patterns.length - fitted.length };
+function fitStageViewForAck(stage: StageView): Record<string, unknown> {
+  return { ...stage, name: clip(stage.name, WRITE_ACK_TEXT_MAX_CHARS).text };
 }
 
 /**
@@ -652,6 +661,28 @@ export function registerMonetCoreTools(
   // long-running handler (e.g. source_sync) can't touch the database after a signal/EOF has
   // closed it out from under it mid-call.
   const inFlightTracker = getInFlightTracker(server);
+  /**
+   * THE KEY, MADE REACHABLE FROM INSIDE THE HANDLER THAT NEEDS IT.
+   *
+   * The wrapper below opens a moment for every call and closes it afterwards, and until this
+   * existed that moment id lived only in the wrapper's closure. Nothing the agent received ever
+   * named it, so the chain stopped one link short: a rule reached the agent, the agent acted, and
+   * there was no id to quote back when the user answered whether the action followed the rule.
+   *
+   * A SIDE CHANNEL, NOT A WIDER SIGNATURE. Only `stage_lookup` needs the id today, and threading a
+   * third parameter through would change the type of every handler in this file to serve one of
+   * them. Keyed on the per-request `extra` object the MCP SDK constructs fresh for each request
+   * (`fullExtra` in its protocol layer), so concurrent calls cannot read each other's id — the
+   * failure mode a module-level "current moment" variable would have.
+   *
+   * NOT BY MUTATING THE PARSED INPUT. The input object is the agent's own claim about the call, and
+   * writing a store-minted id into it would make an argument indistinguishable from a fact this
+   * server produced. A WeakMap also drops its entry when the request object is collected, so
+   * nothing here accumulates.
+   */
+  const storeMomentByRequest = new WeakMap<object, string>();
+  const openedMomentFor = (extra: unknown): string | null =>
+    typeof extra === "object" && extra !== null ? storeMomentByRequest.get(extra) ?? null : null;
   const originalTool = server.tool.bind(server);
   server.tool = ((...toolArgs: unknown[]) => {
     const handler = toolArgs[toolArgs.length - 1] as (...handlerArgs: unknown[]) => unknown;
@@ -677,6 +708,15 @@ export function registerMonetCoreTools(
       const callCircle =
         typeof argCircle === "string" && argCircle.length > 0 && argCircle !== "*" ? argCircle : undefined;
       const momentId = core.openStoreMoment(toolName, callCircle);
+      // Published on the side channel above, for the one handler that opts in. `handlerArgs[1]` is
+      // the SDK's per-request `extra` for every tool registered with a params schema — which is
+      // every tool here that reads this, and the same argument position the circle above is read
+      // relative to. A null id (no spool configured) publishes nothing, so an opted-in handler sees
+      // "no moment" rather than a placeholder.
+      const requestExtra = handlerArgs[1];
+      if (momentId !== null && typeof requestExtra === "object" && requestExtra !== null) {
+        storeMomentByRequest.set(requestExtra, momentId);
+      }
       // Identity, never content: a sha256 of the serialized result. A result that cannot be
       // serialized still closes the moment — with the string form — rather than leaving it open.
       // THE STATUS IS OBSERVED HERE, at the only place that can tell. Each caller below already
@@ -865,17 +905,34 @@ export function registerMonetCoreTools(
    * demands:
    *
    *   WHO CONSUMES IT — the agent, and nobody else. It is an instruction, not data for a reader.
-   *   ON WHICH TURN — the first tool response after a moment was read and then acted on. Not at
-   *     session start (the debt does not exist yet) and not on a timer.
-   *   WHAT BREAKS WITHOUT IT — the agent cannot know it owes a question. The hook that opened the
-   *     moment is store-less and cannot see whether a read happened, so nothing else is in a
-   *     position to tell it. Without the signal, `not asked` stops meaning "the agent failed to ask"
-   *     and starts meaning "the agent was never told" — one number covering a defect and an
-   *     impossibility, which is the precise conflation this whole rebuild exists to remove.
+   *   ON WHICH TURN — the next `stage_lookup` response after a moment was read and then acted on,
+   *     and NO OTHER TOOL'S. Not at session start (the debt does not exist yet) and not on a timer.
+   *   WHAT BREAKS WITHOUT IT — the agent cannot know it owes a question. Nothing else is in a
+   *     position to tell it: the read is recorded inside the store, and the agent's own transcript
+   *     shows it fetched rules, never that a question is outstanding. Without the signal, `not
+   *     asked` stops meaning "the agent failed to ask" and starts meaning "the agent was never
+   *     told" — one number covering a defect and an impossibility, which is the precise conflation
+   *     this whole rebuild exists to remove.
    *
-   * IT NAMES MOMENTS; IT NEVER CARRIES THEIR CONTENT. Ids and one instruction. The agent already has
-   * the action in its own transcript — re-sending a rendering of it would be paying context to tell
-   * the model what it just did.
+   * ONE SURFACE, AND THAT IS THE CORRECTION THIS ROUND MAKES. It used to ride EVERY tool response,
+   * which spent context on `memory_fetch` and `memory_checkpoint` replies where the agent has no
+   * rule in front of it and the instruction is an interruption with nothing to attach to. The agent
+   * is told to collect confirmations at the moment it is being handed rules, and nowhere else —
+   * `stage_lookup` is the one response where the reminder lands in the context that explains it,
+   * beside the very key (`momentId`) the conformance tools take.
+   *
+   * THE COST IS A LATER REMINDER, NOT A LOST ONE. A moment only enters this backlog once its
+   * outcome has landed, and a call's outcome is written after its handler has already returned — so
+   * a `stage_lookup` moment is never named on its own response, only on the next one. That is
+   * acceptable BECAUSE the response now carries its own `momentId`: the agent holds the key from
+   * the first turn, and this signal is the backstop for a debt it did not clear, not the only way
+   * it learns the key.
+   *
+   * IT NAMES MOMENTS; IT NEVER CARRIES THEIR CONTENT. Ids, and the fact that they are outstanding —
+   * the what-to-do lives in the response's own `instruction` field (see CONFORMANCE_INSTRUCTION),
+   * which ships on every lookup that has a `momentId`, so this no longer restates it. The agent
+   * already has the action in its own transcript — re-sending a rendering of it would be paying
+   * context to tell the model what it just did.
    *
    * REPEATED WHILE THE DEBT STANDS, and that is a correction. This used to announce each moment
    * exactly once, reasoning that a banner reappearing every turn is standing text by another name
@@ -906,14 +963,20 @@ export function registerMonetCoreTools(
     if (fresh.length === 0) return "";
     const ids = fresh.join(", ");
     const noun = fresh.length === 1 ? "action" : "actions";
-    // ONE SENTENCE. It names what is owed and the tool that records it, and nothing else — the
-    // wording deliberately asks whether the action FOLLOWED the rule, never whether the rule caused
-    // it, which is unobservable and is not what this measures.
-    // NAMES BOTH TOOLS, and that is a correction rather than a wording preference. This used to name
-    // only `conformance_answer`, so an agent obeying it literally — ask out loud, record the reply —
-    // left `asked_at` null and the moment was counted as an agent defect it had not committed. The
-    // ask is its own event with its own owner; an instruction that omits it asks for the wrong shape.
-    return `Monet: you read a rule and then acted, for ${fresh.length} ${noun} (${ids}). For each: call conformance_ask when you put the question to the user, then conformance_answer with their reply — did the action follow the rule it read?`;
+    // A FACT, NOT A SECOND COPY OF THE INSTRUCTION. It used to carry both — what is owed AND what to
+    // do about it — because it was the only thing on any response that said either. The response's
+    // own `instruction` field now carries the what-to-do on every lookup that has a `momentId`, so
+    // repeating it here would say the same thing twice in one payload. What is left is the half only
+    // this can know: WHICH earlier moments are still outstanding. The two compose — content[0] says
+    // what asking means, this says which ids still need it — and neither is readable as the other's
+    // duplicate.
+    //
+    // THE ORDER SURVIVES A DEGRADED HOST. The instruction rides in content[0], which every host
+    // exposes; this rides as a later content item, which some drop. The half that can go missing is
+    // the id list, never the instruction — the reverse split would lose the what-to-do entirely.
+    //
+    // The wording still says the action FOLLOWED a rule it read, never that the rule caused it.
+    return `Monet: you read a rule and then acted, for ${fresh.length} ${noun} (${ids}) — each still owes that question.`;
   }
 
   function wrapSuccess(
@@ -921,7 +984,8 @@ export function registerMonetCoreTools(
     {
       toolName,
       capturedBlock,
-    }: { toolName: string; capturedBlock?: string | null },
+      carriesConformanceKey,
+    }: { toolName: string; capturedBlock?: string | null; carriesConformanceKey?: boolean },
   ): CallToolResult {
     if (result.content[0]?.type !== "text") return result;
 
@@ -950,7 +1014,29 @@ export function registerMonetCoreTools(
       }
     }
 
-    const askBlock = askSignalBlock();
+    // --- ask signal ---
+    // ONE SURFACE ONLY. See askSignalBlock's own header for why: the agent collects confirmations
+    // at the moment it is handed rules, so the reminder belongs on the response that hands them
+    // over and on no other. Gated HERE rather than inside the block builder so every other tool
+    // response skips the `momentsOwingAQuestion` query — and its fold — outright.
+    //
+    // AND ON THE SAME CONDITION AS THE KEY (review fix — Codex round 2). The two halves were split
+    // deliberately: the response's `instruction` says what asking means and names the two tools that
+    // take a momentId, and this says WHICH earlier moments still owe it. That split is what keeps
+    // either from being the other's duplicate — and it is exactly what stops either from standing
+    // alone. Once the key and its instruction became conditional on this lookup actually delivering
+    // a rule, a lookup that delivered none carried the id half with the what-to-do half missing:
+    // uuids the agent has no surviving text to act on, since nothing else on the response, and no
+    // standing text, names `conformance_ask`.
+    //
+    // WITHHELD RATHER THAN MADE SELF-CONTAINED, and that is the choice. Restating the tool names
+    // here would pay context on EVERY debt-bearing response — the common case, where the
+    // instruction is already present and would now say the same thing twice — to cover the rare one
+    // where it is absent. It would also contradict this surface's own reason for existing: the
+    // reminder belongs where the agent is being handed rules, and a lookup that handed over none is
+    // precisely not that moment. Nothing is lost by waiting: the debt clears only by asking, so the
+    // next lookup that does deliver a rule names it again, beside the line that explains it.
+    const askBlock = toolName === "stage_lookup" && carriesConformanceKey === true ? askSignalBlock() : "";
     if (prewarmBlock === "" && askBlock === "") return result;
 
     const appended = [
@@ -971,13 +1057,18 @@ export function registerMonetCoreTools(
    *
    * Both accept a `capturedBlock` from capturePrewarmSnapshot() called BEFORE the handler ran.
    * For agent_context, pass no capturedBlock (it manages its own lifecycle).
+   *
+   * `carriesConformanceKey` is `stage_lookup`'s alone: it says this response really did hand over a
+   * momentId and the instruction that explains it, which is the condition the ask signal now shares
+   * — see wrapSuccess. Every other tool omits it and appends nothing either way.
    */
   const readOk = (
     content: object,
     toolName: string,
     capturedBlock?: string | null,
+    carriesConformanceKey?: boolean,
   ): CallToolResult =>
-    wrapSuccess(ok(content), { toolName, capturedBlock });
+    wrapSuccess(ok(content), { toolName, capturedBlock, carriesConformanceKey });
 
   const mutOk = (
     content: object,
@@ -1037,12 +1128,6 @@ export function registerMonetCoreTools(
             .max(STAGE_NAME_MAX_CHARS)
             .describe(
               "Stage name or id where the rule fires. A missing stage is created.",
-            ),
-          instance: z
-            .string()
-            .optional()
-            .describe(
-              'Concrete action that failed, such as "Bash:git push --force origin main". Seeds a new stage pattern.',
             ),
           scope: z
             .enum(["domain", "agent"])
@@ -1189,11 +1274,11 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_declare",
-    'Declare a user-authorized rule, stage, principle, or preference. Never call on agent initiative. This is the only tool that may create blocking rules or replace a rule binding. Stages address gates; rules bind content to stages. Principles and preferences enter the always-on skeleton without stage, severity, or patterns; mechanical concerns return as non-blocking `advisories`. Skeleton changes include `instruction` only when a registered standing surface became stale. A permissive standing grant is a rule, not another species.',
+    'Declare a user-authorized rule, stage, principle, or preference. Never call on agent initiative. This is the only tool that may create blocking rules or replace a rule binding. A stage is a named moment; rules bind content to stages. Principles and preferences enter the always-on skeleton without stage or severity; mechanical concerns return as non-blocking `advisories`. Skeleton changes include `instruction` only when a registered standing surface became stale. A permissive standing grant is a rule, not another species.',
     {
       species: z
         .enum(["rule", "stage", "principle", "preference"])
-        .describe('"stage" creates or re-authors a gate; "rule" binds to a stage; "principle"/"preference" enter the momentless skeleton.'),
+        .describe('"stage" registers a named moment; "rule" binds to a stage; "principle"/"preference" enter the momentless skeleton.'),
       stage: z
         .string()
         .max(STAGE_NAME_MAX_CHARS)
@@ -1206,27 +1291,11 @@ export function registerMonetCoreTools(
         .describe(
           'For principle/preference: evidence that would disprove it. Omission advises but never blocks.',
         ),
-      patterns: z
-        .array(z.string())
-        .optional()
-        .describe(
-          'Concrete command shapes, such as ["terraform apply", "Bash:git push --force"]. Replaces all existing patterns; [] disables firing. Omit to preserve them. Words match in order; an optional tool prefix constrains the tool.',
-        ),
-      instance: z
-        .string()
-        .optional()
-        .describe("Concrete action used to seed a new stage when patterns are omitted."),
       severity: z
         .enum(["advisory", "blocking"])
         .optional()
         .describe(
           'Pass only when the user rules on enforcement. Omit to preserve existing severity or default a new rule to advisory. "blocking" denies the action and is for safety boundaries. Changing blocking to advisory removes the deny and is disclosed.',
-        ),
-      acknowledgeBlockingRules: z
-        .array(z.string())
-        .optional()
-        .describe(
-          "When replacing patterns on a stage with blocking rules, list every blocking rule id after showing the user any ids reported missing.",
         ),
       scope: z.enum(["domain", "agent"]).optional().describe('"domain" binds any agent; "agent" (default) compensates for this model.'),
       modelTag: z.string().max(MODEL_TAG_MAX_CHARS).optional().describe('Model compensated for. Required for agent scope unless MONET_MODEL_TAG supplies it.'),
@@ -1243,7 +1312,7 @@ export function registerMonetCoreTools(
         ),
       sourceRefs: z.array(z.string()).optional(),
     },
-    async ({ species, stage, content, exitsEvidence, patterns, instance, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs, acknowledgeBlockingRules }) => {
+    async ({ species, stage, content, exitsEvidence, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs }) => {
       // RAW, UNDISTORTED — memory_declare-scoped (review fix — Codex round 2, item 1). declare()
       // itself must be able to tell "the caller said nothing about circle" (`undefined` — preserves
       // an existing binding's circle, including breadth) from "the caller explicitly named the
@@ -1271,14 +1340,13 @@ export function registerMonetCoreTools(
       const capturedBlock = capturePrewarmSnapshot(homeCircle);
       try {
         const r = await core.declare({
-          species, stage, content, exitsEvidence, patterns, instance, severity, scope: ruleScope,
+          species, stage, content, exitsEvidence, severity, scope: ruleScope,
           // LIVE, not the closure-captured `defaultModelTag` — same review-fix reasoning as
           // memory_store's own rule capture just above (Codex round 3). The HOST tag is injected
           // for RULES only: principle/preference are momentless and reject modelTag, but a
           // caller-supplied value must still reach declare() so that rejection is not bypassed.
           modelTag: species === "rule" ? (core.getRuntimeModelTag() ?? modelTag) : modelTag,
           reason, declaredBy, sourceRefs,
-          acknowledgeBlockingRules,
           circle: declareCircle,
         });
         // BOTH DISCLOSURES CAN APPLY TO ONE DECLARE (Codex round 11, item 7, P2 — found and fixed:
@@ -1326,19 +1394,19 @@ export function registerMonetCoreTools(
         } else {
           let guidance: string;
           if (r.species === "stage") {
-            guidance = "The stage is registered. It fires nothing until a rule is bound to it — until then a matching action reports the stage with no rules, which is the signal to reason from principles.";
-            const previous = fitRenderedPatternsForAck(r.previousPatterns);
-            const patterns = fitRenderedPatternsForAck(r.patterns);
+            // WHAT ACTUALLY HAPPENS NOW, which is less than this used to promise. It said a matching
+            // action would REPORT the stage as having no rules — a sentence from the era of trigger
+            // patterns and the gate hook, when something watched actions and spoke up. Nothing
+            // matches actions any more and nothing reports: an empty stage is simply a `stage_lookup`
+            // that comes back with no rules, and only if someone looks it up. A shipped surface
+            // describing machinery that no longer exists is worse than one that says less — the user
+            // waits for a report that will never arrive, and reads the silence as the stage working.
+            guidance = "The stage is registered. It fires nothing until a rule is bound to it — until then a stage_lookup for it returns no rules, which is the signal to reason from principles.";
             return mutOk({
               circle: homeCircle,
               species: r.species,
               stage: fitStageViewForAck(r.stage),
-              previousPatterns: previous.items,
-              ...(previous.omitted > 0 ? { previousPatternsOmitted: previous.omitted } : {}),
-              patterns: patterns.items,
-              ...(patterns.omitted > 0 ? { patternsOmitted: patterns.omitted } : {}),
-              ...(r.advisories && r.advisories.length > 0 ? { advisories: r.advisories } : {}),
-              guidance: firingWarning(r.advisories) ?? guidance,
+              guidance,
             }, "memory_declare", capturedBlock);
           } else {
             const disclosures = [
@@ -1353,17 +1421,12 @@ export function registerMonetCoreTools(
               r.narrowedFromBreadth
                 ? "BREADTH NARROWED: this rule was global (every circle) and now delivers only in its own circle — every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle=\"*\" to restore it."
                 : null,
-              // THE DECLARE-TIME FIRING TEST (monet-client#59). Same discipline, one axis over: a
-              // rule that will never fire is a rule the user believes is protecting them and is
-              // not — which is the same class of surprise as a silently removed deny, and belongs
-              // on the same loud channel rather than in an advisories array a caller may not read.
-              firingWarning(r.advisories),
             ]
               .filter((line): line is string => line !== null)
               .join(" ");
             guidance = disclosures !== ""
               ? disclosures
-              : "The rule is bound. It will be returned at that gate the next time the action is intercepted; its patterns show as unverified until the first real fire.";
+              : "The rule is bound. It will be returned the next time that stage is looked up by name.";
           }
           return mutOk(
             {
@@ -1714,7 +1777,7 @@ export function registerMonetCoreTools(
    */
   server.tool(
     "conformance_ask",
-    "Record that you asked the user whether an action followed the rule it read. Call this when you put the question, before their reply. The momentId comes from the Monet signal on a prior tool response.",
+    "Record that you asked the user whether an action followed the rule it read. Call this when you put the question, before their reply. The momentId is the one `stage_lookup` returned when it handed you that rule; a later `stage_lookup` also names any you still owe.",
     {
       momentId: z.string().max(MOMENT_ID_MAX_CHARS).describe("The moment you asked about."),
     },
@@ -1740,7 +1803,16 @@ export function registerMonetCoreTools(
     async ({ momentId, answer }) => {
       try {
         core.recordMomentAnswer(momentId, answer);
-        return ok({ recorded: "answer", momentId, answer });
+        // THE FOLLOW-UP RIDES THE ANSWER THAT NEEDS ONE, AND ONLY THAT ONE. Spread rather than a
+        // ternary field so a `followed` response is byte-identical to what it was before this
+        // existed — the silent arm stays silent, and its own key is never serialized as null.
+        // See NOT_FOLLOWED_INSTRUCTION for why the destination is the rule and not a field here.
+        return ok({
+          recorded: "answer",
+          momentId,
+          answer,
+          ...(answer === "not-followed" ? { instruction: NOT_FOLLOWED_INSTRUCTION } : {}),
+        });
       } catch (e) {
         return err(`conformance_answer failed: ${msg(e)}`);
       }
@@ -1753,16 +1825,18 @@ export function registerMonetCoreTools(
     {
       stage: z.string().max(STAGE_NAME_MAX_CHARS).describe("Stage name or id from agent_context/prewarm."),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
-      /**
-       * The moment the delivered instruction named, when one did. Optional BY NECESSITY rather than
-       * by preference: an agent can reach this tool from `agent_context`, where no interception
-       * prompted it and there is no moment to name. Omitting it is a recorded state (an unjoinable
-       * read), never an error — see MonetCore.recordRuleReads.
-       */
-      momentId: z.string().max(MOMENT_ID_MAX_CHARS).optional()
-        .describe("The momentId from a gate instruction, so this read joins the moment that prompted it."),
+      // NO `momentId` INPUT. It used to be one, carrying the id from a gate instruction so the read
+      // could join the moment that prompted it — and no gate instruction is emitted any more, so
+      // the only id an agent could pass would be one it invented or copied from somewhere else.
+      // The moment this read belongs to is now the one THIS CALL opened, which the wrapper mints
+      // and the response hands back; a caller-supplied id could only disagree with it.
     },
-    async ({ stage, circle, momentId }) => {
+    async ({ stage, circle }, extra) => {
+      // THIS CALL'S OWN MOMENT — the id the wrapper opened for this very `stage_lookup`, which is
+      // also the id this response returns. That makes one moment carry the whole chain: the rule
+      // reached the agent here, so the read attaches here, and the question the user is later asked
+      // is about this same id.
+      const momentId = openedMomentFor(extra);
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         // ONE CHAIN: no runtimeModelTag passed here — core.setRuntimeModelTag() was called once at
@@ -1772,11 +1846,36 @@ export function registerMonetCoreTools(
         // double-count the lookup and re-credit identities the fitter dropped, which is the exact
         // defect an earlier round of this review closed.
         const r = core.stageLookup({ stage, circle: scope(circle), recordMomentRead: false });
-        const fixedFields = {
+        // THE KEY THE AGENT QUOTES BACK. `conformance_ask` and `conformance_answer` both take a
+        // momentId, and before this there was no surface an agent could get one from — the fourth
+        // fact was unrecordable in practice for want of an identifier. Handing it out HERE, and
+        // only here, is deliberate: this is the moment a rule reaches the agent, so it is the
+        // moment the eventual question is about.
+        //
+        // OMITTED, NEVER NULL, WHEN THERE IS NO MOMENT: with no spool configured nothing is
+        // recorded and no conformance call could attach anyway, and an explicit `null` would
+        // invite one to be attempted against it. Same omit-when-absent convention as every other
+        // optional field on this response.
+        //
+        // THE KEY AND ITS INSTRUCTION SHIP TOGETHER, in one spread, so neither can appear without
+        // the other. A key with nothing saying what it is for was the state this closes; an
+        // instruction to name a key that is not on the response would be worse than silence.
+        const momentFields = momentId !== null ? { momentId, instruction: CONFORMANCE_INSTRUCTION } : {};
+        const responseFieldsWithoutMoment = {
           circle: scope(circle),
           matched: r.matched,
           ...(r.stage ? { stage: r.stage } : {}),
         };
+        // BUDGETED AS IF THE KEY SHIPS, DECIDED AFTER THE FIT LOOP KNOWS WHETHER IT DOES.
+        //
+        // The two facts are circular by construction: the key ships only when the response carries
+        // at least one rule, and which rules the response carries is what the fit loop below is
+        // computing. Budgeting against the LARGER envelope breaks the circle in the only safe
+        // direction — dropping the key afterwards can only leave the response smaller than what was
+        // measured, never larger, so no field is ever paid for out of a budget that did not know
+        // about it. The reverse (budget small, ship large) is the overflow this envelope's whole
+        // size-fit discipline exists to prevent.
+        const fixedFieldsForBudget = { ...responseFieldsWithoutMoment, ...momentFields };
         const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
 
         // SIZE-FIT #1: rules (blocker fix). Same technique memory_fetch's outline uses (see
@@ -1839,10 +1938,36 @@ export function registerMonetCoreTools(
             ...(rule.disputedParentsTruncated ? { disputedParentsTruncated: true } : {}),
           };
           const candidate = [...fitRules, candidateRule];
-          const serialized = JSON.stringify({ ...fixedFields, rules: candidate }, null, 2);
+          const serialized = JSON.stringify({ ...fixedFieldsForBudget, rules: candidate }, null, 2);
           if (serialized.length > sizeBudget) break;
           fitRules.push(candidateRule);
         }
+
+        // THE KEY SHIPS ONLY WHEN THIS RESPONSE ACTUALLY DELIVERED A RULE.
+        //
+        // WHAT IT USED TO DO: hand out a momentId and the instruction on every lookup that had a
+        // moment at all — a stage that does not exist, a stage with no live rules bound, or a fit
+        // loop that seated none of them. The agent was told to ask the user whether the action
+        // followed "these rules" when no rules were on the response to follow, and the
+        // `conformance_ask` it was instructed to make could not have succeeded: `recordRuleReads`
+        // spools `ruleId: null` for an empty lookup (engine.ts), the fold drops exactly that record
+        // rather than writing a rule read (`if (record.ruleId === null) return`, moment-ledger.ts),
+        // and `requireObservedMoment` refuses any moment whose `rule_reads` is empty
+        // (moment-ledger.ts). So the instruction named a call that was guaranteed to be REFUSED.
+        //
+        // An instruction whose only possible outcome is an error is worse than no instruction: the
+        // agent spends a turn on it, gets `UnknownMomentError`, and has nothing true to tell the
+        // user about why. Omitting both fields says the honest thing — this lookup delivered
+        // nothing, so there is nothing to ask about — through the same absence-is-the-signal
+        // convention the rest of this response uses.
+        //
+        // GATED ON `fitRules`, NOT ON `r.rules`, for the same reason `recordRuleReads` below is:
+        // the response is the authority on what reached the agent. A rule the engine selected and
+        // the size budget then dropped was never read, so it can neither be recorded as read nor
+        // make the moment answerable — the two must agree, and they now share one condition.
+        //
+        // A MISS STILL RETURNS ITS `stageIndex` recovery path; only the key and its instruction go.
+        const fixedFields = fitRules.length > 0 ? fixedFieldsForBudget : responseFieldsWithoutMoment;
         // HONEST TOTAL (review fix — Codex round 2): `r.rulesTotal`, when present, means the SQL
         // retrieval itself was capped — `r.rules.length` alone would understate how many rules
         // truly exist, not just how many the wire chose to show. Absent means `r.rules.length` IS
@@ -1850,8 +1975,15 @@ export function registerMonetCoreTools(
         const rulesTotal = r.rulesTotal ?? r.rules.length;
         const rulesOmittedCount = rulesTotal - fitRules.length;
 
-        // THE READ, RECORDED AGAINST THE MOMENT THAT PROMPTED IT (invariant 03) — AND ONLY FOR THE
+        // THE READ, RECORDED AGAINST THIS CALL'S OWN MOMENT (invariant 03) — AND ONLY FOR THE
         // RULES THIS RESPONSE ACTUALLY CARRIES.
+        //
+        // THE MOMENT USED TO COME FROM THE CALLER, named by a gate instruction that no longer
+        // exists; with nothing emitting one, every read was recorded against `null` and joined
+        // nothing. The moment the wrapper opened for this call is the honest owner: the rules
+        // reached the agent through THIS response, so this is the call whose conformance is later
+        // in question. A null id here still means an unjoinable read (no spool configured), which
+        // is a recorded state rather than an error — see MonetCore.recordRuleReads.
         //
         // THIS USED TO RUN BEFORE THE FIT LOOP, against the engine's whole `r.rules`, on the
         // reasoning that recording the engine's delivered set stops a presentation change from
@@ -1866,7 +1998,7 @@ export function registerMonetCoreTools(
         // reached the agent, its content did not, and `stage_lookup`'s whole job is the content.
         // Delivery and receipt stay separate facts.
         core.recordRuleReads(
-          momentId ?? null,
+          momentId,
           fitRules.map((rule) => rule.conceptId as string),
           // THE STAGE THE AGENT NAMED, resolved to its id — never the stage the gate matched. On
           // a miss there is no id, and null is honest: the agent named something this build could
@@ -1965,7 +2097,10 @@ export function registerMonetCoreTools(
             stageIndex: stageIndexFit.fitted,
             ...(stageIndexFit.omitted > 0 ? { stageIndexTruncated: true, stageIndexOmitted: stageIndexFit.omitted } : {}),
           } : {}),
-        }, "stage_lookup", capturedBlock);
+        // THE SAME `fitRules.length > 0` THAT CHOSE `fixedFields` ABOVE, and deliberately the same
+        // expression rather than a re-derivation: the ask signal and the key must never disagree
+        // about whether this response delivered a rule.
+        }, "stage_lookup", capturedBlock, fitRules.length > 0);
       } catch (e) {
         return err(`stage_lookup failed: ${msg(e)}`);
       }

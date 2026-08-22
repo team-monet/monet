@@ -245,8 +245,13 @@ describe("P1 — moment counts are scoped to the circle the overview asked for",
 
     const core = new MonetCore(":memory:", { momentSpoolPath: path, defaultCircle: "acme-widgets" });
     cores.push(core);
-    expect(core.momentCounts("acme-widgets").fires).toBe(1);
-    expect(core.momentCounts("other-project").fires).toBe(1);
+    // `total` rather than the removed `fires` (2026-08-22): the scoping is what is under test, and
+    // it is the same WHERE clause on either counter. The companion assertion here — that both
+    // moments stayed out of `ungoverned`, so the check could not pass against a counter that counts
+    // everything — went with `ungoverned` itself later that day. Every counter left reads only
+    // `opened` and `circle`, so there is no longer a counter for this one to be confused with.
+    expect(core.momentCounts("acme-widgets").total).toBe(1);
+    expect(core.momentCounts("other-project").total).toBe(1);
   });
 
   it("counts a moment whose circle was never known as unattributed, not as this circle's", () => {
@@ -263,7 +268,9 @@ describe("P1 — moment counts are scoped to the circle the overview asked for",
     const core = new MonetCore(":memory:", { momentSpoolPath: path, defaultCircle: "acme-widgets" });
     cores.push(core);
     const counts = core.momentCounts("acme-widgets");
-    expect(counts.fires).toBe(1);
+    // The attributed one lands in this circle; the unattributable one lands in NEITHER circle's
+    // `total` and is reported on its own — which is the whole point of the split.
+    expect(counts.total).toBe(1);
     expect(counts.unattributed).toBe(1);
   });
 });
@@ -627,35 +634,22 @@ describe("R6 — a resolved-but-failed tool result is not an ok outcome", () => 
   });
 });
 
-describe("R6 — the public gate() and stageLookup() record for a library caller", () => {
-  it("counts fires and silences from MonetCore.gate()", async () => {
-    const dir = mkTmp();
-    const spool = join(dir, "moments.jsonl");
-    const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets", momentSpoolPath: spool });
-    cores.push(core);
-    await core.declare({
-      species: "rule", stage: "terraform apply", patterns: ["Bash:terraform apply"],
-      content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
-    });
-    core.gate({ actionContext: "Bash:terraform apply -auto-approve" });
-    core.gate({ actionContext: "Bash:ls -la" });
-
-    const counts = core.momentCounts("acme-widgets");
-    expect(counts.fires).toBe(1);
-    expect(counts.silences).toBe(1);
-    expect(counts.total).toBe(2);
-    // `record: false` is the documented opt-out and must govern this too.
-    core.gate({ actionContext: "Bash:terraform apply -auto-approve", record: false });
-    expect(core.momentCounts("acme-widgets").total).toBe(2);
-  });
-
+/**
+ * WHAT USED TO SIT HERE TOO: "counts fires and silences from MonetCore.gate()" — the library
+ * caller's own interception moment, written by `spoolApiGateMoment`. That method went with
+ * `MonetCore.gate()` on 2026-08-22, and with it the last IN-PROCESS producer of a fire or a
+ * silence. The counters themselves followed later the same day: with no writer left anywhere in
+ * this tree, `fires`/`silences`/`delivered` could only report a structurally-fixed zero, which
+ * reads as a measurement and is not one. See `MomentCounts`.
+ */
+describe("R6 — the public stageLookup() record for a library caller", () => {
   it("counts stage reads from MonetCore.stageLookup()", async () => {
     const dir = mkTmp();
     const spool = join(dir, "moments.jsonl");
     const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets", momentSpoolPath: spool });
     cores.push(core);
     await core.declare({
-      species: "rule", stage: "terraform apply", patterns: ["Bash:terraform apply"],
+      species: "rule", stage: "terraform apply",
       content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
     });
     const r = core.stageLookup({ stage: "terraform apply" });

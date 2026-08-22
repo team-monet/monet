@@ -4,15 +4,14 @@ import path from "node:path";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
-import { ensureMonetDir, getDbPath, getGateMirrorPath, getMomentSpoolPath, getMonetDir } from "./db/index.js";
+import { ensureMonetDir, getDbPath, getMomentSpoolPath, getMonetDir } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { generateAgentConfig, toYaml } from "./config-cli.js";
 import { openServedCore, openStatusCore } from "./bootstrap.js";
 import { reportStartupFailure } from "./startup-report.js";
 import { registerRecoveryCommands } from "./repair-cli.js";
-import { registerGateCommands } from "./gate-cli.js";
-import { registerInstallCommands } from "./install-cli.js";
 import { MaterializeCliError, registerMaterializeCommands } from "./materialize-cli.js";
+import { registerHookRetirementCommands } from "./uninstall-cli.js";
 import { resolveProjectDir } from "./project-dir.js";
 
 // Read version from package.json so it can never drift from the published version.
@@ -74,7 +73,7 @@ program
     // The one server behaved differently depending on which launch path a host used.
     //
     // Scoped to `start` rather than folded into the shared parseAsync handler: that handler serves
-    // every subcommand, and `monet status`/`doctor`/`gate` failing is not a startup failure — a
+    // every subcommand, and `monet status`/`doctor` failing is not a startup failure — a
     // record written for one of those would be a false positive in the one file a reader trusts to
     // mean "the server could not start".
     //
@@ -101,42 +100,35 @@ program
       // ACL match against.
       process.env.MONET_CALLER_ID = deriveCallerId();
       process.env.MONET_PROJECT_ID = deriveProjectId(projectDir);
-      // COMPONENT B (4b-D): wire mirror materialization into the ONE long-running serving process.
-      // Rooted at `projectDir` (not bare cwd) via getGateMirrorPath's own baseDir parameter — the
-      // SAME project dir `circle` was just derived from, and the SAME default `monet gate` itself
-      // resolves to when nothing overrides it (gate-cli.ts's own defaultGateCliDependencies) — one
-      // project notion, three call sites. See bootstrap.ts's ServedCoreOptions.gateSidecarPath for
-      // why this is the only writer surface.
-      //
       // FIX 1 (Codex round 2 on PR #42): getDbPath(projectDir) — NOT bare getDbPath() — is the fix
       // itself. Bare getDbPath() resolves via getMonetDir()'s own internal process.cwd() default, a
       // SEPARATE "which project" notion from `projectDir` (resolveProjectDir(): MONET_PROJECT_DIR /
       // CLAUDE_PROJECT_DIR, falling back to cwd — see that function's own doc comment, "a host may
       // spawn monet from elsewhere"). With MONET_PROJECT_DIR=A and cwd=B (both with their own
-      // project-local .monet dirs), the OLD code opened the SERVED STORE at B (bare getDbPath()) while
-      // materializing the MIRROR at A (getGateMirrorPath(projectDir) already used projectDir) — a
-      // declaration made through this exact session would land in B's store but refresh A's mirror,
+      // project-local .monet dirs), the OLD code opened the SERVED STORE at B (bare getDbPath())
+      // while every other project-derived answer in this action came from A — the `deriveCircle`
+      // call right above reports A's circle while the session's writes land in B's store,
       // the wrong-project class again, one layer deeper than the P1-B/round-1 fix (which paired
       // circle.ts's OWN internal store lookup with projectDir; this pairs the SERVED CORE's store with
-      // it too). Rooting the store and the mirror at the SAME projectDir is what makes "one project
-      // notion, three call sites" (this comment's own opening line) actually true, not just asserted.
-      // SPOOL: the same "one long-running serving process is the one positioned to maintain it"
-      // argument the mirror above is wired on, applied to the governed-moment record. Without this,
+      // it too). Rooting the store and the circle at the SAME projectDir is what makes "one project
+      // notion, every call site" (this comment's own opening line) actually true, not just asserted.
+      // SPOOL: one long-running serving process is the one positioned to maintain the
+      // governed-moment record. Without this,
       // store-side interception, the ask signal and every conformance surface are silently inert in
       // the shipped binary — the option is optional at the seam, never at an entry point.
       //
       // NOT rooted at `projectDir`, and the one line here that deliberately steps outside "one
-      // project notion, three call sites" above: unlike the store and the mirror, the spool is ONE
-      // stream shared with writers that do not run in this process at all — the installed hook
-      // wrapper and `monet gate` — and the fold's per-run sequence only proves completeness if all
-      // three append to the same file. Those two resolve MONET_STORAGE_DIR, else home; rooting THIS
-      // writer at `projectDir` would point it at a different file whenever the project carried its
-      // own `.monet`. `getMomentSpoolPath()` therefore takes no baseDir at all — see db/index.ts for
-      // why it resolves the two rungs it does, and why the generated wrapper is the fixed point.
+      // project notion, every call site" above: unlike the store, the spool is ONE stream whose
+      // format admits writers that do not run in this process at all, and the fold's per-run
+      // sequence only proves completeness if every writer appends to the same file. Such a writer
+      // can import nothing and resolves MONET_STORAGE_DIR, else home; rooting THIS writer at
+      // `projectDir` would point it at a different file whenever the project carried its own
+      // `.monet`. `getMomentSpoolPath()` therefore takes no baseDir at all — see db/index.ts for
+      // why it resolves the two rungs it does, and for the fact that no out-of-process writer
+      // ships today.
       const core = await openServedCore(getDbPath(projectDir), {
         scopeContext: projectDir,
         defaultCircle: circle,
-        gateSidecarPath: getGateMirrorPath(projectDir),
         momentSpoolPath: getMomentSpoolPath(),
       });
       console.error(`Monet started`);
@@ -250,9 +242,12 @@ program
   });
 
 registerRecoveryCommands(program);
-registerGateCommands(program);
-registerInstallCommands(program);
 registerMaterializeCommands(program);
+// THE MIGRATION PATH OFF `monet install`'s HOOK. Registered here rather than folded into either
+// list above because it is neither recovery nor materialization: it is the pair of commands that
+// exist solely because a previous release wrote hook entries and a wrapper script onto users'
+// disks, and this build removed the commands those entries invoke. See uninstall-cli.ts.
+registerHookRetirementCommands(program);
 
 void program.parseAsync().catch((error: unknown) => {
   if (error instanceof FreshStoreEmbedderUnavailableError) {

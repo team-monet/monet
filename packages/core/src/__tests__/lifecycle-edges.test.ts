@@ -1613,13 +1613,11 @@ describe("ratify() and reassignCircle() — Codex PR #102 fixes", () => {
     c.close();
   });
 
-  it("a momentless declaration refuses an instance, like stage and patterns", async () => {
-    const c = core();
-    await expect(
-      c.declare({ species: "principle", content: "A principle.", instance: "Bash:git push --force" }),
-    ).rejects.toThrow(/carries no instance/);
-    c.close();
-  });
+  // THE `instance` REFUSAL TEST WAS REMOVED HERE (2026-08-22). It asserted that a momentless
+  // declaration rejects `instance` the way it rejects `stage` and `patterns`. `instance` existed
+  // only to seed a new stage's trigger patterns, so it retired with them and there is no field left
+  // to refuse. The surviving refusals (stage, severity, scope, modelTag, reason) are asserted in
+  // gates.test.ts's own momentless-declaration tests.
 
   it("a disputed principle stops governing immediately; mediation restores membership", async () => {
     const c = core();

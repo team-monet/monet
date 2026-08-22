@@ -466,8 +466,10 @@ async function buildUnscrubbedFixtureDb(path: string): Promise<void> {
   // did not.
   //
   // The rows only appear once something FOLDS a spool into the database, which is why this seeds a
-  // spool the way `monet gate` writes one and then triggers the fold through the ordinary
-  // conformance read — no private API, the same path a real session takes.
+  // spool in the on-disk shape a host-side writer produces — the shape the removed `monet gate`
+  // command and hook wrapper wrote, which the fold still has to read (see `MomentWriterRole`) — and
+  // then triggers the fold through the ordinary conformance read: no private API, the same path a
+  // real session takes.
   const spoolPath = `${path}.moments.jsonl`;
   const hookWrittenAction = "cd /Users/dev/code/monet-core && git push --force  # jane.doe@example.com";
   appendFileSync(
