@@ -445,8 +445,24 @@ export function migrateGateColumns(db: StoragePort): void {
   //
   // `rule_bindings.circle` is UNCHANGED and still load-bearing (RULE_LIVENESS_WHERE, below). The
   // TypeScript write path maintains it unassisted: bindRule's own INSERT and UPDATE branches (this
-  // file), graftRows' `effectiveCircle` and its dangling heal, and moveConcept's and renameCircle's
-  // keep-in-step UPDATEs (engine.ts) — audited call site by call site before this removal.
+  // file), graftRows' `effectiveCircle` and its concept-loop repair, and moveConcept's,
+  // renameCircle's and mergeCircle's keep-in-step UPDATEs (engine.ts) — audited call site by call
+  // site before this removal.
+  //
+  // THAT AUDIT HAD A HOLE, and this line is the correction rather than a re-statement (Codex round
+  // 4, P1). Enumerating the writers of `concepts.circle` and matching each to a TypeScript path that
+  // also updates `rule_bindings.circle` establishes that an update EXISTS on every path — never that
+  // it always WINS. On the local movers it does: moveConcept, renameCircle and mergeCircle each run
+  // an UNCONDITIONAL `UPDATE rule_bindings ... WHERE concept_id ... AND circle != '*'`, contested by
+  // nothing. On the GRAFT path it does not: `concepts` and `rule_bindings` carry INDEPENDENT
+  // (sync_revision, sync_writer) pairs, so a relayed concept row can win its own contest and MOVE
+  // while its binding row loses its own — or never reaches it, `continue`d past by DOOR 12, the
+  // breadth boundary check, or the divergent-successor recheck. `trg_rule_bindings_follow_concept_
+  // circle` was the only UNCONDITIONAL repair for that case, and the concept-loop heal that
+  // outlived it only touched `circle IS NULL` rows, so a binding already holding a value stayed in
+  // the circle its concept had left, permanently — a blocking rule included. That heal is now
+  // widened to every non-breadth binding of a moved concept (engine.ts, the BLOCKER B3 block's own
+  // comment), which is what makes this paragraph true as written; the trigger stays retired.
   // ════════════════════════════════════════════════════════════════════════════════════════════
   const hasConceptsTable = db
     .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'concepts'`)

@@ -364,7 +364,8 @@ describe("monet uninstall", () => {
     writeFileSync(f.wrapperPath, "// the generated wrapper");
 
     const result = runCli(f, ["uninstall"]);
-    expect(result.status).toBe(0);
+    // NONZERO, even though three entries really were removed — the partial case (Codex round 4, P2).
+    expect(result.status).toBe(1);
     expect(result.stderr).toContain("removed 3 hook entries");
     expect(result.stderr).toContain("is not valid JSON");
     // THE BUG THIS PINS: withholding was wired to the CONFLICT count alone, so a run with removals
@@ -440,7 +441,8 @@ describe("monet uninstall", () => {
     writeFileSync(f.userSettings, "{ this is not json");
 
     const result = runCli(f, ["uninstall"]);
-    expect(result.status).toBe(0);
+    // NONZERO: this run refused a target, so it cannot report success (Codex round 4, P2).
+    expect(result.status).toBe(1);
     expect(result.stderr).toContain("is not valid JSON");
     expect(result.stderr).toContain("left untouched");
     // A half-understood rewrite of the user's settings is worse than an unremoved hook — which the
@@ -450,6 +452,70 @@ describe("monet uninstall", () => {
     // entry may be in it. NOT "nothing to remove" — that is a verdict on a file nothing could read.
     expect(result.stderr).toContain("remove its entry by hand");
     expect(result.stderr).not.toContain("nothing to remove");
+  });
+  /**
+   * THE STATUS CODE HAS TO SAY WHAT THE PROSE ALREADY SAYS (Codex round 4, P2). Every branch above
+   * is careful never to CLAIM more than the run established — the withheld "nothing to remove", the
+   * withheld "unreferenced" — and then the process exited 0 regardless, which is the one claim that
+   * reaches automation. Exit 0 from a command whose whole job is removal reads as "the entries are
+   * gone"; a script chaining on `&&`, or a user watching `$?`, cannot tell a completed removal from
+   * a refusal. The partial case is the sharpest: other files really were modified, so the run looks
+   * successful in every observable way while a hook entry is still wired.
+   *
+   * ONE, matching this package's own convention for "the run continued but left work undone"
+   * (`monet materialize`'s per-surface failures and `monet materialize list`'s per-surface errors
+   * both set exactly this, through the same injected `setExitCode` seam; `monet doctor`'s 2 is a
+   * different meaning — a diagnostic verdict, not undone work).
+   */
+  it("exits nonzero when a target was left unfinished, even though other files were cleaned", () => {
+    const f = fixture();
+    writeInstalledFixture(f);
+    writeFileSync(f.projectSettings, "{ this is not json");
+
+    const result = runCli(f, ["uninstall"]);
+    // The partial case: other files WERE modified, so every human-facing signal reads like success.
+    expect(result.stderr).toContain("removed 3 hook entries");
+    expect(result.stderr).toContain("is not valid JSON");
+    expect(result.status).toBe(1);
+  });
+
+  it("exits nonzero when the only target was refused as unreadable", () => {
+    const f = fixture();
+    writeFileSync(f.userSettings, "{ this is not json");
+
+    const result = runCli(f, ["uninstall"]);
+    expect(result.stderr).toContain("is not valid JSON");
+    expect(result.status).toBe(1);
+  });
+
+  it("exits nonzero when a write was refused to protect a concurrent edit", () => {
+    const f = fixture();
+    writeInstalledFixture(f);
+    const codes: number[] = [];
+    runInProcess(f, {}, {
+      beforeSettingsWrite: (settingsPath) => {
+        if (settingsPath !== f.userSettings) return;
+        writeFileSync(f.userSettings, `${JSON.stringify({ model: "sonnet" }, null, 2)}\n`);
+      },
+      setExitCode: (code) => codes.push(code),
+    });
+    expect(codes).toEqual([1]);
+  });
+
+  /**
+   * THE UNFINISHED SET IS THE WHOLE TRIGGER, and nothing else is. An ordinary removal, an ordinary
+   * "nothing to remove", and a `--dry-run` that deliberately writes nothing are all COMPLETE runs:
+   * each one did exactly what it set out to do and left no target unspoken for.
+   */
+  it("leaves the exit code alone on every run that left nothing unfinished", () => {
+    const f = fixture();
+    writeInstalledFixture(f);
+    const codes: number[] = [];
+    runInProcess(f, { dryRun: true }, { setExitCode: (code) => codes.push(code) });
+    runInProcess(f, {}, { setExitCode: (code) => codes.push(code) });
+    // ...and the idempotent rerun, which finds nothing left.
+    runInProcess(f, {}, { setExitCode: (code) => codes.push(code) });
+    expect(codes).toEqual([]);
   });
 });
 
@@ -524,13 +590,53 @@ describe("the retired `monet gate` shim", () => {
     }
   });
 
+  /**
+   * ONCE PER INSTALLED WRAPPER, NOT ONCE PER STORAGE DIRECTORY (Codex round 4, P2).
+   *
+   * WHAT IS ACTUALLY INVARIANT HERE, established rather than assumed: the wrapper this notice is
+   * about lives at `~/.monet/gate-hook.mjs`, UNCONDITIONALLY — `runInstall` computed that path and
+   * never consulted `MONET_STORAGE_DIR` (see `installedWrapperPath`'s own comment, and the "finds
+   * the entry at the path the install actually wrote" test above, which pins the same fact from the
+   * settings side). `$MONET_STORAGE_DIR`, by contrast, varies per invocation: it is routinely set
+   * per project, and one hook, from one wrapper, is invoked under every value of it a user has.
+   *
+   * So a marker rooted on the storage rungs claimed "shown once" while showing the notice once per
+   * PROJECT — a recurring warning with a longer period, which is a quieter version of the exact
+   * defect this whole change exists to remove. The notice's own subject is what settles the rung:
+   * it says nothing about a store, it says the HOOK is retired and names the command that removes
+   * it, and there is exactly one of those per home.
+   */
+  it("says it once per installed wrapper, not once per storage directory", () => {
+    const f = fixture();
+    const otherProjectStore = join(f.home, "another-project-store");
+    mkdirSync(otherProjectStore, { recursive: true });
+
+    const first = runShim(f, "Bash:ls");
+    expect(first.stderr).toContain("failing OPEN");
+
+    // THE SAME HOME, THE SAME WRAPPER, A DIFFERENT `$MONET_STORAGE_DIR` — an ordinary second
+    // project for the same user.
+    const second = spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", "gate", "--stdin"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      input: "Bash:ls",
+      env: { ...process.env, HOME: f.home, MONET_STORAGE_DIR: otherProjectStore },
+    });
+    expect(second.status).toBe(0);
+    expect(second.stderr).toBe("");
+    expect(second.stdout).toBe("");
+  });
+
   it("stays silent when the notice marker cannot be claimed, rather than repeating", () => {
     const f = fixture();
     // The claim is an atomic create, so an existing marker — whether from an earlier run or a
     // concurrent hook invocation that won the race — takes the same exit as an unwritable store:
     // say nothing. That is what keeps the hard requirement (no recurring warning) independent of
     // whether this notice mechanism works at all.
-    writeFileSync(join(f.storageDir, "gate-hook-retired.notice"), "");
+    // BESIDE THE INSTALLED WRAPPER, at `~/.monet` — not the storage dir this fixture also sets.
+    // See `retirementNoticeMarkerDir` for why that rung, and not `$MONET_STORAGE_DIR`.
+    mkdirSync(join(f.home, ".monet"), { recursive: true });
+    writeFileSync(join(f.home, ".monet", "gate-hook-retired.notice"), "");
     const result = runShim(f, "Bash:ls");
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");

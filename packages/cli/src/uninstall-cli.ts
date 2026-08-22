@@ -236,15 +236,27 @@ function candidateWrapperPaths(): string[] {
 }
 
 /**
- * Where the shim's one-time notice marker lives.
+ * Where the shim's one-time notice marker lives: BESIDE THE INSTALLED WRAPPER, at
+ * `~/.monet`, unconditionally — the same rung `installedWrapperPath` resolves, deliberately
+ * sharing that function's resolution rather than restating it.
  *
- * ON THE WRAPPER'S OWN TWO RUNGS (`$MONET_STORAGE_DIR`, else `~/.monet`), which is deliberately a
- * DIFFERENT resolution from `installedWrapperPath` above and for a different reason: this file is
- * written by the shim at hook time, and it belongs beside whatever store that invocation is actually
- * running against — the same directory the wrapper itself resolves for its spool.
+ * IT USED TO SIT ON THE WRAPPER'S OWN SPOOL RUNGS (`$MONET_STORAGE_DIR`, else `~/.monet`), on the
+ * reasoning that a file the shim writes at hook time belongs beside whatever store that invocation
+ * runs against. That is right for a spool and wrong for THIS file, because the two are keyed to
+ * different things (Codex round 4, P2). ESTABLISHED, NOT ASSUMED: `$MONET_STORAGE_DIR` varies per
+ * invocation — it is routinely set per project — while the wrapper this notice is about is at
+ * `~/.monet/gate-hook.mjs` for every one of those invocations, since `runInstall` computed that
+ * path and never consulted the override (see `installedWrapperPath`). A marker on the varying rung
+ * therefore promised "shown once" and delivered once per storage directory: a recurring warning
+ * with a longer period, which is a quieter version of the exact defect this change exists to
+ * remove.
+ *
+ * THE NOTICE'S OWN SUBJECT SETTLES IT. It says nothing about a store — it says the HOOK is retired
+ * and names the command that unwires it — and there is exactly one installed wrapper, and one set
+ * of settings files naming it, per home.
  */
 function retirementNoticeMarkerDir(): string {
-  return process.env.MONET_STORAGE_DIR || path.join(os.homedir(), ".monet");
+  return path.dirname(installedWrapperPath());
 }
 
 /**
@@ -422,6 +434,13 @@ interface UninstallHooks {
    * cannot be exercised is a safety property nobody can show works.
    */
   beforeSettingsWrite?: (settingsPath: string) => void;
+  /**
+   * How this command reports "the run left work undone" to whatever invoked it. Defaults to
+   * `process.exitCode`, matching `monet materialize` and `monet doctor`/`monet repair`, which take
+   * the same value the same way through their own dependency objects — and, like them, NEVER
+   * `process.exit()`: the process has to finish writing stderr and unwind normally.
+   */
+  setExitCode?: (code: number) => void;
 }
 
 /**
@@ -558,6 +577,26 @@ export function runUninstall(options: UninstallOptions, hooks: UninstallHooks = 
   // a conflicted file is KNOWN to still hold entries, and an unreadable one is simply UNKNOWN.
   // Withholding on only one of them was the bug — an unknown reported as a verdict.
   const unfinished = refused + conflicted;
+
+  // AND SAID IN THE ONE CHANNEL AUTOMATION CAN READ (Codex round 4, P2). Everything below is
+  // careful to withhold any claim this run did not establish — the "nothing to remove" verdict, the
+  // "unreferenced" advice — and then the process exited 0 regardless, which is itself a claim, and
+  // the only one a script ever sees. Exit 0 from a removal command reads as "the entries are gone";
+  // a caller chaining on `&&` could not tell a refusal from a completed run, and the PARTIAL case
+  // is the sharpest: other files really were rewritten, so every other signal looks like success
+  // while a hook entry is still wired somewhere this run could not speak for.
+  //
+  // ONE, not a code per reason. This package already has a convention for exactly this state and it
+  // is a single value: `monet materialize` sets 1 for a per-surface failure inside a run that
+  // otherwise completed, and `monet materialize list` does the same per surface. (`monet doctor`'s
+  // 2 is a different meaning entirely — a diagnostic verdict on a healthy store, not undone work.)
+  // Refused-unreadable and refused-on-conflict are interchangeable here for the same reason every
+  // sentence below treats them as one: both leave a target this run cannot speak for.
+  //
+  // NOT AN EXCEPTION, and not `process.exit()`: the loop above already did real work on the other
+  // targets, and its report of that work is what the user needs. Setting the code and returning
+  // normally is what keeps both.
+  if (unfinished > 0) (hooks.setExitCode ?? ((code: number) => { process.exitCode = code; }))(1);
 
   if (removedTotal === 0) {
     // SAID PLAINLY, because "nothing happened" is the answer for everyone who never ran the old

@@ -13241,9 +13241,43 @@ export class MonetCore {
           // now, in the SAME transaction, with the SAME semantics as that backfill — stamp the
           // concept's CURRENT circle. Never BREADTH_CIRCLE: the guard at the top of this loop already
           // refuses any relayed concept row claiming '*', so `row.circle` is guaranteed ordinary here.
+          //
+          // WIDENED FROM `circle IS NULL` TO EVERY NON-BREADTH BINDING (Codex round 4, P1 — a safety
+          // regression this branch introduced). `trg_rule_bindings_follow_concept_circle` was the
+          // UNCONDITIONAL repair for a MOVED concept: whatever else a transaction did, a write that
+          // changed `concepts.circle` dragged every non-breadth binding of that concept with it. The
+          // audit that retired the trigger family enumerated a JS keep-in-step update on every
+          // writer of `concepts.circle` — but "an update EXISTS on this path" is not "the update
+          // always WINS", and on THIS path it does not. `concepts` and `rule_bindings` carry
+          // INDEPENDENT (sync_revision, sync_writer) pairs contested by separate INSERT ... WHERE
+          // clauses, so the concept row can win its own contest and MOVE while its binding row loses
+          // its own and stays put — and the binding row can also never reach that contest at all,
+          // `continue`d past by DOOR 12 (a refused reclassification of a live deny), by the breadth
+          // boundary check, or by the divergent-successor recheck, every one of which is right to
+          // refuse the ROW while saying nothing about the concept's move. Left at `circle IS NULL`,
+          // this heal skipped all of it: a binding already holding a value stayed in the circle the
+          // concept LEFT, permanently — delivering nowhere the concept now lives, and never
+          // re-selected by anything that could try again. A blocking rule disappeared, silently,
+          // from the circle it exists to guard.
+          //
+          // `circle != BREADTH_CIRCLE` IN THE WHERE, NOT THE SET — the retired trigger's own
+          // exclusion, verbatim, and the same one moveConcept and renameCircle already carry: a
+          // global binding's reach is a property of the BINDING, independent of wherever its concept
+          // happens to be filed, so a move must never narrow it back down to one circle. Spelled
+          // `circle IS NULL OR circle != ?` because plain `circle != '*'` is NULL — not true — for a
+          // dangling row, which would silently drop the original B3 case this heal exists for.
+          //
+          // NOT SYNC-STAMPED, exactly as this statement already was not: this is a receiver
+          // CONVERGING to a fact the relayed concept row already carries, not a local act. Every
+          // peer that grafts the same concept move performs the identical repair from the identical
+          // input, so stamping would mint a revision on each receiver and let a mere receiver
+          // out-race the originator's own binding row on a third device.
           this.db
-            .prepare(`UPDATE rule_bindings SET circle = ? WHERE concept_id = ? AND circle IS NULL`)
-            .run(row.circle, row.id);
+            .prepare(
+              `UPDATE rule_bindings SET circle = ?
+                WHERE concept_id = ? AND circle IS NOT ? AND (circle IS NULL OR circle != ?)`,
+            )
+            .run(row.circle, row.id, row.circle, BREADTH_CIRCLE);
         } else skipped.concepts++;
         const unionJson = (left: string | null | undefined, right: string | null | undefined): string | null => {
           const values = [...new Set([

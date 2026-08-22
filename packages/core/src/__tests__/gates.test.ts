@@ -6123,6 +6123,154 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     src.close();
     dst.close();
   });
+  /**
+   * THE MOVED CONCEPT THAT STRANDS ITS BINDING (Codex round 4, P1 — a safety regression this
+   * branch introduced). `trg_rule_bindings_follow_concept_circle` used to be the UNCONDITIONAL
+   * repair for exactly this: any write that moved `concepts.circle` dragged every non-breadth
+   * binding of that concept along with it, whatever else the same transaction did or refused to do.
+   * The removal audit that retired it enumerated a JS keep-in-step update on every writer of
+   * `concepts.circle` — but establishing that an update EXISTS on each path is not establishing
+   * that it always WINS, and on the graft path it does not.
+   *
+   * `concepts` and `rule_bindings` are versioned INDEPENDENTLY (separate `sync_revision`/
+   * `sync_writer` pairs, contested by separate INSERT ... WHERE clauses), so the concept row can
+   * win its own contest and MOVE while the binding row loses its own and stays put. The only other
+   * repair left in the concepts loop is `WHERE ... AND circle IS NULL` — it heals a DANGLING
+   * binding and deliberately never revisits one that already holds a value — so a binding with a
+   * non-null circle stays in the circle the concept LEFT, permanently: it delivers nowhere the
+   * concept now lives (RULE_LIVENESS_WHERE tests the BINDING's circle) and nothing ever re-selects
+   * it to try again. A blocking rule silently disappears from the circle it is supposed to guard.
+   */
+  it("a relayed concept move that WINS while its own binding row LOSES the convergence contest must not strand the binding in the circle the concept left (Codex round 4, P1)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: "circle-a", species: "rule", stage: "rm -rf",
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
+
+    // The concept moves on machine-a; both rows are stamped and relayed together, exactly as the
+    // "legitimate move" test above relays them.
+    src.reassignCircle(deny.conceptId, "circle-b");
+    const payload = src.exportDelta(0);
+    expect(payload.concepts.find((c) => c.id === deny.conceptId)?.circle).toBe("circle-b");
+
+    // BUT machine-b's own copy of the BINDING is already at this revision under its own writer id —
+    // the ordinary result of any local act on it (moveConcept and renameCircle both run
+    // `sync_revision = sync_revision + 1, sync_writer = <local device>`), or of a third device
+    // reaching this binding first. The relay's binding row therefore ties on revision and loses the
+    // writer tiebreak, while the CONCEPT row — carrying its own, unrelated counter — still wins.
+    const incumbent = raw(dst).prepare(
+      `SELECT sync_revision, sync_writer FROM rule_bindings WHERE concept_id = ?`,
+    ).get(deny.conceptId) as { sync_revision: number; sync_writer: string | null };
+    const bindingRow = payload.ruleBindings!.find((b) => b.concept_id === deny.conceptId)!;
+    const result = dst.graftRows({
+      ...payload,
+      ruleBindings: [{
+        ...bindingRow,
+        sync_revision: incumbent.sync_revision,
+        sync_writer: incumbent.sync_writer ?? "",
+      }],
+    });
+    // The binding row genuinely lost: the graft counted it as skipped, not landed.
+    expect(result.inserted.rule_bindings).toBe(0);
+    expect(result.skipped.rule_bindings).toBe(1);
+    // The concept genuinely moved.
+    expect((raw(dst).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle)
+      .toBe("circle-b");
+
+    // THE REGRESSION: without the repair the binding still reads "circle-a", and the deny fires in
+    // the circle the concept LEFT while the circle it now lives in is unguarded.
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-b");
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-b" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules).toEqual([]);
+    src.close();
+    dst.close();
+  });
+
+  /**
+   * THE SECOND DOOR ONTO THE SAME STRAND: the binding row does not lose a contest, it never reaches
+   * the contest at all. DOOR 12 (`current?.severity === 'blocking'`) `continue`s past the INSERT
+   * for any incoming row that reclassifies a live deny — correctly, since cross-device rescoping is
+   * not a merge decision. But the CONCEPT's move is a separate, already-accepted fact, and refusing
+   * the reclassification must not also freeze the incumbent deny in a circle its concept has left.
+   */
+  it("a relayed concept move whose binding row is refused by the deny guard must still carry the incumbent deny into the concept's new circle (Codex round 4, P1)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: "circle-a", species: "rule", stage: "rm -rf",
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
+
+    src.reassignCircle(deny.conceptId, "circle-b");
+    const payload = src.exportDelta(0);
+    const bindingRow = payload.ruleBindings!.find((b) => b.concept_id === deny.conceptId)!;
+    // Re-aimed at a different stage — a reclassification DOOR 12 refuses outright, however high its
+    // revision runs.
+    const result = dst.graftRows({
+      ...payload,
+      ruleBindings: [{
+        ...bindingRow, stage_id: "some-other-stage",
+        sync_revision: (bindingRow.sync_revision ?? 0) + 50, sync_writer: "machine-z",
+      }],
+    });
+    expect(result.skipped.rule_bindings).toBe(1);
+    // The refusal held: severity, stage and scope are the incumbent's, untouched.
+    expect(dst.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking" });
+    expect((raw(dst).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle)
+      .toBe("circle-b");
+    // ...and the deny followed its concept anyway.
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-b");
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-b" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules).toEqual([]);
+    src.close();
+    dst.close();
+  });
+
+  /**
+   * THE BREADTH BINDING IS THE ONE THAT MUST NOT FOLLOW, and the repair has to keep it that way —
+   * the retired trigger's own `circle != '*'` exclusion, and moveConcept's and renameCircle's
+   * identical `WHERE ... AND circle != '*'`, all encode the same doctrine: a global binding's reach
+   * is a property of the BINDING, independent of wherever its concept happens to be filed, so
+   * moving the concept must never narrow it back down to one circle.
+   */
+  it("a relayed concept move never narrows a GLOBAL binding down to the concept's new circle (Codex round 4, P1 — the exclusion the repair must keep)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
+      scope: "domain",
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+    const homeCircle = (raw(src).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle;
+
+    src.reassignCircle(deny.conceptId, "circle-b");
+    const payload = src.exportDelta(0);
+    expect(payload.concepts.find((c) => c.id === deny.conceptId)?.circle).toBe("circle-b");
+    expect(homeCircle).not.toBe("circle-b");
+    // The binding row is stripped so ONLY the concept's move lands — isolating the repair.
+    dst.graftRows({ ...payload, ruleBindings: [] } as never);
+
+    expect((raw(dst).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle)
+      .toBe("circle-b");
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
+    src.close();
+    dst.close();
+  });
 
   it("the SAME divergence, for an ADVISORY binding — non-breadth means non-breadth regardless of severity too (Codex round 1, item 3)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
