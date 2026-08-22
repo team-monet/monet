@@ -266,3 +266,185 @@ describe("stages.trigger_patterns: a retired concept whose column had to stay", 
     expect(receiver.stageLookup({ stage: "git force push" }).stage?.name).toBe("git force push");
   });
 });
+
+/**
+ * THE OTHER HALF OF THIS FILE'S CLASS: an object the build no longer CREATES, in a store that
+ * already HAS it.
+ *
+ * The two describe blocks above are about columns that had to survive removal. This one is the
+ * opposite disposition on the same asymmetry — a family of objects that must be actively destroyed,
+ * because leaving them costs work on every write instead of merely occupying a column.
+ *
+ * `gate_meta` and its eleven triggers were the mixed-build compatibility family, removed on
+ * 2026-08-22 by deleting their CREATE statements. That stopped fresh stores from acquiring them and
+ * left every upgraded store carrying all twelve objects, still firing on concept title/status/circle
+ * changes, stage inserts, rule reclassification and alias mutations — each bumping a generation
+ * counter whose last reader went with the gate mirror.
+ *
+ * THE FIXTURE IS BUILT TO BE ABLE TO FAIL. It installs the family with the previous release's own
+ * verbatim DDL and then PROVES the triggers fire — `generation` is read before and after a real
+ * declaration — before the store is ever reopened. Without that, a green result here would be
+ * indistinguishable from a fixture whose triggers were inert typos, which is the one thing a
+ * migration test must not be.
+ */
+describe("gate_meta and its trigger family: objects this build no longer creates", () => {
+  const PREVIOUS_RELEASE_FAMILY_SQL = `
+    CREATE TABLE IF NOT EXISTS gate_meta (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      generation INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO gate_meta (singleton, generation) VALUES (1, 0);
+
+    CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_backfill_circle
+    AFTER INSERT ON rule_bindings
+    FOR EACH ROW WHEN NEW.circle IS NULL
+    BEGIN
+      UPDATE rule_bindings SET circle = (
+        SELECT CASE WHEN c.circle = '*' THEN NULL ELSE c.circle END
+          FROM concepts c WHERE c.id = NEW.concept_id
+      ) WHERE concept_id = NEW.concept_id;
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_follow_concept_circle
+    AFTER UPDATE OF circle ON concepts
+    FOR EACH ROW WHEN NEW.circle != '*'
+    BEGIN
+      UPDATE rule_bindings SET circle = NEW.circle
+       WHERE concept_id = NEW.id AND circle IS NOT NULL AND circle != '*';
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_follow_concept_status
+    AFTER UPDATE OF status ON concepts
+    FOR EACH ROW WHEN OLD.status IS NOT NEW.status AND EXISTS (SELECT 1 FROM rule_bindings WHERE concept_id = NEW.id)
+    BEGIN
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_follow_concept_title
+    AFTER UPDATE OF title ON concepts
+    FOR EACH ROW WHEN OLD.title IS NOT NEW.title AND EXISTS (SELECT 1 FROM rule_bindings WHERE concept_id = NEW.id)
+    BEGIN
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_bump_on_reclassification
+    AFTER UPDATE OF stage_id, severity, scope, model_tag, origin, declared_by, reason ON rule_bindings
+    FOR EACH ROW WHEN
+      OLD.stage_id IS NOT NEW.stage_id OR OLD.severity IS NOT NEW.severity OR OLD.scope IS NOT NEW.scope OR
+      OLD.model_tag IS NOT NEW.model_tag OR OLD.origin IS NOT NEW.origin OR OLD.declared_by IS NOT NEW.declared_by OR
+      OLD.reason IS NOT NEW.reason
+    BEGIN
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_stages_bump_on_trigger_patterns
+    AFTER UPDATE OF trigger_patterns ON stages
+    FOR EACH ROW WHEN OLD.trigger_patterns IS NOT NEW.trigger_patterns
+    BEGIN
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_stages_bump_on_insert
+    AFTER INSERT ON stages
+    BEGIN
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_concepts_bump_on_delete
+    AFTER DELETE ON concepts
+    FOR EACH ROW WHEN EXISTS (SELECT 1 FROM rule_bindings WHERE concept_id = OLD.id)
+    BEGIN
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_circle_aliases_bump_on_insert
+    AFTER INSERT ON circle_aliases
+    BEGIN
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_circle_aliases_bump_on_update
+    AFTER UPDATE OF to_name, status ON circle_aliases
+    FOR EACH ROW WHEN OLD.to_name IS NOT NEW.to_name OR OLD.status IS NOT NEW.status
+    BEGIN
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_circle_aliases_bump_on_delete
+    AFTER DELETE ON circle_aliases
+    BEGIN
+      UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+    END;
+  `;
+
+  /** Every object of the family still present, by name — the whole point is that this ends empty. */
+  const familyObjectsIn = (c: MonetCore): string[] =>
+    (
+      raw(c)
+        .prepare(
+          `SELECT name FROM sqlite_master
+            WHERE (type = 'trigger' AND name LIKE 'trg_%')
+               OR (type = 'table' AND name = 'gate_meta')
+            ORDER BY name`,
+        )
+        .all() as Array<{ name: string }>
+    ).map((row) => row.name);
+
+  const generationOf = (c: MonetCore): number =>
+    (raw(c).prepare(`SELECT generation FROM gate_meta WHERE singleton = 1`).get() as { generation: number })
+      .generation;
+
+  it("an upgraded store carrying the family comes out clean, and keeps writing", async () => {
+    const path = join(mkTmp(), "monet.db");
+
+    // A STORE THE PREVIOUS RELEASE WROTE: this build's schema, plus the family it no longer creates.
+    const previousRelease = core(path);
+    raw(previousRelease).exec(PREVIOUS_RELEASE_FAMILY_SQL);
+    expect(familyObjectsIn(previousRelease)).toHaveLength(12);
+
+    // THE FIXTURE CAN EXHIBIT THE EFFECT — measured, not assumed. A declaration inserts a stage and
+    // a rule binding, so at least two of the eleven fire; if the counter does not move, the DDL
+    // above is decorative and everything below it proves nothing.
+    const before = generationOf(previousRelease);
+    await previousRelease.store("Never force-push to a shared branch.", {
+      kind: "rule",
+      rule: { stage: "git force push", scope: "domain" },
+    });
+    expect(generationOf(previousRelease)).toBeGreaterThan(before);
+    previousRelease.close();
+
+    // REOPENED BY THIS BUILD. Deleting the CREATE statements did nothing to this store; the drop in
+    // `migrateGateColumns` is what has to.
+    const c = core(path);
+    expect(familyObjectsIn(c)).toEqual([]);
+    expect(
+      raw(c).prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gate_meta'`).get(),
+    ).toBeUndefined();
+
+    // AND THE STORE STILL WORKS. Dropping `gate_meta` while a trigger that writes to it survived
+    // would leave the next stage insert failing "no such table: gate_meta" — this write is what
+    // proves the triggers-before-table ordering actually held.
+    await c.declare({ species: "stage", stage: "terraform apply" });
+    expect(c.stages().map((s) => s.name).sort()).toEqual(["git force push", "terraform apply"]);
+    // What the previous release wrote is still readable, and still delivers.
+    expect(c.stageLookup({ stage: "git force push" }).rules).toHaveLength(1);
+  });
+
+  it("is a no-op on a store that never had the family, and on a second open", async () => {
+    const path = join(mkTmp(), "monet.db");
+
+    // A store created entirely by this build: twelve `IF EXISTS` drops that find nothing.
+    const fresh = core(path);
+    expect(familyObjectsIn(fresh)).toEqual([]);
+    await fresh.declare({ species: "stage", stage: "terraform apply" });
+    fresh.close();
+
+    // Reopened — the drop runs again (twice per construction, via init() and after migrate()) and
+    // is still a no-op. Idempotence here is what lets it run unconditionally with no version gate.
+    const reopened = core(path);
+    expect(familyObjectsIn(reopened)).toEqual([]);
+    expect(reopened.stages().map((s) => s.name)).toEqual(["terraform apply"]);
+  });
+});

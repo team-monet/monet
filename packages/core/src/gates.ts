@@ -322,6 +322,59 @@ export function createGateTables(db: StoragePort): void {
 }
 
 /**
+ * The eleven triggers of the mixed-build compatibility family, plus the singleton table they all
+ * wrote to. Names are the ones the removed CREATE statements declared, verbatim — a name that does
+ * not match an object in the store simply drops nothing.
+ */
+const RETIRED_GATE_TRIGGERS = [
+  "trg_rule_bindings_backfill_circle",
+  "trg_rule_bindings_follow_concept_circle",
+  "trg_rule_bindings_follow_concept_status",
+  "trg_rule_bindings_follow_concept_title",
+  "trg_rule_bindings_bump_on_reclassification",
+  "trg_stages_bump_on_insert",
+  "trg_stages_bump_on_trigger_patterns",
+  "trg_concepts_bump_on_delete",
+  "trg_circle_aliases_bump_on_insert",
+  "trg_circle_aliases_bump_on_update",
+  "trg_circle_aliases_bump_on_delete",
+] as const;
+
+/**
+ * DELETING A CREATE STATEMENT IS NOT A MIGRATION. `createGateTables` is `IF NOT EXISTS` per object,
+ * so removing the trigger family's DDL stopped FRESH stores from ever getting it and did nothing at
+ * all to a store that already had it — exactly the asymmetry gate-schema-compat.test.ts's own header
+ * describes for a dropped column, one object type over. Every upgraded store still carries
+ * `gate_meta` and all eleven triggers, and they still FIRE: on a concept's title, status or circle
+ * changing, on a stage insert, on a rule reclassification, and on every alias mutation — each one
+ * bumping a counter that no surviving code reads. Work that cannot be observed is not harmless; it
+ * is a write amplification on the hot path of every declaration, plus a schema object a future
+ * `ALTER` on `rule_bindings` or `circle_aliases` can collide with.
+ *
+ * WHY DROPPING IS SAFE, rather than restating it: the removal record in `migrateGateColumns` below
+ * ("THE MIXED-BUILD COMPATIBILITY TRIGGER FAMILY WAS REMOVED HERE") holds the owner's ruling that
+ * no old build writes to this store, and names what the family's absence gives up. That record is
+ * the authority for this function; nothing here re-argues it.
+ *
+ * TRIGGERS FIRST, THEN THE TABLE, and the order is load-bearing rather than tidy. SQLite resolves a
+ * trigger's BODY at fire time, not at drop time — so a store left holding a live
+ * `trg_stages_bump_on_insert` after `gate_meta` had gone would fail its NEXT stage insert with
+ * "no such table: gate_meta". Dropping in the other order turns a dead counter into a broken write
+ * path, which is strictly worse than leaving the family alone.
+ *
+ * IDEMPOTENT AND SAFE ON A STORE THAT NEVER HAD THE FAMILY: `IF EXISTS` on every statement, so a
+ * fresh store drops eleven triggers and one table that are all already absent, at the cost of twelve
+ * no-op statements per open. That is the same posture as the guarded ALTER below — cheap enough to
+ * run unconditionally, which is what makes it correct without a version gate to keep in step.
+ */
+function dropRetiredGateTriggerFamily(db: StoragePort): void {
+  for (const trigger of RETIRED_GATE_TRIGGERS) {
+    db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+  }
+  db.exec(`DROP TABLE IF EXISTS gate_meta`);
+}
+
+/**
  * PHASE (c): every gate-substrate migration that is NOT table creation — the `rule_bindings.circle`
  * column guard, its backfill, and the circle index, in that order (review fix — Codex round 3,
  * item 1; split out of createGateSchema, which used to run all of this immediately after its own
@@ -333,6 +386,7 @@ export function createGateTables(db: StoragePort): void {
  * (see each guard's own comment) regardless of which concurrent migrator gets there first.
  */
 export function migrateGateColumns(db: StoragePort): void {
+  dropRetiredGateTriggerFamily(db);
   // THE COLUMN GUARD, for breadth (slice 4b-B follow-up): a store created before breadth shipped
   // has a rule_bindings table with no `circle` column at all. No constant would fix it — the
   // correct value is "whichever circle this binding's own concept already lives in", which is a

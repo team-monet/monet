@@ -75,6 +75,25 @@ function coreWithSpool(spoolPath: string): MonetCore {
   return core;
 }
 
+/**
+ * One live rule at `stage`, so a `stage_lookup` of that stage DELIVERS something.
+ *
+ * The key and its instruction ship only on a response that actually carried a rule (mcp-server.ts),
+ * so a test asserting on either has to look up a stage that has one. The rule's own wording stays
+ * clear of every needle the assertions count — `conformance_ask`, `followed these rules` — because
+ * one of them counts occurrences across the whole payload, and rule text lands in that payload.
+ */
+async function declareRuleAt(core: MonetCore, stage: string): Promise<void> {
+  await core.declare({
+    species: "rule",
+    stage,
+    content: "Check with the branch owner first.",
+    severity: "advisory",
+    scope: "domain",
+    circle: "acme-widgets",
+  });
+}
+
 describe("the four states, kept apart", () => {
   it("separates a queue owed to the user from a defect owed by the agent", () => {
     const path = join(mkTmp(), "moments.jsonl");
@@ -310,9 +329,16 @@ describe("the signal that tells the agent it owes a question", () => {
     const core = coreWithSpool(path);
     seq = 0;
     readAndActed(path, "owed-one");
+    // A DELIVERING LOOKUP, because the key and its instruction only ship when the response actually
+    // carried a rule. This used to look up "nothing-here" — an arbitrary miss — and still expect the
+    // instruction, which was the defect: the agent was told to ask about "these rules" when none
+    // were on the response, and the `conformance_ask` it named would have been refused outright.
+    // The miss was never this test's subject; the debt it asserts on comes from `readAndActed`
+    // above, not from the lookup.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
-      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       const signal = texts(result).find((text) => text.includes("Monet: you read a rule"));
       expect(signal).toBeDefined();
       // A signal naming a moment...
@@ -345,9 +371,12 @@ describe("the signal that tells the agent it owes a question", () => {
     const core = coreWithSpool(path);
     seq = 0;
     readAndActed(path, "owed-one");
+    // Delivering, for the reason the previous test states: both halves can only ride one response
+    // if the response is one that carries a rule at all.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
-      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       const parts = texts(result);
       // BOTH halves are on this one response: the standing instruction, which ships with the key on
       // every lookup, and the debt signal, which fires only because a moment is outstanding.

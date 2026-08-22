@@ -1816,30 +1816,36 @@ export function registerMonetCoreTools(
         // double-count the lookup and re-credit identities the fitter dropped, which is the exact
         // defect an earlier round of this review closed.
         const r = core.stageLookup({ stage, circle: scope(circle), recordMomentRead: false });
-        const fixedFields = {
+        // THE KEY THE AGENT QUOTES BACK. `conformance_ask` and `conformance_answer` both take a
+        // momentId, and before this there was no surface an agent could get one from — the fourth
+        // fact was unrecordable in practice for want of an identifier. Handing it out HERE, and
+        // only here, is deliberate: this is the moment a rule reaches the agent, so it is the
+        // moment the eventual question is about.
+        //
+        // OMITTED, NEVER NULL, WHEN THERE IS NO MOMENT: with no spool configured nothing is
+        // recorded and no conformance call could attach anyway, and an explicit `null` would
+        // invite one to be attempted against it. Same omit-when-absent convention as every other
+        // optional field on this response.
+        //
+        // THE KEY AND ITS INSTRUCTION SHIP TOGETHER, in one spread, so neither can appear without
+        // the other. A key with nothing saying what it is for was the state this closes; an
+        // instruction to name a key that is not on the response would be worse than silence.
+        const momentFields = momentId !== null ? { momentId, instruction: CONFORMANCE_INSTRUCTION } : {};
+        const responseFieldsWithoutMoment = {
           circle: scope(circle),
           matched: r.matched,
           ...(r.stage ? { stage: r.stage } : {}),
-          // THE KEY THE AGENT QUOTES BACK. `conformance_ask` and `conformance_answer` both take a
-          // momentId, and before this there was no surface an agent could get one from — the fourth
-          // fact was unrecordable in practice for want of an identifier. Handing it out HERE, and
-          // only here, is deliberate: this is the moment a rule reaches the agent, so it is the
-          // moment the eventual question is about.
-          //
-          // OMITTED, NEVER NULL, WHEN THERE IS NO MOMENT: with no spool configured nothing is
-          // recorded and no conformance call could attach anyway, and an explicit `null` would
-          // invite one to be attempted against it. Same omit-when-absent convention as every other
-          // optional field on this response.
-          //
-          // IN `fixedFields` SO THE SIZE-FIT BELOW COUNTS IT. Every budget check serializes this
-          // envelope; a field added after the loop would be paid for out of a budget that never
-          // knew about it. The instruction is counted the same way, for the same reason.
-          //
-          // THE KEY AND ITS INSTRUCTION SHIP TOGETHER, in one spread, so neither can appear without
-          // the other. A key with nothing saying what it is for was the state this closes; an
-          // instruction to name a key that is not on the response would be worse than silence.
-          ...(momentId !== null ? { momentId, instruction: CONFORMANCE_INSTRUCTION } : {}),
         };
+        // BUDGETED AS IF THE KEY SHIPS, DECIDED AFTER THE FIT LOOP KNOWS WHETHER IT DOES.
+        //
+        // The two facts are circular by construction: the key ships only when the response carries
+        // at least one rule, and which rules the response carries is what the fit loop below is
+        // computing. Budgeting against the LARGER envelope breaks the circle in the only safe
+        // direction — dropping the key afterwards can only leave the response smaller than what was
+        // measured, never larger, so no field is ever paid for out of a budget that did not know
+        // about it. The reverse (budget small, ship large) is the overflow this envelope's whole
+        // size-fit discipline exists to prevent.
+        const fixedFieldsForBudget = { ...responseFieldsWithoutMoment, ...momentFields };
         const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
 
         // SIZE-FIT #1: rules (blocker fix). Same technique memory_fetch's outline uses (see
@@ -1902,10 +1908,36 @@ export function registerMonetCoreTools(
             ...(rule.disputedParentsTruncated ? { disputedParentsTruncated: true } : {}),
           };
           const candidate = [...fitRules, candidateRule];
-          const serialized = JSON.stringify({ ...fixedFields, rules: candidate }, null, 2);
+          const serialized = JSON.stringify({ ...fixedFieldsForBudget, rules: candidate }, null, 2);
           if (serialized.length > sizeBudget) break;
           fitRules.push(candidateRule);
         }
+
+        // THE KEY SHIPS ONLY WHEN THIS RESPONSE ACTUALLY DELIVERED A RULE.
+        //
+        // WHAT IT USED TO DO: hand out a momentId and the instruction on every lookup that had a
+        // moment at all — a stage that does not exist, a stage with no live rules bound, or a fit
+        // loop that seated none of them. The agent was told to ask the user whether the action
+        // followed "these rules" when no rules were on the response to follow, and the
+        // `conformance_ask` it was instructed to make could not have succeeded: `recordRuleReads`
+        // spools `ruleId: null` for an empty lookup (engine.ts), the fold drops exactly that record
+        // rather than writing a rule read (`if (record.ruleId === null) return`, moment-ledger.ts),
+        // and `requireObservedMoment` refuses any moment whose `rule_reads` is empty
+        // (moment-ledger.ts). So the instruction named a call that was guaranteed to be REFUSED.
+        //
+        // An instruction whose only possible outcome is an error is worse than no instruction: the
+        // agent spends a turn on it, gets `UnknownMomentError`, and has nothing true to tell the
+        // user about why. Omitting both fields says the honest thing — this lookup delivered
+        // nothing, so there is nothing to ask about — through the same absence-is-the-signal
+        // convention the rest of this response uses.
+        //
+        // GATED ON `fitRules`, NOT ON `r.rules`, for the same reason `recordRuleReads` below is:
+        // the response is the authority on what reached the agent. A rule the engine selected and
+        // the size budget then dropped was never read, so it can neither be recorded as read nor
+        // make the moment answerable — the two must agree, and they now share one condition.
+        //
+        // A MISS STILL RETURNS ITS `stageIndex` recovery path; only the key and its instruction go.
+        const fixedFields = fitRules.length > 0 ? fixedFieldsForBudget : responseFieldsWithoutMoment;
         // HONEST TOTAL (review fix — Codex round 2): `r.rulesTotal`, when present, means the SQL
         // retrieval itself was capped — `r.rules.length` alone would understate how many rules
         // truly exist, not just how many the wire chose to show. Absent means `r.rules.length` IS

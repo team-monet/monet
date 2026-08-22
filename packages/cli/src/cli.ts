@@ -11,6 +11,7 @@ import { openServedCore, openStatusCore } from "./bootstrap.js";
 import { reportStartupFailure } from "./startup-report.js";
 import { registerRecoveryCommands } from "./repair-cli.js";
 import { MaterializeCliError, registerMaterializeCommands } from "./materialize-cli.js";
+import { registerHookRetirementCommands } from "./uninstall-cli.js";
 import { resolveProjectDir } from "./project-dir.js";
 
 // Read version from package.json so it can never drift from the published version.
@@ -242,6 +243,11 @@ program
 
 registerRecoveryCommands(program);
 registerMaterializeCommands(program);
+// THE MIGRATION PATH OFF `monet install`'s HOOK. Registered here rather than folded into either
+// list above because it is neither recovery nor materialization: it is the pair of commands that
+// exist solely because a previous release wrote hook entries and a wrapper script onto users'
+// disks, and this build removed the commands those entries invoke. See uninstall-cli.ts.
+registerHookRetirementCommands(program);
 
 void program.parseAsync().catch((error: unknown) => {
   if (error instanceof FreshStoreEmbedderUnavailableError) {
