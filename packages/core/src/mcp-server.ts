@@ -652,6 +652,28 @@ export function registerMonetCoreTools(
   // long-running handler (e.g. source_sync) can't touch the database after a signal/EOF has
   // closed it out from under it mid-call.
   const inFlightTracker = getInFlightTracker(server);
+  /**
+   * THE KEY, MADE REACHABLE FROM INSIDE THE HANDLER THAT NEEDS IT.
+   *
+   * The wrapper below opens a moment for every call and closes it afterwards, and until this
+   * existed that moment id lived only in the wrapper's closure. Nothing the agent received ever
+   * named it, so the chain stopped one link short: a rule reached the agent, the agent acted, and
+   * there was no id to quote back when the user answered whether the action followed the rule.
+   *
+   * A SIDE CHANNEL, NOT A WIDER SIGNATURE. Only `stage_lookup` needs the id today, and threading a
+   * third parameter through would change the type of every handler in this file to serve one of
+   * them. Keyed on the per-request `extra` object the MCP SDK constructs fresh for each request
+   * (`fullExtra` in its protocol layer), so concurrent calls cannot read each other's id — the
+   * failure mode a module-level "current moment" variable would have.
+   *
+   * NOT BY MUTATING THE PARSED INPUT. The input object is the agent's own claim about the call, and
+   * writing a store-minted id into it would make an argument indistinguishable from a fact this
+   * server produced. A WeakMap also drops its entry when the request object is collected, so
+   * nothing here accumulates.
+   */
+  const storeMomentByRequest = new WeakMap<object, string>();
+  const openedMomentFor = (extra: unknown): string | null =>
+    typeof extra === "object" && extra !== null ? storeMomentByRequest.get(extra) ?? null : null;
   const originalTool = server.tool.bind(server);
   server.tool = ((...toolArgs: unknown[]) => {
     const handler = toolArgs[toolArgs.length - 1] as (...handlerArgs: unknown[]) => unknown;
@@ -677,6 +699,15 @@ export function registerMonetCoreTools(
       const callCircle =
         typeof argCircle === "string" && argCircle.length > 0 && argCircle !== "*" ? argCircle : undefined;
       const momentId = core.openStoreMoment(toolName, callCircle);
+      // Published on the side channel above, for the one handler that opts in. `handlerArgs[1]` is
+      // the SDK's per-request `extra` for every tool registered with a params schema — which is
+      // every tool here that reads this, and the same argument position the circle above is read
+      // relative to. A null id (no spool configured) publishes nothing, so an opted-in handler sees
+      // "no moment" rather than a placeholder.
+      const requestExtra = handlerArgs[1];
+      if (momentId !== null && typeof requestExtra === "object" && requestExtra !== null) {
+        storeMomentByRequest.set(requestExtra, momentId);
+      }
       // Identity, never content: a sha256 of the serialized result. A result that cannot be
       // serialized still closes the moment — with the string form — rather than leaving it open.
       // THE STATUS IS OBSERVED HERE, at the only place that can tell. Each caller below already
@@ -865,13 +896,28 @@ export function registerMonetCoreTools(
    * demands:
    *
    *   WHO CONSUMES IT — the agent, and nobody else. It is an instruction, not data for a reader.
-   *   ON WHICH TURN — the first tool response after a moment was read and then acted on. Not at
-   *     session start (the debt does not exist yet) and not on a timer.
-   *   WHAT BREAKS WITHOUT IT — the agent cannot know it owes a question. The hook that opened the
-   *     moment is store-less and cannot see whether a read happened, so nothing else is in a
-   *     position to tell it. Without the signal, `not asked` stops meaning "the agent failed to ask"
-   *     and starts meaning "the agent was never told" — one number covering a defect and an
-   *     impossibility, which is the precise conflation this whole rebuild exists to remove.
+   *   ON WHICH TURN — the next `stage_lookup` response after a moment was read and then acted on,
+   *     and NO OTHER TOOL'S. Not at session start (the debt does not exist yet) and not on a timer.
+   *   WHAT BREAKS WITHOUT IT — the agent cannot know it owes a question. Nothing else is in a
+   *     position to tell it: the read is recorded inside the store, and the agent's own transcript
+   *     shows it fetched rules, never that a question is outstanding. Without the signal, `not
+   *     asked` stops meaning "the agent failed to ask" and starts meaning "the agent was never
+   *     told" — one number covering a defect and an impossibility, which is the precise conflation
+   *     this whole rebuild exists to remove.
+   *
+   * ONE SURFACE, AND THAT IS THE CORRECTION THIS ROUND MAKES. It used to ride EVERY tool response,
+   * which spent context on `memory_fetch` and `memory_checkpoint` replies where the agent has no
+   * rule in front of it and the instruction is an interruption with nothing to attach to. The agent
+   * is told to collect confirmations at the moment it is being handed rules, and nowhere else —
+   * `stage_lookup` is the one response where the reminder lands in the context that explains it,
+   * beside the very key (`momentId`) the conformance tools take.
+   *
+   * THE COST IS A LATER REMINDER, NOT A LOST ONE. A moment only enters this backlog once its
+   * outcome has landed, and a call's outcome is written after its handler has already returned — so
+   * a `stage_lookup` moment is never named on its own response, only on the next one. That is
+   * acceptable BECAUSE the response now carries its own `momentId`: the agent holds the key from
+   * the first turn, and this signal is the backstop for a debt it did not clear, not the only way
+   * it learns the key.
    *
    * IT NAMES MOMENTS; IT NEVER CARRIES THEIR CONTENT. Ids and one instruction. The agent already has
    * the action in its own transcript — re-sending a rendering of it would be paying context to tell
@@ -950,7 +996,12 @@ export function registerMonetCoreTools(
       }
     }
 
-    const askBlock = askSignalBlock();
+    // --- ask signal ---
+    // ONE SURFACE ONLY. See askSignalBlock's own header for why: the agent collects confirmations
+    // at the moment it is handed rules, so the reminder belongs on the response that hands them
+    // over and on no other. Gated HERE rather than inside the block builder so every other tool
+    // response skips the `momentsOwingAQuestion` query — and its fold — outright.
+    const askBlock = toolName === "stage_lookup" ? askSignalBlock() : "";
     if (prewarmBlock === "" && askBlock === "") return result;
 
     const appended = [
@@ -1714,7 +1765,7 @@ export function registerMonetCoreTools(
    */
   server.tool(
     "conformance_ask",
-    "Record that you asked the user whether an action followed the rule it read. Call this when you put the question, before their reply. The momentId comes from the Monet signal on a prior tool response.",
+    "Record that you asked the user whether an action followed the rule it read. Call this when you put the question, before their reply. The momentId is the one `stage_lookup` returned when it handed you that rule; a later `stage_lookup` also names any you still owe.",
     {
       momentId: z.string().max(MOMENT_ID_MAX_CHARS).describe("The moment you asked about."),
     },
@@ -1753,16 +1804,18 @@ export function registerMonetCoreTools(
     {
       stage: z.string().max(STAGE_NAME_MAX_CHARS).describe("Stage name or id from agent_context/prewarm."),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
-      /**
-       * The moment the delivered instruction named, when one did. Optional BY NECESSITY rather than
-       * by preference: an agent can reach this tool from `agent_context`, where no interception
-       * prompted it and there is no moment to name. Omitting it is a recorded state (an unjoinable
-       * read), never an error — see MonetCore.recordRuleReads.
-       */
-      momentId: z.string().max(MOMENT_ID_MAX_CHARS).optional()
-        .describe("The momentId from a gate instruction, so this read joins the moment that prompted it."),
+      // NO `momentId` INPUT. It used to be one, carrying the id from a gate instruction so the read
+      // could join the moment that prompted it — and no gate instruction is emitted any more, so
+      // the only id an agent could pass would be one it invented or copied from somewhere else.
+      // The moment this read belongs to is now the one THIS CALL opened, which the wrapper mints
+      // and the response hands back; a caller-supplied id could only disagree with it.
     },
-    async ({ stage, circle, momentId }) => {
+    async ({ stage, circle }, extra) => {
+      // THIS CALL'S OWN MOMENT — the id the wrapper opened for this very `stage_lookup`, which is
+      // also the id this response returns. That makes one moment carry the whole chain: the rule
+      // reached the agent here, so the read attaches here, and the question the user is later asked
+      // is about this same id.
+      const momentId = openedMomentFor(extra);
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         // ONE CHAIN: no runtimeModelTag passed here — core.setRuntimeModelTag() was called once at
@@ -1776,6 +1829,21 @@ export function registerMonetCoreTools(
           circle: scope(circle),
           matched: r.matched,
           ...(r.stage ? { stage: r.stage } : {}),
+          // THE KEY THE AGENT QUOTES BACK. `conformance_ask` and `conformance_answer` both take a
+          // momentId, and before this there was no surface an agent could get one from — the fourth
+          // fact was unrecordable in practice for want of an identifier. Handing it out HERE, and
+          // only here, is deliberate: this is the moment a rule reaches the agent, so it is the
+          // moment the eventual question is about.
+          //
+          // OMITTED, NEVER NULL, WHEN THERE IS NO MOMENT: with no spool configured nothing is
+          // recorded and no conformance call could attach anyway, and an explicit `null` would
+          // invite one to be attempted against it. Same omit-when-absent convention as every other
+          // optional field on this response.
+          //
+          // IN `fixedFields` SO THE SIZE-FIT BELOW COUNTS IT. Every budget check serializes this
+          // envelope; a field added after the loop would be paid for out of a budget that never
+          // knew about it.
+          ...(momentId !== null ? { momentId } : {}),
         };
         const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
 
@@ -1850,8 +1918,15 @@ export function registerMonetCoreTools(
         const rulesTotal = r.rulesTotal ?? r.rules.length;
         const rulesOmittedCount = rulesTotal - fitRules.length;
 
-        // THE READ, RECORDED AGAINST THE MOMENT THAT PROMPTED IT (invariant 03) — AND ONLY FOR THE
+        // THE READ, RECORDED AGAINST THIS CALL'S OWN MOMENT (invariant 03) — AND ONLY FOR THE
         // RULES THIS RESPONSE ACTUALLY CARRIES.
+        //
+        // THE MOMENT USED TO COME FROM THE CALLER, named by a gate instruction that no longer
+        // exists; with nothing emitting one, every read was recorded against `null` and joined
+        // nothing. The moment the wrapper opened for this call is the honest owner: the rules
+        // reached the agent through THIS response, so this is the call whose conformance is later
+        // in question. A null id here still means an unjoinable read (no spool configured), which
+        // is a recorded state rather than an error — see MonetCore.recordRuleReads.
         //
         // THIS USED TO RUN BEFORE THE FIT LOOP, against the engine's whole `r.rules`, on the
         // reasoning that recording the engine's delivered set stops a presentation change from
@@ -1866,7 +1941,7 @@ export function registerMonetCoreTools(
         // reached the agent, its content did not, and `stage_lookup`'s whole job is the content.
         // Delivery and receipt stay separate facts.
         core.recordRuleReads(
-          momentId ?? null,
+          momentId,
           fitRules.map((rule) => rule.conceptId as string),
           // THE STAGE THE AGENT NAMED, resolved to its id — never the stage the gate matched. On
           // a miss there is no id, and null is honest: the agent named something this build could

@@ -258,3 +258,126 @@ describe("stage_lookup records the stage the agent named", () => {
     expect([...reads.keys()][0]).toEqual(expect.any(String));
   });
 });
+
+/**
+ * THE KEY, AND THE ORDER THAT MAKES IT USABLE.
+ *
+ * `stage_lookup` now records its read against the moment THIS CALL opened, and hands that id back
+ * so the agent can quote it to `conformance_ask` / `conformance_answer`. That only works if the
+ * three stamps land in the order the design assumes, and the order is not something the code says
+ * out loud anywhere — it is a consequence of where each one is written:
+ *
+ *   `at`         — `openStoreMoment`, in the wrapper, BEFORE the handler runs.
+ *   `readAt`     — `recordRuleReads`, inside the handler.
+ *   `outcome_at` — `closeStoreMoment`, in the wrapper, AFTER the handler returns.
+ *
+ * If that held only by accident, a self-read would fold into `late_rule_reads` instead of
+ * `rule_reads` — the fold classifies a read after the outcome as late — and the moment would owe no
+ * question, silently, because every consumer of this record requires a TIMELY read. So it is
+ * measured here rather than assumed. A tie counts as timely by the fold's own rule, which matters:
+ * all three stamps routinely land inside one millisecond.
+ */
+describe("a stage_lookup carries its own moment through the whole chain", () => {
+  async function lookupOnce(
+    spoolPath: string,
+    stage: string,
+  ): Promise<{ core: MonetCore; response: Record<string, unknown> }> {
+    const core = new MonetCore(":memory:", { momentSpoolPath: spoolPath, defaultCircle: "acme-widgets" });
+    cores.push(core);
+    await core.declare({
+      species: "rule", stage, patterns: [`Bash:${stage}`],
+      content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
+    });
+    const server = new McpServer({ name: "t", version: "1" }, { capabilities: { tools: {} } });
+    registerMonetCoreTools(server, core, { autoPrewarm: false });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.connect(st);
+    const client = new Client({ name: "c", version: "1" });
+    await client.connect(ct);
+    try {
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage, circle: "acme-widgets" } });
+      const first = (result as { content: Array<{ type: string; text?: string }> }).content[0];
+      return { core, response: JSON.parse(first.text ?? "{}") as Record<string, unknown> };
+    } finally {
+      await client.close();
+    }
+  }
+
+  it("returns the momentId the read was recorded against", async () => {
+    const spoolPath = join(mkTmp(), "moments.jsonl");
+    const db = mkDb();
+    const { response } = await lookupOnce(spoolPath, "terraform apply");
+
+    // THE KEY IS ON THE WIRE. Before this, `conformance_ask` took a momentId that no surface an
+    // agent could reach ever produced — the fourth fact was unrecordable for want of an identifier.
+    const momentId = response.momentId;
+    expect(momentId).toEqual(expect.any(String));
+
+    // ...and it is THIS call's moment, not some other id: the row it names is the stage_lookup, and
+    // the rules this response carried are the ones recorded as read against it.
+    const moment = readGovernedMoment(db, spoolPath, momentId as string);
+    expect(moment?.surface).toBe("stage_lookup");
+    const delivered = (response.rules as Array<{ conceptId: string }>).map((rule) => rule.conceptId);
+    expect(delivered.length).toBeGreaterThan(0);
+    expect(Object.keys(moment?.ruleReads ?? {}).sort()).toEqual([...delivered].sort());
+  });
+
+  it("lands the self-read as TIMELY, not late — the ordering the design depends on", async () => {
+    const spoolPath = join(mkTmp(), "moments.jsonl");
+    const db = mkDb();
+    const { response } = await lookupOnce(spoolPath, "terraform apply");
+    const moment = readGovernedMoment(db, spoolPath, response.momentId as string);
+
+    // Received: the rules reached the agent, and the record says so.
+    expect(Object.keys(moment?.ruleReads ?? {})).not.toEqual([]);
+    // NOT LATE. This is the assertion the whole design rests on; if it ever flips, the read is
+    // being recorded after the moment closes and no stage_lookup can ever owe a question.
+    expect(moment?.lateRuleReads).toEqual({});
+    // The act happened and the wrapper observed how it went — so "did it follow the rule?" has a
+    // referent, which is what makes the moment answerable at all.
+    expect(moment?.outcomeAt).toEqual(expect.any(String));
+    expect(moment?.outcomeStatus).toBe("ok");
+    // The ordering itself, stated as the comparison the fold performs. Equal stamps are timely.
+    expect(Object.values(moment?.ruleReads ?? {}).every((readAt) => readAt <= (moment?.outcomeAt ?? ""))).toBe(true);
+
+    // THE CONTROL — because a green that cannot fail reads exactly like a green that did not. The
+    // assertion above is only evidence if this fixture is capable of producing a LATE read at all,
+    // so here is one: the same core, the same spool, the same fold, with the read deliberately
+    // recorded after the moment closed. It lands in the other column.
+    const lateCore = cores[cores.length - 1];
+    const control = lateCore.openStoreMoment("stage_lookup");
+    lateCore.closeStoreMoment(control, "{}", "ok");
+    // The stamps are millisecond-resolution and a tie counts as timely, so the read must be pushed
+    // past the outcome by more than one tick for this to be the case it claims to be.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    lateCore.recordRuleReads(control, ["rule-late"], "stage-late", "acme-widgets");
+    const lateMoment = readGovernedMoment(db, spoolPath, control as string);
+    expect(lateMoment?.lateRuleReads).toEqual({ "rule-late": expect.any(String) });
+    expect(lateMoment?.ruleReads).toEqual({});
+  });
+
+  it("owes a question once closed, satisfying every condition the ask signal requires", async () => {
+    const spoolPath = join(mkTmp(), "moments.jsonl");
+    const db = mkDb();
+    const { core, response } = await lookupOnce(spoolPath, "terraform apply");
+    const momentId = response.momentId as string;
+
+    // All five conditions `momentsOwingAQuestion` gates on, checked one by one rather than only
+    // through the query — so a failure says WHICH one broke.
+    const moment = readGovernedMoment(db, spoolPath, momentId);
+    expect(moment?.opened).toBe(true);
+    expect(Object.keys(moment?.ruleReads ?? {})).not.toEqual([]);
+    expect(moment?.outcomeAt).toEqual(expect.any(String));
+    expect(moment?.askedAt).toBeNull();
+    expect(moment?.answer).toBeNull();
+
+    // And through the query the ask signal actually calls.
+    expect(core.momentsOwingAQuestion(10)).toContain(momentId);
+
+    // The debt clears the way the design says it does: the agent asks, the user answers, using the
+    // id this response handed out. Nothing else in this system can produce that id.
+    core.recordMomentAsk(momentId);
+    core.recordMomentAnswer(momentId, "followed");
+    expect(core.momentsOwingAQuestion(10)).not.toContain(momentId);
+  });
+});

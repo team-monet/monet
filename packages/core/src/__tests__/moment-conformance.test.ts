@@ -240,6 +240,11 @@ describe("the ask and the answer attach to a moment that exists", () => {
  *
  * So these tests are as much about what it does NOT say as what it does: no rule content, no action
  * rendering, nothing on the overwhelming majority of responses, and never twice for one moment.
+ *
+ * THEY DRIVE `stage_lookup`, NOT `memory_search`, AND THAT IS THE POINT OF ONE OF THEM. The signal
+ * used to ride every tool response; it now rides the ONE response that hands the agent rules,
+ * because that is the only place the instruction has context to attach to. Written against
+ * `memory_search`, these tests would now be asserting silence and calling it delivery.
  */
 describe("the signal that tells the agent it owes a question", () => {
   async function pair(core: MonetCore): Promise<{ client: Client; cleanup: () => Promise<void> }> {
@@ -262,10 +267,39 @@ describe("the signal that tells the agent it owes a question", () => {
     const core = coreWithSpool(path);
     const { client, cleanup } = await pair(core);
     try {
-      const result = await client.callTool({ name: "memory_search", arguments: { query: "anything" } });
+      // Asserted on the surface that CAN speak. On any other tool this would be trivially silent
+      // and would prove nothing about the debt being empty.
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
       // SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so the ordinary
       // response carries no Monet instruction whatsoever.
       expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("rides stage_lookup and no other tool, even with a debt standing", async () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const core = coreWithSpool(path);
+    seq = 0;
+    readAndActed(path, "owed-one");
+    const { client, cleanup } = await pair(core);
+    try {
+      // The debt is real and unpaid — the same fixture the next test finds the signal for.
+      expect(core.momentsOwingAQuestion(10)).toEqual(["owed-one"]);
+      // ...and an ordinary tool response still says nothing about it. The agent is told to collect
+      // confirmations where it is being handed rules; on a `memory_search` reply there is no rule
+      // in front of it and the instruction is an interruption with nothing to attach to.
+      for (const call of [
+        { name: "memory_search", arguments: { query: "anything" } },
+        { name: "memory_overview", arguments: {} },
+      ]) {
+        const result = await client.callTool(call);
+        expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
+      }
+      // The same debt, on the one surface that carries it.
+      const lookup = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
+      expect(texts(lookup).some((text) => text.includes("owed-one"))).toBe(true);
     } finally {
       await cleanup();
     }
@@ -278,7 +312,7 @@ describe("the signal that tells the agent it owes a question", () => {
     readAndActed(path, "owed-one");
     const { client, cleanup } = await pair(core);
     try {
-      const result = await client.callTool({ name: "memory_search", arguments: { query: "anything" } });
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
       const signal = texts(result).find((text) => text.includes("Monet: you read a rule"));
       expect(signal).toBeDefined();
       // An instruction naming a moment...
@@ -307,9 +341,9 @@ describe("the signal that tells the agent it owes a question", () => {
     readAndActed(path, "owed-one");
     const { client, cleanup } = await pair(core);
     try {
-      const first = await client.callTool({ name: "memory_search", arguments: { query: "a" } });
+      const first = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
       expect(texts(first).some((t) => t.includes("owed-one"))).toBe(true);
-      const second = await client.callTool({ name: "memory_search", arguments: { query: "b" } });
+      const second = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
       // ANNOUNCE-ONCE WAS WRONG, and this assertion is its reversal. The signal rides as a secondary
       // content item; a host that exposes only content[0] shows it to nobody, and marking it
       // delivered anyway then counting the silence as `notAsked` is the conflation between "ignored
@@ -329,7 +363,10 @@ describe("the signal that tells the agent it owes a question", () => {
     readAndActed(path, "owed-one");
     const { client, cleanup } = await pair(core);
     try {
-      await client.callTool({ name: "memory_search", arguments: { query: "a" } });
+      // The signal WAS shown here — this is the surface that carries it — and the agent did not act
+      // on it. A miss lookup, so this call's own moment records a read with no rule identity and
+      // never joins the `notAsked` population itself; the one below is the seeded debt.
+      await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
     } finally {
       await cleanup();
     }
