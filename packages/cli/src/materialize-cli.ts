@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { atomicWriteFile } from "./install-cli.js";
+import { atomicWriteFile } from "./atomic-write.js";
 import path from "node:path";
 import { Command } from "commander";
 import { MonetCore, type SkeletonBody } from "@team-monet/core";

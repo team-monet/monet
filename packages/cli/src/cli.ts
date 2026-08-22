@@ -4,14 +4,12 @@ import path from "node:path";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
-import { ensureMonetDir, getDbPath, getGateMirrorPath, getMomentSpoolPath, getMonetDir } from "./db/index.js";
+import { ensureMonetDir, getDbPath, getMomentSpoolPath, getMonetDir } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { generateAgentConfig, toYaml } from "./config-cli.js";
 import { openServedCore, openStatusCore } from "./bootstrap.js";
 import { reportStartupFailure } from "./startup-report.js";
 import { registerRecoveryCommands } from "./repair-cli.js";
-import { registerGateCommands } from "./gate-cli.js";
-import { registerInstallCommands } from "./install-cli.js";
 import { MaterializeCliError, registerMaterializeCommands } from "./materialize-cli.js";
 import { resolveProjectDir } from "./project-dir.js";
 
@@ -101,13 +99,6 @@ program
       // ACL match against.
       process.env.MONET_CALLER_ID = deriveCallerId();
       process.env.MONET_PROJECT_ID = deriveProjectId(projectDir);
-      // COMPONENT B (4b-D): wire mirror materialization into the ONE long-running serving process.
-      // Rooted at `projectDir` (not bare cwd) via getGateMirrorPath's own baseDir parameter — the
-      // SAME project dir `circle` was just derived from, and the SAME default `monet gate` itself
-      // resolves to when nothing overrides it (gate-cli.ts's own defaultGateCliDependencies) — one
-      // project notion, three call sites. See bootstrap.ts's ServedCoreOptions.gateSidecarPath for
-      // why this is the only writer surface.
-      //
       // FIX 1 (Codex round 2 on PR #42): getDbPath(projectDir) — NOT bare getDbPath() — is the fix
       // itself. Bare getDbPath() resolves via getMonetDir()'s own internal process.cwd() default, a
       // SEPARATE "which project" notion from `projectDir` (resolveProjectDir(): MONET_PROJECT_DIR /
@@ -136,7 +127,6 @@ program
       const core = await openServedCore(getDbPath(projectDir), {
         scopeContext: projectDir,
         defaultCircle: circle,
-        gateSidecarPath: getGateMirrorPath(projectDir),
         momentSpoolPath: getMomentSpoolPath(),
       });
       console.error(`Monet started`);
@@ -250,8 +240,6 @@ program
   });
 
 registerRecoveryCommands(program);
-registerGateCommands(program);
-registerInstallCommands(program);
 registerMaterializeCommands(program);
 
 void program.parseAsync().catch((error: unknown) => {

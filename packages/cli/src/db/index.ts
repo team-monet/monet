@@ -10,7 +10,6 @@ import { MOMENT_SPOOL_FILENAME, startupFailurePath } from "@team-monet/core";
  */
 const MONET_DIR = ".monet";
 const DB_FILE = "monet.db";
-const GATE_MIRROR_FILE = "gate-mirror.json";
 const MATERIALIZE_FILE = "materialize.json";
 
 /**
@@ -49,27 +48,6 @@ export function getMonetDir(baseDir: string = process.cwd()): string {
  */
 export function getDbPath(baseDir?: string): string {
   return path.join(getMonetDir(baseDir), DB_FILE);
-}
-
-/**
- * Default path for the offline gate mirror (`monet gate`'s `--mirror`, slice 4b-C).
- *
- * THIS IS A NEW CONVENTION, not one carried over from an existing default: `@team-monet/core`'s
- * `MonetCoreOptions.gateSidecarPath` has no built-in default of its own (`opts.gateSidecarPath ??
- * null` in engine.ts — a caller that never passes it simply never materializes a mirror), and
- * nothing in this client passes that option today (`start`, `status`, the source commands, and
- * `doctor`/`repair` all construct `MonetCore`/open the store without it). The one place this path
- * already existed before this file named it was a mirror a human materialized by hand at
- * `~/.monet/gate-mirror.json` — this just makes that the documented default, alongside `getDbPath`
- * exactly the way `getMonetDir` already resolves both.
- *
- * `baseDir` forwards straight to `getMonetDir` (see that function's own comment for why the
- * parameter exists at all) — omitted, this defaults to cwd exactly as before; the `gate` command
- * passes its resolved project dir so the mirror-path default and the circle default are rooted at
- * the SAME directory.
- */
-export function getGateMirrorPath(baseDir?: string): string {
-  return path.join(getMonetDir(baseDir), GATE_MIRROR_FILE);
 }
 
 /**

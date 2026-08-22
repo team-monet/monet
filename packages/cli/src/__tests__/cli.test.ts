@@ -13,7 +13,7 @@ const CLI_ENTRY = join(REPO_ROOT, "src/cli.ts");
 const TSX_LOADER = join(REPO_ROOT, "node_modules/tsx/dist/loader.mjs");
 
 describe("CLI usage errors", () => {
-  it.each(["gate", "status"])("names the %s subcommand", (command) => {
+  it.each(["status"])("names the %s subcommand", (command) => {
     const result = spawnSync(
       process.execPath,
       ["--import", "tsx", "src/cli.ts", command, "--bogus"],

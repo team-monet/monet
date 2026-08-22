@@ -1,6 +1,6 @@
 import path from "node:path";
 import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
-import { ensureMonetDir, getDbPath, getGateMirrorPath, getMomentSpoolPath } from "./db/index.js";
+import { ensureMonetDir, getDbPath, getMomentSpoolPath } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { openServedCore } from "./bootstrap.js";
 import { reportStartupFailure } from "./startup-report.js";
@@ -58,7 +58,6 @@ async function main() {
   const core = await openServedCore(getDbPath(projectDir), {
     scopeContext: projectDir,
     defaultCircle: circle,
-    gateSidecarPath: getGateMirrorPath(projectDir),
     momentSpoolPath: getMomentSpoolPath(),
   });
   await createMonetCoreMcpServer(core);

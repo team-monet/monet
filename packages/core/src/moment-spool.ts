@@ -52,8 +52,6 @@ import { dirname } from "node:path";
 export type MomentWriterRole =
   /** The generated host hook. Runs on every intercepted tool call, opens no store. */
   | "host-hook"
-  /** The `monet gate` command, invoked by a host that shells out rather than hooking in. */
-  | "gate-cli"
   /** In-process interception inside core itself (calls into the store, and the MCP surface). */
   | "core";
 
@@ -831,7 +829,7 @@ export function parseMomentSpoolLine(line: string): MomentSpoolRecord | null | "
 }
 
 function isWriterRole(value: unknown): value is MomentWriterRole {
-  return value === "host-hook" || value === "gate-cli" || value === "core";
+  return value === "host-hook" || value === "core";
 }
 
 function isDisposition(value: unknown): value is MomentDisposition {
