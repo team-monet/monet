@@ -284,11 +284,17 @@ describe("the signal that tells the agent it owes a question", () => {
   it("says nothing at all when nothing is owed", async () => {
     const path = join(mkTmp(), "moments.jsonl");
     const core = coreWithSpool(path);
+    // A DELIVERING LOOKUP, for the same reason the key-and-instruction round already moved its
+    // sibling below off an arbitrary miss: the signal now ships only where the instruction that
+    // explains it ships, and that is a lookup that actually handed over a rule. Asserted on a miss,
+    // this would be silent whatever the debt was — silence proving nothing, which is the exact
+    // green-that-cannot-fail these tests are written against.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
       // Asserted on the surface that CAN speak. On any other tool this would be trivially silent
       // and would prove nothing about the debt being empty.
-      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       // SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so the ordinary
       // response carries no Monet instruction whatsoever.
       expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
@@ -302,6 +308,8 @@ describe("the signal that tells the agent it owes a question", () => {
     const core = coreWithSpool(path);
     seq = 0;
     readAndActed(path, "owed-one");
+    // DELIVERING, not a miss — see the first test in this block.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
       // The debt is real and unpaid — the same fixture the next test finds the signal for.
@@ -317,7 +325,7 @@ describe("the signal that tells the agent it owes a question", () => {
         expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
       }
       // The same debt, on the one surface that carries it.
-      const lookup = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
+      const lookup = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       expect(texts(lookup).some((text) => text.includes("owed-one"))).toBe(true);
     } finally {
       await cleanup();
@@ -407,11 +415,13 @@ describe("the signal that tells the agent it owes a question", () => {
     const core = coreWithSpool(path);
     seq = 0;
     readAndActed(path, "owed-one");
+    // DELIVERING on both calls — see the first test in this block.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
-      const first = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
+      const first = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       expect(texts(first).some((t) => t.includes("owed-one"))).toBe(true);
-      const second = await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
+      const second = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       // ANNOUNCE-ONCE WAS WRONG, and this assertion is its reversal. The signal rides as a secondary
       // content item; a host that exposes only content[0] shows it to nobody, and marking it
       // delivered anyway then counting the silence as `notAsked` is the conflation between "ignored
@@ -429,16 +439,22 @@ describe("the signal that tells the agent it owes a question", () => {
     const core = coreWithSpool(path);
     seq = 0;
     readAndActed(path, "owed-one");
+    // DELIVERING, and here that is the whole premise rather than a detail. This test is named for an
+    // IGNORED signal, so a miss lookup — which no longer carries one — would leave it asserting that
+    // a signal nobody was shown was ignored: true, and about nothing.
+    await declareRuleAt(core, "git force push");
     const { client, cleanup } = await pair(core);
     try {
-      // The signal WAS shown here — this is the surface that carries it — and the agent did not act
-      // on it. A miss lookup, so this call's own moment records a read with no rule identity and
-      // never joins the `notAsked` population itself; the one below is the seeded debt.
-      await client.callTool({ name: "stage_lookup", arguments: { stage: "nothing-here" } });
+      const shown = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
+      // THE SIGNAL WAS SHOWN, asserted rather than assumed — and then the agent did not act on it.
+      expect(texts(shown).some((t) => t.includes("owed-one"))).toBe(true);
     } finally {
       await cleanup();
     }
-    // Announcing once is safe precisely BECAUSE ignoring it is mechanically detectable.
-    expect(momentConformance(db, path, "acme-widgets").notAsked).toBe(1);
+    // TWO, and both are the same defect: the seeded debt the agent ignored, plus this lookup's own
+    // moment, which delivered a rule and was likewise never asked about. The count is what makes
+    // ignoring the signal mechanically detectable, which is what lets the signal be a notice rather
+    // than an enforcement.
+    expect(momentConformance(db, path, "acme-widgets").notAsked).toBe(2);
   });
 });

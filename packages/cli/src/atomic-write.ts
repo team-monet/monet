@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 /**
@@ -100,5 +100,43 @@ export function atomicWriteFile(
       // cleanup failure.
     }
     throw error;
+  }
+}
+
+/**
+ * THE COMPARE HALF OF THE COMPARE-AND-SWAP `verifyBeforeRename` exists for: are the destination's
+ * bytes still exactly the bytes the caller read at the start of its operation?
+ *
+ * IT LIVES HERE, BESIDE THE HOOK IT IS WRITTEN FOR, rather than in any one caller. It was private to
+ * `materialize-cli.ts` while materialization was the only compare-and-swap in the tree; `monet
+ * uninstall` now needs the identical check on the user's `settings.json`, and a second hand-rolled
+ * copy of a concurrency predicate is the shape that drifts — one caller learns something about
+ * dangling links or encodings and the other never does.
+ *
+ * `snapshot === null` MEANS "NOTHING WAS THERE WHEN I LOOKED", and anything existing now — notably a
+ * newly-created dangling symlink, which `lstatSync` sees and `statSync` would not — is a change.
+ *
+ * WHAT IT CANNOT DETECT, stated because a safety check that overstates itself is worse than none:
+ *   - the window between this comparison and the rename that follows it. Closing it needs
+ *     cross-process locking and lock-recovery state, which is disproportionate for a single-user
+ *     CLI; this catches the practical race without new persistent state.
+ *   - a concurrent write that lands byte-identical content (classic ABA). Indistinguishable from no
+ *     write at all, and harmless here: the bytes this caller reasoned from are still the bytes on
+ *     disk.
+ *   - an edit made before the caller's own read. That is not a concurrent edit; it is the input.
+ */
+export function byteSnapshotStillMatches(pathname: string, snapshot: Buffer | null): boolean {
+  if (snapshot !== null) {
+    try {
+      return readFileSync(pathname).equals(snapshot);
+    } catch {
+      return false;
+    }
+  }
+  try {
+    lstatSync(pathname);
+    return false; // Something now exists — notably a newly-created dangling link.
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
 }

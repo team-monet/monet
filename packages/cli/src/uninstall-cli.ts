@@ -30,7 +30,7 @@ import { existsSync, mkdirSync, openSync, readFileSync, readSync, closeSync } fr
 import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
-import { atomicWriteFile } from "./atomic-write.js";
+import { atomicWriteFile, byteSnapshotStillMatches } from "./atomic-write.js";
 import { resolveProjectDir } from "./project-dir.js";
 
 /**
@@ -405,6 +405,26 @@ interface UninstallOptions {
 }
 
 /**
+ * The settings file changed between this command reading it and writing it back.
+ *
+ * ITS OWN TYPE, so the catch around the write can tell a REFUSAL from a real write failure. A
+ * permission error, a full disk, a read-only mount — those must keep propagating to the top-level
+ * handler exactly as they did before this check existed; only a concurrent edit is a per-file
+ * outcome this command reports and continues past.
+ */
+class SettingsConflictError extends Error {}
+
+interface UninstallHooks {
+  /**
+   * Runs immediately before a settings file is written, and exists so a test can open the
+   * concurrent-edit window that is otherwise unreachable from outside the process. Same seam, same
+   * reason, as `materialize`'s own `beforeSurfaceWrite`: a compare-and-swap whose losing branch
+   * cannot be exercised is a safety property nobody can show works.
+   */
+  beforeSettingsWrite?: (settingsPath: string) => void;
+}
+
+/**
  * `monet uninstall` — takes the hook entries out, and nothing else.
  *
  * WHAT IT DELIBERATELY DOES NOT DO: delete `~/.monet/gate-hook.mjs`. The wrapper is inert once
@@ -426,80 +446,150 @@ export function registerUninstallCommand(program: Command): void {
     .description("Remove the retired Monet gate hook from your Claude Code settings")
     .option("--dry-run", "Show what would change without writing anything")
     .action((options: UninstallOptions) => {
-      const wrapperPaths = candidateWrapperPaths();
-      const projectDir = resolveProjectDir();
-      let removedTotal = 0;
-      let refused = 0;
-
-      console.error(
-        `monet uninstall: removing hook entries that invoke ${wrapperPaths.join(" or ")}`,
-      );
-
-      for (const target of settingsTargets(projectDir)) {
-        if (!existsSync(target.settingsPath)) continue;
-
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(readFileSync(target.settingsPath, "utf8"));
-        } catch (error) {
-          refused++;
-          console.error(
-            `monet uninstall: ${target.settingsPath} is not valid JSON ` +
-              `(${error instanceof Error ? error.message : String(error)}) — left untouched`,
-          );
-          continue;
-        }
-
-        const shape = validateSettingsShape(parsed);
-        if (!shape.ok) {
-          refused++;
-          console.error(
-            `monet uninstall: ${target.settingsPath} is not a settings file this command can read ` +
-              `safely (${shape.reason}) — left untouched`,
-          );
-          continue;
-        }
-
-        const result = removeMonetHooks(shape.settings, wrapperPaths);
-        if (result.removed === 0) continue;
-        removedTotal += result.removed;
-
-        if (options.dryRun) {
-          console.error(
-            `monet uninstall: would remove ${result.removed} hook ` +
-              `${result.removed === 1 ? "entry" : "entries"} from ${target.scope} settings at ${target.settingsPath}`,
-          );
-          continue;
-        }
-        atomicWriteFile(target.settingsPath, JSON.stringify(result.settings, null, 2) + "\n");
-        console.error(
-          `monet uninstall: removed ${result.removed} hook ` +
-            `${result.removed === 1 ? "entry" : "entries"} from ${target.scope} settings at ${target.settingsPath}`,
-        );
-      }
-
-      if (removedTotal === 0) {
-        // SAID PLAINLY, because "nothing happened" is the answer for everyone who never ran the old
-        // install, and it must not read like a failure.
-        console.error(`monet uninstall: no Monet hook entries found — nothing to remove.`);
-        if (refused > 0) {
-          console.error(
-            `monet uninstall: ${refused} settings ${refused === 1 ? "file" : "files"} could not be read safely ` +
-              `(above) — if the hook was wired there, remove its entry by hand.`,
-          );
-        }
-        return;
-      }
-
-      console.error(`monet uninstall: restart Claude Code for the change to take effect.`);
-      for (const wrapperPath of wrapperPaths.filter((candidate) => existsSync(candidate))) {
-        // NAMED, NOT DELETED — see this function's own comment for why.
-        console.error(
-          `monet uninstall: the generated wrapper at ${wrapperPath} is now unreferenced by the ` +
-            `files above and is safe to delete by hand.`,
-        );
-      }
+      runUninstall(options);
     });
+}
+
+/**
+ * The command's body, extracted so the concurrent-edit refusal below can be exercised — see
+ * `UninstallHooks`. The commander action is the only production caller and passes no hooks.
+ */
+export function runUninstall(options: UninstallOptions, hooks: UninstallHooks = {}): void {
+  const wrapperPaths = candidateWrapperPaths();
+  const projectDir = resolveProjectDir();
+  let removedTotal = 0;
+  let refused = 0;
+  let conflicted = 0;
+
+  console.error(
+    `monet uninstall: removing hook entries that invoke ${wrapperPaths.join(" or ")}`,
+  );
+
+  for (const target of settingsTargets(projectDir)) {
+    if (!existsSync(target.settingsPath)) continue;
+
+    // READ AS BYTES, PARSED FROM THEM. The bytes are the snapshot the write below compares against,
+    // and they have to be the SAME read that produced the parse — re-reading the file to snapshot it
+    // would just move the window this check exists to close.
+    let snapshot: Buffer;
+    let parsed: unknown;
+    try {
+      snapshot = readFileSync(target.settingsPath);
+      parsed = JSON.parse(snapshot.toString("utf8"));
+    } catch (error) {
+      refused++;
+      console.error(
+        `monet uninstall: ${target.settingsPath} is not valid JSON ` +
+          `(${error instanceof Error ? error.message : String(error)}) — left untouched`,
+      );
+      continue;
+    }
+
+    const shape = validateSettingsShape(parsed);
+    if (!shape.ok) {
+      refused++;
+      console.error(
+        `monet uninstall: ${target.settingsPath} is not a settings file this command can read ` +
+          `safely (${shape.reason}) — left untouched`,
+      );
+      continue;
+    }
+
+    const result = removeMonetHooks(shape.settings, wrapperPaths);
+    if (result.removed === 0) continue;
+
+    if (options.dryRun) {
+      removedTotal += result.removed;
+      console.error(
+        `monet uninstall: would remove ${result.removed} hook ` +
+          `${result.removed === 1 ? "entry" : "entries"} from ${target.scope} settings at ${target.settingsPath}`,
+      );
+      continue;
+    }
+
+    // REFUSE, DO NOT CLOBBER. Everything between the read above and the rename inside
+    // `atomicWriteFile` is a window in which Claude Code, a settings UI, or another config command
+    // can write this same file — and this command's write is a WHOLE-FILE replacement built from
+    // what it read, so anything landing in that window is silently erased. That loss is
+    // unrecoverable in a way none of this module's other failure modes are: settings.json is the
+    // user's own configuration, and nothing Monet holds could reconstruct an edit it overwrote.
+    //
+    // The check is the same best-effort byte compare-and-swap `monet materialize` already uses on
+    // the user's standing files, running immediately before the rename — see
+    // `byteSnapshotStillMatches` for exactly what it does and does not catch.
+    //
+    // AN UNREMOVED HOOK ENTRY IS THE CHEAP OUTCOME HERE, which is what makes refusing the right
+    // default rather than merely the cautious one: the retired shim (above) has already made a
+    // stale entry harmless, so the worst case of refusing is a rerun, while the worst case of
+    // writing is a destroyed edit.
+    try {
+      hooks.beforeSettingsWrite?.(target.settingsPath);
+      atomicWriteFile(
+        target.settingsPath,
+        JSON.stringify(result.settings, null, 2) + "\n",
+        undefined,
+        () => {
+          if (!byteSnapshotStillMatches(target.settingsPath, snapshot)) {
+            throw new SettingsConflictError(target.settingsPath);
+          }
+        },
+      );
+    } catch (error) {
+      // ONLY THE CONFLICT IS SWALLOWED. Every other write failure keeps propagating exactly as it
+      // did before, to the top-level handler.
+      if (!(error instanceof SettingsConflictError)) throw error;
+      conflicted++;
+      console.error(
+        `monet uninstall: ${target.settingsPath} changed after it was read — refusing to overwrite ` +
+          `a concurrent edit; nothing was removed from it. Rerun \`monet uninstall\`.`,
+      );
+      continue;
+    }
+    removedTotal += result.removed;
+    console.error(
+      `monet uninstall: removed ${result.removed} hook ` +
+        `${result.removed === 1 ? "entry" : "entries"} from ${target.scope} settings at ${target.settingsPath}`,
+    );
+  }
+
+  if (removedTotal === 0) {
+    // SAID PLAINLY, because "nothing happened" is the answer for everyone who never ran the old
+    // install, and it must not read like a failure. NOT SAID AT ALL when a file was refused for
+    // conflict: entries WERE found there, and calling that "nothing to remove" would be the one
+    // reading of this run that is simply false.
+    if (conflicted === 0) {
+      console.error(`monet uninstall: no Monet hook entries found — nothing to remove.`);
+    }
+    if (refused > 0) {
+      console.error(
+        `monet uninstall: ${refused} settings ${refused === 1 ? "file" : "files"} could not be read safely ` +
+          `(above) — if the hook was wired there, remove its entry by hand.`,
+      );
+    }
+    return;
+  }
+
+  // THE FOOTER DESCRIBES THE RUN THAT ACTUALLY HAPPENED. Under `--dry-run` the loop above wrote
+  // nothing, so every past-tense claim here was false on that path: there is no change to restart
+  // for, and the wrapper is referenced by exactly the entries that are still on disk.
+  console.error(
+    options.dryRun
+      ? `monet uninstall: nothing was written — rerun without --dry-run to apply, then restart Claude Code.`
+      : `monet uninstall: restart Claude Code for the change to take effect.`,
+  );
+  // AND NOT CLAIMED AT ALL WHEN A FILE WAS REFUSED: that file still holds an entry naming the
+  // wrapper, so "unreferenced by the files above" would be wrong in the one case it matters.
+  if (conflicted > 0) return;
+  for (const wrapperPath of wrapperPaths.filter((candidate) => existsSync(candidate))) {
+    // NAMED, NOT DELETED — see `registerUninstallCommand`'s own comment for why.
+    console.error(
+      options.dryRun
+        ? `monet uninstall: the generated wrapper at ${wrapperPath} would then be unreferenced by ` +
+            `the files above and safe to delete by hand.`
+        : `monet uninstall: the generated wrapper at ${wrapperPath} is now unreferenced by the ` +
+            `files above and is safe to delete by hand.`,
+    );
+  }
 }
 
 /** Both halves of the retirement, registered together so neither can ship without the other. */

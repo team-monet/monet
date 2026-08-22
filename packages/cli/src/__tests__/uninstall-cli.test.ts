@@ -19,8 +19,8 @@ import type { SpawnSyncReturns } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { removeMonetHooks } from "../uninstall-cli";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { removeMonetHooks, runUninstall } from "../uninstall-cli";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
@@ -77,6 +77,45 @@ function runCli(f: Fixture, args: string[]): { status: number | null; stderr: st
 
 const readJson = (path: string): Record<string, unknown> =>
   JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+
+/**
+ * The same command, driven IN PROCESS so a test can reach `beforeSettingsWrite`.
+ *
+ * The subprocess harness above is the right default — it proves the wiring all the way through
+ * commander — but the concurrent-edit window this command now refuses to write into opens and
+ * closes inside a single function call, and nothing outside that process can land an edit in it
+ * reliably. `runUninstall`'s hook is the seam; this is the only thing that uses it.
+ */
+function runInProcess(
+  f: Fixture,
+  options: { dryRun?: boolean },
+  hooks: Parameters<typeof runUninstall>[1] = {},
+): { stderr: string } {
+  const saved = {
+    HOME: process.env.HOME,
+    MONET_STORAGE_DIR: process.env.MONET_STORAGE_DIR,
+    MONET_PROJECT_DIR: process.env.MONET_PROJECT_DIR,
+    CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR,
+  };
+  process.env.HOME = f.home;
+  process.env.MONET_STORAGE_DIR = f.storageDir;
+  delete process.env.MONET_PROJECT_DIR;
+  process.env.CLAUDE_PROJECT_DIR = f.projectDir;
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  try {
+    runUninstall(options, hooks);
+  } finally {
+    spy.mockRestore();
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  return { stderr: lines.join("\n") };
+}
 
 describe("removeMonetHooks — what it takes, and what it must not", () => {
   const wrapperPath = "/home/u/.monet/gate-hook.mjs";
@@ -235,6 +274,84 @@ describe("monet uninstall", () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toContain("would remove 3 hook entries");
     expect(readFileSync(f.userSettings, "utf8")).toBe(before);
+  });
+
+  it("--dry-run's footer claims nothing the run did not do", () => {
+    const f = fixture();
+    writeInstalledFixture(f);
+    // The wrapper has to be ON DISK for the footer to reach its claim about it at all.
+    mkdirSync(join(f.home, ".monet"), { recursive: true });
+    writeFileSync(f.wrapperPath, "// the generated wrapper");
+
+    const result = runCli(f, ["uninstall", "--dry-run"]);
+    expect(result.status).toBe(0);
+    // THE BUG THIS PINS: the loop skipped every write and the footer still spoke in the past tense —
+    // a wrapper reported as "now unreferenced" while every entry naming it is still on disk, and a
+    // restart demanded for a change that does not exist. A user who deleted the wrapper on that
+    // advice would be left with live hook entries pointing at a missing file.
+    expect(result.stderr).not.toContain("is now unreferenced");
+    expect(result.stderr).not.toContain("restart Claude Code for the change to take effect");
+    // What it says instead is conditional, and says plainly that nothing was written.
+    expect(result.stderr).toContain("nothing was written");
+    expect(result.stderr).toContain("would then be unreferenced");
+    // And the entries really are all still there, which is what makes the past tense false.
+    expect(readJson(f.userSettings).hooks).toBeDefined();
+  });
+
+  it("refuses to overwrite a settings file that changed after it was read", () => {
+    const f = fixture();
+    writeInstalledFixture(f);
+    mkdirSync(join(f.home, ".monet"), { recursive: true });
+    writeFileSync(f.wrapperPath, "// the generated wrapper");
+    // WHAT LANDS IN THE WINDOW: a whole-file rewrite of the kind Claude Code, a settings UI, or
+    // another config command performs — and nothing this removal would ever produce, so its
+    // survival cannot be an accident of the two writes agreeing.
+    const concurrent = `${JSON.stringify({ model: "sonnet", statusLine: "mine" }, null, 2)}\n`;
+    let injected = false;
+
+    const result = runInProcess(f, {}, {
+      beforeSettingsWrite: (settingsPath) => {
+        if (settingsPath !== f.userSettings || injected) return;
+        injected = true;
+        writeFileSync(f.userSettings, concurrent);
+      },
+    });
+
+    expect(injected).toBe(true);
+    // THE PROOF, and the reason this is worth a check at all: settings.json is the USER's file, so a
+    // write lost here is not recoverable from anything Monet holds.
+    expect(readFileSync(f.userSettings, "utf8")).toBe(concurrent);
+    expect(result.stderr).toContain("changed after it was read");
+    expect(result.stderr).toContain("refusing to overwrite a concurrent edit");
+    // NOT COUNTED AS REMOVED — the entries are still in whatever the other writer left behind.
+    expect(result.stderr).not.toContain("removed 3 hook");
+    // AND THE WRAPPER CLAIM IS WITHHELD: a file that still names it was refused, so "unreferenced"
+    // is exactly the sentence this run cannot honestly say.
+    expect(result.stderr).not.toContain("unreferenced");
+    // The scope that was NOT interfered with is still cleaned — one refusal is not an abort.
+    expect(readJson(f.projectSettings).hooks).toBeUndefined();
+  });
+
+  it("says nothing about 'nothing to remove' when the only file with entries was refused", () => {
+    const f = fixture();
+    // ONE target only, so a refusal leaves removedTotal at zero and the footer has to choose.
+    writeFileSync(
+      f.userSettings,
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { matcher: "^Bash$", hooks: [{ type: "command", command: "/usr/bin/node", args: [f.wrapperPath] }] },
+          ],
+        },
+      }),
+    );
+    const result = runInProcess(f, {}, {
+      beforeSettingsWrite: () => writeFileSync(f.userSettings, "{}\n"),
+    });
+    // Entries WERE found. Reporting "nothing to remove" would be the one reading of this run that is
+    // simply false, and it is the reading a user acts on by deleting the wrapper.
+    expect(result.stderr).not.toContain("nothing to remove");
+    expect(result.stderr).toContain("changed after it was read");
   });
 
   it("is idempotent, and says plainly when there is nothing to remove", () => {

@@ -984,7 +984,8 @@ export function registerMonetCoreTools(
     {
       toolName,
       capturedBlock,
-    }: { toolName: string; capturedBlock?: string | null },
+      carriesConformanceKey,
+    }: { toolName: string; capturedBlock?: string | null; carriesConformanceKey?: boolean },
   ): CallToolResult {
     if (result.content[0]?.type !== "text") return result;
 
@@ -1018,7 +1019,24 @@ export function registerMonetCoreTools(
     // at the moment it is handed rules, so the reminder belongs on the response that hands them
     // over and on no other. Gated HERE rather than inside the block builder so every other tool
     // response skips the `momentsOwingAQuestion` query — and its fold — outright.
-    const askBlock = toolName === "stage_lookup" ? askSignalBlock() : "";
+    //
+    // AND ON THE SAME CONDITION AS THE KEY (review fix — Codex round 2). The two halves were split
+    // deliberately: the response's `instruction` says what asking means and names the two tools that
+    // take a momentId, and this says WHICH earlier moments still owe it. That split is what keeps
+    // either from being the other's duplicate — and it is exactly what stops either from standing
+    // alone. Once the key and its instruction became conditional on this lookup actually delivering
+    // a rule, a lookup that delivered none carried the id half with the what-to-do half missing:
+    // uuids the agent has no surviving text to act on, since nothing else on the response, and no
+    // standing text, names `conformance_ask`.
+    //
+    // WITHHELD RATHER THAN MADE SELF-CONTAINED, and that is the choice. Restating the tool names
+    // here would pay context on EVERY debt-bearing response — the common case, where the
+    // instruction is already present and would now say the same thing twice — to cover the rare one
+    // where it is absent. It would also contradict this surface's own reason for existing: the
+    // reminder belongs where the agent is being handed rules, and a lookup that handed over none is
+    // precisely not that moment. Nothing is lost by waiting: the debt clears only by asking, so the
+    // next lookup that does deliver a rule names it again, beside the line that explains it.
+    const askBlock = toolName === "stage_lookup" && carriesConformanceKey === true ? askSignalBlock() : "";
     if (prewarmBlock === "" && askBlock === "") return result;
 
     const appended = [
@@ -1039,13 +1057,18 @@ export function registerMonetCoreTools(
    *
    * Both accept a `capturedBlock` from capturePrewarmSnapshot() called BEFORE the handler ran.
    * For agent_context, pass no capturedBlock (it manages its own lifecycle).
+   *
+   * `carriesConformanceKey` is `stage_lookup`'s alone: it says this response really did hand over a
+   * momentId and the instruction that explains it, which is the condition the ask signal now shares
+   * — see wrapSuccess. Every other tool omits it and appends nothing either way.
    */
   const readOk = (
     content: object,
     toolName: string,
     capturedBlock?: string | null,
+    carriesConformanceKey?: boolean,
   ): CallToolResult =>
-    wrapSuccess(ok(content), { toolName, capturedBlock });
+    wrapSuccess(ok(content), { toolName, capturedBlock, carriesConformanceKey });
 
   const mutOk = (
     content: object,
@@ -1371,7 +1394,14 @@ export function registerMonetCoreTools(
         } else {
           let guidance: string;
           if (r.species === "stage") {
-            guidance = "The stage is registered. It fires nothing until a rule is bound to it — until then a matching action reports the stage with no rules, which is the signal to reason from principles.";
+            // WHAT ACTUALLY HAPPENS NOW, which is less than this used to promise. It said a matching
+            // action would REPORT the stage as having no rules — a sentence from the era of trigger
+            // patterns and the gate hook, when something watched actions and spoke up. Nothing
+            // matches actions any more and nothing reports: an empty stage is simply a `stage_lookup`
+            // that comes back with no rules, and only if someone looks it up. A shipped surface
+            // describing machinery that no longer exists is worse than one that says less — the user
+            // waits for a report that will never arrive, and reads the silence as the stage working.
+            guidance = "The stage is registered. It fires nothing until a rule is bound to it — until then a stage_lookup for it returns no rules, which is the signal to reason from principles.";
             return mutOk({
               circle: homeCircle,
               species: r.species,
@@ -2067,7 +2097,10 @@ export function registerMonetCoreTools(
             stageIndex: stageIndexFit.fitted,
             ...(stageIndexFit.omitted > 0 ? { stageIndexTruncated: true, stageIndexOmitted: stageIndexFit.omitted } : {}),
           } : {}),
-        }, "stage_lookup", capturedBlock);
+        // THE SAME `fitRules.length > 0` THAT CHOSE `fixedFields` ABOVE, and deliberately the same
+        // expression rather than a re-derivation: the ask signal and the key must never disagree
+        // about whether this response delivered a rule.
+        }, "stage_lookup", capturedBlock, fitRules.length > 0);
       } catch (e) {
         return err(`stage_lookup failed: ${msg(e)}`);
       }

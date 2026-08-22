@@ -9172,6 +9172,28 @@ describe("MCP surface", () => {
     c.close();
   });
 
+  it("the empty-stage acknowledgement describes the lookup that exists, not a report that does not", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const declared = await call("memory_declare", { species: "stage", stage: "an empty stage" });
+    expect(declared.isError).toBe(false);
+    const guidance = declared.json.guidance as string;
+    // WHAT IT USED TO PROMISE: that a matching ACTION would REPORT the stage as having no rules.
+    // Both halves of that sentence were trigger patterns and the gate hook, and both are retired —
+    // nothing watches actions and nothing reports. A user who waits for that report waits forever,
+    // and reads the silence as the stage working.
+    expect(guidance).not.toContain("matching action");
+    expect(guidance).not.toContain("reports");
+    // WHAT ACTUALLY HAPPENS, asserted against the real surface and not just the sentence: someone
+    // looks the stage up by name, and it comes back matched with no rules.
+    expect(guidance).toContain("stage_lookup");
+    const looked = await call("stage_lookup", { stage: "an empty stage" });
+    expect(looked.isError).toBe(false);
+    expect(looked.json).toMatchObject({ matched: true, rules: [] });
+    await client.close();
+    c.close();
+  });
+
   it("stage_lookup wire response stays parseable JSON at adversarial rule/body/reason sizes (blocker fix)", async () => {
     const c = core();
     const { call, client } = await harness(c, { modelTag: "host-model" });

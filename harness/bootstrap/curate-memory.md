@@ -8,7 +8,7 @@ Within-store reorganization: synthesize what's dirty, mediate duplicates, and re
 
 **Curation covers the normative layer too, not just concepts.** A store holds principles, rules and
 the stages they bind to alongside its facts, and those have their own decay: a stage whose rules have
-all died is inert, a rule that is read but never changes behaviour is a retirement candidate, and a
+all died is inert, a rule the counts show read and not followed is a retirement candidate, and a
 stage no agent has ever looked up may be aimed at a moment that does not occur. Surface those in the
 same pass — they are cheaper to notice here than to discover when a rule turns out to govern nothing.
 
@@ -56,11 +56,11 @@ For each stale concept the overview surfaced: "Last confirmed [when]: [title] �
 
 The normative layer decays on its own terms, and none of it shows in the concept counts — `memory_overview`'s gate exceptions and retirement candidates are the entry point. This phase needs a Monet whose `memory_overview` actually exposes that normative layer; if yours reports no such section (older releases don't), skip this phase or upgrade first. Three checks, each producing proposals the user confirms like everything else in this pass:
 
-- **Decay:** a rule that is read and then not followed, or followed without ever changing behaviour, is a retirement candidate — bring it with its conformance record, not its title. A stage nobody has ever looked up is aimed at a moment that may not occur: propose re-aiming it at a moment that does, or retiring it. A stage whose rules have all died is inert.
+- **Decay:** conformance is answered per moment and counted per circle (`gate.conformance`), never per rule — cite the counts and let the user name the rule, never attribute. Per-rule evidence is `gate.retirementCandidates` (a model tag other than the one running) and `gate.unexplainedDenies`. A stage in `gate.unreadStages` has never been looked up: propose re-aiming it at a moment that occurs, or retiring it. A stage whose rules have all died is inert.
 - **Shape:** a rule body carrying steps, a roster, a tool list, or a copy of another artifact is a procedure wearing a rule's clothes — the copy rots while the original moves on. Propose extraction: the how goes to an artifact the host loads on demand (a skill, a playbook file), and the rule shrinks to its constraint, the reason it exists, and a pointer to that artifact.
 - **Pointers:** for every rule that names an artifact, verify the artifact still exists. A dangling pointer is a rule that reaches you pointing at nothing — repair the pointer or retire the rule.
 
-Batch the proposals with their evidence — the conformance record, the offending rule body, the missing path — and apply only what the user confirms. Apply with the write surface that exists — and for a Shape extraction, order matters: write the procedure into its on-demand artifact and confirm it reads back BEFORE storing the successor, or the steps are gone while the pointer leads nowhere. A successor rule is `memory_store kind:"rule"` at the same stage (the acknowledgement's `ruleSuccession` records what it replaced); a retirement is `kind:"correction"` against the rule, then `memory_resolve` on the contradiction it opens; a re-aim is the successor at the right stage plus that retirement of the misaimed one. Read back with `stage_lookup` on each affected stage — the surviving roster is the check — and for an extraction, open the pointed-at artifact too.
+Batch the proposals with their evidence — the counts, the offending rule body, the missing path — and apply only what the user confirms. Apply with the write surface that exists — and for a Shape extraction, order matters: write the procedure into its on-demand artifact and confirm it reads back BEFORE storing the successor, or the steps are gone while the pointer leads nowhere. A successor rule is `memory_store kind:"rule"` at the same stage (the acknowledgement's `ruleSuccession` records what it replaced); a retirement is `kind:"correction"` against the rule, then `memory_resolve` on the contradiction it opens; a re-aim is the successor at the right stage plus that retirement of the misaimed one. Read back with `stage_lookup` on each affected stage — the surviving roster is the check — and for an extraction, open the pointed-at artifact too.
 
 ## Phase 6 — Report
 
