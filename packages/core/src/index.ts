@@ -137,23 +137,18 @@ export {
   STAGE_NAME_MAX_CHARS,
   STAGE_ORIGINS,
   COMMAND_BOUNDARY,
-  assertNoUnacknowledgedDenies,
+  RETIRED_TRIGGER_PATTERNS,
   createGateSchema,
-  formatTriggerPattern,
   evaluateStageLookup,
   gateCoverage,
   hasLineBreak,
   hasNoReason,
   liveBlockingRulesForStage,
   liveStageIndex,
-  matchesTriggerPattern,
   normalizeMatchToken,
   normalizeStageName,
   parseActionContext,
-  parseTriggerPatterns,
   ruleOutlineForStage,
-  seedTriggerPattern,
-  serializeTriggerPatterns,
   stageLookup,
 } from "./gates";
 export type {
@@ -174,7 +169,6 @@ export type {
   StageLookupRule,
   StageOrigin,
   StageRow,
-  TriggerPattern,
 } from "./gates";
 export {
   CLAUDE_CODE_HOST,

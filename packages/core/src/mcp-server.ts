@@ -239,9 +239,6 @@ const RECALL_EMPTY_LINE = "Nothing matched.";
 /** Circle names are routing identifiers, not prose; bound every caller-controlled echo before writes. */
 export const CIRCLE_NAME_MAX_CHARS = 256;
 const WRITE_ACK_LIST_MAX = 25;
-const STAGE_ACK_PATTERNS_MAX = 8;
-const STAGE_ACK_TOKEN_MAX_CHARS = 80;
-const STAGE_ACK_PATTERN_MAX_CHARS = 300;
 const WRITE_ACK_TEXT_MAX_CHARS = 1_000;
 const ANOMALOUS_STORE_RESOLUTION_MODES = new Set([
   "ambiguous-fork",
@@ -267,65 +264,13 @@ function fitRuleSuccessionForAck(succession: RuleSuccession): Record<string, unk
   };
 }
 
-function fitStageViewForAck(stage: StageView): Record<string, unknown> {
-  const fitted = stage.patterns.slice(0, STAGE_ACK_PATTERNS_MAX).map((pattern) => ({
-    tool: pattern.tool === null ? null : clip(pattern.tool, STAGE_ACK_TOKEN_MAX_CHARS).text,
-    tokens: pattern.tokens.map((token) => clip(token, STAGE_ACK_TOKEN_MAX_CHARS).text),
-  }));
-  return {
-    ...stage,
-    name: clip(stage.name, WRITE_ACK_TEXT_MAX_CHARS).text,
-    patterns: fitted,
-    ...(stage.patterns.length > fitted.length ? { patternsOmitted: stage.patterns.length - fitted.length } : {}),
-  };
-}
-
 /**
- * The declare-time firing test's finding, rendered for the one channel a caller cannot skim past
- * (monet-client#59).
- *
- * WHY THIS IS GUIDANCE AND NOT JUST AN ADVISORY ENTRY: the write went through — sovereignty, and
- * that is correct — so the only thing standing between the author and a gate that never fires is
- * whether they read this. A rule the user believes protects them and does not is the same class of
- * surprise as a silently removed deny, and the downgrade disclosure right beside this one already
- * settled how that class is handled: say it plainly, in band, at the moment it happens.
- *
- * Returns null when nothing fired, so an ordinary declaration reads exactly as it did before.
+ * A stage, bounded for the acknowledgement envelope. Only the NAME is caller text now — the pattern
+ * array and its three caps (STAGE_ACK_PATTERNS_MAX / _TOKEN_MAX_CHARS / _PATTERN_MAX_CHARS) went
+ * with trigger patterns on 2026-08-22, and nothing else on a StageView is caller-controlled.
  */
-function firingWarning(advisories: readonly { kind: string; message: string }[] | undefined): string | null {
-  const inert = (advisories ?? []).filter((advisory) => advisory.kind === "pattern_never_matches");
-  const mismatch = (advisories ?? []).filter((advisory) => advisory.kind === "pattern_matches_no_example");
-  if (inert.length === 0 && mismatch.length === 0) return null;
-
-  // TWO DIFFERENT FINDINGS, SAID DIFFERENTLY (Codex P2 on PR #144, and it was right). One wording
-  // covered both and overstated the weaker one: a pattern that misses its example may still govern
-  // other action contexts perfectly well, and telling the author it "governs nothing" invites them
-  // to replace a good pattern when the EXAMPLE was the wrong thing. Only a pattern that seeds to an
-  // empty token run is inert everywhere, and only that one gets the absolute claim.
-  const parts: string[] = [];
-  if (inert.length > 0) {
-    parts.push(
-      `PATTERN WILL NOT FIRE: it matches no action at all, so the gate it addresses is inert. It is ` +
-        `written anyway — you declared it — but it governs nothing until the patterns are fixed. ` +
-        `Tell the user plainly. ${inert.map((advisory) => advisory.message).join(" ")}`,
-    );
-  }
-  if (mismatch.length > 0) {
-    parts.push(
-      `EXAMPLE MISMATCH: checked with the gate's own matcher, these patterns did not match the ` +
-        `example you gave — so this gate would not have fired on the very action it was authored ` +
-        `from. They may still match other actions; what is established is that the pattern and the ` +
-        `example disagree, and one of the two is wrong. Tell the user plainly. ` +
-        `${mismatch.map((advisory) => advisory.message).join(" ")}`,
-    );
-  }
-  return parts.join(" ");
-}
-
-function fitRenderedPatternsForAck(patterns: readonly string[]): { items: string[]; omitted: number } {
-  const fitted = patterns.slice(0, STAGE_ACK_PATTERNS_MAX)
-    .map((pattern) => clip(pattern, STAGE_ACK_PATTERN_MAX_CHARS).text);
-  return { items: fitted, omitted: patterns.length - fitted.length };
+function fitStageViewForAck(stage: StageView): Record<string, unknown> {
+  return { ...stage, name: clip(stage.name, WRITE_ACK_TEXT_MAX_CHARS).text };
 }
 
 /**
@@ -1161,12 +1106,6 @@ export function registerMonetCoreTools(
             .describe(
               "Stage name or id where the rule fires. A missing stage is created.",
             ),
-          instance: z
-            .string()
-            .optional()
-            .describe(
-              'Concrete action that failed, such as "Bash:git push --force origin main". Seeds a new stage pattern.',
-            ),
           scope: z
             .enum(["domain", "agent"])
             .optional()
@@ -1312,11 +1251,11 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_declare",
-    'Declare a user-authorized rule, stage, principle, or preference. Never call on agent initiative. This is the only tool that may create blocking rules or replace a rule binding. Stages address gates; rules bind content to stages. Principles and preferences enter the always-on skeleton without stage, severity, or patterns; mechanical concerns return as non-blocking `advisories`. Skeleton changes include `instruction` only when a registered standing surface became stale. A permissive standing grant is a rule, not another species.',
+    'Declare a user-authorized rule, stage, principle, or preference. Never call on agent initiative. This is the only tool that may create blocking rules or replace a rule binding. A stage is a named moment; rules bind content to stages. Principles and preferences enter the always-on skeleton without stage or severity; mechanical concerns return as non-blocking `advisories`. Skeleton changes include `instruction` only when a registered standing surface became stale. A permissive standing grant is a rule, not another species.',
     {
       species: z
         .enum(["rule", "stage", "principle", "preference"])
-        .describe('"stage" creates or re-authors a gate; "rule" binds to a stage; "principle"/"preference" enter the momentless skeleton.'),
+        .describe('"stage" registers a named moment; "rule" binds to a stage; "principle"/"preference" enter the momentless skeleton.'),
       stage: z
         .string()
         .max(STAGE_NAME_MAX_CHARS)
@@ -1329,27 +1268,11 @@ export function registerMonetCoreTools(
         .describe(
           'For principle/preference: evidence that would disprove it. Omission advises but never blocks.',
         ),
-      patterns: z
-        .array(z.string())
-        .optional()
-        .describe(
-          'Concrete command shapes, such as ["terraform apply", "Bash:git push --force"]. Replaces all existing patterns; [] disables firing. Omit to preserve them. Words match in order; an optional tool prefix constrains the tool.',
-        ),
-      instance: z
-        .string()
-        .optional()
-        .describe("Concrete action used to seed a new stage when patterns are omitted."),
       severity: z
         .enum(["advisory", "blocking"])
         .optional()
         .describe(
           'Pass only when the user rules on enforcement. Omit to preserve existing severity or default a new rule to advisory. "blocking" denies the action and is for safety boundaries. Changing blocking to advisory removes the deny and is disclosed.',
-        ),
-      acknowledgeBlockingRules: z
-        .array(z.string())
-        .optional()
-        .describe(
-          "When replacing patterns on a stage with blocking rules, list every blocking rule id after showing the user any ids reported missing.",
         ),
       scope: z.enum(["domain", "agent"]).optional().describe('"domain" binds any agent; "agent" (default) compensates for this model.'),
       modelTag: z.string().max(MODEL_TAG_MAX_CHARS).optional().describe('Model compensated for. Required for agent scope unless MONET_MODEL_TAG supplies it.'),
@@ -1366,7 +1289,7 @@ export function registerMonetCoreTools(
         ),
       sourceRefs: z.array(z.string()).optional(),
     },
-    async ({ species, stage, content, exitsEvidence, patterns, instance, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs, acknowledgeBlockingRules }) => {
+    async ({ species, stage, content, exitsEvidence, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs }) => {
       // RAW, UNDISTORTED — memory_declare-scoped (review fix — Codex round 2, item 1). declare()
       // itself must be able to tell "the caller said nothing about circle" (`undefined` — preserves
       // an existing binding's circle, including breadth) from "the caller explicitly named the
@@ -1394,14 +1317,13 @@ export function registerMonetCoreTools(
       const capturedBlock = capturePrewarmSnapshot(homeCircle);
       try {
         const r = await core.declare({
-          species, stage, content, exitsEvidence, patterns, instance, severity, scope: ruleScope,
+          species, stage, content, exitsEvidence, severity, scope: ruleScope,
           // LIVE, not the closure-captured `defaultModelTag` — same review-fix reasoning as
           // memory_store's own rule capture just above (Codex round 3). The HOST tag is injected
           // for RULES only: principle/preference are momentless and reject modelTag, but a
           // caller-supplied value must still reach declare() so that rejection is not bypassed.
           modelTag: species === "rule" ? (core.getRuntimeModelTag() ?? modelTag) : modelTag,
           reason, declaredBy, sourceRefs,
-          acknowledgeBlockingRules,
           circle: declareCircle,
         });
         // BOTH DISCLOSURES CAN APPLY TO ONE DECLARE (Codex round 11, item 7, P2 — found and fixed:
@@ -1450,18 +1372,11 @@ export function registerMonetCoreTools(
           let guidance: string;
           if (r.species === "stage") {
             guidance = "The stage is registered. It fires nothing until a rule is bound to it — until then a matching action reports the stage with no rules, which is the signal to reason from principles.";
-            const previous = fitRenderedPatternsForAck(r.previousPatterns);
-            const patterns = fitRenderedPatternsForAck(r.patterns);
             return mutOk({
               circle: homeCircle,
               species: r.species,
               stage: fitStageViewForAck(r.stage),
-              previousPatterns: previous.items,
-              ...(previous.omitted > 0 ? { previousPatternsOmitted: previous.omitted } : {}),
-              patterns: patterns.items,
-              ...(patterns.omitted > 0 ? { patternsOmitted: patterns.omitted } : {}),
-              ...(r.advisories && r.advisories.length > 0 ? { advisories: r.advisories } : {}),
-              guidance: firingWarning(r.advisories) ?? guidance,
+              guidance,
             }, "memory_declare", capturedBlock);
           } else {
             const disclosures = [
@@ -1476,11 +1391,6 @@ export function registerMonetCoreTools(
               r.narrowedFromBreadth
                 ? "BREADTH NARROWED: this rule was global (every circle) and now delivers only in its own circle — every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle=\"*\" to restore it."
                 : null,
-              // THE DECLARE-TIME FIRING TEST (monet-client#59). Same discipline, one axis over: a
-              // rule that will never fire is a rule the user believes is protecting them and is
-              // not — which is the same class of surprise as a silently removed deny, and belongs
-              // on the same loud channel rather than in an advisories array a caller may not read.
-              firingWarning(r.advisories),
             ]
               .filter((line): line is string => line !== null)
               .join(" ");

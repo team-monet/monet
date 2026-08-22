@@ -33,20 +33,16 @@ import {
   COMMAND_BOUNDARY,
   createGateSchema,
   evaluateStageLookup,
-  formatTriggerPattern,
   gateCoverage,
   LEGACY_STAR_CIRCLE,
   migrateGateColumns,
-  readTriggerPatterns,
   upsertStage,
   liveStageIndex,
-  matchesTriggerPattern,
   MODEL_TAG_MAX_CHARS,
   normalizeMatchToken,
   normalizeStageName,
+  RETIRED_TRIGGER_PATTERNS,
   parseActionContext,
-  parseTriggerPatterns,
-  seedTriggerPattern,
   stageLookup as standaloneStageLookup,
   STAGE_INDEX_CAP,
   STAGE_LOOKUP_BODY_CAP,
@@ -201,84 +197,31 @@ async function withdrawDeny(c: MonetCore, conceptId: string, stage: string, circ
 }
 
 // ---------------------------------------------------------------------------
-// the pattern format — the contract a human reads
+// the action-context tokenizer — what survived the matcher
 // ---------------------------------------------------------------------------
-describe("trigger pattern format", () => {
-  it("seeds `Bash: git push --force` from the instance the correction was captured on", () => {
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    expect(pattern).toEqual({ tool: "bash", tokens: ["git", "push", "--force"] });
-    expect(formatTriggerPattern(pattern)).toBe("bash: git push --force");
-  });
-
-  it("fires on the dangerous shape and stays silent on its safe siblings (the slice's fixtures)", () => {
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    const fires = (context: string): boolean => matchesTriggerPattern(pattern, parseActionContext(context));
-
-    // Fires: a prefix of the captured instance...
-    expect(fires("Bash:git push --force")).toBe(true);
-    // ...and the same command buried mid-chain behind a `cd`, with different operands.
-    expect(fires("Bash:cd /x && git push --force origin dev")).toBe(true);
-    // Silent: the same tool and the same leading word, but not this command.
-    expect(fires("Bash:git status")).toBe(false);
-    // Silent: a different tool entirely.
-    expect(fires("Read:/etc/hosts")).toBe(false);
-  });
-
-  it("fires a declared `terraform apply` stage on `Bash:terraform apply -auto-approve`", () => {
-    // A declaration authored from a bare command name gets no tool constraint, which is what lets
-    // it fire on whichever host surface actually runs it.
-    const pattern = seedTriggerPattern("terraform apply");
-    expect(pattern).toEqual({ tool: null, tokens: ["terraform", "apply"] });
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:terraform apply -auto-approve"))).toBe(true);
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:terraform plan"))).toBe(false);
-  });
-
-  it("seeds from the substantive command in a chain, whichever end it sits at", () => {
-    expect(seedTriggerPattern("Bash:cd /x && git push --force origin dev").tokens)
-      .toEqual(["git", "push", "--force"]);
-    expect(seedTriggerPattern("Bash:git push --force && echo done").tokens)
-      .toEqual(["git", "push", "--force"]);
-  });
-
-  it("keeps a quoted run as one token, so message text never leaks into a pattern", () => {
+//
+// THE TRIGGER-PATTERN SUITE THAT STOOD HERE WENT WITH THE PATTERNS (2026-08-22): seeding, the
+// rendered contract, tool-constraint firing, the contiguous-run match, the empty-run refusal, the
+// corrupt-row read, and the padding test that proved matching never runs on a prefix. Nothing
+// matches an action any more, so none of them had a subject left.
+//
+// WHAT REMAINS HAS A LIVE READER. `parseActionContext` still answers one question — is this
+// declared content shaped like a command? — for `declareAdvisories`, so its tokenizer's decisions
+// are still load-bearing and still pinned here. Every assertion below is about the TOKENIZER
+// alone; not one of them mentions a pattern.
+describe("action-context tokenizer", () => {
+  it("keeps a quoted run as one token, so message text never leaks into a token stream", () => {
     // ONE token, and it carries the quoted CONTENT rather than the quotes: `-m "a b"` can never be
     // confused with the three-token `-m a b`, and the quotes themselves are not part of the word.
     expect(parseActionContext(`Bash:git commit -m "fix the thing"`).tokens)
       .toEqual(["git", "commit", "-m", "fix the thing"]);
-    expect(seedTriggerPattern(`Bash:git commit -m "fix the thing"`).tokens)
-      .toEqual(["git", "commit", "-m"]);
-  });
-
-  it("sees through quoting and escaping — the same command to the shell is the same command here", () => {
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    const fires = (context: string): boolean => matchesTriggerPattern(pattern, parseActionContext(context));
-    expect(fires(`Bash:git "push" --force origin main`)).toBe(true);
-    expect(fires(`Bash:git 'push' '--force' origin main`)).toBe(true);
-    expect(fires(`Bash:git push \\-\\-force origin main`)).toBe(true);
-    expect(fires("Bash:GIT PUSH --FORCE origin main")).toBe(true);
-    // ACCEPTED NON-MATCHES, documented in the module header rather than half-fixed.
-    // Genuinely different tokens — teaching the matcher otherwise means teaching it every tool's
-    // flag grammar, which is how a deterministic matcher becomes a heuristic one.
-    expect(fires("Bash:git push --force=true origin main")).toBe(false);
-    expect(fires("Bash:git push -f origin main")).toBe(false);
-    // ANSI-C quoting. `$'...'` carries its own escape table, and a partial implementation is worse
-    // than none: stripping the `$` and treating the run as literal would render `$'a\nb'` as four
-    // characters where the shell produces two words. Left alone, deliberately, and pinned here so
-    // the day someone implements the escape table in full, this test is what they update.
-    expect(fires("Bash:$'git' push --force origin main")).toBe(false);
   });
 
   it("processes shell escapes EXACTLY ONCE, so a literal backslash survives", () => {
     // `foo\\bar` is the five characters `foo\bar` to the shell. The tokenizer resolved that
     // correctly and then normalizeMatchToken unescaped the result a SECOND time, yielding
-    // `foobar` — a token that matches things it should not and misses the one it should.
+    // `foobar` — a token that means something other than what was written.
     expect(parseActionContext("Bash:foo\\\\bar").tokens).toEqual(["foo\\bar"]);
-    expect(seedTriggerPattern("Bash:foo\\\\bar --flag").tokens).toEqual(["foo\\bar", "--flag"]);
-    // Seed and match agree because both come through the same tokenizer.
-    expect(matchesTriggerPattern(
-      seedTriggerPattern("Bash:foo\\\\bar --flag"),
-      parseActionContext("Bash:foo\\\\bar --flag now"),
-    )).toBe(true);
     // ...and a token whose literal content IS a quoted string keeps its quotes.
     expect(parseActionContext(`Bash:echo '"quoted"'`).tokens).toEqual(["echo", '"quoted"']);
     // The single-escape cases still resolve, once.
@@ -286,53 +229,18 @@ describe("trigger pattern format", () => {
     expect(parseActionContext("Bash:git push \\-\\-force").tokens).toEqual(["git", "push", "--force"]);
   });
 
-  it("normalizes BOTH sides with one function, so a stored pattern cannot drift from the matcher", () => {
-    // The shared form is CASE FOLDING ONLY, and that is what makes it idempotent. Quote-stripping
-    // and unescaping belong to the TOKENIZER, which is the only layer that knows which characters
-    // were syntax and which were data — see the double-processing test below.
+  it("folds case and nothing else — the one normalization, still applied exactly once", () => {
+    // CASE FOLDING ONLY, which is what makes it idempotent. Quote-stripping and unescaping belong
+    // to the TOKENIZER, the only layer that knows which characters were syntax and which were data
+    // — see the double-processing test above.
     expect(normalizeMatchToken('"push"')).toBe('"push"');
     expect(normalizeMatchToken("--Force")).toBe("--force");
-    // What matters is that both sides agree, which they do because both come through the tokenizer.
-    const stored = readTriggerPatterns(JSON.stringify([{ tool: "Bash", tokens: ["GIT", "Push"] }])).patterns;
-    expect(stored).toEqual([{ tool: "bash", tokens: ["git", "push"] }]);
-    expect(matchesTriggerPattern(stored[0]!, parseActionContext("Bash:git push --force"))).toBe(true);
-  });
-
-  it("refuses a seed that is nothing but flags — that stage would address every command", () => {
-    // K1: `--force` alone fires on `rm -rf --force`, on `git push --force`, on anything carrying
-    // the flag. Born pattern-less and inert instead, visible in the dead-pattern watchlist.
-    expect(seedTriggerPattern("Bash:--force").tokens).toEqual([]);
-    expect(seedTriggerPattern("--force -v").tokens).toEqual([]);
-    expect(matchesTriggerPattern(seedTriggerPattern("Bash:--force"), parseActionContext("Bash:rm -rf --force")))
-      .toBe(false);
-    // A flag run that DOES have a word reaches for it rather than giving up.
-    expect(seedTriggerPattern("Bash:-v --force rm").tokens).toEqual(["-v", "--force", "rm"]);
-  });
-
-  it("matches the whole context — a wall of padding cannot push the command out of view", () => {
-    // F1: the old token clamp meant N tokens of padding silenced every gate in the store. A cap
-    // that turns "long" into "ungoverned" is worse than no cap.
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    const padding = Array.from({ length: 4000 }, (_, i) => `arg${i}`).join(" ");
-    expect(matchesTriggerPattern(pattern, parseActionContext(`Bash:${padding} && git push --force origin main`)))
-      .toBe(true);
+    expect(parseActionContext("Bash:GIT PUSH --FORCE").tokens).toEqual(["git", "push", "--force"]);
   });
 
   it("only reads a tool prefix when the text before the colon is a bare identifier", () => {
     expect(parseActionContext(`psql -c "select 1:2"`).tool).toBeNull();
     expect(parseActionContext("Bash:ls").tool).toBe("bash");
-  });
-
-  it("never matches on an empty token run — a stage that fires on everything is worse than none", () => {
-    expect(matchesTriggerPattern({ tool: null, tokens: [] }, parseActionContext("Bash:anything at all"))).toBe(false);
-    expect(matchesTriggerPattern({ tool: "bash", tokens: [] }, parseActionContext("Bash:anything at all"))).toBe(false);
-  });
-
-  it("reads a corrupt stage row as zero patterns instead of throwing on the firing path", () => {
-    expect(parseTriggerPatterns("not json at all")).toEqual([]);
-    expect(parseTriggerPatterns('{"tool":"bash"}')).toEqual([]);
-    expect(parseTriggerPatterns('[{"tool":"Bash","tokens":["GIT","Push"]},{"nope":1}]'))
-      .toEqual([{ tool: "bash", tokens: ["git", "push"] }]);
   });
 });
 
@@ -346,7 +254,6 @@ describe("rule capture", () => {
       kind: "rule",
       rule: {
         stage: "git force push",
-        instance: "Bash:git push --force origin main",
         reason: "it destroys teammates' commits",
         ...AGENT_RULE,
       },
@@ -364,11 +271,11 @@ describe("rule capture", () => {
     });
 
     // The stage did not exist a moment ago: the correction's landing on an unstaged action IS its
-    // creation, and its pattern comes from the instance that was visible at that moment.
+    // creation. The stage is its NAME — since trigger patterns retired there is nothing else about
+    // it for the capture moment to author.
     const stages = c.stages();
     expect(stages).toHaveLength(1);
     expect(stages[0]).toMatchObject({ name: "git force push", origin: "correction" });
-    expect(stages[0]!.patterns).toEqual([{ tool: "bash", tokens: ["git", "push", "--force"] }]);
     expect(stored.concept.kind).toBe("rule");
     c.close();
   });
@@ -376,17 +283,20 @@ describe("rule capture", () => {
   it("takes the rule's address from an existing stage rather than creating a second one", async () => {
     const c = core();
     const first = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
+    const incumbent = c.stages()[0]!;
     const second = await c.store("Announce in the channel before any force push.", {
       // Named by a DIFFERENT spelling of the same stage — normalization is what keeps the stage set
       // "finite, slow-growing, countable".
-      kind: "rule", rule: { stage: "  Git   Force Push ", instance: "Bash:git push --force -u origin x", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "  Git   Force Push ", ...AGENT_RULE },
     });
     expect(c.stages()).toHaveLength(1);
     expect(c.ruleBinding(first.conceptId)!.stage_id).toBe(c.ruleBinding(second.conceptId)!.stage_id);
-    // The incumbent stage keeps its own patterns: a later capture does not re-author an address.
-    expect(c.stages()[0]!.patterns).toEqual([{ tool: "bash", tokens: ["git", "push", "--force"] }]);
+    // THE INCUMBENT ROW IS UNTOUCHED — a later capture does not re-author an address. This used to
+    // be asserted about the stage's trigger patterns; with those retired the claim is stronger and
+    // simpler, because the whole row is what must not move.
+    expect(c.stages()[0]).toEqual(incumbent);
     c.close();
   });
 
@@ -402,19 +312,20 @@ describe("rule capture", () => {
   it("a rule corrected twice at ONE stage is two observations, one rule — and its address does not move", async () => {
     const c = resolvingCore();
     const first = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
+    const incumbent = c.stages()[0]!;
     const second = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force -u origin x", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
 
     expect(second.conceptId).toBe(first.conceptId);
     expect(second.action).toBe("attached");
     expect(second.concept.supportCount).toBe(2);
-    // The rule's address did NOT move, and the repeat's own instance did not re-author the stage's
-    // patterns either: a later capture does not re-address a live rule by either mechanism.
+    // The rule's address did NOT move, and the repeat did not re-author the stage row either: a
+    // later capture does not re-address a live rule by either mechanism.
     expect(c.stages().map((s) => s.name)).toEqual(["git force push"]);
-    expect(c.stages()[0]!.patterns).toEqual([{ tool: "bash", tokens: ["git", "push", "--force"] }]);
+    expect(c.stages()[0]).toEqual(incumbent);
     const bound = c.stages().find((s) => s.id === c.ruleBinding(first.conceptId)!.stage_id)!;
     expect(bound.name).toBe("git force push");
     c.close();
@@ -431,13 +342,13 @@ describe("rule capture", () => {
   it("creates no orphan stage when the binding it would serve is kept", async () => {
     const c = resolvingCore();
     const first = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     // A named attach whose rule options name a DIFFERENT action keeps the incumbent binding — and
     // used to leave the newly named stage behind, unbound: it delivers nothing and can never
     // deliver anything, a permanent dead entry in the registry.
     await c.store("Never force-push to a shared branch.", {
-      kind: "rule", attachTo: first.conceptId, rule: { stage: "some other gate", instance: "Bash:rm -rf", ...AGENT_RULE },
+      kind: "rule", attachTo: first.conceptId, rule: { stage: "some other gate", ...AGENT_RULE },
     });
     expect(c.stages().map((s) => s.name)).toEqual(["git force push"]);
     // The registry's own live-stage list is the surviving witness: one stage, and it is the bound one.
@@ -446,7 +357,7 @@ describe("rule capture", () => {
 
     // A DECLARATION still moves the address, stage and all — that is the sovereign path.
     await c.declare({
-      species: "rule", stage: "some other gate", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "some other gate",
       content: "Never force-push to a shared branch.", ...AGENT_RULE,
     });
     expect(c.stages().map((s) => s.name).sort()).toEqual(["git force push", "some other gate"]);
@@ -478,7 +389,7 @@ describe("rule capture", () => {
     // Identical text, so the nomination scan picks the fact — but a binding on a fact would be
     // accepted, stored, and never delivered, because the gate only ever returns kind='rule'.
     const rule = await c.store("Always run terraform plan before apply.", {
-      kind: "rule", rule: { stage: "terraform apply", instance: "Bash:terraform apply", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "terraform apply", ...AGENT_RULE },
     });
     expect(rule.conceptId).not.toBe(fact.conceptId);
     expect(rule.action).toBe("created");
@@ -495,7 +406,7 @@ describe("rule capture", () => {
   it("will not attach fresh rule evidence to a SUPERSEDED rule — history takes no new evidence", async () => {
     const c = resolvingCore();
     const original = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     await c.store("Force-push is fine on your own branch; never on a shared one.", {
       kind: "correction", attachTo: original.conceptId,
@@ -540,7 +451,7 @@ describe("rule death — a correction supersedes rather than attaches", () => {
   it("treats a NOMINATED landing on a rule exactly like a named one", async () => {
     const c = resolvingCore();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     // No attachTo: the resolution hybrid decides WHICH concept this lands on; what landing MEANS is
     // a property of what it landed on.
@@ -595,7 +506,7 @@ describe("rule provenance", () => {
     const rule = await c.store("Never force-push to a shared branch.", {
       kind: "rule",
       sourceRefs: [SPAN, "src/deploy.ts"],
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      rule: { stage: "git force push", ...AGENT_RULE },
     });
     const provenance = c.getLifecycleEdges(rule.conceptId, { direction: "out", family: "provenance" });
     expect(provenance).toHaveLength(1);
@@ -631,20 +542,19 @@ describe("rule provenance", () => {
 // declaration
 // ---------------------------------------------------------------------------
 describe("declaration — the sovereign entrance", () => {
-  it("declares a stage, then a rule at it, and replaces patterns on re-declaration", async () => {
+  it("declares a stage, then a rule at it, and re-declaring the stage is a no-op", async () => {
     const c = core();
-    const stage = await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
+    const stage = await c.declare({ species: "stage", stage: "terraform apply" });
     expect(stage).toMatchObject({ species: "stage" });
     expect(c.stages()[0]).toMatchObject({ name: "terraform apply", origin: "declaration" });
-    expect(c.stages()[0]!.patterns).toEqual([{ tool: null, tokens: ["terraform", "apply"] }]);
+    const declared = c.stages()[0]!;
 
-    // Re-declaration REPLACES: this is how a mis-seeded pattern is fixed.
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["Bash:terraform apply", "Bash:terraform destroy"] });
+    // RE-DECLARATION IS CREATE-OR-FETCH. It used to REPLACE the stage's trigger patterns, which was
+    // the only editable thing a stage carried; with those retired a stage is its name, so a second
+    // declaration of the same name returns the same row rather than re-authoring anything.
+    await c.declare({ species: "stage", stage: "terraform apply" });
     expect(c.stages()).toHaveLength(1);
-    expect(c.stages()[0]!.patterns).toEqual([
-      { tool: "bash", tokens: ["terraform", "apply"] },
-      { tool: "bash", tokens: ["terraform", "destroy"] },
-    ]);
+    expect(c.stages()[0]).toEqual(declared);
 
     const rule = await c.declare({
       species: "rule", stage: "terraform apply", content: "Always run plan first.",
@@ -735,7 +645,7 @@ describe("declaration — the sovereign entrance", () => {
     // that omits it never rules on severity and never reaches this check. This one names `blocking`
     // explicitly on a rule that is currently advisory — deny power actually being acquired.
     const first = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", ...AGENT_RULE,
     });
     if (first.species !== "rule") throw new Error("unreachable");
@@ -773,7 +683,7 @@ describe("declaration — the sovereign entrance", () => {
   it("PRESERVES an omitted reason exactly as it preserves an omitted severity", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      species: "rule", ...DENY,
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -807,7 +717,7 @@ describe("declaration — the sovereign entrance", () => {
   it("carries a withdrawn deny's reason forward into the advisory it becomes", async () => {
     const c = core();
     const deny = await c.declare({
-      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      species: "rule", ...DENY,
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -822,7 +732,7 @@ describe("declaration — the sovereign entrance", () => {
   it("REFUSES a restatement that blanks a live deny's reason, though it never named a severity", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      species: "rule", ...DENY,
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -850,7 +760,7 @@ describe("declaration — the sovereign entrance", () => {
   it("lets an explicit reason replace on either severity, and lets an advisory clear its own", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      species: "rule", ...DENY,
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -908,7 +818,7 @@ describe("declaration — the sovereign entrance", () => {
   it("REJECTS rather than normalizing, so nobody is handed back words they did not write", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -937,7 +847,7 @@ describe("declaration — the sovereign entrance", () => {
   it("REFUSES a multi-line reason on a restatement that never named a severity", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -1052,14 +962,16 @@ describe("declaration — the sovereign entrance", () => {
       c.close();
     });
 
-    it("rejects stage/severity/patterns on species principle/preference — a preference bound to a moment is just a rule", async () => {
+    // `patterns` USED TO BE THE THIRD REFUSAL HERE, and `instance` a fourth. Both fields were
+    // removed from DeclareInput with trigger patterns (2026-08-22), so there is nothing left to
+    // refuse — a caller that sends them is sending a key the schema does not define. The refusals
+    // that remain are the ones whose fields still exist.
+    it("rejects stage/severity on species principle/preference — a preference bound to a moment is just a rule", async () => {
       const c = core();
       await expect(c.declare({ species: "principle", content: "x", stage: "git push" }))
         .rejects.toThrow(/momentless and cannot bind to a stage.*use species:"rule"/);
       await expect(c.declare({ species: "preference", content: "x", severity: "advisory" }))
         .rejects.toThrow(/carries no severity.*use species:"rule"/);
-      await expect(c.declare({ species: "principle", content: "x", patterns: ["git push"] }))
-        .rejects.toThrow(/carries no trigger patterns.*use species:"rule"/);
       c.close();
     });
 
@@ -1073,10 +985,9 @@ describe("declaration — the sovereign entrance", () => {
           .rejects.toThrow(new RegExp(`species '${species}' carries no modelTag: modelTag names the model a rule.*use species:"rule"`));
         await expect(c.declare({ species, content: "x", reason: "there is no undo" }))
           .rejects.toThrow(new RegExp(`species '${species}' carries no reason: reason explains a rule.*use species:"rule"`));
-        await expect(c.declare({ species, content: "x", acknowledgeBlockingRules: ["rule-1"] }))
-          .rejects.toThrow(
-            new RegExp(`species '${species}' carries no blocking-rule acknowledgement: acknowledgeBlockingRules.*use species:"rule"`),
-          );
+        // A FOURTH REFUSAL STOOD HERE — `acknowledgeBlockingRules`, which authorized re-aiming a
+        // gate that carries live denies. The parameter retired with trigger patterns, so the field
+        // a momentless species had to be refused no longer exists to send.
         c.close();
       },
     );
@@ -1225,7 +1136,7 @@ describe("declaration — the sovereign entrance", () => {
         const c = resolvingCore();
         const text = "Never delete a directory tree unattended.";
         const deny = await c.declare({
-          species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+          species: "rule", stage: "rm -rf",
           content: text, severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
         });
         if (deny.species !== "rule") throw new Error("unreachable");
@@ -1305,21 +1216,11 @@ describe("declaration — the sovereign entrance", () => {
     });
 
     describe("warning-light advisories — mechanical only, NEVER block the write", () => {
-      it('advises when content matches an EXISTING stage\'s own trigger patterns, naming the stage', async () => {
-        const c = core();
-        await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-        const r = await c.declare({
-          species: "principle",
-          content: "Always run terraform apply only after a clean plan.",
-        });
-        if (r.species !== "principle") throw new Error("unreachable");
-        // NEVER BLOCKS: the write proceeded despite looking rule-shaped.
-        expect(r.conceptId).toBeTruthy();
-        expect(r.advisories).toContainEqual(
-          expect.objectContaining({ kind: "stage_shaped", stage: "terraform apply" }),
-        );
-        c.close();
-      });
+      // THE STRONGER HALF OF `stage_shaped` WAS REMOVED HERE (2026-08-22). It swept the registry
+      // for a stage whose trigger patterns matched the declared content and named that stage in the
+      // advisory (`{ kind: "stage_shaped", stage: "terraform apply" }`). Nothing matches a stage any
+      // more, so the general half below — the content's own command SHAPE — is the whole check, and
+      // the advisory it emits carries no `stage` field. That absence is asserted there.
 
       it("advises on command-shaped content (Tool:command convention) when no stage matches", async () => {
         const c = core();
@@ -1396,10 +1297,11 @@ describe("declaration — the sovereign entrance", () => {
 
       it("never blocks the write even when multiple advisories fire at once", async () => {
         const c = core();
-        await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-        // Stage-shaped (matches the "terraform apply" stage) AND missing-exits-evidence (none
-        // given) both fire on this one write, and it still proceeds — advisories never block.
-        const r = await c.declare({ species: "principle", content: "Always run terraform apply only after a clean plan." });
+        // Command-shaped (the `Tool:` prefix) AND missing-exits-evidence (none given) both fire on
+        // this one write, and it still proceeds — advisories never block. This used to be triggered
+        // by content MATCHING a registered stage's patterns; with those retired, the content's own
+        // shape is what raises `stage_shaped`, and firing two at once is still the property here.
+        const r = await c.declare({ species: "principle", content: "Bash:terraform apply only after a clean plan" });
         if (r.species !== "principle") throw new Error("unreachable");
         expect(r.conceptId).toBeTruthy();
         expect(r.advisories.length).toBeGreaterThanOrEqual(2);
@@ -1460,7 +1362,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     // The parent edge, written the way memory_ratify writes it: the human named this rule as a
     // member of the principle's evidence.
@@ -1494,10 +1396,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const incumbent = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const successor = await c.store("Force-push is fine on your own branch; never on a shared one.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force-with-lease", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     await c.ratify({
       candidateId: principle, verdict: "re-ratify", memberRuleIds: [incumbent.conceptId], ratifiedBy: "john",
@@ -1544,10 +1446,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const incumbent = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const successor = await c.store("Force-push is fine on your own branch; never on a shared one.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force-with-lease", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({
       family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction",
@@ -1586,10 +1488,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
         `SELECT id FROM observations WHERE concept_id = ? LIMIT 1`,
       ).get(principle) as { id: string }).id;
       const incumbent = await c.store(`Never force-push to a shared branch (${scenario.name}).`, {
-        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, instance: `Bash:${scenario.name}`, ...AGENT_RULE },
+        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, ...AGENT_RULE },
       });
       const successor = await c.store(`Lease-push instead on shared branches (${scenario.name}).`, {
-        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, instance: `Bash:s-${scenario.name}`, ...AGENT_RULE },
+        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, ...AGENT_RULE },
       });
       c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
       c.addLifecycleEdge({
@@ -1614,10 +1516,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     for (const shape of ["retired", "disputed"] as const) {
       const principle = await principleOf(c, `Irreversible acts get a confirmation (${shape}).`);
       const incumbent = await c.store(`Never force-push to a shared branch (${shape}).`, {
-        kind: "rule", rule: { stage: `live successor ${shape}`, instance: `Bash:${shape}`, ...AGENT_RULE },
+        kind: "rule", rule: { stage: `live successor ${shape}`, ...AGENT_RULE },
       });
       const successor = await c.store(`Lease-push instead on shared branches (${shape}).`, {
-        kind: "rule", rule: { stage: `live successor ${shape}`, instance: `Bash:s-${shape}`, ...AGENT_RULE },
+        kind: "rule", rule: { stage: `live successor ${shape}`, ...AGENT_RULE },
       });
       c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
       if (shape === "retired") {
@@ -1656,10 +1558,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (cross-stage).");
     const incumbent = await c.store("Never force-push to a shared branch (cross-stage).", {
-      kind: "rule", rule: { stage: "cross-stage gate", instance: "Bash:cross-stage", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "cross-stage gate", ...AGENT_RULE },
     });
     const elsewhere = await c.store("Snapshot volumes before stateful deletes (cross-stage).", {
-      kind: "rule", rule: { stage: "cross-stage other gate", instance: "Bash:cross-stage-other", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "cross-stage other gate", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
 
@@ -1682,10 +1584,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (audience).");
     const incumbent = await c.store("Never force-push to a shared branch (audience).", {
-      kind: "rule", rule: { stage: "audience gate", instance: "Bash:audience", scope: "domain" },
+      kind: "rule", rule: { stage: "audience gate", scope: "domain" },
     });
     const narrower = await c.store("Lease-push instead on shared branches (audience).", {
-      kind: "rule", rule: { stage: "audience gate", instance: "Bash:audience-2", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "audience gate", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
 
@@ -1706,10 +1608,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (retired incumbent).");
     const incumbent = await c.store("Never force-push to a shared branch (retired incumbent).", {
-      kind: "rule", rule: { stage: "retired incumbent gate", instance: "Bash:ri", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "retired incumbent gate", ...AGENT_RULE },
     });
     const successor = await c.store("Lease-push instead on shared branches (retired incumbent).", {
-      kind: "rule", rule: { stage: "retired incumbent gate", instance: "Bash:ri-2", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "retired incumbent gate", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
     c.retireConcept(incumbent.conceptId);
@@ -1731,10 +1633,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (disputed incumbent).");
     const incumbent = await c.store("Never force-push to a shared branch (disputed incumbent).", {
-      kind: "rule", rule: { stage: "disputed incumbent gate", instance: "Bash:di", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "disputed incumbent gate", ...AGENT_RULE },
     });
     const successor = await c.store("Lease-push instead on shared branches (disputed incumbent).", {
-      kind: "rule", rule: { stage: "disputed incumbent gate", instance: "Bash:di-2", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "disputed incumbent gate", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
     // The supported route to a disputed advisory rule: detach carries an open dispute onto it.
@@ -1764,10 +1666,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (chained).");
     const other = await c.store("Never force-push to a shared branch (chained).", {
-      kind: "rule", rule: { stage: "chained gate", instance: "Bash:chained", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "chained gate", ...AGENT_RULE },
     });
     const dead = await c.store("Lease-push instead on shared branches (chained).", {
-      kind: "rule", rule: { stage: "chained gate", instance: "Bash:chained-2", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "chained gate", ...AGENT_RULE },
     });
     // Overturn `dead` through the ordinary path: still active, still bound, but no gate delivers it.
     await c.store("Force-push freely on throwaway spikes (chained).", { kind: "correction", attachTo: dead.conceptId });
@@ -1789,7 +1691,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     // exists for this case, and that is the property under test.
     const projected = await c.store("Rebuild the image before deploying after a lockfile change.", {
       kind: "rule",
-      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "docker build", scope: "domain", projectedFromPrincipleId: principle },
     });
     expect(raw(c).prepare(
       `SELECT born_of FROM lifecycle_edges WHERE family='derivation' AND src_concept_id=? AND dst_concept_id=?`,
@@ -1813,14 +1715,14 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const pref = await c.declare({ species: "preference", content: "Write as a peer." });
     if (pref.species !== "preference") throw new Error("unreachable");
     const ruleA = await c.store("Address the reader directly in commit messages.", {
-      kind: "rule", rule: { stage: "git commit", instance: "Bash:git commit -m x", scope: "domain" },
+      kind: "rule", rule: { stage: "git commit", scope: "domain" },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: pref.conceptId, dstConceptId: ruleA.conceptId, bornOf: "extraction" });
 
     // (2) A parent that does not resolve locally — the relayed-edge case walkDerivation's own doc
     //     comment warns about. Written straight to the table, exactly as a graft would land it.
     const ruleB = await c.store("Squash before merging a long branch.", {
-      kind: "rule", rule: { stage: "git merge", instance: "Bash:git merge --no-ff", scope: "domain" },
+      kind: "rule", rule: { stage: "git merge", scope: "domain" },
     });
     raw(c).prepare(
       `INSERT INTO lifecycle_edges (id, family, src_concept_id, dst_concept_id, born_of, event_ref, circle, created_at, sync_updated_at)
@@ -1849,7 +1751,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     /** A principle, a rule, a derivation edge between them, and the correction that kills the rule. */
     const impeachAttempt = async (principle: string, stage: string, text: string) => {
-      const rule = await c.store(text, { kind: "rule", rule: { stage, instance: `Bash:${stage}`, scope: "domain" } });
+      const rule = await c.store(text, { kind: "rule", rule: { stage, scope: "domain" } });
       c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
       return c.store(`${text} — except on the first run.`, { kind: "correction", attachTo: rule.conceptId });
     };
@@ -1889,7 +1791,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
 
@@ -1918,7 +1820,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     // Derivation is deliberately NON-unique (lifecycle-edges.ts): a rule projected from a principle
     // and later named in that same principle's ratification packet legitimately carries two.
@@ -1949,10 +1851,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const ruleA = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const ruleB = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain" },
     });
     await c.ratify({
       candidateId: principle, verdict: "re-ratify", ratifiedBy: "john",
@@ -2001,7 +1903,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
     // An impeachment naming THIS child is already open, and the parent is disputed by it — the
@@ -2024,7 +1926,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
     await c.store("Force-push is fine on your own branch; never on a shared one.", { kind: "correction", attachTo: rule.conceptId });
@@ -2070,7 +1972,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
     await c.store("Force-push is fine on your own branch; never on a shared one.", { kind: "correction", attachTo: rule.conceptId });
@@ -2113,7 +2015,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
     await c.store("Force-push is fine on your own branch; never on a shared one.", { kind: "correction", attachTo: rule.conceptId });
@@ -2180,7 +2082,7 @@ describe("5-B: the projection write path", () => {
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     });
 
     const edges = raw(c).prepare(
@@ -2262,7 +2164,7 @@ describe("5-B: the projection write path", () => {
     const c = core();
     const legalParent = await principleOf(c, "Irreversible acts get a confirmation.");
     const legalRule = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain" },
     });
     c.addLifecycleEdge({
       family: "derivation", srcConceptId: legalParent, dstConceptId: legalRule.conceptId,
@@ -2294,7 +2196,7 @@ describe("5-B: the projection write path", () => {
       .toThrow(/is not a current skeleton member \(no ratification on record\)/);
 
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"], scope: "domain",
+      species: "rule", stage: "rm -rf", scope: "domain",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", declaredBy: "john",
     });
@@ -2314,7 +2216,7 @@ describe("5-B: the projection write path", () => {
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const text = "Confirm the target namespace before deleting a release.";
     const first = await c.store(text, {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     });
     const second = await c.store(text, {
       kind: "rule", rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
@@ -2338,7 +2240,7 @@ describe("5-B: the projection write path", () => {
     // the slice's own operative test ("ever projected onto = excluded from extraction evidence")
     // depend on which edge happened to land first. Both acts are now on record, oldest first.
     const other = await c.store("Announce a release deletion in the ops channel.", {
-      kind: "rule", rule: { stage: "helm announce", instance: "Bash:helm list", scope: "domain" },
+      kind: "rule", rule: { stage: "helm announce", scope: "domain" },
     });
     await c.ratify({ candidateId: principle, verdict: "re-ratify", memberRuleIds: [other.conceptId] });
     await c.store("Announce a release deletion in the ops channel.", {
@@ -2379,10 +2281,10 @@ describe("5-B: the projection write path", () => {
     // The ambiguous band, so two near-matching rules at different stages fork into a flagged pair;
     // identical text still ATTACHES, which is how the later projection lands on an existing rule.
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
-    const ruleAt = (text: string, stage: string, instance: string) =>
-      c.store(text, { kind: "rule", rule: { stage, instance, scope: "domain" } });
-    const first = await ruleAt("Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt("After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const ruleAt = (text: string, stage: string) =>
+      c.store(text, { kind: "rule", rule: { stage, scope: "domain" } });
+    const first = await ruleAt("Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt("After the source changes, verify the artifact itself.", "npm install");
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
@@ -2397,7 +2299,7 @@ describe("5-B: the projection write path", () => {
     // (2) THE PROJECTION LANDS SECOND, onto that very rule — a cache hit on the attach path.
     const projection = await c.store("Verify the built artifact after the source changes.", {
       kind: "rule",
-      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "docker build", scope: "domain", projectedFromPrincipleId: principle },
     });
     expect(projection.action).toBe("attached");
     expect(projection.conceptId).toBe(first.conceptId);
@@ -2430,7 +2332,7 @@ describe("5-B: the projection write path", () => {
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     });
     expect(raw(c).prepare(
       `SELECT born_of FROM lifecycle_edges WHERE family='derivation' AND src_concept_id=? AND dst_concept_id=?`,
@@ -2471,7 +2373,7 @@ describe("5-B: the projection write path", () => {
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"], scope: "domain",
+      species: "rule", stage: "rm -rf", scope: "domain",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", declaredBy: "john",
     });
@@ -2547,7 +2449,7 @@ describe("5-B: the projection write path", () => {
 
     await expect(c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     })).rejects.toThrow(/is 'disputed', not active: a contested or retired principle governs nothing/);
 
     // NOTHING LANDED. The refusal is the same named error the preflight raises, and the transaction
@@ -2572,7 +2474,7 @@ describe("5-B: the projection write path", () => {
 
     await expect(c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     })).rejects.toThrow(/is not a current skeleton member \(latest verdict 'retire'\)/);
     expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM lifecycle_edges WHERE family='derivation'`).get()).toMatchObject({ n: 0 });
     race.restore();
@@ -2595,8 +2497,8 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   const bandCore = (): MonetCore => new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
 
-  const ruleAt = (c: MonetCore, text: string, stage: string, instance: string, extra: Record<string, unknown> = {}) =>
-    c.store(text, { kind: "rule", rule: { stage, instance, scope: "domain", ...extra } });
+  const ruleAt = (c: MonetCore, text: string, stage: string, extra: Record<string, unknown> = {}) =>
+    c.store(text, { kind: "rule", rule: { stage, scope: "domain", ...extra } });
 
   /** The PAIR FLAGS between two concepts — the ordinary derived graph (related/co_occurred/follows)
    *  is not this suite's subject and would only make the assertions brittle to edge derivation. */
@@ -2609,8 +2511,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("flags a pair of near-matching rules bound to DIFFERENT stages — the breadth precondition, at rule birth", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
 
     expect(second.action).toBe("ambiguous"); // forked, so this really is a rule BIRTH
     expect(second.extractionCandidate).toEqual({ pairedRuleId: first.conceptId, score: second.nearMatchScore });
@@ -2632,7 +2534,7 @@ describe("5-B: extraction-candidate flagging", () => {
     // a rule came through — two rules at different stages restating one reason are extraction
     // evidence whether a correction or a human put them there.
     const declared = await c.declare({
-      species: "rule", stage: "kubectl apply", instance: "Bash:kubectl apply -f x", scope: "domain",
+      species: "rule", stage: "kubectl apply", scope: "domain",
       content: "Verify the artifact that was built once the source changes.",
     });
     if (declared.species !== "rule") throw new Error("unreachable");
@@ -2653,8 +2555,8 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("stops reporting a pair once a re-declaration puts both rules at ONE stage — and reports it again when the binding moves back", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
@@ -2693,8 +2595,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("stops reporting a pair while either endpoint is disputed, then restores it after mediation", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
@@ -2739,7 +2641,7 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("refuses to flag a new pair when the near-match rule is already disputed", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     const disputedEvidence = await c.store("A separate evidence packet is internally contested.", {
       kind: "fact", resolution: "forceNew",
     });
@@ -2756,7 +2658,7 @@ describe("5-B: extraction-candidate flagging", () => {
       destConceptId: first.conceptId,
     });
     expect((await c.getConcept(first.conceptId))!.status).toBe("disputed");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(second.nearMatchId).toBe(first.conceptId);
     expect(second.extractionCandidate).toBeUndefined();
     expect(c.overview("default").counts.extractionCandidates).toBe(0);
@@ -2765,8 +2667,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("does NOT flag two rules at the SAME stage — that is a duplicate or a supersession, not breadth", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "docker build");
     expect(second.action).toBe("ambiguous");
     expect(second.extractionCandidate).toBeUndefined();
     expect(edgeTypesBetween(c, first.conceptId, second.conceptId)).toEqual(["possible_duplicate_of"]);
@@ -2781,16 +2683,16 @@ describe("5-B: extraction-candidate flagging", () => {
     const principle = declared.conceptId;
 
     // (1) THE OLD SIDE is projection-born.
-    const projected = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .", {
+    const projected = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", {
       projectedFromPrincipleId: principle,
     });
-    const fresh = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const fresh = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(fresh.nearMatchId).toBe(projected.conceptId); // the near-match really did happen
     expect(fresh.extractionCandidate).toBeUndefined();
 
     // (2) THE NEW SIDE is projection-born — checked separately, because "excluded from extraction
     //     evidence" is a property of the rule, not of which end of the pair it lands on.
-    const newProjection = await ruleAt(c, "Once the source has changed, verify what was built.", "terraform apply", "Bash:terraform apply", {
+    const newProjection = await ruleAt(c, "Once the source has changed, verify what was built.", "terraform apply", {
       projectedFromPrincipleId: principle,
     });
     expect(newProjection.nearMatchId).toBeTruthy();
@@ -2821,15 +2723,15 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("stops reporting a pair once EITHER rule becomes projection-born — checked at read time, on both endpoints", async () => {
     const specs = [
-      { text: "Verify the built artifact after the source changes.", stage: "docker build", instance: "Bash:docker build ." },
-      { text: "After the source changes, verify the artifact itself.", stage: "npm install", instance: "Bash:npm install" },
+      { text: "Verify the built artifact after the source changes.", stage: "docker build" },
+      { text: "After the source changes, verify the artifact itself.", stage: "npm install" },
     ] as const;
 
     /** Flag an ordinary cross-stage pair, then project onto whichever rule fills `role`. */
     const projectOntoEndpoint = async (role: "ca" | "cb"): Promise<void> => {
       const c = bandCore();
-      const first = await ruleAt(c, specs[0].text, specs[0].stage, specs[0].instance);
-      const second = await ruleAt(c, specs[1].text, specs[1].stage, specs[1].instance);
+      const first = await ruleAt(c, specs[0].text, specs[0].stage);
+      const second = await ruleAt(c, specs[1].text, specs[1].stage);
       // THE PREMISE: an ORDINARY pair — neither rule is projection-born, so it is flagged and shown.
       expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
       expect(c.overview("default").counts.extractionCandidates).toBe(1);
@@ -2851,7 +2753,7 @@ describe("5-B: extraction-candidate flagging", () => {
       const projection = await c.store(target.spec.text, {
         kind: "rule",
         rule: {
-          stage: target.spec.stage, instance: target.spec.instance, scope: "domain",
+          stage: target.spec.stage, scope: "domain",
           projectedFromPrincipleId: declared.conceptId,
         },
       });
@@ -2899,10 +2801,10 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("flags a FORCE-NEW rule birth against its cross-stage nearest neighbour — distinctness is not the extraction question", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     const opts = {
       kind: "rule", resolution: "forceNew" as const, operationId: "bulk-import-1",
-      rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" as const },
+      rule: { stage: "npm install", scope: "domain" as const },
     };
     const forced = await c.store("After the source changes, verify the artifact itself.", opts);
 
@@ -2932,10 +2834,10 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("does NOT flag a FORCE-NEW rule birth against a SAME-stage neighbour — the qualifiers are unchanged", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     const forced = await c.store("After the source changes, verify the artifact itself.", {
       kind: "rule", resolution: "forceNew",
-      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain" },
+      rule: { stage: "docker build", scope: "domain" },
     });
     expect(forced.action).toBe("created");
     expect(forced.conceptId).not.toBe(first.conceptId);
@@ -2959,10 +2861,10 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("does NOT flag a FORCE-NEW rule birth whose nearest neighbour is below tauAmbiguous — the floor is the band's", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.95 });
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     const forced = await c.store("After the source changes, verify the artifact itself.", {
       kind: "rule", resolution: "forceNew",
-      rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      rule: { stage: "npm install", scope: "domain" },
     });
     expect(forced.action).toBe("created");
     expect(forced.conceptId).not.toBe(first.conceptId);
@@ -2983,7 +2885,7 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("does NOT flag a birth against a SUPERSEDED rule — active status is not gate liveness", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     // Overturn it: the correction births its successor at the same gate and supersedes it in one act.
     const overturn = await c.store("Skip verification entirely on throwaway spike branches.", {
       kind: "correction", attachTo: first.conceptId,
@@ -2994,7 +2896,7 @@ describe("5-B: extraction-candidate flagging", () => {
     expect(c.ruleBinding(first.conceptId)).not.toBeNull();
 
     // A cross-stage birth whose nearest is the SUPERSEDED incumbent (its text, not the successor's).
-    const probe = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const probe = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(probe.nearMatchId).toBe(first.conceptId);
     expect(probe.extractionCandidate).toBeUndefined();
     // NO extraction flag. The possible_duplicate_of pair the ambiguous-fork records is untouched —
@@ -3012,8 +2914,8 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("stops reporting a pair once EITHER rule is superseded — checked at read time, edge and dismissal intact", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
@@ -3037,7 +2939,7 @@ describe("5-B: extraction-candidate flagging", () => {
     const c = bandCore();
     // A FACT the rule paraphrases: the possible-duplicate machinery's business, not extraction's.
     const fact = await c.store("The build artifact is a snapshot of the source at build time.");
-    const rule = await ruleAt(c, "A built artifact is a snapshot of its source at build time.", "docker build", "Bash:docker build .");
+    const rule = await ruleAt(c, "A built artifact is a snapshot of its source at build time.", "docker build");
     expect(rule.nearMatchId).toBe(fact.conceptId);
     expect(rule.extractionCandidate).toBeUndefined();
 
@@ -3051,8 +2953,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("dismisses an extraction candidate through the SAME pair-dismissal path duplicates use", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
     // Widened from possible_duplicate_of alone in 5-B: without this, the flag had no exit, and
@@ -3070,9 +2972,9 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("survives a detach/rederive cycle with its dismissal intact — pair flags are snapshotted, not re-derived", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
-    const third = await ruleAt(c, "Check the deployed bundle after a source change.", "kubectl apply", "Bash:kubectl apply -f x");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
+    const third = await ruleAt(c, "Check the deployed bundle after a source change.", "kubectl apply");
     expect(c.overview("default").counts.extractionCandidates).toBeGreaterThanOrEqual(2);
     c.dismissPossibleDuplicate(first.conceptId, second.conceptId, "john");
 
@@ -3094,8 +2996,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("renders as its own curation heading, not folded into possible duplicates", async () => {
     const c = bandCore();
-    await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     const rendered = renderOverview(c.overview("default"), { color: false, width: 200 });
     expect(rendered).toContain("EXTRACTION CANDIDATES");
     expect(rendered).toContain("rules at different stages that may share one reason");
@@ -3130,8 +3032,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("a ratification naming BOTH rules of a flagged pair resolves the flag, stamped with the ratifier", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
     const principle = await principleFor(c, "A build artifact is a snapshot; re-materialize after the source changes.");
 
@@ -3169,9 +3071,9 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("resolves EVERY flagged pair among three or more member rules, not just adjacent ones", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
-    const third = await ruleAt(c, "Check the deployed bundle after a source change.", "kubectl apply", "Bash:kubectl apply -f x");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
+    const third = await ruleAt(c, "Check the deployed bundle after a source change.", "kubectl apply");
     const open = c.overview("default").counts.extractionCandidates;
     expect(open).toBeGreaterThanOrEqual(2); // which births paired with which is the fixture's business
     const principle = await principleFor(c, "A build artifact is a snapshot; re-materialize after the source changes.");
@@ -3192,8 +3094,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("leaves the flag open when only ONE of the pair is named — half an answer is not an answer", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     const principle = await principleFor(c, "A build artifact is a snapshot; re-materialize after the source changes.");
 
     const ratified = await c.ratify({
@@ -3223,8 +3125,8 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("resolves the flags inside the verdict's own transaction — an injected failure rolls the verdict back", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     const principle = await principleFor(c, "A build artifact is a snapshot; re-materialize after the source changes.");
     const verdictsBefore = c.getRatifications(principle).length;
 
@@ -3281,14 +3183,14 @@ describe("5-B: extraction-candidate flagging", () => {
  */
 describe("5-B: a rule repeating across stages forks instead of absorbing", () => {
   /** SHIPPING THRESHOLDS: identical text scores far above tauAttach, which is the case under test. */
-  const ruleAt = (c: MonetCore, text: string, stage: string, instance: string, extra: Record<string, unknown> = {}) =>
-    c.store(text, { kind: "rule", rule: { stage, instance, scope: "domain", ...extra } });
+  const ruleAt = (c: MonetCore, text: string, stage: string, extra: Record<string, unknown> = {}) =>
+    c.store(text, { kind: "rule", rule: { stage, scope: "domain", ...extra } });
   const TEXT = "Verify the built artifact after the source changes.";
 
   it("forks a cross-stage rule capture, binds each rule to its own stage, and flags the extraction candidate", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, TEXT, "npm install", "Bash:npm install");
+    const first = await ruleAt(c, TEXT, "docker build");
+    const second = await ruleAt(c, TEXT, "npm install");
 
     // A FORK, not an attach — and it reports itself as one.
     expect(second.conceptId).not.toBe(first.conceptId);
@@ -3321,8 +3223,8 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
 
   it("does NOT fork at the SAME stage — that is one rule gaining a second observation", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, TEXT, "docker build");
+    const second = await ruleAt(c, TEXT, "docker build");
     expect(second.conceptId).toBe(first.conceptId);
     expect(second.action).toBe("attached");
     expect(second.resolutionMode).toBe("attach");
@@ -3333,7 +3235,7 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
 
   it("leaves an EXPLICIT attachTo alone — the caller asserted identity, so the incumbent address stands", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, TEXT, "docker build");
     const attached = await c.store(TEXT, {
       kind: "rule", attachTo: first.conceptId, rule: { stage: "npm install", scope: "domain" },
     });
@@ -3356,7 +3258,7 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
    */
   it("leaves a DECLARATION alone — re-addressing a live rule is the sovereign act, not a fork", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, TEXT, "docker build");
     const moved = await c.declare({ species: "rule", stage: "npm install", scope: "domain", content: TEXT });
     if (moved.species !== "rule") throw new Error("unreachable");
     expect(moved.conceptId).toBe(first.conceptId);
@@ -3367,9 +3269,9 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
 
   it("forks onto a stage that does not exist yet — a to-be-created stage differs from every incumbent", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, TEXT, "docker build");
     expect(c.stages().map((s) => s.name)).toEqual(["docker build"]);
-    const second = await ruleAt(c, TEXT, "terraform apply", "Bash:terraform apply");
+    const second = await ruleAt(c, TEXT, "terraform apply");
     expect(second.resolutionMode).toBe("stage-fork");
     expect(second.conceptId).not.toBe(first.conceptId);
     // The stage is born with the forked rule, exactly as any other rule birth births its stage.
@@ -3387,7 +3289,7 @@ describe("5-B: fire-time doubt disclosure", () => {
     const principle = declared.conceptId;
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     });
     // BEFORE: a parent in good standing announces provenance and nothing else.
     expect(c.stageLookup({ stage: "helm delete" }).rules[0]!.parentDisputed).toBeUndefined();
@@ -3396,7 +3298,7 @@ describe("5-B: fire-time doubt disclosure", () => {
     // it is a different rule from the one firing below, which is the whole point: the rule that
     // fires is untouched and still governs.
     const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: principle },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain", projectedFromPrincipleId: principle },
     });
     await c.store("Snapshot the volume AND drain the node before deleting a stateful set.", {
       kind: "correction", attachTo: sibling.conceptId,
@@ -3422,12 +3324,12 @@ describe("5-B: fire-time doubt disclosure", () => {
     const later = await c.declare({ species: "principle", content: "Risk belongs with the actor who can reverse it." });
     if (earliest.species !== "principle" || later.species !== "principle") throw new Error("unreachable");
     const shared = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain" },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: earliest.conceptId, dstConceptId: shared.conceptId, bornOf: "extraction" });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: later.conceptId, dstConceptId: shared.conceptId, bornOf: "extraction" });
     const laterSibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain" },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain" },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: later.conceptId, dstConceptId: laterSibling.conceptId, bornOf: "extraction" });
 
@@ -3468,11 +3370,11 @@ describe("5-B: fire-time doubt disclosure", () => {
     const parent = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
     if (parent.species !== "principle") throw new Error("unreachable");
     const child = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: parent.conceptId },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: parent.conceptId },
     });
     // Half 1: an impeachment answered by REJECT closes, and the projection recomputes to active.
     const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: parent.conceptId },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain", projectedFromPrincipleId: parent.conceptId },
     });
     await c.store("Snapshot AND drain before deleting a stateful set.", { kind: "correction", attachTo: sibling.conceptId });
     expect((await c.getConcept(parent.conceptId))!.status).toBe("disputed");
@@ -3501,7 +3403,7 @@ describe("5-B: fire-time doubt disclosure", () => {
   it("caps disputedParentIds and signals truncation past the cap", async () => {
     const c = core();
     const child = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain" },
     });
     const parents: string[] = [];
     for (let i = 0; i < 9; i++) {
@@ -3525,7 +3427,7 @@ describe("5-B: fire-time doubt disclosure", () => {
   it("omits the flag entirely when the parent is fine, and when there is no parent at all", async () => {
     const c = core();
     const plain = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", scope: "domain" },
+      kind: "rule", rule: { stage: "git force push", scope: "domain" },
     });
     const rule = c.stageLookup({ stage: "git force push", record: false }).rules[0]!;
     expect(rule.conceptId).toBe(plain.conceptId);
@@ -3541,10 +3443,10 @@ describe("5-B: fire-time doubt disclosure", () => {
     if (declared.species !== "principle") throw new Error("unreachable");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: declared.conceptId },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: declared.conceptId },
     });
     const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: declared.conceptId },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain", projectedFromPrincipleId: declared.conceptId },
     });
     await c.store("Snapshot the volume AND drain the node first.", { kind: "correction", attachTo: sibling.conceptId });
     expect(c.stageLookup({ stage: "helm delete", record: false }).rules[0]!.parentDisputed).toBe(true);
@@ -3571,14 +3473,14 @@ describe("breadth inherits into the recognized surfaces", () => {
     // some other circle's index, proving the test below is measuring breadth, not "every stage
     // shows up everywhere regardless".
     await c.declare({
-      species: "rule", stage: "eslint --fix all", patterns: ["Bash:eslint --fix --all"],
+      species: "rule", stage: "eslint --fix all",
       content: "Confirm the file count before a repo-wide autofix.", severity: "advisory", scope: "domain",
     });
 
     // The global rule: a BLOCKING breadth binding, plus a LOCAL advisory sharing its stage in
     // "default" — same union shape the parity test's own breadth fixture uses.
     const globalDeny = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "docker system prune --all", patterns: ["Bash:docker system prune --all --volumes"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "docker system prune --all",
       content: "Never prune with --volumes outside a maintenance window.", severity: "blocking",
       reason: "a volume prune destroys data no image rebuild can recover", scope: "domain",
     });
@@ -3635,7 +3537,7 @@ describe("circle '*' is refused as query input, everywhere a gate query can be s
   it("refuses at every entrance — evaluateStageLookup, stageLookup (standalone), and MonetCore.stageLookup() — each naming the same repair", async () => {
     const c = core();
     await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
     });
     const db = (c as unknown as { db: StoragePort }).db;
@@ -3677,7 +3579,7 @@ describe("rule delivery through stageLookup", () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "it destroys teammates' commits", ...AGENT_RULE },
+      rule: { stage: "git force push", reason: "it destroys teammates' commits", ...AGENT_RULE },
     });
     const fired = c.stageLookup({ stage: "git force push" });
     expect(fired.matched).toBe(true);
@@ -3734,7 +3636,7 @@ describe("rule delivery through stageLookup", () => {
   it("is circle-scoped: a rule in circle A never fires in circle B", async () => {
     const c = core();
     const inA = await c.store("Never force-push to a shared branch.", {
-      circle: "a", kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      circle: "a", kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     // The STAGE is store-global — the same moment in both circles — but the RULE is not.
     expect(c.stageLookup({ stage: "git force push", circle: "a" }).rules.map((r) => r.conceptId)).toEqual([inA.conceptId]);
@@ -3747,7 +3649,7 @@ describe("rule delivery through stageLookup", () => {
   it("never re-injects a superseded rule, and delivers its successor instead", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
 
@@ -3765,7 +3667,7 @@ describe("rule delivery through stageLookup", () => {
     const c = core();
     const principle = await c.store("Irreversible acts get a confirmation.", { kind: "insight" });
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle.conceptId, dstConceptId: rule.conceptId, bornOf: "extraction" });
     expect(c.stageLookup({ stage: "git force push" }).rules[0]!.projectedFromPrincipleId).toBe(principle.conceptId);
@@ -3786,7 +3688,7 @@ describe("gate substrate sync", () => {
     const dst = core({ syncDeviceId: "machine-b" });
     const rule = await src.store("Never force-push to a shared branch.", {
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "destroys commits", ...AGENT_RULE },
+      rule: { stage: "git force push", reason: "destroys commits", ...AGENT_RULE },
     });
 
     const payload = src.exportDelta(0);
@@ -3818,7 +3720,7 @@ describe("gate substrate sync", () => {
     const a = core({ syncDeviceId: "machine-a" });
     const b = core({ syncDeviceId: "machine-b" });
     const rule = await a.store("A rule that will be retired on machine A.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     a.retireConcept(rule.conceptId);
 
@@ -3851,7 +3753,7 @@ describe("gate substrate sync", () => {
     // Declared legitimately HERE, because this build will not mint one without a reason. Stripping
     // the reason from the exported row is what a peer running the older build relays natively.
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -3950,7 +3852,7 @@ describe("gate substrate sync", () => {
         tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a",
       });
       const deny = await c.declare({
-        species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+        species: "rule", stage: "rm -rf",
         content: "Never delete a tree unattended.", severity: "blocking",
         reason: "there is no undo", ...AGENT_RULE,
       });
@@ -3977,7 +3879,7 @@ describe("gate substrate sync", () => {
   it("treats a NUMBER in reason as the text SQLite actually stored, not as corruption", async () => {
     const c = core();
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4001,7 +3903,7 @@ describe("gate substrate sync", () => {
   it("lets an ordinary declaration REPAIR a corrupt reason, rather than locking the rule", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4035,7 +3937,7 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4064,7 +3966,7 @@ describe("gate substrate sync", () => {
     const dst = core({ syncDeviceId: "machine-b" });
     const atMax = "s".repeat(STAGE_NAME_MAX_CHARS);
     await src.declare({
-      species: "rule", stage: atMax, patterns: ["Bash:frob"],
+      species: "rule", stage: atMax,
       content: "Guidance at the boundary length.", severity: "advisory", ...AGENT_RULE,
     });
     const payload = src.exportDelta(0);
@@ -4090,7 +3992,7 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     await src.declare({
-      species: "rule", stage: "Git Force Push", patterns: ["Bash:git push --force"],
+      species: "rule", stage: "Git Force Push",
       content: "Guidance for a canonical stage.", severity: "advisory", ...AGENT_RULE,
     });
     const payload = src.exportDelta(0);
@@ -4124,7 +4026,7 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4174,7 +4076,7 @@ describe("gate substrate sync", () => {
     const dst = core({ syncDeviceId: "machine-b" });
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4280,7 +4182,7 @@ describe("gate substrate sync", () => {
     // Seven entries remain compact in the overview's source-capped exception queue.
     for (let i = 0; i < 7; i++) {
       await src.declare({
-        species: "rule", stage: `gate-${i}`, patterns: [`Bash:tool${i} run`],
+        species: "rule", stage: `gate-${i}`,
         content: `Never run tool ${i} unattended.`, severity: "blocking",
         reason: "there is no undo", ...AGENT_RULE,
       });
@@ -4312,7 +4214,7 @@ describe("gate substrate sync", () => {
     const c = core();
     // An advisory rule with no reason is the ordinary case, not a broken promise — marking it would
     // bury the one population a caller has to say something about.
-    await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE } });
+    await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", ...AGENT_RULE } });
     expect(c.stageLookup({ stage: "git push" }).rules[0]).toMatchObject({
       severity: "advisory", reason: null, reasonMissing: false,
     });
@@ -4320,7 +4222,7 @@ describe("gate substrate sync", () => {
 
     // ...and an ordinary deny, declared properly, is never marked either.
     await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4333,7 +4235,7 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const rule = await src.store("An ordinary advisory rule.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const payload = src.exportDelta(0);
     const forged = { ...payload.ruleBindings![0]!, severity: "blocking" };
@@ -4364,7 +4266,7 @@ describe("gate substrate sync", () => {
   it("keeps a graft atomic when two replicas independently created the same stage", async () => {
     const local = core({ syncDeviceId: "machine-a" });
     await local.store("A rule.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const payload = local.exportDelta(0);
     const mine = local.stages()[0]!.id;
@@ -4394,7 +4296,7 @@ describe("gate substrate sync", () => {
 describe("deny power cannot be removed by accident", () => {
   const declareDeny = async (c: MonetCore, content = "Never delete a directory tree unattended.") => {
     const r = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"], content,
+      species: "rule", stage: "rm -rf", content,
       severity: "blocking", reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
     });
     if (r.species !== "rule") throw new Error("unreachable");
@@ -4459,7 +4361,7 @@ describe("deny power cannot be removed by accident", () => {
     const c = new MonetCore(":memory:", {});
     const CONTENT = "Never install without a lockfile present.";
     const first = await c.declare({
-      circle: "*", species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: "*", species: "rule", stage: "npm install",
       content: CONTENT, severity: "blocking", reason: "an unlocked install can drift", ...AGENT_RULE,
     });
     if (first.species !== "rule") throw new Error("unreachable");
@@ -4488,7 +4390,7 @@ describe("deny power cannot be removed by accident", () => {
     const c = new MonetCore(":memory:", {});
     const CONTENT = "Never install without a lockfile present.";
     const first = await c.declare({
-      circle: "*", species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: "*", species: "rule", stage: "npm install",
       content: CONTENT, severity: "blocking", reason: "an unlocked install can drift", ...AGENT_RULE,
     });
     if (first.species !== "rule") throw new Error("unreachable");
@@ -4520,7 +4422,7 @@ describe("deny power cannot be removed by accident", () => {
   it("a NEW declaration without a circle still defaults to defaultCircle, unchanged (Codex round 2, item 1 regression check)", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, defaultCircle: "my-default" });
     const rule = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -4529,101 +4431,23 @@ describe("deny power cannot be removed by accident", () => {
     c.close();
   });
 
-  it("PATH 2 — re-authoring a stage that carries a deny is REFUSED until the denies are named", async () => {
-    const c = core();
-    const deny = await declareDeny(c);
-    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
-
-    // D0-D2: one ordinary agent-callable declaration used to reroute the deny's firing surface —
-    // deny fires, pattern edit, silence, and the binding still reads `blocking`.
-    await expect(
-      c.declare({ species: "stage", stage: "rm -rf", patterns: ["Bash:something-else"] }),
-    ).rejects.toThrow(new RegExp(`would change what 1 blocking rule\\(s\\) deny.*${deny.conceptId}`, "s"));
-    // Refused means UNCHANGED: the deny is still bound, and the stage still aims where it was
-    // declared to aim — the firing surface the refused declaration tried to move.
-    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
-    expect(c.stages().find((s) => s.name === "rm -rf")!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
-
-    // Acknowledged: the human has seen the deny and is re-aiming it deliberately.
-    const reaimed = await c.declare({
-      species: "stage", stage: "rm -rf", patterns: ["Bash:rm -rf", "Bash:rm -fr"],
-      acknowledgeBlockingRules: [deny.conceptId],
-    });
-    if (reaimed.species !== "stage") throw new Error("unreachable");
-    expect(reaimed.previousPatterns).toEqual(["bash: rm -rf"]);
-    expect(reaimed.patterns).toEqual(["bash: rm -rf", "bash: rm -fr"]);
-    // The re-aim moved the MECHANICAL surface and took nothing away: the deny is still bound to the
-    // stage and still delivered by name (doctrine — a pattern change is not a withdrawal lever).
-    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
-    c.close();
-  });
-
-  it("PATH 2 — the acknowledgement is enforced INSIDE the write transaction, not just at the edge", async () => {
-    const c = resolvingCore();
-    const declared = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (declared.species !== "rule") throw new Error("unreachable");
-
-    // THE TOCTOU. declare() validates BEFORE the embed and outside the write transaction, so a deny
-    // bound during the embed window would be re-aimed by a call that was validated when no deny
-    // existed. Asserting against the layer that performs the mutation is the direct test of where
-    // the guard lives: if it existed only in declare(), this would silently re-aim the deny.
-    const deps = { db: raw(c) as never, newId: () => "unused", nextSyncTimestamp: () => Date.now(), syncDeviceId: "d" };
-    expect(() => upsertStage(deps, { stage: "rm -rf", patterns: ["Bash:something-else"], origin: "declaration" }))
-      .toThrow(new RegExp(`would change what 1 blocking rule\\(s\\) deny.*${declared.conceptId}`, "s"));
-    // The deny still points where it was declared to point.
-    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
-    expect(c.stages().find((s) => s.name === "rm -rf")!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
-
-    // Acknowledged at the mutation layer succeeds, which proves both checks read one predicate.
-    expect(() => upsertStage(deps, {
-      stage: "rm -rf", patterns: ["Bash:something-else"],
-      acknowledgeBlockingRules: [declared.conceptId], origin: "declaration",
-    })).not.toThrow();
-    c.close();
-  });
-
-  it("PATH 2 — an empty patterns array disarms a stage, and is guarded like any other replacement", async () => {
-    const c = core();
-    const deny = await declareDeny(c);
-    // `patterns: []` used to coerce to null and be silently ignored — so the one input shape most
-    // obviously aimed at disarming a gate slipped past the guard entirely.
-    await expect(c.declare({ species: "stage", stage: "rm -rf", patterns: [] }))
-      .rejects.toThrow(/would change what 1 blocking rule/);
-    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
-    expect(c.stages().find((s) => s.name === "rm -rf")!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
-
-    const disarmed = await c.declare({
-      species: "stage", stage: "rm -rf", patterns: [], acknowledgeBlockingRules: [deny.conceptId],
-    });
-    if (disarmed.species !== "stage") throw new Error("unreachable");
-    expect(disarmed.patterns).toEqual([]);
-    // DISARMED, read off the row itself: the stage has no firing surface left at all.
-    expect(c.stages().find((s) => s.name === "rm -rf")!.patterns).toEqual([]);
-    // An inert stage is visible in curation rather than quietly gone — it still holds a live rule,
-    // so it stays in the live-stage registry and stays reachable by NAME. Disarming its patterns
-    // removed a firing surface, not the stage.
-    expect(c.gateCoverage().liveStages.map((st) => st.stageName)).toContain("rm -rf");
-    expect(c.stageLookup({ stage: "rm -rf" }).matched).toBe(true);
-    c.close();
-  });
-
-  it("PATH 2 — an advisory-only stage is re-authored freely", async () => {
-    const c = core();
-    await c.declare({ species: "rule", stage: "terraform apply", patterns: ["terraform apply"], content: "Plan first.", ...AGENT_RULE });
-    const r = await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform destroy"] });
-    if (r.species !== "stage") throw new Error("unreachable");
-    expect(r.patterns).toEqual(["*: terraform destroy"]);
-    c.close();
-  });
-
+  // PATH 2 — RE-AIMING A GATE'S PATTERNS — WAS CLOSED BY REMOVAL (2026-08-22), not by a guard.
+  //
+  // Four tests stood here: the refusal until every deny was named, the same refusal re-run inside
+  // the write transaction (the TOCTOU the acknowledgement guard existed to close), `patterns: []`
+  // as the disarm shape that had once slipped past it, and the advisory-only stage that could be
+  // re-authored freely. All four had the same subject — `acknowledgeBlockingRules` — and that
+  // parameter is gone with trigger patterns themselves, because the ACT it guarded cannot be
+  // performed any more: a stage is its name, and a rule is bound to the stage.
+  //
+  // The numbering is left alone. PATH 2 is a closed door, and a renumbered list would hide that
+  // this door was ever open. PATH 4 below is its RELAY-side twin and is still live — see the Door
+  // 10 comment in graftRows for why an old peer keeps that one reachable.
   it("PATH 4 — sync can neither mint a deny nor demote or repoint one", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const deny = await declareDeny(src);
-    await src.declare({ species: "stage", stage: "another gate", patterns: ["Bash:other"] });
+    await src.declare({ species: "stage", stage: "another gate" });
     dst.graftRows(src.exportDelta(0));
     expect(dst.ruleBinding(deny.conceptId)!.severity).toBe("blocking");
 
@@ -4675,7 +4499,7 @@ describe("deny power cannot be removed by accident", () => {
 
     // UNIFORM across severities: the refusal is about what a rule IS, not about how hard it bites.
     const advisory = await c.store("An advisory rule.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     expect(() => c.flagContradiction(advisory.conceptId, { detail: "hmm" }))
       .toThrow(/is a rule and cannot be flagged as contradicted/);
@@ -4691,7 +4515,7 @@ describe("deny power cannot be removed by accident", () => {
     // scan is kind-blind, so this is what used to consume the rule and strand its binding.
     await c.store("Never delete a directory tree unattended.", { circle: "target", kind: "fact" });
     const deny = await c.declare({
-      circle: "origin", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "origin", species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -4734,7 +4558,7 @@ describe("receipt replay", () => {
   it("returns the SAME rule outcome on a retried operationId", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
       operationId: "op-capture-1",
     });
     expect(rule.ruleBindingChange).toEqual({
@@ -4768,7 +4592,7 @@ describe("receipt replay", () => {
   it("replays a DOWNGRADE faithfully — the one transition the substrate cannot re-derive", async () => {
     const c = resolvingCore();
     await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     const downgrade = await c.store("Never delete a tree unattended.", {
@@ -4794,7 +4618,7 @@ describe("receipt replay", () => {
   it("replays a NARROWING (from breadth) faithfully — the other transition the substrate cannot re-derive", async () => {
     const c = resolvingCore();
     await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     const narrowed = await c.store("Never delete a tree unattended.", {
@@ -4823,7 +4647,7 @@ describe("receipt replay", () => {
   it("replays A's narrowing faithfully even after a LATER operation B widens the SAME rule back to breadth (Codex round 12, item 3)", async () => {
     const c = resolvingCore();
     await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     // OPERATION A: narrows the global rule to 'default'.
@@ -4867,7 +4691,7 @@ describe("receipt replay", () => {
   it("replays A's downgrade faithfully even after a LATER operation B re-declares the SAME rule blocking (Codex round 12, item 4)", async () => {
     const c = resolvingCore();
     await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     // OPERATION A: downgrades the rule to advisory.
@@ -4928,10 +4752,10 @@ describe("receipt replay", () => {
     // The ambiguous band the 5-B flagging block uses: the flag rides a fork's near-match.
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
     const first = await c.store("Verify the built artifact after the source changes.", {
-      kind: "rule", rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain" },
+      kind: "rule", rule: { stage: "docker build", scope: "domain" },
     });
     const second = await c.store("After the source changes, verify the artifact itself.", {
-      kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      kind: "rule", rule: { stage: "npm install", scope: "domain" },
       operationId: "op-extraction-1",
     });
     expect(second.extractionCandidate).toEqual({ pairedRuleId: first.conceptId, score: second.nearMatchScore });
@@ -4958,7 +4782,7 @@ describe("receipt replay", () => {
     // the fresh call reported nothing. A replay reading `near_match_id` alone would invent one.
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
     await c.store("Verify the built artifact after the source changes.", {
-      kind: "rule", rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain" },
+      kind: "rule", rule: { stage: "docker build", scope: "domain" },
     });
     const second = await c.store("After the source changes, verify the artifact itself.", {
       kind: "rule", rule: { stage: "docker build", scope: "domain" }, operationId: "op-same-stage-1",
@@ -4977,7 +4801,7 @@ describe("receipt replay", () => {
     const declared = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation.", declaredBy: "john" });
     if (declared.species !== "principle") throw new Error("unreachable");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: declared.conceptId, dstConceptId: rule.conceptId, bornOf: "extraction" });
 
@@ -5009,7 +4833,7 @@ describe("receipt replay", () => {
   it("omits impeachedPrincipleIds on replay when the correction impeached nothing", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const correction = await c.store("Force-push is fine on your own branch; never on a shared one.", {
       kind: "correction", attachTo: rule.conceptId, operationId: "op-no-impeach-1",
@@ -5034,7 +4858,7 @@ describe("the chokepoint: every door is a call site", () => {
    */
   async function liveDeny(c: MonetCore) {
     const r = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
     });
@@ -5188,7 +5012,7 @@ describe("the chokepoint: every door is a call site", () => {
   it("MOVES a BREADTH-bound live deny into an archived circle — that move takes delivery from nowhere", async () => {
     const c = resolvingCore();
     const declared = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
     });
@@ -5337,10 +5161,12 @@ describe("the chokepoint: every door is a call site", () => {
     expect(denies(AGENT_RULE.modelTag)).toEqual([deny.conceptId]);
     expect(denies("some-other-model")).toEqual([]);
 
-    // RELAYED STAGE RE-AIM (door 10) — the last member of the class. The chokepoint stops a relayed
-    // act from REMOVING a deny; this stops one from silently changing what a deny denies, which is
-    // the same authority reached by a different mechanism. Locally this needs
-    // acknowledgeBlockingRules; a grafted row carries no acknowledgment.
+    // RELAYED STAGE RE-AIM (door 10) — the last member of the class, and now the ONLY member. The
+    // chokepoint stops a relayed act from REMOVING a deny; this stops one from silently changing
+    // what a deny denies, which is the same authority reached by a different mechanism. The LOCAL
+    // twin of this guard retired with trigger patterns (see the PATH 2 note above) because the act
+    // it refused cannot be performed here any more. THIS one stays reachable: an older peer still
+    // sends real pattern sets, which is exactly what the forged row below is.
     const stageId = dst.stages().find((st) => st.name === "rm -rf")!.id;
     const stageRow = dst.exportDelta(0).stages!.find((st) => st.id === stageId)!;
     const reaim = dst.graftRows({
@@ -5353,9 +5179,12 @@ describe("the chokepoint: every door is a call site", () => {
       }],
     });
     expect(reaim.skipped.stages).toBeGreaterThan(0);
-    // The deny still stands, and on the patterns it was DECLARED against.
+    // The deny still stands, and the forged value never reached the row. Read off the column
+    // itself: a StageView carries no patterns any more, and the column is the only place the
+    // challenger's bytes could have landed.
     expect(fires(dst)).toBe(1);
-    expect(dst.stages().find((st) => st.id === stageId)!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
+    expect(raw(dst).prepare(`SELECT trigger_patterns FROM stages WHERE id = ?`).get(stageId))
+      .toEqual({ trigger_patterns: RETIRED_TRIGGER_PATTERNS });
 
     // The LOCAL declaration path still withdraws it — that is the point of refusing the relay
     // rather than refusing the withdrawal: this machine decides about this machine's deny.
@@ -5373,19 +5202,33 @@ describe("the chokepoint: every door is a call site", () => {
     const dst = core({ syncDeviceId: "machine-b" });
     // An ADVISORY-only stage converges normally — the guard is about deny power, not about stages.
     await src.store("Pull before you push.", {
-      kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git push", ...AGENT_RULE },
     });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     dst.graftRows(src.exportDelta(0));
 
-    await src.declare({ species: "stage", stage: "git push", patterns: ["Bash:git push --all"] });
-    dst.graftRows(src.exportDelta(0));
-    expect(dst.stages().find((st) => st.name === "git push")!.patterns)
-      .toEqual([{ tool: "bash", tokens: ["git", "push", "--all"] }]);
+    // THE SAME FORGED SHAPE, on an ADVISORY-only stage. Nothing local authors patterns any more,
+    // so this is an OLDER PEER's row — the only thing that can still produce a differing
+    // `trigger_patterns` — and it must converge, because the guard is about deny power and this
+    // stage carries none.
+    const pushId = src.stages().find((st) => st.name === "git push")!.id;
+    const pushRow = src.exportDelta(0).stages!.find((st) => st.id === pushId)!;
+    const relayed = JSON.stringify([{ tool: "bash", tokens: ["git", "push", "--all"] }]);
+    dst.graftRows({
+      ...src.exportDelta(0),
+      stages: [{
+        ...pushRow,
+        trigger_patterns: relayed,
+        sync_revision: (pushRow.sync_revision ?? 0) + 5,
+        sync_writer: "zzz-newer-writer",
+      }],
+    });
+    expect(raw(dst).prepare(`SELECT trigger_patterns FROM stages WHERE id = ?`).get(pushId))
+      .toEqual({ trigger_patterns: relayed });
 
     // A pattern-IDENTICAL row on a blocking-bound stage still converges: there is no re-aim in it,
     // so the guard has nothing to refuse. The guard `continue`s BEFORE the upsert, so a row that
@@ -5434,7 +5277,7 @@ describe("the chokepoint: every door is a call site", () => {
   it("leaves ADVISORY rules and ordinary concepts completely alone", async () => {
     const c = resolvingCore();
     const advisory = await c.store("An advisory rule.", {
-      kind: "rule", rule: { stage: "rm -rf", instance: "Bash:rm -rf", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE },
     });
     const fact = await c.store("An ordinary fact.", { kind: "fact" });
     // The guard is about deny power, not about rules in general — an advisory rule retires freely.
@@ -5460,7 +5303,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.1 refuses '*' minted from every non-declaration origin, severity flipped to advisory to prove the circle check does not ride on the (separate) blocking-only guard", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -5486,7 +5329,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     const fact = await src.store("An ordinary fact.", { kind: "fact" });
     const insight = await src.store("An ordinary insight.", { kind: "insight" });
     const rule = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "advisory", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -5528,7 +5371,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     for (const startSeverity of ["blocking", "advisory"] as const) {
       const src = core({ syncDeviceId: "machine-a" });
       const rule = await src.declare({
-        species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+        species: "rule", stage: "rm -rf",
         content: "Never delete a tree unattended.", severity: startSeverity,
         ...(startSeverity === "blocking" ? { reason: "there is no undo" } : {}),
         ...AGENT_RULE,
@@ -5591,7 +5434,7 @@ describe("DOOR 13: the breadth graft surface", () => {
         const label = `${startSeverity}/${circleField}`;
         const src = core({ syncDeviceId: "machine-a" });
         const rule = await src.declare({
-          circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+          circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
           content: "Never delete a tree unattended.", severity: startSeverity,
           ...(startSeverity === "blocking" ? { reason: "there is no undo" } : {}),
           ...AGENT_RULE,
@@ -5649,7 +5492,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.5 an old-protocol dangling deny (circle absent, reason absent) fires and discloses the moment its concept lands — no reopen required", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -5698,7 +5541,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.6 a still-dangling NULL-circle binding is never delivered", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -5740,7 +5583,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.7 a legitimate '*' deny relays verbatim and fires in a circle the receiver never configured", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile present.", severity: "blocking",
       reason: "an unlocked install can pull an unreviewed transitive dependency", scope: "domain",
     });
@@ -5793,7 +5636,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     // the supersession edge together — the ordinary shape one incremental export produces.
     const src = core({ syncDeviceId: "machine-a" });
     const original = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
     });
     if (original.species !== "rule") throw new Error("unreachable");
@@ -5813,7 +5656,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     // dst — naming it as anyone's successor.
     const src2 = core({ syncDeviceId: "machine-c" });
     const ordinary = await src2.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "An ordinary local rule.", severity: "advisory", scope: "domain",
     });
     if (ordinary.species !== "rule") throw new Error("unreachable");
@@ -5857,7 +5700,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     // twice, so both sides genuinely share one src_concept_id to diverge over.
     const origin = core({ syncDeviceId: "machine-origin" });
     const shared = await origin.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
     });
     if (shared.species !== "rule") throw new Error("unreachable");
@@ -5942,7 +5785,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.11 a legitimate owner narrowing relays and converges: B agrees; B's own stale ('*') delta replayed back at A does not resurrect it; a forged non-declaration transition is still held (Codex round 10, item 1)", async () => {
     const src = new MonetCore(":memory:", { syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
       ...AGENT_RULE,
     });
@@ -6013,7 +5856,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.12 an admitted declaration-origin narrowing lands at the CONCEPT's own actual circle on the receiver, not the row's claimed circle, when the two diverge (Codex round 11, item 6)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "advisory", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -6068,7 +5911,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.13 an admitted narrowing arrives while its own concept is STILL dangling — the binding lands NULL (never the row's claim, never a frozen '*'), and heals to wherever the concept actually lands, even when that differs from the narrowing's own claim (post-merge review round, P1, item d)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "advisory", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -6135,7 +5978,7 @@ describe("correcting a global rule inherits its breadth, not just its content", 
   it("correcting a global ADVISORY rule succeeds: the successor is '*', fires everywhere, and the supersession edge + disclosure are intact", async () => {
     const c = core();
     const original = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
     });
     if (original.species !== "rule") throw new Error("unreachable");
@@ -6173,10 +6016,12 @@ describe("correcting a global rule inherits its breadth, not just its content", 
    * rather than assumed: there is no acknowledgment door that unlocks blocking-rule correction.
    * `ruleCorrectionVerdict` returns `"blocking"` — refused, UNCONDITIONALLY — for ANY blocking
    * incumbent, by explicit design ("Declaration is the only mutation path for a blocking rule, in
-   * both directions" — that function's own comment). `acknowledgeBlockingRules` is a REAL mechanism
-   * in this codebase, but for a different door entirely (re-authoring a STAGE's trigger patterns
-   * when blocking rules are bound to it — assertNoUnacknowledgedDenies), not for unlocking
-   * correction-based supersession of a blocking rule's CONTENT. succeedRule's own doc comment
+   * both directions" — that function's own comment). `acknowledgeBlockingRules` WAS a real mechanism
+   * in this codebase when this was written, but for a different door entirely (re-authoring a
+   * STAGE's trigger patterns when blocking rules were bound to it), never for unlocking
+   * correction-based supersession of a blocking rule's CONTENT. It has since retired with trigger
+   * patterns (2026-08-22), which makes the disagreement below stronger rather than weaker: the door
+   * the review imagined composing with does not exist at all now. succeedRule's own doc comment
    * already states the successor "cannot inherit blocking severity, because the incumbent could
    * never have been blocking" — this is a confirmed, pre-existing, deliberate invariant, not a gap
    * this round's fix should touch. What this test proves instead: that invariant survives this fix
@@ -6186,7 +6031,7 @@ describe("correcting a global rule inherits its breadth, not just its content", 
   it("correcting a global BLOCKING rule is still refused, unconditionally — declaration-only, unrelated to breadth (a correction to the review's own premise, not a gap this fix should close)", async () => {
     const c = core();
     const deny = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "blocking", reason: "unlocked installs drift",
       scope: "domain",
     });
@@ -6222,7 +6067,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("a relayed row claiming a DIFFERENT local circle than its own concept converges to the concept — the deny STAYS in the concept's actual circle and still fires there (Codex round 1, item 3)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "circle-a", species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -6257,7 +6102,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("a legitimate move — the concept row ALSO moves circles in the SAME payload — the binding follows it (Codex round 1, item 3)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "circle-a", species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -6282,7 +6127,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("the SAME divergence, for an ADVISORY binding — non-breadth means non-breadth regardless of severity too (Codex round 1, item 3)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "circle-a", species: "rule", stage: "rm -rf",
       content: "Confirm before deleting.", severity: "advisory", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -6320,7 +6165,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("a binding-first graft: the row claims one circle while dangling, but its concept later lands in a DIFFERENT circle — the binding heals to the concept's ACTUAL circle, never freezing the row's stale claim (post-merge review round, P1)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
       circle: "claimed",
     });
@@ -6373,7 +6218,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("renameCircle's rule_bindings update is stamped for sync too — a rename relayed to a peer moves the binding, not only the concept", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "circle-a", species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -6395,44 +6240,46 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   });
 });
 
-describe("silence never means I gave up", () => {
-  it("does not let a token run cross a command boundary — a newline ends a command", () => {
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    // `echo git` on one line and `push --force` on the next is two commands; matching across them
-    // fires a gate on a command nobody ran. A false positive is the expensive kind of wrong.
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:echo git\npush --force"))).toBe(false);
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:echo git\r\npush --force"))).toBe(false);
-    // ...and the real thing on one line still fires.
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:echo hi\ngit push --force origin main"))).toBe(true);
-    // Seeding uses the same vocabulary, so both sides segment identically.
-    expect(seedTriggerPattern("Bash:cd /x\ngit push --force origin dev").tokens).toEqual(["git", "push", "--force"]);
-  });
-});
+describe("shell fidelity in the tokenizer", () => {
+  // THESE TESTS USED TO ASSERT THROUGH THE MATCHER (`fires(...)` over a seeded pattern). The
+  // matcher retired with trigger patterns on 2026-08-22; every decision they pin belongs to the
+  // TOKENIZER, which is still live behind `parseActionContext`, so they now assert against its
+  // token stream directly — the same properties, one layer down, with no pattern in sight.
 
-describe("shell fidelity in the shared tokenization", () => {
-  const pattern = seedTriggerPattern("Bash:git push --force origin main");
-  const fires = (context: string): boolean => matchesTriggerPattern(pattern, parseActionContext(context));
+  it("does not let a token run cross a command boundary — a newline ends a command", () => {
+    // `echo git` on one line and `push --force` on the next is TWO commands. A consumer that
+    // stitched them into one contiguous run would be reading a command nobody ran, which is why
+    // the boundary is emitted as its own token rather than treated as ordinary whitespace.
+    expect(parseActionContext("Bash:echo git\npush --force").tokens)
+      .toEqual(["echo", "git", COMMAND_BOUNDARY, "push", "--force"]);
+    expect(parseActionContext("Bash:echo git\r\npush --force").tokens)
+      .toEqual(["echo", "git", COMMAND_BOUNDARY, "push", "--force"]);
+    // One boundary per RUN of newlines — a blank line means "the command ended", not "twice".
+    expect(parseActionContext("Bash:a\n\n\nb").tokens).toEqual(["a", COMMAND_BOUNDARY, "b"]);
+  });
 
   it("joins a line continuation, because the shell does", () => {
-    // Round one made newline a command boundary — correctly — which turned `git \<nl>push` into the
-    // token `\npush` and made a continued command MISS its deny. Backslash-newline is a JOIN.
-    expect(fires("Bash:git \\\npush --force origin main")).toBe(true);
-    expect(fires("Bash:git \\\r\npush --force origin main")).toBe(true);
+    // Making newline a command boundary — correctly — once turned `git \<nl>push` into the token
+    // `\npush`, splitting a command the shell reads as one. Backslash-newline is a JOIN, consumed
+    // before the boundary rule can see the newline.
+    expect(parseActionContext("Bash:git \\\npush --force origin main").tokens)
+      .toEqual(["git", "push", "--force", "origin", "main"]);
+    expect(parseActionContext("Bash:git \\\r\npush --force origin main").tokens)
+      .toEqual(["git", "push", "--force", "origin", "main"]);
     expect(parseActionContext("Bash:a\\\nb").tokens).toEqual(["ab"]);
     // ...and an ESCAPED backslash before a newline is not a continuation: the first backslash
     // consumes the second, so the newline reaches the boundary rule on its own.
     expect(parseActionContext("Bash:a\\\\\nb").tokens).toEqual(["a\\", COMMAND_BOUNDARY, "b"]);
-    // A bare newline is still a boundary, so the round-one false positive stays fixed.
-    expect(fires("Bash:echo git\npush --force")).toBe(false);
   });
 
   it("strips a shell comment, and only where the shell would", () => {
-    // `echo safe # git push --force` runs `echo safe`. Firing inside the comment is a false
-    // positive on a command nobody ran.
-    expect(fires("Bash:echo safe # git push --force origin main")).toBe(false);
+    // `echo safe # git push --force` runs `echo safe`. Everything after the `#` is not a command.
+    expect(parseActionContext("Bash:echo safe # git push --force origin main").tokens)
+      .toEqual(["echo", "safe"]);
     expect(parseActionContext("Bash:echo safe # secret").tokens).toEqual(["echo", "safe"]);
     // The comment ends at the newline, so the next line is live again.
-    expect(fires("Bash:echo safe # nothing here\ngit push --force origin main")).toBe(true);
+    expect(parseActionContext("Bash:echo safe # nothing here\ngit push --force").tokens)
+      .toEqual(["echo", "safe", COMMAND_BOUNDARY, "git", "push", "--force"]);
     // A `#` INSIDE a word is an ordinary character — URLs and fragments survive.
     expect(parseActionContext("Bash:curl http://x/y#frag").tokens).toEqual(["curl", "http://x/y#frag"]);
     expect(parseActionContext("Bash:a#b c").tokens).toEqual(["a#b", "c"]);
@@ -6441,29 +6288,17 @@ describe("shell fidelity in the shared tokenization", () => {
   });
 });
 
-describe("corruption narrows a pattern, never widens it", () => {
-  it("makes a malformed pattern INERT instead of coercing it into a wildcard", () => {
-    // `tool: 42` used to become `tool: null`, which is the ANY-TOOL wildcard: a corrupt row widened
-    // the gate's firing surface. A dropped token is the same disease — a shorter run matches more.
-    const widened = JSON.stringify([{ tool: 42, tokens: ["git", "push"] }]);
-    expect(readTriggerPatterns(widened)).toEqual({ patterns: [], malformed: 1 });
-    const shortened = JSON.stringify([{ tool: "Bash", tokens: ["git", null, "--force"] }]);
-    expect(readTriggerPatterns(shortened)).toEqual({ patterns: [], malformed: 1 });
-    // An absent or explicitly null tool is NOT corruption — that is the legitimate any-tool pattern.
-    expect(readTriggerPatterns(JSON.stringify([{ tokens: ["terraform", "apply"] }])).patterns)
-      .toEqual([{ tool: null, tokens: ["terraform", "apply"] }]);
-    // A good pattern beside a bad one survives; only the bad one is dropped.
-    const mixed = JSON.stringify([{ tool: 42, tokens: ["a"] }, { tool: "Bash", tokens: ["git", "push"] }]);
-    expect(readTriggerPatterns(mixed)).toEqual({ patterns: [{ tool: "bash", tokens: ["git", "push"] }], malformed: 1 });
-  });
-
-});
+// THE CORRUPTION SUITE WENT WITH `readTriggerPatterns` (2026-08-22). It pinned one rule — a
+// malformed stored pattern must go INERT rather than be coerced into something BROADER (a non-string
+// `tool` becoming the any-tool wildcard, a dropped token shortening a run so it matches more). The
+// rule mattered because a widened pattern produces confident wrong denies. Nothing stores or reads a
+// pattern any more, so there is no row left to narrow or widen.
 
 describe("model-tag retirement", () => {
   it("delivers a compensation only to the model it compensates for", async () => {
     const c = core();
     const forOld = await c.store("Old model forgets to quote paths.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-1" },
+      kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "model-1" },
     });
     const domain = await c.store("Force-push destroys shared history.", {
       kind: "rule", rule: { stage: "git force push", scope: "domain" },
@@ -6494,7 +6329,7 @@ describe("model-tag retirement", () => {
   it("takes the runtime tag from the store when the call does not name one", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, runtimeModelTag: "model-2" });
     const forOld = await c.store("A compensation for the old model.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-1" },
+      kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "model-1" },
     });
     expect(c.stageLookup({ stage: "git force push" }).rules).toEqual([]);
     expect(c.gateCoverage().retirementCandidates.map((r) => r.conceptId)).toEqual([forOld.conceptId]);
@@ -6527,7 +6362,7 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const ok = await src.declare({
-      species: "rule", stage: "ws3", patterns: ["Bash:frob"],
+      species: "rule", stage: "ws3",
       content: "A compensation.", severity: "advisory", ...AGENT_RULE,
     });
     if (ok.species !== "rule") throw new Error("unreachable");
@@ -6547,7 +6382,7 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
 
     const c = core();
     const stored = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: padded },
+      kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: padded },
     });
     // STORED CANONICAL, not padded — bindRule trims before writing, the same canonical-form
     // discipline normalizeStageName already enforces for stage names.
@@ -6655,7 +6490,7 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
     const atMax = "m".repeat(MODEL_TAG_MAX_CHARS);
     const stored = await src.store("Never force-push to a shared branch.", {
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: atMax },
+      rule: { stage: "git force push", scope: "agent", modelTag: atMax },
     });
     expect(src.ruleBinding(stored.conceptId)!.model_tag).toBe(atMax);
     expect(src.stageLookup({ stage: "git force push", runtimeModelTag: atMax }).rules.map((r) => r.conceptId))
@@ -6677,7 +6512,7 @@ describe("stageLookup — the recognized matcher", () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "it destroys teammates' commits", ...AGENT_RULE },
+      rule: { stage: "git force push", reason: "it destroys teammates' commits", ...AGENT_RULE },
     });
     const db = (c as unknown as { db: StoragePort }).db;
     // The unwrapped read, the transaction-wrapped standalone form, and the MonetCore wrapper are
@@ -6698,7 +6533,7 @@ describe("stageLookup — the recognized matcher", () => {
   it("excludes a foreign-model agent-scoped rule", async () => {
     const c = core();
     const forOld = await c.store("Old model forgets to quote paths.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-1" },
+      kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "model-1" },
     });
     const domain = await c.store("Force-push destroys shared history.", {
       kind: "rule", rule: { stage: "git force push", scope: "domain" },
@@ -6726,7 +6561,7 @@ describe("stageLookup — the recognized matcher", () => {
 
   it("is a HIT with rules:[] for a stage that exists but has none bound — never a miss", async () => {
     const c = core();
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
+    await c.declare({ species: "stage", stage: "terraform apply" });
     const r = c.stageLookup({ stage: "terraform apply" });
     expect(r).toMatchObject({ matched: true, rules: [] });
     expect(r.stage).toMatchObject({ name: "terraform apply" });
@@ -6775,34 +6610,13 @@ describe("stageLookup — the recognized matcher", () => {
     c.close();
   });
 
-  it("re-aiming a stage's patterns moves the MECHANICAL firing surface only — recognized delivery is unaffected (doctrine, item 7)", async () => {
-    const c = core();
-    const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
-      ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    expect(c.stages().find((st) => st.name === "rm -rf")!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
-    expect(c.stageLookup({ stage: "rm -rf" }).rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
-
-    // Re-aim the stage's MECHANICAL firing surface to a shape that no longer matches the old
-    // action — acknowledging the deny, exactly as the guard requires.
-    await c.declare({
-      species: "stage", stage: "rm -rf", patterns: ["Bash:something-else-entirely"],
-      acknowledgeBlockingRules: [deny.conceptId],
-    });
-
-    // MECHANICAL reachability changed: the stage no longer aims at the old action shape at all.
-    expect(c.stages().find((st) => st.name === "rm -rf")!.patterns)
-      .toEqual([{ tool: "bash", tokens: ["something-else-entirely"] }]);
-    // RECOGNIZED reachability did NOT change: the SAME deny is still delivered by name, severity
-    // and all — pattern re-aiming is not a rule-withdrawal lever on either matcher (doctrine).
-    const stillReachable = c.stageLookup({ stage: "rm -rf" });
-    expect(stillReachable.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
-    expect(stillReachable.rules[0]!.severity).toBe("blocking");
-    c.close();
-  });
+  // THE RE-AIM DOCTRINE TEST WAS REMOVED HERE (2026-08-22), because its premise was.
+  //
+  // It pinned doctrine item 7: re-aiming a stage's patterns moved the MECHANICAL firing surface and
+  // took nothing away — the same deny stayed bound, stayed blocking, and stayed delivered by name.
+  // The half that mattered was always the second one, and it is unchanged and asserted elsewhere
+  // (stage_lookup resolves by NAME, and a deny is withdrawn only by rule-level acts — see PATH 1).
+  // The first half no longer names anything: there is no mechanical firing surface to move.
 });
 
 // ---------------------------------------------------------------------------
@@ -6953,7 +6767,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     // shape a pre-breadth store has on disk.
     const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
     await built.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", circle: "alpha", ...AGENT_RULE,
     });
@@ -6961,7 +6775,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       circle: "alpha", kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE },
     });
     await built.store("Prefer npm ci.", {
-      circle: "beta", kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", ...AGENT_RULE },
+      circle: "beta", kind: "rule", rule: { stage: "npm install", ...AGENT_RULE },
     });
     // This concept moves circles BEFORE the downgrade — the backfill must follow the CONCEPT's
     // CURRENT circle ("gamma"), not whatever the binding might have remembered.
@@ -7045,7 +6859,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     const racePath = join(raceDir, "race.db");
     const seedForRace = new MonetCore(racePath, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
     await seedForRace.store("Prefer npm ci.", {
-      circle: "beta", kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", ...AGENT_RULE },
+      circle: "beta", kind: "rule", rule: { stage: "npm install", ...AGENT_RULE },
     });
     seedForRace.close();
     downgradeToPreBreadthSchema(racePath);
@@ -7115,7 +6929,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     // (circle != '*' OR origin = 'declaration') would NOT reject this combination, so an unfixed
     // backfill copying '*' straight onto it would succeed and mint an ACCIDENTAL global deny.
     const deny = await built.declare({
-      circle: "an-ordinary-circle", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "an-ordinary-circle", species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -7259,7 +7073,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     expect(migratedRow.circle).toBe(LEGACY_STAR_CIRCLE);
     // Every gate table now exists, backfill included — a fresh rule declared now works end to end.
     const rule = await upgraded.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
       scope: "domain",
     });
@@ -7295,7 +7109,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     expect(migratedRow.circle).toBe(LEGACY_STAR_CIRCLE);
     expect(raw(upgraded).prepare(`SELECT 1 FROM sync_meta WHERE singleton = 1`).get()).toBeDefined();
     const rule = await upgraded.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
       scope: "domain",
     });
@@ -7388,14 +7202,14 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       // proving the resolution lands on the migrated destination rather than degenerating to
       // global-only.
       const localRule = await built.declare({
-        circle: "project", species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+        circle: "project", species: "rule", stage: "npm install",
         content: "Confirm the registry before installing.", severity: "advisory", scope: "domain",
       });
       if (localRule.species !== "rule") throw new Error("unreachable");
       // A GENUINELY GLOBAL rule sharing the same stage — the control that makes "delivers the local
       // rule too" distinguishable from "delivers only global rules regardless".
       const globalRule = await built.declare({
-        circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+        circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
         content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
       });
       if (globalRule.species !== "rule") throw new Error("unreachable");
@@ -7473,7 +7287,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     // "active concept, kind='rule', not superseded"), so the concept side must satisfy it even
     // though its OWN binding (created here too) never crosses to the receiver — stripped below.
     const futureRule = await peer.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "A rule concept that has not arrived on the receiver yet.", severity: "advisory", scope: "domain",
       circle: "project",
     });
@@ -7485,7 +7299,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
 
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "Seed rule so a real stage exists on the receiver too.", severity: "advisory", scope: "domain",
     });
     if (seed.species !== "rule") throw new Error("unreachable");
@@ -7519,7 +7333,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
   it("the bulk backfill leaves UNRESOLVABLE NULL-circle bindings alone — dangling (no concept at all) or parked in the reserved '*' circle — rather than resolving either to a wrong value (Codex round 12, P2)", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "Seed rule so a real stage exists to bind against.", severity: "advisory", scope: "domain",
     });
     if (seed.species !== "rule") throw new Error("unreachable");
@@ -7835,7 +7649,7 @@ describe("evaluateStageLookup — SQL-level retrieval bounds", () => {
     // shorter than the cap returns the whole string) — reasonMissing computes false exactly as it
     // did before retrieval was ever bounded.
     const ordinary = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", scope: "domain",
     });
@@ -7851,7 +7665,7 @@ describe("evaluateStageLookup — SQL-level retrieval bounds", () => {
     // elsewhere in this file — constructed directly so the analysis is verified empirically rather
     // than by inspection alone.
     const pathological = await c.declare({
-      species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
+      species: "rule", stage: "terraform apply",
       content: "Confirm the plan before applying.", severity: "blocking",
       reason: "a placeholder reason", scope: "domain",
     });
@@ -7911,7 +7725,7 @@ describe("liveStageIndex", () => {
   it("excludes a stage whose only rule was SUPERSEDED (corrected away), not just retired", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     expect(c.prewarm().stageIndex).toEqual(["git force push"]);
     // A correction supersedes the rule AND births a successor bound to the same stage, so the
@@ -8131,7 +7945,7 @@ describe("MCP surface", () => {
     const stored = await call("memory_store", {
       content: "Never force-push to a shared branch.",
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "it destroys teammates' commits" },
+      rule: { stage: "git force push", reason: "it destroys teammates' commits" },
     });
     expect(stored.isError).toBe(false);
     // The model tag came from the HOST, not from the agent — the agent never named one.
@@ -8140,7 +7954,7 @@ describe("MCP surface", () => {
     });
 
     const declared = await call("memory_declare", {
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
       declaredBy: "john",
     });
@@ -8352,7 +8166,7 @@ describe("MCP surface", () => {
     const declared = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation.", declaredBy: "john" });
     if (declared.species !== "principle") throw new Error("unreachable");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: declared.conceptId, dstConceptId: rule.conceptId, bornOf: "extraction" });
     // A correction kills the rule, which impeaches the parent — the reachable route to an open
@@ -8378,10 +8192,10 @@ describe("MCP surface", () => {
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
     const { call, client } = await harness(c);
     const first = await c.store("Verify the built artifact after the source changes.", {
-      kind: "rule", rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain" },
+      kind: "rule", rule: { stage: "docker build", scope: "domain" },
     });
     const second = await c.store("After the source changes, verify the artifact itself.", {
-      kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      kind: "rule", rule: { stage: "npm install", scope: "domain" },
     });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
     const declared = await c.declare({
@@ -8415,7 +8229,7 @@ describe("MCP surface", () => {
   /** A live deny, declared the only way a deny can be born: by declaration. `circle: "*"` = global. */
   async function mcpDeny(c: MonetCore, content: string, stage: string, circle?: string) {
     const r = await c.declare({
-      species: "rule", stage, patterns: [`Bash:${stage}`], content,
+      species: "rule", stage, content,
       severity: "blocking", reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
       ...(circle ? { circle } : {}),
     });
@@ -8650,7 +8464,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(a);
     // Advisory at the moment the caller asked, so the old pre-call read said "nothing to disclose".
     const rule = await a.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", reason: "there is no undo",
       declaredBy: "john", ...AGENT_RULE,
     });
@@ -8721,7 +8535,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c);
 
     const first = await call("memory_declare", {
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
       scope: "domain", // domain, not the "agent" default — sidesteps the modelTag requirement entirely, irrelevant to what this test targets
     });
@@ -8773,7 +8587,7 @@ describe("MCP surface", () => {
     const CONTENT = "Never install without a lockfile present.";
 
     const first = await call("memory_declare", {
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"], scope: "domain",
+      species: "rule", stage: "npm install", scope: "domain",
       content: CONTENT, severity: "blocking", reason: "an unlocked install can drift", circle: "*",
     });
     expect(first.isError).toBe(false);
@@ -8822,7 +8636,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c, { autoPrewarm: true });
 
     const declared = await call("memory_declare", {
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"], scope: "domain",
+      species: "rule", stage: "npm install", scope: "domain",
       content: "Never install without a lockfile present.", severity: "blocking",
       reason: "an unlocked install can drift", circle: "*",
     });
@@ -8854,7 +8668,7 @@ describe("MCP surface", () => {
     // would then retire the wrong ones — a boundary that must not rest on self-knowledge.
     const stored = await call("memory_store", {
       content: "A compensation.", kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force", modelTag: "agent-claimed-model" },
+      rule: { stage: "git force push", modelTag: "agent-claimed-model" },
     });
     expect(c.ruleBinding(stored.json.conceptId as string)!.model_tag).toBe("host-model");
 
@@ -8875,7 +8689,7 @@ describe("MCP surface", () => {
       const { call, client } = await harness(c); // no host tag at all
       const stored = await call("memory_store", {
         content: "A compensation.", kind: "rule",
-        rule: { stage: "git force push", instance: "Bash:git push --force", modelTag: "agent-claimed-model" },
+        rule: { stage: "git force push", modelTag: "agent-claimed-model" },
       });
       expect(stored.isError).toBe(false);
       expect(c.ruleBinding(stored.json.conceptId as string)!.model_tag).toBe("agent-claimed-model");
@@ -8897,7 +8711,7 @@ describe("MCP surface", () => {
 
     const stored = await call("memory_store", {
       content: "Never force-push to a shared branch.", kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main" },
+      rule: { stage: "git force push" },
     });
     expect(stored.isError).toBe(false);
     expect(c.ruleBinding(stored.json.conceptId as string)!.model_tag).toBe("model-b");
@@ -8910,7 +8724,7 @@ describe("MCP surface", () => {
 
     // memory_declare's capture handler carries the identical fix.
     const declared = await call("memory_declare", {
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
     });
     expect(declared.isError).toBe(false);
@@ -8931,8 +8745,10 @@ describe("MCP surface", () => {
     // rather than slipping in under a negative assertion. `projectedFromPrincipleId` (slice 5-B) is
     // the one addition since, and it is refused outright in combination with blocking severity —
     // "no agent, and NO PROJECTION, can self-assign deny power" (see the refusal test below).
+    // `instance` came OFF this list on 2026-08-22: it existed only to seed a new stage's trigger
+    // patterns and retired with them. The exact-list discipline is the point and is unchanged.
     expect(Object.keys(ruleSchema.properties ?? {}).sort())
-      .toEqual(["instance", "modelTag", "projectedFromPrincipleId", "reason", "scope", "stage"]);
+      .toEqual(["modelTag", "projectedFromPrincipleId", "reason", "scope", "stage"]);
     // ...while memory_declare does carry it, and says so.
     const declare = tools.find((t) => t.name === "memory_declare")!;
     expect(Object.keys(declare.inputSchema.properties as object)).toContain("severity");
@@ -8954,7 +8770,7 @@ describe("MCP surface", () => {
     const projected = await call("memory_store", {
       content: "Rebuild the image before deploying after a lockfile change.",
       kind: "rule",
-      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain", projectedFromPrincipleId: principle.conceptId },
+      rule: { stage: "docker build", scope: "domain", projectedFromPrincipleId: principle.conceptId },
     });
     expect(projected.isError).toBe(false);
     expect(c.ruleBinding(projected.json.conceptId as string)!.origin).toBe("projection");
@@ -8970,11 +8786,11 @@ describe("MCP surface", () => {
     // EXTRACTION CANDIDATE on the store response, omitted-when-absent like every optional field.
     const first = await call("memory_store", {
       content: "Verify the built artifact after the source changes.",
-      kind: "rule", rule: { stage: "terraform apply", instance: "Bash:terraform apply", scope: "domain" },
+      kind: "rule", rule: { stage: "terraform apply", scope: "domain" },
     });
     const second = await call("memory_store", {
       content: "After the source changes, verify the artifact itself.",
-      kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      kind: "rule", rule: { stage: "npm install", scope: "domain" },
     });
     expect(second.json.extractionCandidate).toMatchObject({ pairedRuleId: first.json.conceptId });
     expect(first.json.extractionCandidate).toBeUndefined();
@@ -9010,11 +8826,11 @@ describe("MCP surface", () => {
 
     const first = await call("memory_store", {
       content: "Verify the built artifact after the source changes.",
-      kind: "rule", rule: { stage: "terraform apply", instance: "Bash:terraform apply", scope: "domain" },
+      kind: "rule", rule: { stage: "terraform apply", scope: "domain" },
     });
     const second = await call("memory_store", {
       content: "After the source changes, verify the artifact itself.",
-      kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      kind: "rule", rule: { stage: "npm install", scope: "domain" },
     });
     expect(second.json.extractionCandidate).toBeDefined();
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
@@ -9093,7 +8909,7 @@ describe("MCP surface", () => {
     if (principle.species !== "principle") throw new Error("unreachable");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle.conceptId },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle.conceptId },
     });
 
     const before = await call("stage_lookup", { stage: "helm delete" });
@@ -9103,7 +8919,7 @@ describe("MCP surface", () => {
 
     // Impeach the parent through a SIBLING rule, so the rule being looked up is itself untouched.
     const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: principle.conceptId },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain", projectedFromPrincipleId: principle.conceptId },
     });
     const corrected = await call("memory_store", {
       content: "Snapshot the volume AND drain the node before deleting a stateful set.",
@@ -9176,7 +8992,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c, { modelTag: "m1" });
     const stored = await call("memory_store", {
       content: "Never force-push to a shared branch.",
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main" },
+      kind: "rule", rule: { stage: "git force push" },
     });
     const corrected = await call("memory_store", {
       content: "Force-push is fine on your own branch; never on a shared one.",
@@ -9198,7 +9014,7 @@ describe("MCP surface", () => {
     // raw throw surfaces as a protocol failure, which reads as "the tool is broken" rather than
     // "you left out the one field this rule is required to carry".
     const r = await call("memory_declare", {
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking",
     });
     expect(r.isError).toBe(true);
@@ -9242,7 +9058,7 @@ describe("MCP surface", () => {
       // DELIVERY still filters by the constructor's tag, not by "" (which would match nothing —
       // every compensation invisible, the exact failure this fix closes).
       const forA = await c.store("A compensation for model-a.", {
-        kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-a" },
+        kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "model-a" },
       });
       const forOther = await c.store("A compensation for a different model.", {
         kind: "rule", resolution: "forceNew", rule: { stage: "git force push", scope: "agent", modelTag: "other-model" },
@@ -9253,7 +9069,7 @@ describe("MCP surface", () => {
       // CAPTURE is not poisoned either: an agent-scoped write with no explicit modelTag stamps the
       // constructor's live tag, not "" — the second half of the bug this fix closes.
       const captured = await call("memory_store", {
-        content: "Another compensation.", kind: "rule", rule: { stage: "rm -rf", instance: "Bash:rm -rf" },
+        content: "Another compensation.", kind: "rule", rule: { stage: "rm -rf" },
       });
       expect(captured.isError).toBe(false);
       expect(c.ruleBinding(captured.json.conceptId as string)!.model_tag).toBe("model-a");
@@ -9276,7 +9092,7 @@ describe("MCP surface", () => {
       // DELIVERY: every agent-scoped rule still fires, unfiltered — the documented meaning of an
       // absent runtime tag, not "matches nothing" (which a poisoned "" would have produced).
       const stored = await c.store("A compensation.", {
-        kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "some-model" },
+        kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "some-model" },
       });
       expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId)).toEqual([stored.conceptId]);
 
@@ -9284,7 +9100,7 @@ describe("MCP surface", () => {
       // the agent's tag only when the host supplies none" above): falls back to the agent's own tag.
       const captured = await call("memory_store", {
         content: "Another compensation.", kind: "rule",
-        rule: { stage: "rm -rf", instance: "Bash:rm -rf", modelTag: "agent-claimed-model" },
+        rule: { stage: "rm -rf", modelTag: "agent-claimed-model" },
       });
       expect(captured.isError).toBe(false);
       expect(c.ruleBinding(captured.json.conceptId as string)!.model_tag).toBe("agent-claimed-model");
@@ -9401,7 +9217,7 @@ describe("MCP surface", () => {
     const c = core();
     const { call, client } = await harness(c, { modelTag: "host-model" });
     const declared = await call("memory_declare", {
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
     });
     expect(declared.isError).toBe(false);
@@ -9425,7 +9241,7 @@ describe("MCP surface", () => {
 
     const forHost = await call("memory_store", {
       content: "A compensation for THIS model.",
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", modelTag: "host-model" },
+      kind: "rule", rule: { stage: "git force push", modelTag: "host-model" },
     });
     expect(forHost.isError).toBe(false);
     const forOther = await call("memory_store", {
@@ -9738,7 +9554,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c, { modelTag: "host-model" });
     const stored = await call("memory_store", {
       content: "A compensation for THIS model.",
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", modelTag: "host-model" },
+      kind: "rule", rule: { stage: "git force push", modelTag: "host-model" },
     });
     expect(stored.isError).toBe(false);
     const lookup = await call("stage_lookup", { stage: "git force push" });
@@ -10020,7 +9836,7 @@ describe("MCP surface", () => {
     const c = core();
     const { call, client } = await harness(c);
     const declaredStage = await call("memory_declare", {
-      species: "stage", stage: "opening a pr", patterns: ["Bash:gh pr create"], declaredBy: "john",
+      species: "stage", stage: "opening a pr", declaredBy: "john",
     });
     expect(declaredStage.isError).toBe(false);
     expect(c.stages().find((stage) => stage.name === "opening a pr")!.origin).toBe("declaration");
@@ -10434,60 +10250,15 @@ describe("MCP surface", () => {
 });
 
 // ---------------------------------------------------------------------------
-// the performance contract
+// THE TRIGGER-MATCHER PERFORMANCE CONTRACT WAS REMOVED HERE (2026-08-22), with the matcher.
 // ---------------------------------------------------------------------------
-describe("trigger-matcher performance", () => {
-  /**
-   * WHY THIS TEST IS CALIBRATED AND RATIO-BASED RATHER THAN ABSOLUTE.
-   *
-   * An earlier version asserted a bare `p95 < 1ms` and failed CI at p50=1.069/p95=1.159 — on a
-   * runner that is simply slower hardware, uniformly, for every operation. Best-of-batches removes
-   * scheduler NOISE but cannot remove a slower CPU, so an absolute millisecond bound in a portable
-   * test measures the machine and calls it a regression.
-   *
-   * What a PORTABLE test can prove is SCALING, asserted hardware-independently: a slower machine
-   * scales both sides of a ratio, so the ratio holds everywhere. That is the assertion that catches
-   * the real failure mode — an O(patterns x context) matcher — with orders of magnitude of margin.
-   */
-
-  /** Best-of-batches p95 — batches absorb the runner's scheduler, the minimum picks a clean one. */
-  function bestP95(fn: () => void, iters: number, batches = 8): number {
-    for (let i = 0; i < Math.min(100, iters); i++) fn();
-    const out: number[] = [];
-    for (let b = 0; b < batches; b++) {
-      const samples: number[] = [];
-      for (let i = 0; i < iters; i++) {
-        const started = process.hrtime.bigint();
-        fn();
-        samples.push(Number(process.hrtime.bigint() - started) / 1e6);
-      }
-      samples.sort((a, b2) => a - b2);
-      out.push(samples[Math.floor(samples.length * 0.95)]!);
-    }
-    return Math.min(...out);
-  }
-
-  it("does not scale with pattern count times context length — the matcher stays indexed", () => {
-    // THE ALGORITHMIC GUARD, and the one that needs no hardware assumptions at all. It exercises the
-    // pure matcher, so there is no DB, no clock and no I/O in the measurement.
-    //
-    // Before the context index, matching N patterns against a long context rescanned the whole token
-    // stream once per pattern: 200 stages x 4,000 tokens = 800k comparisons, measured at 2.4ms and
-    // the reason a context cap looked necessary. Indexed, a pattern whose first token is absent
-    // costs one Map lookup, so a 400x longer context costs essentially the same. The bound below is
-    // 20x — two orders of magnitude of headroom against the linear behaviour, which no hardware
-    // difference can manufacture.
-    const patterns = Array.from({ length: 200 }, (_, i) => seedTriggerPattern(`Bash:tool${i} run --flag${i}`));
-    const short = parseActionContext("Bash:tool7 run --flag7 operand");
-    const long = parseActionContext(
-      `Bash:${Array.from({ length: 4000 }, (_, i) => `arg${i}`).join(" ")} && tool42 run --flag42`,
-    );
-    const matchAll = (ctx: ReturnType<typeof parseActionContext>) => (): void => {
-      for (const pattern of patterns) matchesTriggerPattern(pattern, ctx);
-    };
-    const shortCost = bestP95(matchAll(short), 150, 5);
-    const longCost = bestP95(matchAll(long), 150, 5);
-    expect(longCost, `match 200 patterns: short=${shortCost.toFixed(5)}ms long=${longCost.toFixed(5)}ms`)
-      .toBeLessThan(Math.max(shortCost * 20, 0.05));
-  });
-});
+//
+// It measured 200 patterns against a 4,000-token context and held the indexed cost to within 20x of
+// a short one — a RATIO rather than an absolute bound, so a slower CI runner scaled both sides and
+// the assertion stayed portable. What it caught was an O(patterns x context) matcher, the shape
+// that once made a long command line look like a reason to cap the context.
+//
+// `ActionContext.index` went with it: the occurrence map existed only to make the matcher's
+// candidate-start scan cheap and had no other reader. `parseActionContext` survives for
+// `declareAdvisories`, which reads `context.tool` and never scans the token stream at all, so there
+// is no scan left here to hold to a bound.

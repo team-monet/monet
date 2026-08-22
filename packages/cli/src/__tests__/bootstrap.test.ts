@@ -96,7 +96,6 @@ describe("client core bootstrap", () => {
     await core.declare({
       species: "rule",
       stage: "git force push",
-      patterns: ["Bash:git push --force"],
       content: "Never force-push to main.",
       severity: "blocking",
       scope: "domain",
@@ -150,7 +149,7 @@ describe("FIX 1: served core store/mirror project pairing", () => {
       async () => new HashingEmbeddingProvider(),
     );
     await coreA.declare({
-      species: "rule", stage: "git force push", patterns: ["Bash:git push --force"],
+      species: "rule", stage: "git force push",
       content: "Never force-push to main.", severity: "blocking", scope: "domain",
       reason: "declared through A's served core — must land in A's mirror, never B's store",
     });

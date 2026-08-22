@@ -236,7 +236,7 @@ describe("stage_lookup records the stage the agent named", () => {
     const core = new MonetCore(":memory:", { momentSpoolPath: spoolPath, defaultCircle: "acme-widgets" });
     cores.push(core);
     await core.declare({
-      species: "rule", stage: "terraform apply", patterns: ["Bash:terraform apply"],
+      species: "rule", stage: "terraform apply",
       content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
     });
 
@@ -285,7 +285,7 @@ describe("a stage_lookup carries its own moment through the whole chain", () => 
     const core = new MonetCore(":memory:", { momentSpoolPath: spoolPath, defaultCircle: "acme-widgets" });
     cores.push(core);
     await core.declare({
-      species: "rule", stage, patterns: [`Bash:${stage}`],
+      species: "rule", stage,
       content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
     });
     const server = new McpServer({ name: "t", version: "1" }, { capabilities: { tools: {} } });
@@ -355,7 +355,7 @@ describe("a stage_lookup carries its own moment through the whole chain", () => 
     const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets" });
     cores.push(core);
     await core.declare({
-      species: "rule", stage: "terraform apply", patterns: ["Bash:terraform apply"],
+      species: "rule", stage: "terraform apply",
       content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
     });
     const server = new McpServer({ name: "t", version: "1" }, { capabilities: { tools: {} } });

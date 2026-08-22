@@ -113,7 +113,6 @@ import type {
 } from "./lifecycle-edges";
 import {
   assertBlockingRuleMutationAllowed,
-  assertNoUnacknowledgedDenies,
   bindRule,
   blockingRuleMutationGuard,
   BREADTH_CIRCLE,
@@ -121,23 +120,17 @@ import {
   migrateGateColumns,
   evaluateStageLookup,
   findStage,
-  formatTriggerPattern,
   gateCoverage,
   getRuleBinding,
   hasLineBreak,
   hasNoReason,
   isCircleLocalLiveBlockingRule,
   LEGACY_STAR_CIRCLE,
-  listMatchableStages,
   listStages,
   liveBlockingRulesForStage,
   liveStageIndex,
-  assertPatternCountWithinCap,
-  matchesTriggerPattern,
   normalizeStageName,
   parseActionContext,
-  seedTriggerPattern,
-  parseTriggerPatterns,
   upsertStage,
   MODEL_TAG_MAX_CHARS,
   RULE_BINDING_ORIGINS,
@@ -156,7 +149,6 @@ import type {
   StageLookupResult,
   StageOrigin,
   StageRow,
-  TriggerPattern,
 } from "./gates";
 import { readFileSync } from "node:fs";
 import { RATIFICATION_ENTRANCES, classifyRatificationPair } from "./lifecycle-edges";
@@ -1094,8 +1086,8 @@ interface SkeletonDeliveryChange {
 /**
  * Rule capture — "a rule is born at a correction", stored live when the agent notices it.
  *
- * Every field here answers a question the gate will be asked later: WHERE does this fire (`stage`
- * + `instance`), WHAT does it cost to ignore (`reason` — "the reason is what earns compliance"),
+ * Every field here answers a question the gate will be asked later: WHERE does this fire (`stage`),
+ * WHAT does it cost to ignore (`reason` — "the reason is what earns compliance"),
  * and WHO does it bind (`scope` + `modelTag`, so a new model can retire the old model's
  * compensations automatically).
  */
@@ -1103,15 +1095,8 @@ export interface RuleCaptureOpts {
   /** Stage name or id. Created if unknown — "a correction landing on an action with no stage IS
    *  the stage's creation." */
   stage: string;
-  /** The concrete action observed at the capture moment, e.g. "Bash:git push --force origin main".
-   *  Seeds the trigger pattern when the stage is being born; ignored when it already exists. */
-  instance?: string;
   /** Advisory only on this surface. Blocking is declaration-only — use declare(). */
   severity?: RuleSeverity;
-  /** Declaration only: replaces the stage's trigger patterns. Ignored on the capture path. */
-  patterns?: string[];
-  /** Declaration only: the live blocking rules a pattern replacement is knowingly re-aiming. */
-  acknowledgeBlockingRules?: string[];
   /**
    * INTERNAL — declaration-scoped for the two non-`undefined` values, restated for a second field
    * for the same reason blocking severity gets its own check independent of the schema CHECK: an
@@ -1202,13 +1187,15 @@ const MAX_CONTEXT_HEADING_CHARS = 120;
 const MAX_CONTEXT_PREFIX_CHARS = 300;
 
 /**
- * A stage as read back: the registry entry, with its patterns already parsed. A stage is store-
- * global and carries no circle — `git push --force` is the same action in every project.
+ * A stage as read back. A stage is store-global and carries no circle — `git push --force` is the
+ * same action in every project.
+ *
+ * `patterns` WAS REMOVED 2026-08-22 with trigger patterns themselves. A stage is now its NAME plus
+ * its origin; there is nothing else about it to read back.
  */
 export interface StageView {
   id: string;
   name: string;
-  patterns: TriggerPattern[];
   origin: StageOrigin;
   createdAt: number;
 }
@@ -1234,10 +1221,6 @@ export interface DeclareInput {
    * battery's Exits test exists to catch.
    */
   exitsEvidence?: string;
-  /** Replaces the stage's trigger patterns outright. Each entry is seeded like a capture instance. */
-  patterns?: string[];
-  /** A concrete instance to seed from when the stage is new and no explicit patterns were given. */
-  instance?: string;
   /**
    * THE ONLY SURFACE THAT ACCEPTS "blocking".
    *
@@ -1268,12 +1251,6 @@ export interface DeclareInput {
   declaredBy?: string;
   circle?: string;
   sourceRefs?: string[];
-  /**
-   * Required when `patterns` would re-author a stage that carries live blocking rules: name every
-   * one of them. Re-aiming a gate re-aims its denies, and this is what stops that from happening
-   * without the decision being made — see assertPatternReauthoringAcknowledged.
-   */
-  acknowledgeBlockingRules?: string[];
 }
 
 /**
@@ -1403,12 +1380,6 @@ export type DeclareResult =
   | {
       species: "stage";
       stage: StageView;
-      /** Rendered patterns before this call, so a re-authoring is auditable in-band. */
-      previousPatterns: string[];
-      /** Rendered patterns after. Equal to `previousPatterns` when nothing changed. */
-      patterns: string[];
-      /** Warning-light only; the write above has already happened. Omitted when nothing fired. */
-      advisories?: DeclareAdvisory[];
     }
   | {
       species: "rule";
@@ -1435,8 +1406,6 @@ export type DeclareResult =
        * flagged nothing, which is the ordinary case.
        */
       extractionCandidate?: { pairedRuleId: string; score: number };
-      /** Warning-light only; the write above has already happened. Omitted when nothing fired. */
-      advisories?: DeclareAdvisory[];
     }
   | {
       /**
@@ -11165,15 +11134,6 @@ export class MonetCore {
     }
     const stage = upsertStage(this.gateDeps(), {
       stage: rule.stage,
-      instance: rule.instance,
-      // Patterns ride in here rather than being applied by a separate declare()-side call. That is
-      // what collapses declaration into ONE transaction: there is no window in which a re-authored
-      // stage can survive a failed rule write.
-      patterns: declaration ? rule.patterns : undefined,
-      // Carried all the way to the mutation: upsertStage re-checks it inside this transaction, so a
-      // deny bound during declare()'s embed window cannot be re-aimed by a call validated before it
-      // existed.
-      acknowledgeBlockingRules: rule.acknowledgeBlockingRules,
       origin: declaration ? "declaration" : "correction",
     });
     const bound = bindRule(
@@ -11549,19 +11509,6 @@ export class MonetCore {
             `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
         );
       }
-      if (input.patterns !== undefined) {
-        throw new Error(
-          `species '${input.species}' carries no trigger patterns: patterns address a gate, and a ` +
-            `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
-        );
-      }
-      if (input.instance !== undefined) {
-        throw new Error(
-          `species '${input.species}' carries no instance: an instance is the concrete gate action ` +
-            `that seeds a trigger pattern, and a ${input.species} bound to a moment is just a rule — ` +
-            `use species:"rule" instead.`,
-        );
-      }
       if (input.scope !== undefined) {
         throw new Error(
           `species '${input.species}' carries no scope: scope is a rule-binding property, and a ` +
@@ -11580,13 +11527,6 @@ export class MonetCore {
           `species '${input.species}' carries no reason: reason explains a rule at the moment its ` +
             `gate fires, and a ${input.species} bound to a moment is just a rule — use ` +
             `species:"rule" instead.`,
-        );
-      }
-      if (input.acknowledgeBlockingRules !== undefined) {
-        throw new Error(
-          `species '${input.species}' carries no blocking-rule acknowledgement: ` +
-            `acknowledgeBlockingRules authorizes re-aiming a gate that carries live denies, and a ` +
-            `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
         );
       }
       if (!input.content || input.content.trim().length === 0) {
@@ -11656,36 +11596,15 @@ export class MonetCore {
         );
       }
     }
-    this.assertPatternReauthoringAcknowledged(input);
-    const firingAdvisories = this.patternFiringAdvisories(input);
-
     let result: DeclareResult;
     if (input.species === "stage") {
-      const existing = findStage(this.db, input.stage!);
-      const priorPatterns = existing ? this.toStageView(existing).patterns : [];
+      // DECLARING A STAGE IS NOW CREATE-OR-FETCH, and the response carries no old → new pair
+      // because there is nothing about an existing stage a declaration can change. Trigger
+      // patterns were the only editable thing a stage had; see gates.ts's retreat record.
       const stage = this.db.immediateTransaction(() =>
-        upsertStage(this.gateDeps(), {
-          stage: input.stage!,
-          patterns: input.patterns,
-          instance: input.instance,
-          acknowledgeBlockingRules: input.acknowledgeBlockingRules,
-          origin: "declaration",
-        }),
+        upsertStage(this.gateDeps(), { stage: input.stage!, origin: "declaration" }),
       )();
-      const view = this.toStageView(stage);
-      result = {
-        species: "stage",
-        stage: view,
-        // Old → new, in the response, so a pattern change is auditable IN BAND. A full pattern
-        // history table is DEFERRED (see assertPatternReauthoringAcknowledged): this response is
-        // the v1 record, which means an edit is visible to whoever made it but not reconstructible
-        // afterwards. Worth building when there is a second consumer of the history.
-        previousPatterns: priorPatterns.map(formatTriggerPattern),
-        patterns: view.patterns.map(formatTriggerPattern),
-        // Omitted when nothing fired, per the residency law that governs advisories: an always-
-        // present empty array is a field every reader pays for and no reader learns from.
-        ...(firingAdvisories.length > 0 ? { advisories: firingAdvisories } : {}),
-      };
+      result = { species: "stage", stage: this.toStageView(stage) };
     } else if (input.species === "principle" || input.species === "preference") {
       // THE DECLARATION ENTRANCE — sovereignty replaces the battery. Net-new code: unlike the rule
       // branch below, this never touches stages or rule_bindings (principles/preferences have no
@@ -11762,9 +11681,6 @@ export class MonetCore {
         sourceRefs: input.sourceRefs,
         rule: {
           stage: input.stage!,
-          instance: input.instance,
-          patterns: input.patterns,
-          acknowledgeBlockingRules: input.acknowledgeBlockingRules,
           // Passed through UNDEFAULTED. `undefined` means "the caller did not rule on severity",
           // which on an existing binding preserves what is there — see BindRuleInput.severity.
           severity: input.severity,
@@ -11814,147 +11730,10 @@ export class MonetCore {
         // Straight through from the shared write path (slice 5-B) — flagged by the same near-match
         // hook regardless of entrance, and disclosed here for the same reason it is on memory_store.
         ...(stored.extractionCandidate ? { extractionCandidate: stored.extractionCandidate } : {}),
-        // THE DECLARE-TIME FIRING TEST's finding, on the entrance that can actually carry patterns.
-        // Same disclosure discipline as the two above: legal, sovereign, and never something the
-        // caller should discover later rather than see reported here.
-        ...(firingAdvisories.length > 0 ? { advisories: firingAdvisories } : {}),
       };
     }
 
-    // Recorded only now: the declaration is committed, so `admitted: true` is a fact rather than a
-    // prediction. See journalFiringAdvisories.
     return result;
-  }
-
-  /**
-   * A stage's patterns are its MECHANICAL firing surface, so re-authoring them REROUTES every rule
-   * bound to it FOR THE MECHANICAL MATCHER — including the denies. That made "silence this
-   * mechanical deny" a single ordinary agent-callable declaration: edit the patterns, the deny
-   * stops matching an intercepted action, and the binding still reads `blocking` so nothing in the
-   * store looks wrong.
-   *
-   * DOCTRINE, RULED: pattern re-aiming is NOT a rule-withdrawal lever, on either matcher, and this
-   * guard's whole justification is scoped to the mechanical one. Patterns say WHICH TOOL SHAPES are
-   * this moment; rules say WHAT GOVERNS the moment — conflating "re-aim the patterns" with
-   * "withdraw the rule" made sense only while mechanical matching was the sole way anything reached
-   * a rule at all. Now that `stageLookup` resolves by stage NAME/id rather than by pattern, a rule
-   * bound here — including a blocking one — stays fully reachable by a correctly-recognizing agent
-   * after this re-authoring: only the MECHANICAL interception stops, not the rule's existence or
-   * its advisory delivery via recognition. Silently reducing a correctly-recognizing agent's
-   * protection through an act that never said "the rule stops applying" would be exactly the wrong
-   * kind of quiet. The universal ways to actually withdraw a rule are rule-level acts (declare it
-   * advisory, or let a correction supersede it) and the stage itself going inert (every rule bound
-   * to it dies — see the design's own "a stage whose rules have all died is inert ... removable by
-   * declaration"). This method's guard is about the FIRST of those two surfaces only.
-   *
-   * The guard is acknowledgement, not prohibition: the human may absolutely re-aim a gate that
-   * carries a deny, but they must NAME the denies they are re-aiming. An agent that has not been
-   * told those rules exist cannot produce their ids, and a human who has been shown them is making
-   * the decision the parameter is asking about.
-   *
-   * DEFERRED, explicitly: there is no pattern-change audit trail. The declare response carries
-   * old → new (see above) and that is all — a change is visible to whoever made it, not
-   * reconstructible by whoever finds it later. The acknowledgement parameter is the v1 guard.
-   */
-  /**
-   * FAST FEEDBACK ONLY — the binding guard lives in upsertStage, inside the write transaction.
-   *
-   * This runs before the embed so a caller learns immediately which denies it has to name, but it
-   * is not the thing that makes the guard sound: between this check and the commit there is an
-   * embed, and a blocking rule bound in that window would be re-aimed by a call validated when it
-   * did not exist. upsertStage re-runs `assertNoUnacknowledgedDenies` against the same predicate
-   * inside the transaction that performs the replacement, which is where the window closes.
-   */
-  private assertPatternReauthoringAcknowledged(input: DeclareInput): void {
-    if (input.patterns === undefined) return;
-    const stage = findStage(this.db, input.stage!);
-    if (!stage) return; // a stage being born carries no rules yet, so nothing can be rerouted
-    assertNoUnacknowledgedDenies(this.db, stage, input.acknowledgeBlockingRules);
-  }
-
-  /**
-   * THE DECLARE-TIME FIRING TEST — monet-client#59:
-   * "a pattern is admitted with at least one example action context it matches, verified at declare
-   * time by the same evaluator the gate runs."
-   *
-   * ONE EVALUATOR, NOT A SECOND ONE. `seedTriggerPattern` (exactly what upsertStage will store),
-   * `parseActionContext` and `matchesTriggerPattern` — the store's only trigger-pattern matcher.
-   * A declare-time check that used its own matching machinery could pass while the real one fails,
-   * which would be a worse lie than no check — it would vouch for a pattern that matches nothing.
-   * The stage-shaped advisory below already set this precedent; this reuses the same three.
-   *
-   * THE EXAMPLE IS `instance`, and no new field is added for it. `instance` already means "the
-   * concrete action this is about": when no patterns are given it SEEDS one, and when patterns are
-   * given it now VERIFIES them. One field, one meaning, two uses.
-   *
-   * WARNED, NEVER REFUSED — and that is the entrance, not timidity. §2 rules that a non-matching
-   * pattern is "refused on extraction-quality writes and warned-and-recorded on sovereign ones",
-   * and `patterns` is reachable from `memory_declare` ALONE (the capture path derives a pattern
-   * from the instance itself, so it is self-matching by construction and has nothing to verify).
-   * Every pattern this check can see therefore arrived through the sovereign entrance, where
-   * sovereignty replaces the battery. There is no extraction-quality pattern write to refuse, so no
-   * refusal path is built for one; if such an entrance is ever added, this is where its refusal goes.
-   *
-   * WHAT THIS PROVES, AND WHAT IT DOES NOT. An author-supplied example proves only that the author
-   * wrote a string matching their own pattern — the `Agent:` trap is exactly a pair of matching
-   * fictions. It is not evidence that any host ever produced such a context, and nothing here
-   * records it as if it were.
-   *
-   * RATIONED, per the residency law that governs advisories. "Patterns given, no example" is NOT
-   * advised: it would fire on nearly every pattern declaration there has ever been, and that signal
-   * already has a home in the governed-moment record.
-   */
-  private patternFiringAdvisories(input: DeclareInput): DeclareAdvisory[] {
-    // Everything echoed below is CALLER TEXT, and the MCP schema bounds neither `instance` nor a
-    // pattern (Codex P2 on PR #144, and it was right). A ~40k-character mismatching declaration
-    // would produce a message so large that the acknowledgement envelope replaced the whole
-    // response with its truncation notice — deleting the very warning the caller needed. Clipped
-    // here, at the source, so both the response and the journal stay bounded.
-    if (input.patterns === undefined || input.patterns.length === 0) return [];
-    // COUNT FIRST (Codex P2 on PR #144, and it was right). upsertStage refuses past
-    // MAX_STAGE_PATTERNS in constant time, but this analysis ran BEFORE it and tokenized every entry
-    // — so an arbitrarily large array was fully seeded just to be thrown away, on a path any MCP
-    // caller can reach with no `.max()` on the schema. Work proportional to a payload already known
-    // to be refused.
-    assertPatternCountWithinCap(input.patterns);
-    const seeded = input.patterns.map((pattern) => seedTriggerPattern(pattern));
-    const advisories: DeclareAdvisory[] = [];
-
-    // (a) INERT BY CONSTRUCTION — no example needed to know it. Seeding yields an empty token run
-    // for a segment that is nothing but flags ("a stage that means 'some command, somewhere, with
-    // this flag' is noise wearing a gate's clothes"), and matchesTriggerPattern returns false for
-    // an empty run unconditionally. The stage is born addressing nothing. This is a FORM defect —
-    // knowable without judging content, which is the only kind this layer is allowed to raise.
-    const inert = input.patterns.filter((_, index) => seeded[index]!.tokens.length === 0);
-    if (inert.length > 0) {
-      advisories.push({
-        kind: "pattern_never_matches",
-        message:
-          `These patterns can never match any action, so the gate they address is inert: ` +
-          `${joinAdvisoryEchoes(inert)}. A pattern seeds to its ` +
-          `command word through its last flag, and a run of nothing but flags addresses nothing. ` +
-          `Name the command the flag belongs to.`,
-      });
-    }
-
-    // (b) THE FIRING TEST ITSELF. An example was supplied and nothing declared here matches it.
-    if (typeof input.instance === "string" && input.instance.trim().length > 0) {
-      const context = parseActionContext(input.instance);
-      if (!seeded.some((pattern) => matchesTriggerPattern(pattern, context))) {
-        advisories.push({
-          kind: "pattern_matches_no_example",
-          message:
-            `None of these patterns match the example action given as \`instance\` ` +
-            `(${JSON.stringify(clipAdvisoryEcho(input.instance))}), evaluated with the gate's own matcher — so this ` +
-            `gate would not have fired on the very action it was authored from. The usual cause is ` +
-            `a tool prefix: a "Bash:" pattern can never match a "Task:" context, and a host's name ` +
-            `for a tool is a variable, not a constant (monet-client#58). Declared: ` +
-            `${joinAdvisoryEchoes(seeded.map(formatTriggerPattern))}.`,
-        });
-      }
-    }
-
-    return advisories;
   }
 
   /**
@@ -12225,25 +12004,17 @@ export class MonetCore {
   ): DeclareAdvisory[] {
     const advisories: DeclareAdvisory[] = [];
 
-    // (a) STAGE-SHAPED CONTENT — reuses the SAME matcher the gate itself fires with (parseActionContext
-    // + matchesTriggerPattern, both from gates.ts): no new matching machinery, per the design's own
-    // residency law — a second classifier here would be exactly the kind of unrationed surface the
-    // design's own audit measured at zero behavioral yield. "Command-shaped" reuses the identical
-    // parse the live gate path uses to recognize a `Tool:command` context (context.tool !== null);
-    // a registered stage match is the stronger, more specific signal and is preferred in the message
-    // when both are true.
+    // (a) COMMAND-SHAPED CONTENT — no new classifier, per the design's own residency law: a second
+    // one here would be exactly the kind of unrationed surface the design's audit measured at zero
+    // behavioral yield. `parseActionContext` answers this from the CONTENT'S OWN FORM alone.
+    //
+    // THE STRONGER HALF OF THIS CHECK WENT WITH TRIGGER PATTERNS (2026-08-22). It swept the registry
+    // for a stage whose patterns matched this content and named that stage in the message — a more
+    // specific signal, and preferred over the bare command shape when both were true. Nothing
+    // matches a stage any more, so the general half is now the whole of it: a declaration that reads
+    // like a command still gets told so, just without a stage name attached.
     const context = parseActionContext(content);
-    const matchedStage = listMatchableStages(this.db).find((stage) =>
-      parseTriggerPatterns(stage.trigger_patterns).some((pattern) => matchesTriggerPattern(pattern, context)),
-    );
-    if (matchedStage) {
-      advisories.push({
-        kind: "stage_shaped",
-        stage: matchedStage.name,
-        message: `This looks like a rule — it matches stage "${matchedStage.name}"'s own trigger patterns. ` +
-          `Consider species:"rule" bound to that gate instead of an always-on ${species}.`,
-      });
-    } else if (context.tool !== null) {
+    if (context.tool !== null) {
       // CLAMPED (Codex PR #102, round 2): `context.tool` is a verbatim prefix of caller content and
       // advisories are a fixed field of the acknowledgement, so an unbounded tool name could push the
       // complete envelope past the result ceiling. 120 chars is ample for any real command head.
@@ -12302,7 +12073,6 @@ export class MonetCore {
     return {
       id: row.id,
       name: row.name,
-      patterns: parseTriggerPatterns(row.trigger_patterns),
       origin: row.origin,
       createdAt: row.created_at,
     };
@@ -13977,9 +13747,22 @@ export class MonetCore {
         const current = this.db.prepare(`SELECT sync_revision, trigger_patterns FROM stages WHERE id = ?`)
           .get(row.id) as { sync_revision: number; trigger_patterns: string } | undefined;
         // DOOR 10. AN ACT REFUSED BY HAND MUST NOT LAND AS FACT BY RELAY. Locally, re-aiming a
-        // stage that carries live blocking rules requires acknowledgeBlockingRules — the human has
-        // to name every deny they are re-pointing. A grafted row carries no acknowledgment, so it
-        // does not converge here.
+        // stage that carries live blocking rules used to require acknowledgeBlockingRules — the
+        // human had to name every deny they were re-pointing. A grafted row carries no
+        // acknowledgment, so it does not converge here.
+        //
+        // STILL REACHABLE, AND THAT IS WHY IT STAYS (2026-08-22). Trigger patterns were retired and
+        // the local acknowledgement guard went with them, so THIS build never writes a pattern —
+        // every stage it creates carries RETIRED_TRIGGER_PATTERNS. But an OLD PEER still sends real
+        // pattern sets, and `current` may still hold one an older build wrote, so the byte
+        // comparison below is genuinely reachable during the mixed period. Retiring the local guard
+        // and leaving this one standing is deliberate: the local act cannot be performed at all any
+        // more, while the relayed one can still arrive.
+        //
+        // WHEN THIS BECOMES RETIRABLE: when no peer that can still write a non-`[]`
+        // `trigger_patterns` remains — at which point both sides of the comparison are always
+        // RETIRED_TRIGGER_PATTERNS, the branch can never be taken, and it should be removed rather
+        // than left looking like a live check. That is the same test that retired the local guard.
         //
         // This is the last member of the removal/re-aim class: the chokepoint stops a relayed act
         // from REMOVING a deny, and this stops one from silently changing what a deny denies, which
@@ -13995,10 +13778,11 @@ export class MonetCore {
         // stage. Each device declares it locally until act-relay exists. Divergence you can see
         // beats a deny quietly re-aimed by a machine that never asked.
         //
-        // Scoped as narrowly as the risk: only when the patterns ACTUALLY DIFFER (byte comparison
-        // is exact here — both sides serialize through serializeTriggerPatterns, so an identical
-        // pattern set is an identical string) and only when live denies are bound. Identical-pattern
-        // rows and advisory-only stages flow untouched.
+        // Scoped as narrowly as the risk: only when the stored bytes ACTUALLY DIFFER, and only when
+        // live denies are bound. Identical rows and advisory-only stages flow untouched. The
+        // comparison is a plain byte comparison because there is nothing left to parse — this build
+        // writes RETIRED_TRIGGER_PATTERNS and an older peer writes whatever its own serializer
+        // produced, and "different bytes" is the whole question either way.
         if (
           current !== undefined &&
           row.trigger_patterns !== current.trigger_patterns &&

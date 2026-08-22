@@ -649,7 +649,7 @@ describe("R6 — the public stageLookup() record for a library caller", () => {
     const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets", momentSpoolPath: spool });
     cores.push(core);
     await core.declare({
-      species: "rule", stage: "terraform apply", patterns: ["Bash:terraform apply"],
+      species: "rule", stage: "terraform apply",
       content: "Always run plan first.", severity: "advisory", scope: "domain", circle: "acme-widgets",
     });
     const r = core.stageLookup({ stage: "terraform apply" });

@@ -11,94 +11,42 @@
  * delegates (refactoring-build directive, same shape as src/resolution.ts and src/lifecycle-edges.ts).
  *
  * ────────────────────────────────────────────────────────────────────────────────────────────────
- * THE TRIGGER PATTERN FORMAT
+ * TRIGGER PATTERNS WERE RETIRED HERE (2026-08-22) — the plain record of the retreat.
  * ────────────────────────────────────────────────────────────────────────────────────────────────
  *
- * A pattern is a TOOL CONSTRAINT plus an ORDERED TOKEN RUN:
+ * REMOVED: the `TriggerPattern` format and its whole matcher — `matchesTriggerPattern`,
+ * `seedTriggerPattern`, `parseTriggerPatterns`, `readTriggerPatterns`, `serializeTriggerPatterns`,
+ * `formatTriggerPattern`, `listMatchableStages`/`MatchableStage`, `MAX_STAGE_PATTERNS`,
+ * `MAX_PATTERN_TOKENS`, `assertPatternCountWithinCap`, and `assertNoUnacknowledgedDenies` with its
+ * `acknowledgeBlockingRules` parameter. `stages.trigger_patterns` survives as a TOMBSTONE COLUMN
+ * only — see its own note in GATE_SCHEMA_SQL for why the column could not go with the concept.
  *
- *     { "tool": "Bash", "tokens": ["git", "push", "--force"] }      rendered:  Bash: git push --force
- *     { "tool": null,   "tokens": ["terraform", "apply"] }          rendered:  *: terraform apply
+ * WHY: Monet no longer intercepts anything. `stageLookup` resolves a stage BY NAME, never by
+ * pattern, so nothing in the store had matched an action since the interception path was removed.
+ * The only surviving readers were two declare-time advisories that warned the author about the
+ * patterns themselves — circular — and one of them told the author something false: that a rule
+ * "governs nothing until the patterns are fixed", when the rule governs by stage name whatever its
+ * patterns say. Owner ruled 2026-08-22: retire them.
  *
- * It FIRES on an action context when (a) the pattern's tool equals the context's tool, or the
- * pattern names no tool at all, and (b) the pattern's tokens appear as a CONTIGUOUS RUN anywhere in
- * the context's token stream. So `Bash: git push --force` fires on `Bash:git push --force origin
- * main` and on `Bash:cd /x && git push --force origin dev`, and stays silent on `Bash:git status`
- * and `Read:/etc/hosts`.
+ * WHAT IS GIVEN UP, stated plainly because it was real protection:
  *
- * Why this format, against the four constraints the slice was given:
+ *   THE DENY RE-AIM ACKNOWLEDGEMENT. Re-authoring a stage's patterns used to require naming every
+ *   live blocking rule bound there (`acknowledgeBlockingRules`), so a human could not silently
+ *   change what a deny denies. There is no longer any way to re-aim a gate — a stage is its name,
+ *   and a rule is bound to the stage — so the act that guard governed cannot be performed at all.
+ *   The guard is not weakened; its subject is gone. A guard that cannot fire is the APPEARANCE of
+ *   protection rather than protection, which is why it was removed rather than left standing.
  *
- *   DETERMINISTIC — the whole matcher is `===` over lowercased tokens. No scoring, no thresholds,
- *   no clock, no embedder. The same (pattern, context) pair answers the same way forever, which is
- *   what lets a blocking rule be a safety boundary rather than a probability.
+ *   THE MALFORMED-PATTERN DIAGNOSTIC (`gateCoverage().malformedPatterns`). It reported stages whose
+ *   stored patterns were unreadable. Nothing writes a pattern any more, so it would have answered a
+ *   question about a column that only ever holds `[]` — the same not-known-rendered-as-a-verdict
+ *   that retired `unverifiedPatterns` alongside the mechanical matcher.
  *
- *   SUB-MILLISECOND AT HUNDREDS OF STAGES — matching one pattern is O(|context| × |pattern|) string
- *   comparisons over token arrays that are tens of entries long, and the first-token check rejects
- *   almost every non-match after ONE comparison. 200 stages is a few thousand comparisons.
- *
- *   EXPLAINABLE — the rendered form IS the rule of firing: "this tool, these words in this order,
- *   somewhere in the command". That is the property a regex would destroy first. It is NOT a claim
- *   that a reader can predict firing with no further knowledge, and the earlier version of this
- *   comment said so wrongly: matching happens over NORMALIZED tokens, so a reader also has to know
- *   the three normalizations `normalizeMatchToken` performs (case, quoting, backslash escapes). The
- *   honest claim is that the rendered pattern plus one short, fixed, documented normalization rule
- *   predicts firing — not the pattern alone.
- *
- *   NO REGEX FROM USER CONTENT — nothing here ever constructs a RegExp (or a LIKE/GLOB pattern) out
- *   of stored or caller-supplied text. The only regexes in this module are fixed literals used to
- *   validate a tool name. A pathological pattern cannot blow up the matcher: pattern length is
- *   capped on the write path, and match cost is linear in the context's length.
- *
- * NORMALIZATION, AND WHY IT IS ONE FUNCTION. `git "push" --force` is the same command to the shell
- * as `git push --force`, so a gate that fired on one and not the other would be defeated by a pair
- * of quotes. Both sides of every comparison therefore pass through `normalizeMatchToken`: the
- * context tokens on the way out of the tokenizer, and the pattern tokens on the way out of storage.
- * ONE function, applied on BOTH sides, is the whole anti-drift mechanism — two functions that agree
- * today are two functions that can stop agreeing.
- *
- * WHAT NORMALIZATION DELIBERATELY DOES NOT DO — the accepted non-matches, all one judgement:
- *
- *   - `-f` does not match `--force`, and `--force=true` does not match `--force`. Genuinely
- *     different tokens; teaching the matcher otherwise means teaching it every tool's flag grammar,
- *     which is how a deterministic matcher becomes a heuristic one.
- *   - ANSI-C QUOTING: `$'git' push --force` does not match a `git push --force` pattern (the token
- *     reads `$git`). This one is a deliberate stop, not an oversight. The common ACCIDENTAL ways a
- *     command gets written differently — ordinary quotes, backslash escapes, line continuations,
- *     shell comments, newlines between commands — are all handled, because those happen by
- *     accident and a gate that missed them would miss real work. `$'...'` carries its own escape
- *     table (`\n`, `\t`, `\xHH`, `\uHHHH`, `\'`), and a partial implementation is worse than
- *     none: stripping the `$` and treating the run as literal would turn `$'a\nb'` into the three
- *     characters `a`, `\`, `n`, `b` rather than the two words the shell produces — a wrong answer
- *     dressed as a right one, in a matcher whose whole value is that its answers are predictable.
- *     Implement the escape table in full or leave the token alone; this leaves it alone.
- *
- * A stage that needs any of these spellings gets a pattern for each, by declaration.
- *
- * SEEDING (byproduct law — "the trigger pattern is seeded from the concrete instance visible at the
- * capture moment"). `seedTriggerPattern("Bash:git push --force origin main")` yields
- * `Bash: git push --force`, by three mechanical steps:
- *
- *   1. Split the tool prefix off the first `:`, but only when the text before it is a bare
- *      identifier (`Bash`, `Read`, `Task`). `psql -c "select 1:2"` therefore has NO tool prefix
- *      rather than a nonsense one.
- *   2. Tokenize the command shell-ishly: quoted runs are one token, and `&&`, `||`, `;`, `|` are
- *      their own tokens (so they can never be swallowed into a word). Then take the LONGEST
- *      segment between those separators, ties broken toward the first. `cd /x && git push --force
- *      origin dev` seeds from the push, not the cd; `git push --force && echo done` also seeds from
- *      the push. The substantive command in a chain is the long one — navigation prologues and
- *      `echo` epilogues are short — and picking by length needs no verb blocklist to maintain.
- *   3. Keep the command word through the LAST FLAG-SHAPED TOKEN, dropping the operands after it;
- *      with no flag at all, keep the first two tokens (command + subcommand). The correction that
- *      births the rule is almost never about `origin main` — it is about `--force`, and about
- *      `apply` rather than which workspace. Keeping the flags is what makes the pattern fire on the
- *      dangerous shape and stay silent on the safe sibling. A run that would end up ALL FLAGS is
- *      refused: `--force` alone fires on `rm -rf --force` and on every other command that happens
- *      to carry that flag, which is a stage that means nothing. Such a stage is born PATTERN-LESS
- *      and inert, and must be armed by declaration.
- *
- * Seeding is a heuristic over one observed instance and is expected to be wrong sometimes. That is
- * survivable BY CONSTRUCTION and not by care: DECLARATION replaces a stage's patterns outright, and
- * the failure mode of a bad seed is a stage nobody recognizes, never a wrong deny — blocking
- * severity is declaration-only.
+ * WHAT SURVIVES, and why it is not pattern machinery: `parseActionContext` and `tokenizeCommand`.
+ * `declareAdvisories` still uses them to notice that a declared principle looks COMMAND-SHAPED
+ * ("this reads like `Bash:…` rather than a standing truth") — a check on the declared content's own
+ * form that never consulted a stage's patterns. Only `ActionContext.index` went, because it existed
+ * solely to make the matcher's candidate-start scan cheap and had no other reader.
  */
 
 import type { StoragePort } from "./storage";
@@ -195,11 +143,39 @@ export const RULE_BINDING_ORIGINS: readonly RuleBindingOrigin[] = [
 
 // ---- row shapes (column names match the DB schema exactly) ------------------
 
+/**
+ * WHAT EVERY NEW STAGE ROW WRITES INTO THE RETIRED `trigger_patterns` COLUMN.
+ *
+ * THE COLUMN COULD NOT GO WITH THE CONCEPT, for two independent reasons, either one sufficient:
+ *
+ *   1. THE LOCAL STORE. `createGateTables` is `CREATE TABLE IF NOT EXISTS`, a no-op against a store
+ *      that already exists — so a column removed from the DDL stays in every store the previous
+ *      release wrote, with the constraints it was declared with. `trigger_patterns` is
+ *      `TEXT NOT NULL` with NO DEFAULT (unlike `stages.verified`, whose `DEFAULT 0` is exactly why
+ *      that removal could stop naming it). An INSERT that stopped naming this column would fail
+ *      with `NOT NULL constraint failed: stages.trigger_patterns` on every upgraded store, breaking
+ *      stage creation for existing users while every fresh store stayed green.
+ *
+ *   2. THE WIRE. `exportDelta` selects `*`, so dropping the column would send peers a stage row with
+ *      no `trigger_patterns` property. A peer still running the previous release binds that
+ *      positionally into its own NOT NULL column, and its graft loop has no per-row catch — so the
+ *      throw aborts the ENTIRE graft, not just the row. The wire field could never have been
+ *      dropped independently of the local question.
+ *
+ * So the CONCEPT retires and the COLUMN stays, holding a constant nothing reads. Do not "clean this
+ * up" by removing it from the DDL or from either INSERT.
+ */
+export const RETIRED_TRIGGER_PATTERNS = "[]";
+
 export interface StageRow {
   id: string;
   /** Normalized (trimmed, whitespace-collapsed, lowercased) — see `normalizeStageName`. UNIQUE. */
   name: string;
-  /** JSON array of TriggerPattern. Replaced wholesale by declaration; never appended to blindly. */
+  /**
+   * RETIRED COLUMN — a tombstone, never read. Every row this build writes carries
+   * `RETIRED_TRIGGER_PATTERNS`; see that constant for why the column outlived the concept. A row
+   * from an older store or an older peer may still hold a real pattern array, and nothing parses it.
+   */
   trigger_patterns: string;
   origin: StageOrigin;
   created_at: number;
@@ -261,11 +237,15 @@ export const GATE_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS stages (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    trigger_patterns TEXT NOT NULL,   -- JSON array of {tool: string|null, tokens: string[]}
+    -- RETIRED 2026-08-22, and DELIBERATELY STILL HERE. NOT NULL with no default, so an INSERT that
+    -- stopped naming it would break every store the previous release wrote. Writers put
+    -- RETIRED_TRIGGER_PATTERNS in it; no reader parses it. See that constant for the full reasoning.
+    trigger_patterns TEXT NOT NULL,
     origin TEXT NOT NULL CHECK (origin IN ('correction','declaration','import')),
     created_at INTEGER NOT NULL,
     sync_updated_at INTEGER NOT NULL,
-    -- Convergence clock for the mutable columns (trigger_patterns, origin). A bare sync_updated_at
+    -- Convergence clock for the mutable columns (origin, and trigger_patterns for as long as any
+    -- peer still writes one -- no local path changes either). A bare sync_updated_at
     -- comparison cannot decide these: the local value is the receiver's relay watermark and the
     -- incoming value is the sender's, two incomparable clock domains. (revision, writer) is the
     -- house pattern for mutable row convergence — circle_aliases, first_block, lifecycle_edges.
@@ -685,37 +665,20 @@ export function liveBlockingRulesForStage(db: StoragePort, stageId: string): Arr
     .all(stageId) as Array<{ conceptId: string; title: string }>;
 }
 
-// ---- trigger patterns -------------------------------------------------------
+// ---- action-context parsing -------------------------------------------------
+//
+// WHAT IS LEFT OF THE MATCHER, and it is not a matcher. Nothing here compares an action against a
+// stage any more (see the retreat record in the module header). `parseActionContext` survives for
+// ONE reader: `declareAdvisories`, which asks whether a declared principle's own text is shaped
+// like a command (`context.tool !== null`) rather than like a standing truth. That question is
+// about the declared content's form, never about any stage's stored patterns.
 
-/**
- * One trigger pattern. `tool` null means "any tool" — the shape a declaration authored from a bare
- * command name ("terraform apply") produces, and the reason such a stage fires on `Bash:terraform
- * apply -auto-approve` without the declarer having to know which host surface will run it.
- */
-export interface TriggerPattern {
-  tool: string | null;
-  tokens: string[];
-}
-
-/** A tokenized action context: what the matcher actually compares against. */
+/** A tokenized action context: tool prefix plus the command's tokens. */
 export interface ActionContext {
   /** Lowercased tool name, or null when the raw context carried no `Tool:` prefix. */
   tool: string | null;
   /** Lowercased tokens of the whole command, separators included as their own tokens. */
   tokens: string[];
-  /**
-   * Where each token occurs, built ONCE per context by `parseActionContext`.
-   *
-   * Without it, matching is O(stages × context length): every stage rescans the whole token stream
-   * looking for its first token, so a long command line multiplies the cost of the entire registry.
-   * Measured at 200 stages against a 4,000-token command that is 2.4ms — over the sub-ms contract,
-   * and the reason the (now removed) context token cap looked necessary. With the index, a stage
-   * whose first token does not occur at all costs one Map lookup, and one that does occur only
-   * examines the positions where it actually appears.
-   *
-   * Optional so a hand-built context still matches correctly, just linearly.
-   */
-  index?: Map<string, number[]>;
 }
 
 /**
@@ -739,41 +702,6 @@ export const COMMAND_BOUNDARY = "\n";
 
 /** Shell separators that end a command segment. Matched as whole tokens, longest first. */
 const SEPARATORS = ["&&", "||", ";", "|"] as const;
-const SEPARATOR_SET: ReadonlySet<string> = new Set<string>([...SEPARATORS, COMMAND_BOUNDARY]);
-
-/**
- * A pattern longer than this is not more precise, only slower and less legible. Patterns are
- * AUTHORED (seeded or declared), so clamping one is bounded work on a write path.
- */
-const MAX_PATTERN_TOKENS = 12;
-
-/**
- * How many patterns one stage may carry. Every gate lookup parses and scans EVERY pattern of every
- * stage, so an unbounded array is an unbounded per-action cost that any declaration could inflict —
- * and it would show up as the gate getting slower, not as anything looking wrong. 32 is far past
- * what a real gate needs (the busiest hand-authored stage in the design's own fixtures has three)
- * and small enough that the worst case stays bounded. Declaration REJECTS beyond it, so a human
- * finds out immediately; graft CLAMPS and counts, because an incoming row must never abort a graft.
- */
-export const MAX_STAGE_PATTERNS = 32;
-
-/**
- * The pattern-count refusal, in ONE place so there is one wording for one rule.
- *
- * Exported because the declare-time firing test has to apply it BEFORE it tokenizes anything
- * (Codex P2 on PR #144): that analysis ran ahead of this check and seeded every entry of an
- * arbitrarily large array just to have it refused a moment later. Re-typing the message at the
- * second call site would have been two refusals that could drift; this is the same refusal, raised
- * earlier.
- */
-export function assertPatternCountWithinCap(patterns: readonly string[] | undefined): void {
-  if (patterns === undefined || patterns.length <= MAX_STAGE_PATTERNS) return;
-  throw new Error(
-    `a stage may carry at most ${MAX_STAGE_PATTERNS} trigger patterns (got ${patterns.length}): ` +
-      `every gate lookup scans every pattern of every stage, so this is a per-action cost. Split the ` +
-      `action into separate stages, or use shorter patterns that cover more shapes.`,
-  );
-}
 
 /**
  * THE LESSON THE CONTEXT BOUNDS LEFT BEHIND, kept because the next thing that matches an action
@@ -807,9 +735,10 @@ export function assertPatternCountWithinCap(patterns: readonly string[] | undefi
  * eaten. Escape processing must happen EXACTLY ONCE, and the tokenizer is where it belongs, because
  * only the tokenizer knows which characters were syntax and which were data.
  *
- * The consequence for stored patterns is the conservative one, and deliberate: a hand-written row
- * containing `\-\-force` is now compared literally and simply will not match, rather than being
- * "helpfully" widened. Corruption and hand-editing narrow a pattern; they never broaden it.
+ * SINCE TRIGGER PATTERNS RETIRED there is no second side to agree with: this now folds case on the
+ * tokenizer's output alone, for `parseActionContext`'s one surviving reader. It stays a named
+ * function rather than an inline `.toLowerCase()` because the reason it exists — one normalization,
+ * applied in one place, by one function — is the thing that would be lost first.
  */
 export function normalizeMatchToken(raw: string): string {
   return raw.toLowerCase();
@@ -934,190 +863,10 @@ export function parseActionContext(raw: string): ActionContext {
   if (colon > 0) {
     const candidate = text.slice(0, colon);
     if (TOOL_NAME_RE.test(candidate)) {
-      return withIndex(candidate.toLowerCase(), tokenizeCommand(text.slice(colon + 1)));
+      return { tool: candidate.toLowerCase(), tokens: tokenizeCommand(text.slice(colon + 1)) };
     }
   }
-  return withIndex(null, tokenizeCommand(text));
-}
-
-/** Build the occurrence index alongside the tokens. See ActionContext.index for why. */
-function withIndex(tool: string | null, tokens: string[]): ActionContext {
-  const index = new Map<string, number[]>();
-  for (let i = 0; i < tokens.length; i++) {
-    const at = index.get(tokens[i]!);
-    if (at) at.push(i);
-    else index.set(tokens[i]!, [i]);
-  }
-  return { tool, tokens, index };
-}
-
-/** A flag-shaped token: `-f`, `--force`, `-auto-approve`. Never a bare `-` or a negative number. */
-function isFlagToken(token: string): boolean {
-  if (!token.startsWith("-") || token.length < 2) return false;
-  const body = token.replace(/^-+/, "");
-  return body.length > 0 && !/^[0-9]/.test(body);
-}
-
-/**
- * Seed a trigger pattern from ONE concrete instance — the byproduct law applied to gate addressing.
- * See the module header for the three steps and why each one is what it is.
- *
- * Total: every input yields a pattern. An empty or separator-only instance yields an empty token
- * run, which `matchesTriggerPattern` treats as matching NOTHING (see there) rather than everything
- * — a stage that fires on every action would be the fastest possible way to kill gate trust.
- */
-export function seedTriggerPattern(instance: string): TriggerPattern {
-  const { tool, tokens } = parseActionContext(instance);
-
-  // Step 2: the longest segment between shell separators, ties toward the first.
-  const segments: string[][] = [[]];
-  for (const token of tokens) {
-    if (SEPARATOR_SET.has(token)) segments.push([]);
-    else segments[segments.length - 1]!.push(token);
-  }
-  let chosen: string[] = [];
-  for (const segment of segments) {
-    if (segment.length > chosen.length) chosen = segment;
-  }
-
-  // Step 3: command word through the last flag; with no flag, command + subcommand.
-  let lastFlag = -1;
-  for (let i = 0; i < chosen.length; i++) {
-    if (isFlagToken(chosen[i]!)) lastFlag = i;
-  }
-  let keep = lastFlag >= 0 ? lastFlag + 1 : Math.min(2, chosen.length);
-
-  // A RUN OF NOTHING BUT FLAGS ADDRESSES NOTHING. `--force` on its own fires on `rm -rf --force`,
-  // on `git push --force`, and on every other command that happens to carry that flag — a stage
-  // that means "some command, somewhere, with this flag" is noise wearing a gate's clothes, and
-  // noise is the fastest way to kill gate trust. Extend the window to reach the first non-flag
-  // token if the segment has one; if it has NONE, emit an empty run, which never matches (see
-  // matchesTriggerPattern). The stage is then born inert, until a declaration arms it with a
-  // pattern a human actually meant.
-  if (!chosen.slice(0, keep).some((token) => !isFlagToken(token))) {
-    const firstWord = chosen.findIndex((token) => !isFlagToken(token));
-    keep = firstWord === -1 ? 0 : Math.max(keep, firstWord + 1);
-  }
-  return { tool, tokens: chosen.slice(0, Math.min(keep, MAX_PATTERN_TOKENS)) };
-}
-
-/**
- * Render a pattern as the line a human reads in curation and in the gate response. The rendering
- * is the CONTRACT the module header describes — `Bash: git push --force` means "tool
- * Bash, these three words in this order, anywhere in the command".
- */
-export function formatTriggerPattern(pattern: TriggerPattern): string {
-  return `${pattern.tool ?? "*"}: ${pattern.tokens.join(" ")}`;
-}
-
-/**
- * Read a stage's stored patterns. Tolerant by design: a row whose JSON is unreadable, or whose
- * entries are the wrong shape, yields the patterns it CAN read rather than throwing. A gate lookup
- * is on the critical path of an agent's action, and the correct behaviour when one stage's row is
- * corrupt is that this stage goes quiet — never that every gate in the store starts throwing.
- */
-export function parseTriggerPatterns(json: string): TriggerPattern[] {
-  return readTriggerPatterns(json).patterns;
-}
-
-/**
- * Read a stage's stored patterns, reporting how many were unusable.
- *
- * CORRUPTION MAKES A PATTERN INERT, NEVER BROADER — the single rule this function exists to
- * enforce. The previous version "cleaned" malformed input: a non-string `tool` became `null`, which
- * is the WILDCARD (matches every tool), and a non-string token was filtered out of the run, which
- * SHORTENS it (a shorter run matches strictly more). So a corrupt row silently widened a gate's
- * firing surface — the direction that produces confident wrong denies. Every shape violation now
- * drops the whole pattern instead, and the count surfaces in `gateCoverage().malformedPatterns` so a
- * stage that has gone quiet says why.
- *
- * `tool` ABSENT or explicitly null is not corruption: that is the legitimate any-tool pattern a
- * declaration authored from a bare command name produces.
- */
-export function readTriggerPatterns(json: string): { patterns: TriggerPattern[]; malformed: number } {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(json);
-  } catch {
-    return { patterns: [], malformed: 1 };
-  }
-  if (!Array.isArray(raw)) return { patterns: [], malformed: 1 };
-  const patterns: TriggerPattern[] = [];
-  let malformed = 0;
-  // The read-side clamp: a row that arrived over sync, or was hand-written, cannot make this store's
-  // gate slow. Counted as malformed so an over-long array surfaces in curation rather than being
-  // silently truncated.
-  if (raw.length > MAX_STAGE_PATTERNS) malformed += raw.length - MAX_STAGE_PATTERNS;
-  for (const entry of raw.slice(0, MAX_STAGE_PATTERNS)) {
-    if (typeof entry !== "object" || entry === null) {
-      malformed++;
-      continue;
-    }
-    const { tool, tokens } = entry as { tool?: unknown; tokens?: unknown };
-    if (tool !== undefined && tool !== null && typeof tool !== "string") {
-      malformed++;
-      continue;
-    }
-    if (!Array.isArray(tokens) || tokens.some((token) => typeof token !== "string")) {
-      malformed++;
-      continue;
-    }
-    // Normalized on the way OUT of storage, with the same function the tokenizer applies on the way
-    // out of the context. Doing it here rather than trusting the write path means a row written by
-    // any other route — a raw INSERT, a graft from a peer, a hand-repair — is compared in the same
-    // form as everything else instead of silently never matching.
-    patterns.push({
-      tool: typeof tool === "string" ? tool.toLowerCase() : null,
-      tokens: (tokens as string[]).map(normalizeMatchToken).slice(0, MAX_PATTERN_TOKENS),
-    });
-  }
-  return { patterns, malformed };
-}
-
-/** Canonical serialization. Tools lowercased and tokens normalized/clamped so stored ≡ matched. */
-export function serializeTriggerPatterns(patterns: TriggerPattern[]): string {
-  return JSON.stringify(
-    patterns.map((pattern) => ({
-      tool: pattern.tool === null ? null : pattern.tool.toLowerCase(),
-      tokens: pattern.tokens.map(normalizeMatchToken).slice(0, MAX_PATTERN_TOKENS),
-    })),
-  );
-}
-
-/**
- * Does `pattern` fire on `context`? Tool agreement, then a contiguous token run.
- *
- * AN EMPTY TOKEN RUN NEVER MATCHES. Mathematically the empty sequence is contained in everything,
- * and that answer would make an unseedable stage (an empty instance, a corrupt row) fire on every
- * single action in the store. "Noise is the fastest way to kill gates" — so the vacuous truth is
- * refused explicitly here rather than left to the write path to prevent.
- */
-export function matchesTriggerPattern(pattern: TriggerPattern, context: ActionContext): boolean {
-  if (pattern.tokens.length === 0) return false;
-  if (pattern.tool !== null && pattern.tool !== context.tool) return false;
-  const { tokens } = context;
-  const needle = pattern.tokens;
-  const last = tokens.length - needle.length;
-  if (last < 0) return false;
-  // Candidate start positions: exactly where the first token occurs, when the context carries an
-  // index; otherwise every position, which is the same answer computed the slow way.
-  const starts = context.index?.get(needle[0]!);
-  if (context.index && starts === undefined) return false;
-  const count = starts ? starts.length : last + 1;
-  for (let s = 0; s < count; s++) {
-    const start = starts ? starts[s]! : s;
-    if (start > last) break;
-    if (!starts && tokens[start] !== needle[0]) continue;
-    let matched = true;
-    for (let offset = 1; offset < needle.length; offset++) {
-      if (tokens[start + offset] !== needle[offset]) {
-        matched = false;
-        break;
-      }
-    }
-    if (matched) return true;
-  }
-  return false;
+  return { tool: null, tokens: tokenizeCommand(text) };
 }
 
 // ---- stage registry ---------------------------------------------------------
@@ -1253,40 +1002,32 @@ export interface GateDeps {
 export interface UpsertStageInput {
   /** Name or existing stage id. Resolved as an id first, then as a normalized name. */
   stage: string;
-  /** Concrete action instance to seed patterns from, when the stage has to be created. */
-  instance?: string;
-  /**
-   * Explicit patterns. Declaration only: PRESENT means REPLACE this stage's patterns outright, and
-   * an EMPTY ARRAY is a present instruction meaning "this stage fires on nothing" — not an absence.
-   */
-  patterns?: string[];
-  /** Concept ids of every live blocking rule bound here, when a replacement would re-aim them. */
-  acknowledgeBlockingRules?: string[];
   origin: StageOrigin;
 }
 
-/**
- * Refuse a pattern replacement that would re-aim denies the caller has not named.
- *
- * THE guard — shared by declare()'s early check and upsertStage's in-transaction one, so the two
- * cannot disagree about what counts as acknowledged.
- */
-export function assertNoUnacknowledgedDenies(
-  db: StoragePort,
-  stage: StageRow,
-  acknowledged: string[] | undefined,
-): void {
-  const denies = liveBlockingRulesForStage(db, stage.id);
-  if (denies.length === 0) return;
-  const named = new Set(acknowledged ?? []);
-  const missing = denies.filter((deny) => !named.has(deny.conceptId));
-  if (missing.length === 0) return;
-  throw new Error(
-    `re-authoring the patterns of stage '${stage.name}' would change what ${denies.length} blocking ` +
-      `rule(s) deny. Confirm by passing acknowledgeBlockingRules with every one of them. Missing: ` +
-      missing.map((deny) => `${deny.conceptId} (${deny.title})`).join("; "),
-  );
-}
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// `assertNoUnacknowledgedDenies` AND ITS `acknowledgeBlockingRules` PARAMETER WERE REMOVED HERE
+// (2026-08-22, owner ruling) — the plain record of the retreat, in the place the guard stood.
+//
+// WHAT IT DID: re-authoring a stage's trigger patterns would silently change what every blocking
+// rule bound to that stage denies. The guard refused such a call unless the caller NAMED each live
+// deny it was re-aiming — acknowledgement, never prohibition, so a human could still do it but only
+// with the denies in front of them. It ran twice on purpose: once early in declare() for fast
+// feedback, and once inside upsertStage's write transaction, which is what closed the window where
+// a deny bound during the embed could be re-aimed by a call validated before it existed.
+//
+// WHY IT IS GONE: its only entry condition was a supplied `patterns`. With trigger patterns retired
+// there is no act of re-aiming a gate at all — a stage is its name, a rule is bound to the stage —
+// so the guard could never fire again. A guard that cannot fire is the APPEARANCE of protection,
+// and leaving it standing would have told the next reader that this authority was still checked.
+//
+// WHAT IS GIVEN UP: nothing that is still reachable. The authority it protected (what a deny
+// denies) is now changed only by rule-level acts — declaring the rule advisory, or letting a
+// correction supersede it — each of which says plainly that the rule is changing.
+//
+// THE RELAY-SIDE TWIN SURVIVES: graftRows' Door 10 still refuses a pattern change arriving from a
+// peer, because an OLD peer can still send one. See its own comment for when it becomes retirable.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 
 /** Resolve a stage by id first, then by normalized name. Null when neither matches. */
 export function findStage(db: StoragePort, key: string): StageRow | null {
@@ -1301,69 +1042,21 @@ export function listStages(db: StoragePort): StageRow[] {
   return db.prepare(`SELECT * FROM stages ORDER BY created_at ASC, id ASC`).all() as StageRow[];
 }
 
-/** Exactly the three columns the matcher reads. See `listMatchableStages` for why that matters. */
-export interface MatchableStage {
-  id: string;
-  name: string;
-  trigger_patterns: string;
-}
-
 /**
- * The pattern-matching path's own projection, deliberately NOT `listStages`.
+ * Create the stage if it does not exist. An EXISTING stage is returned untouched.
  *
- * A pattern sweep reads EVERY stage — that is what "no index can help, so keep the row cheap"
- * means here — and the columns the matcher never looks at (origin, the two clocks, the revision,
- * the writer) are pure marshalling cost paid once per stage per sweep. Measured at 200 stages:
- * dropping them takes a silent lookup from ~0.25ms to ~0.15ms. A narrower SELECT is the whole
- * optimization; there is no cache, so there is no invalidation to get wrong.
- */
-export function listMatchableStages(db: StoragePort): MatchableStage[] {
-  return db
-    .prepare(`SELECT id, name, trigger_patterns FROM stages ORDER BY created_at ASC, id ASC`)
-    .all() as MatchableStage[];
-}
-
-/**
- * Create the stage if it does not exist; replace its patterns when a declaration supplies them.
+ * THERE IS NO UPDATE BRANCH ANY MORE, and that is the shape of the whole registry now: a stage is
+ * its NAME, and trigger patterns were the only mutable thing it carried (see the module header's
+ * retreat record). "A correction landing on an action with no stage IS the stage's creation" is now
+ * the entirety of this function rather than its first half.
  *
- * A CORRECTION NEVER REWRITES AN EXISTING STAGE'S PATTERNS. "A correction landing on an action with
- * no stage IS the stage's creation" — the creation, not a continuous re-authoring. If every capture
- * re-seeded, the gate's addressing would drift with whatever command happened to be corrected last,
- * and the human who declared `terraform apply` would find it silently narrowed to
- * `terraform apply -auto-approve` by the next correction. Editing rides declaration, which is where
- * sovereignty lives.
+ * The schema still calls `origin` a mutable column for convergence purposes because a GRAFT can
+ * still change it. No LOCAL path does.
  */
 export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
   const { db } = deps;
   const existing = findStage(db, input.stage);
-  // AN EMPTY ARRAY IS AN INSTRUCTION, NOT AN ABSENCE. `patterns: []` used to coerce to null and be
-  // silently ignored, which meant a declarer could not make a stage inert — and, worse, that the
-  // one input shape most obviously aimed at disarming a gate slipped past the acknowledgement guard
-  // entirely. Only `undefined` means "I am not authoring patterns".
-  assertPatternCountWithinCap(input.patterns);
-  const declaredPatterns = input.patterns === undefined
-    ? null
-    : input.patterns.map((pattern) => seedTriggerPattern(pattern));
-
-  if (existing) {
-    if (declaredPatterns === null) return existing;
-    const nextPatterns = serializeTriggerPatterns(declaredPatterns);
-    if (nextPatterns === existing.trigger_patterns) return existing; // no-op: nothing to bump for
-    // THE ACKNOWLEDGEMENT GUARD LIVES WITH THE MUTATION, not only at the API edge. declare() checks
-    // it early for fast feedback, but that check runs before the embed and outside the write
-    // transaction — so a blocking rule bound during the embed window would have its firing surface
-    // re-aimed by a call that was validated when no deny existed. Re-checking here closes that
-    // window by construction: this runs inside whatever transaction the caller opened.
-    assertNoUnacknowledgedDenies(db, existing, input.acknowledgeBlockingRules);
-    const syncAt = deps.nextSyncTimestamp();
-    db.prepare(
-      `UPDATE stages
-          SET trigger_patterns = ?, origin = ?, sync_updated_at = ?,
-              sync_revision = sync_revision + 1, sync_writer = ?
-        WHERE id = ?`,
-    ).run(nextPatterns, input.origin, syncAt, deps.syncDeviceId, existing.id);
-    return db.prepare(`SELECT * FROM stages WHERE id = ?`).get(existing.id) as StageRow;
-  }
+  if (existing) return existing;
 
   // NEW STAGE. STAGE_NAME_MAX_CHARS is enforced HERE — the one place a stage name is ever minted —
   // so every creation surface (memory_store's rule capture, memory_declare's stage/rule species)
@@ -1371,25 +1064,23 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
   // with the guarantee that anything actually storable stays name-lookupable (review fix: the two
   // ends had drifted, lookup capped at 500 while creation stayed unbounded). A NAMED REFUSAL, not a
   // silent truncation — a name this long was never a "moment" in the design's sense; that content
-  // belongs in the rule's own instance/content/reason, not in the address.
+  // belongs in the rule's own content or reason, not in the address.
   const normalizedName = normalizeStageName(input.stage);
   if (normalizedName.length > STAGE_NAME_MAX_CHARS) {
     throw new Error(
       `a stage name may be at most ${STAGE_NAME_MAX_CHARS} characters (got ${normalizedName.length}): ` +
         `stage names are short, human-readable identifiers for a moment ("git force push", "opening a ` +
-        `PR"), not a command or a paragraph — put that in the rule's own instance, content, or reason.`,
+        `PR"), not a command or a paragraph — put that in the rule's own content or reason.`,
     );
   }
 
-  // Seeding precedence: explicit declared patterns, else the observed instance, else the stage name
-  // itself. The last is the import/declaration case the design calls out — "their trigger pattern is
-  // authored at import from the rule's named action".
-  const seeds = declaredPatterns ?? [seedTriggerPattern(input.instance ?? input.stage)];
   const syncAt = deps.nextSyncTimestamp();
   const row: StageRow = {
     id: deps.newId(),
     name: normalizedName,
-    trigger_patterns: serializeTriggerPatterns(seeds),
+    // THE TOMBSTONE, WRITTEN DELIBERATELY. See RETIRED_TRIGGER_PATTERNS: naming this column in the
+    // INSERT is what keeps stage creation working on a store the previous release wrote.
+    trigger_patterns: RETIRED_TRIGGER_PATTERNS,
     origin: input.origin,
     created_at: syncAt,
     sync_updated_at: syncAt,
@@ -2035,7 +1726,7 @@ const RULE_LIVENESS_WHERE = `
  * caller reuse this query as-is instead of writing a leaner second copy.
  *
  * `withBody` — SELECT `c.body` or not. Omitting it skips fetching and marshalling a concept's full
- * body across the sqlite boundary, the same class of waste `listMatchableStages` vs `listStages`
+ * body across the sqlite boundary, the same class of waste `liveStageIndex`'s narrow projection
  * already exists to avoid ("a narrower SELECT is the whole optimization; there is no cache, so
  * there is no invalidation to get wrong"). `evaluateStageLookup` passes `true`, because
  * `toStageLookupRule` reads the field; `toGateRule` never does.
@@ -2583,11 +2274,15 @@ export function stageLookup(db: StoragePort, opts: StageLookupOptions): StageLoo
  * `unverifiedPatterns` IS GONE TOO, with the mechanical matcher that fed it. It listed stages whose
  * `verified` flag was still 0 — "these patterns have never matched a real action". Nothing matches
  * an action any more, so every stage would have qualified, forever: a not-known rendered as a
- * verdict. `malformedPatterns` survives because it asks a question the registry can still answer —
- * whether a stage's stored patterns are readable at all.
+ * verdict.
+ *
+ * `malformedPatterns` FOLLOWED IT ON 2026-08-22, for the same fault one step later. It listed stages
+ * whose stored `trigger_patterns` would not parse, and it outlived the matcher because "is this row
+ * readable" was still answerable. Retiring trigger patterns ended that: every row this build writes
+ * holds `RETIRED_TRIGGER_PATTERNS` and no reader parses any of them, so the list could only ever
+ * report on a column nothing writes — the same not-known-rendered-as-a-verdict, one column over.
  */
 export interface GateCoverage {
-  malformedPatterns: Array<{ stageId: string; stageName: string; malformed: number; readable: string[] }>;
   retirementCandidates: Array<{ conceptId: string; title: string; modelTag: string; stageName: string }>;
   /** True number omitted after the source cap; absent when the list is complete. */
   retirementCandidatesOmitted?: number;
@@ -2644,20 +2339,6 @@ export function gateCoverage(db: StoragePort, opts: GateCoverageOptions): GateCo
         ORDER BY s.name ASC`,
     )
     .all(opts.circle, opts.runtimeModelTag ?? null, opts.runtimeModelTag ?? null) as GateCoverage["liveStages"];
-  const malformedPatterns: GateCoverage["malformedPatterns"] = [];
-  for (const stage of db
-    .prepare(`SELECT id, name, trigger_patterns FROM stages ORDER BY created_at ASC, id ASC`)
-    .all() as Array<{ id: string; name: string; trigger_patterns: string }>) {
-    const read = readTriggerPatterns(stage.trigger_patterns);
-    if (read.malformed > 0) {
-      malformedPatterns.push({
-        stageId: stage.id,
-        stageName: stage.name,
-        malformed: read.malformed,
-        readable: read.patterns.map(formatTriggerPattern),
-      });
-    }
-  }
 
   const exceptionLimit = opts.exceptionLimit === undefined
     ? undefined
@@ -2720,7 +2401,6 @@ export function gateCoverage(db: StoragePort, opts: GateCoverageOptions): GateCo
     : unexplainedDeniesAll.slice(0, exceptionLimit);
   return {
     liveStages,
-    malformedPatterns,
     retirementCandidates,
     ...(retirementCandidatesOmitted > 0 ? { retirementCandidatesOmitted } : {}),
     // Deliberately NOT filtered by runtime model tag: a compensation for another model still holds
