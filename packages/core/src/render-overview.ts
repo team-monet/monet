@@ -106,15 +106,13 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   ) {
     lines.push(bold("GATE"));
     if (gates.total > 0) {
-      // BOTH NUMBERS, THOUGH NOTHING IN THIS BUILD CAN MAKE THEM DIFFER. `ungoverned` counts the
-      // moments nothing evaluated, and today that is every moment a Monet build writes — so the two
-      // are equal and the line reads as a tautology. It still says the true thing: everything this
-      // record holds is an act nobody consulted a rule about. The line printed rates beside them
-      // ("fired", "silent", "delivered") until 2026-08-22; those came off with the counters, which
-      // were pinned at zero by construction once nothing matched an action. See `MomentCounts`.
-      lines.push(truncate(dim(
-        `  ${gates.total} moments · ${gates.ungoverned} ungoverned`,
-      ), width));
+      // ONE NUMBER, BECAUSE THERE IS ONLY ONE POPULATION LEFT TO NAME. This line carried rates
+      // ("fired", "silent", "delivered") until 2026-08-22, and an `ungoverned` count beside the
+      // total until later the same day. The rates went because nothing writes the columns they read.
+      // `ungoverned` went because it reads `rule_ids IS NULL`, which is what the sole surviving
+      // writer hard-codes — so it equalled `total` on everything this build records, and the line
+      // was printing one population under two names. See `MomentCounts`.
+      lines.push(truncate(dim(`  ${gates.total} moments`), width));
     }
     // ITS OWN LINE, because it is in no other number here: `total` counts THIS circle's moments and
     // these have no circle at all, so without a line of their own an opened section could show

@@ -112,12 +112,10 @@ describe("overview composition + invariants", () => {
     // The counts, the four conformance states, and what the record knows it is missing — and
     // nothing else until there is something actionable to say.
     expect(Object.keys(clean).sort()).toEqual([
-      "conformance", "losses", "total", "unattributed", "ungoverned", "unopened",
+      "conformance", "losses", "total", "unattributed", "unopened",
     ].sort());
     // `unopened` is its own key BY DESIGN (F3): debris is excluded from every rate, and excluding
     // it must not make it invisible — a swallowed interception is a real loss.
-    // `ungoverned` is NOT a rename of `overflows`: it is wider, and it is its own number precisely
-    // so a moment nothing evaluated cannot be read as one something looked at.
     expect(clean).not.toHaveProperty("overflows");
     expect(clean).not.toHaveProperty("byStage");
     expect(clean).not.toHaveProperty("unverifiedPatterns");
@@ -127,6 +125,10 @@ describe("overview composition + invariants", () => {
     expect(clean).not.toHaveProperty("fires");
     expect(clean).not.toHaveProperty("silences");
     expect(clean).not.toHaveProperty("delivered");
+    // `ungoverned` came off later the same day, by the mirror of that argument: it counts
+    // `rule_ids IS NULL`, which is what the only surviving writer hard-codes, so it restated
+    // `total` under a second name instead of adding a fact.
+    expect(clean).not.toHaveProperty("ungoverned");
     // The two pending states are separate keys and are never summed into one.
     const conformance = clean.conformance as Record<string, unknown>;
     expect(conformance).toHaveProperty("unanswered");

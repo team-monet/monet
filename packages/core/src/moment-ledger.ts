@@ -946,17 +946,29 @@ export function momentConformance(db: StoragePort, spoolPath: string, circle: st
  * counters return when something writes the columns again, and they should return with their split
  * intact (see below).
  *
+ * `ungoverned` WENT THE SAME DAY, AND FOR THE SAME REASON ONE STEP ON. It counted the moments
+ * nothing evaluated — `rule_ids IS NULL` — and since `openStoreMoment` is the only writer left and
+ * hard-codes exactly that, every moment this build writes is ungoverned. The number therefore
+ * restates `total` rather than adding a fact, and a surface that prints the same population twice
+ * under two names invites a reader to find a difference between them that cannot exist.
+ *
+ * THE ONE CASE THE TWO DIFFER IS ITSELF THE ARGUMENT FOR REMOVING IT. The spool is home-level and
+ * shared, so a fresh store folds every line already on disk, including moments a pre-strip build
+ * wrote with a real evaluation on them. On that store `ungoverned` < `total` — and the gap is a
+ * count of historical evaluations by a matcher this tree no longer has, which is precisely the
+ * reporting `fires`, `silences` and `delivered` were removed for. `total` says how many moments are
+ * on record and claims nothing about what looked at them, which is all this build can honestly say.
+ *
  * THE SPLIT THEY ENCODED, kept here because the next interceptor will have to rebuild it. `ruleIds`
  * distinguishes three states, not two: `['r1']` is "something was bound", `[]` is "a matcher looked
  * and bound nothing", and NULL is "nothing evaluated this moment at all". Only the first two are
  * claims about an evaluation. Lumping the third into a silence count reports "nothing governs this"
- * for an action no rule set was ever consulted about, which is why `ungoverned` is its own number
- * and never folded into either. Receipt is a fourth state again: an advisory that delivers stage
- * names and no rule id has not delivered an identity, and cannot be counted as if it had.
+ * for an action no rule set was ever consulted about, so whatever counts these next must give that
+ * third state a number of its own and never fold it into either. Receipt is a fourth state again:
+ * an advisory that delivers stage names and no rule id has not delivered an identity, and cannot be
+ * counted as if it had.
  */
 export interface MomentCounts {
-  /** Nothing evaluated this moment: an overflow, an unreadable surface, or a call into the store. */
-  ungoverned: number;
   /** Every governed moment on record in this circle. Debris is excluded and counted below. */
   total: number;
   /**
@@ -983,12 +995,11 @@ export function momentCounts(db: StoragePort, spoolPath: string, circle: string)
   foldMomentSpool(db, spoolPath);
   const one = (sql: string): number => (db.prepare(sql).get(circle) as { n: number }).n;
   const oneNoArg = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
-  // F3: scoped to observed moments. `ungoverned` in particular is documented as "an overflow, an
-  // unreadable surface, or a call into the store" — debris is none of those, and counting it there
-  // put a fourth, undocumented population inside a number a human reads.
+  // F3: scoped to observed moments. `total` is documented as "every governed moment on record" —
+  // debris was never observed at all, so counting it there would put a second, undocumented
+  // population inside a number a human reads. It gets `unopened` instead.
   // SCOPED, because the spool is shared across projects and this store folded all of it.
   return {
-    ungoverned: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 1 AND circle = ? AND rule_ids IS NULL`),
     total: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 1 AND circle = ?`),
     // NOT circle-scoped, deliberately: debris has no interception, so it has no circle either.
     unopened: oneNoArg(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 0`),

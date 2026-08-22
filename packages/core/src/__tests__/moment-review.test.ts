@@ -246,12 +246,12 @@ describe("P1 — moment counts are scoped to the circle the overview asked for",
     const core = new MonetCore(":memory:", { momentSpoolPath: path, defaultCircle: "acme-widgets" });
     cores.push(core);
     // `total` rather than the removed `fires` (2026-08-22): the scoping is what is under test, and
-    // it is the same WHERE clause on either counter. Both moments are evaluated records, so both
-    // stay out of `ungoverned` — asserted here so the scoping check cannot silently start passing
-    // against a counter that counts everything.
+    // it is the same WHERE clause on either counter. The companion assertion here — that both
+    // moments stayed out of `ungoverned`, so the check could not pass against a counter that counts
+    // everything — went with `ungoverned` itself later that day. Every counter left reads only
+    // `opened` and `circle`, so there is no longer a counter for this one to be confused with.
     expect(core.momentCounts("acme-widgets").total).toBe(1);
     expect(core.momentCounts("other-project").total).toBe(1);
-    expect(core.momentCounts("acme-widgets").ungoverned).toBe(0);
   });
 
   it("counts a moment whose circle was never known as unattributed, not as this circle's", () => {

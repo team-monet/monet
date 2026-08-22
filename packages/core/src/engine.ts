@@ -2047,18 +2047,19 @@ export interface MemoryOverview {
    *
    * REBUILT ON THE GOVERNED MOMENT. The counts used to come from a `gate_events` row per intercepted
    * action; they now come from the moment record, which unlike a verdict row can name the rules that
-   * fired and be joined back to the act. Two shapes changed with it, both deliberately:
+   * fired and be joined back to the act. One shape changed with it, deliberately:
    *
-   *   - `ungoverned` replaces the old `overflows`, and is wider: it counts every moment NOTHING
-   *     evaluated — an overflow, a surface no interception could read, or a call into the store.
    *   - `unreadStages` is derived by joining the live stage registry against the stages agents have
    *     actually NAMED through `stage_lookup`, rather than against a per-stage event count. A stage
    *     absent from that set has never been asked for, which is the state indistinguishable from a
    *     healthy quiet one until something says so.
    *
-   * WHAT IS DELIBERATELY ABSENT: `fires`, `silences` and `delivered`. Nothing in this tree writes
-   * the columns behind them any more, so each would report a structurally-fixed zero — see
-   * `MomentCounts`' own comment for why that is worse than reporting nothing.
+   * WHAT IS DELIBERATELY ABSENT: `fires`, `silences`, `delivered`, and `ungoverned` (which had
+   * itself replaced an older `overflows`). Nothing in this tree writes the columns behind the first
+   * three, so each would report a structurally-fixed zero, which is worse than reporting nothing.
+   * `ungoverned` read the same columns from the other side and failed the mirrored test: with
+   * `openStoreMoment` the only writer left, every moment is ungoverned, so it restated `total`
+   * instead of adding a fact. See `MomentCounts`' own comment for both removals.
    *
    * `conformance` is the fourth fact and the only one no machine produced. `unanswered` and
    * `notAsked` are reported separately and never summed: one is a queue owed to the user, the other
@@ -12132,7 +12133,7 @@ export class MonetCore {
   /** What is known about every moment on record. Folds first. */
   momentCounts(circle?: string): MomentCounts {
     if (this.momentSpoolPath === null) {
-      return { ungoverned: 0, total: 0, unopened: 0, unattributed: 0 };
+      return { total: 0, unopened: 0, unattributed: 0 };
     }
     return momentCounts(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }

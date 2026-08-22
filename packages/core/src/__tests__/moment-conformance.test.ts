@@ -20,7 +20,7 @@ import { MonetCore } from "../engine";
 import { registerMonetCoreTools } from "../mcp-server";
 import { BetterSqlitePort } from "../storage";
 import type { StoragePort } from "../storage";
-import { UnknownMomentError, momentConformance, momentCounts, momentsOwingAQuestion } from "../moment-ledger";
+import { UnknownMomentError, momentConformance, momentsOwingAQuestion } from "../moment-ledger";
 
 const dirs: string[] = [];
 const ports: StoragePort[] = [];
@@ -335,49 +335,5 @@ describe("the signal that tells the agent it owes a question", () => {
     }
     // Announcing once is safe precisely BECAUSE ignoring it is mechanically detectable.
     expect(momentConformance(db, path, "acme-widgets").notAsked).toBe(1);
-  });
-});
-
-/**
- * THE MOMENT COUNTERS. `fires`, `silences` and `delivered` were removed on 2026-08-22 with the
- * matcher that wrote the columns behind them, so the two cases that asserted their VALUES are gone
- * with their subject (see `MomentCounts`' own comment for why a structurally-fixed zero is worse
- * than reporting nothing). The fixture and the property underneath them are kept here, because the
- * property is the one that must not regress whatever gets counted next.
- *
- * THE SPLIT IS ON WHETHER ANYTHING EVALUATED THE MOMENT, never on the disposition word. `ungoverned`
- * is scoped to `rule_ids IS NULL` — nothing looked — and an evaluated moment must stay out of it,
- * whether that evaluation bound a rule or deliberately bound none. Widening `ungoverned` to "every
- * moment", now that the evaluated population happens to be empty in anything this build writes,
- * would silently redefine it into `total` and lose exactly this distinction the day a spool with
- * real evaluations is folded — which is not hypothetical: the spool is home-level and shared, and a
- * fresh store folds every line already on disk.
- */
-describe("what is known about a moment, counted", () => {
-  it("keeps 'nothing evaluated this' apart from 'something evaluated this', across all four record shapes", () => {
-    const path = join(mkTmp(), "moments.jsonl");
-    const db = mkDb();
-    seq = 0;
-    const moment = (id: string, ruleIds: string[] | null, disposition: string, delivered: string[] | null): void => {
-      line(path, {
-        kind: "interception", momentId: id, at: "2026-08-19T00:00:00.000Z", toolUseId: null, circle: "acme-widgets",
-        sessionId: null, surface: "Bash", actionSha256: "a".repeat(64), actionRendering: "x",
-        actionChars: 1, actionClipped: false, stageId: null, ruleIds, disposition,
-        deliveredRuleIds: delivered,
-      });
-    };
-    moment("fired", ["rule-a"], "advised", []); // bound, but no identity sent
-    moment("blocked", ["rule-b"], "blocked", ["rule-b"]); // bound, identity sent
-    moment("quiet", [], "silent", []); // looked, bound nothing — a VALUE, not an absence
-    moment("store-call", null, "ungoverned", null); // no gate evaluates a call into the store
-
-    const counts = momentCounts(db, path, "acme-widgets");
-    expect(counts).toEqual({ ungoverned: 1, total: 4, unopened: 0, unattributed: 0 });
-    // ONLY the store call. The three evaluated moments — including the silent one — stay out:
-    // counting `quiet` as ungoverned would say "nothing looked at this" about a moment where
-    // something looked and bound nothing, and counting `fired`/`blocked` there would be absurd.
-    // This is also why `ungoverned` and `total` are NOT the same number, however equal they happen
-    // to be on a store holding only what this build writes.
-    expect(counts.ungoverned).not.toBe(counts.total);
   });
 });

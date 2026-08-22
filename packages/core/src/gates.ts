@@ -342,25 +342,24 @@ export function createGateTables(db: StoragePort): void {
 }
 
 /**
- * PHASE (c): every gate-substrate migration that is NOT table creation — the `gate_events.matcher`
- * column guard, the `rule_bindings.circle` column guard, its backfill, and the circle index, in
- * that order (review fix — Codex round 3, item 1; split out of createGateSchema, which used to run
- * all of this immediately after its own `db.exec(GATE_SCHEMA_SQL)`). Requires every gate table to
- * already exist — `createGateTables` must run first, in every caller — and, for the backfill to
- * land the CURRENT circle rather than `*`, requires `migrateLegacyStarCircle()` (engine.ts, phase
- * (b)) to already have run: the ordering invariant this whole round-3 split exists to enforce is
- * (a) tables → (b) legacy-star move → (c) this function, and every one of the three remains
- * independently idempotent and race-safe (see each guard's own comment) regardless of which
- * concurrent migrator gets there first.
+ * PHASE (c): every gate-substrate migration that is NOT table creation — the `rule_bindings.circle`
+ * column guard, its backfill, and the circle index, in that order (review fix — Codex round 3,
+ * item 1; split out of createGateSchema, which used to run all of this immediately after its own
+ * `db.exec(GATE_SCHEMA_SQL)`). Requires every gate table to already exist — `createGateTables` must
+ * run first, in every caller — and, for the backfill to land the CURRENT circle rather than `*`,
+ * requires `migrateLegacyStarCircle()` (engine.ts, phase (b)) to already have run: the ordering
+ * invariant this whole round-3 split exists to enforce is (a) tables → (b) legacy-star move →
+ * (c) this function, and every one of the three remains independently idempotent and race-safe
+ * (see each guard's own comment) regardless of which concurrent migrator gets there first.
  */
 export function migrateGateColumns(db: StoragePort): void {
-  // SAME GUARD, for breadth (slice 4b-B follow-up): a store created before breadth shipped has a
-  // rule_bindings table with no `circle` column at all. UNLIKE `matcher`, there is no single
-  // constant default — the correct value is "whichever circle this binding's own concept already
-  // lives in", which is a per-row lookup, not a column DEFAULT. So the column is added nullable
-  // (the CREATE TABLE above declares it the same way, for a fresh install), and the backfill just
-  // below fills every pre-existing row from its concept — safe to run unconditionally, since
-  // `WHERE circle IS NULL` makes every call after the first a no-op scan.
+  // THE COLUMN GUARD, for breadth (slice 4b-B follow-up): a store created before breadth shipped
+  // has a rule_bindings table with no `circle` column at all. No constant would fix it — the
+  // correct value is "whichever circle this binding's own concept already lives in", which is a
+  // per-row lookup, not a column DEFAULT. So the column is added nullable (the CREATE TABLE above
+  // declares it the same way, for a fresh install), and the backfill just below fills every
+  // pre-existing row from its concept — safe to run unconditionally, since `WHERE circle IS NULL`
+  // makes every call after the first a no-op scan.
   const ruleBindingCols = db.prepare(`PRAGMA table_info(rule_bindings)`).all() as Array<{ name: string }>;
   if (!ruleBindingCols.some((c) => c.name === "circle")) {
     try {
@@ -384,11 +383,11 @@ export function migrateGateColumns(db: StoragePort): void {
   // same tolerance the rest of this module already has for that case.
   //
   // GUARDED ON `concepts` EXISTING: this module's own header says it "owns every statement against
-  // stages/rule_bindings/gate_events" — deliberately NOT concepts, which lives in engine.ts's own
-  // schema — and createGateSchema is called standalone, against a bare rule_bindings/stages/
-  // gate_events fixture with no concepts table at all, by this file's own concurrent-migrator race
-  // tests. A backfill that assumed concepts always exists would turn a legitimate standalone call
-  // into a crash rather than the harmless no-op it should be when there is nothing yet to backfill.
+  // `stages` and `rule_bindings`" — deliberately NOT concepts, which lives in engine.ts's own
+  // schema — and `createGateSchema` is exported (index.ts), so a caller can legitimately hold a
+  // store carrying the gate tables and no concepts table at all. A backfill that assumed concepts
+  // always exists would turn such a call into a crash rather than the harmless no-op it should be
+  // when there is nothing yet to backfill.
   // ════════════════════════════════════════════════════════════════════════════════════════════
   // THE MIXED-BUILD COMPATIBILITY TRIGGER FAMILY WAS REMOVED HERE (2026-08-22) — this is the plain
   // record the banner that stood here demanded of whoever took its retreat.
@@ -423,7 +422,7 @@ export function migrateGateColumns(db: StoragePort): void {
     // HERE in round 1, item 4). Round 1's version moved only `concepts.circle` — this gates-layer
     // position cannot reach the OTHER circle-scoped tables (observations, memory_edge, entities,
     // first_block, lifecycle_edges/ratifications: this module's own header says it owns
-    // "stages/rule_bindings/gate_events" alone) without either duplicating renameCircle's full table
+    // `stages` and `rule_bindings` alone) without either duplicating renameCircle's full table
     // list a second time or reaching across the module boundary into engine.ts's private methods.
     // The honest seam is MonetCore's own construction: `migrateLegacyStarCircle()` (engine.ts) now
     // runs inside `init()`, immediately before `createGateSchema(this.db)` is called — so the
@@ -2573,8 +2572,10 @@ export function stageLookup(db: StoragePort, opts: StageLookupOptions): StageLoo
  * `byStageRead`), all read from a `gate_events` row per intercepted action. That table is gone: a
  * verdict row could not name the rules that fired, could not be joined back to the act that
  * prompted it, and could not record an interception that declined to evaluate at all. The governed
- * moment replaced it, and the rates are derived there now (`momentCounts`), with the read dimension
- * answered by `momentStageReads` against this registry.
+ * moment replaced it, and the rates did NOT survive the move: `momentCounts` reports populations
+ * only. Every rate came off on 2026-08-22 once nothing wrote the columns behind them, `overflows`'
+ * successor `ungoverned` with them for restating `total` (see `MomentCounts`). The read dimension
+ * is answered by `momentStageReads` against this registry.
  *
  * WHAT REMAINS IS EVERYTHING THAT READS `stages` AND `rule_bindings` — facts about what is
  * DECLARED, not about what happened. Those never depended on the event table and are unchanged.
