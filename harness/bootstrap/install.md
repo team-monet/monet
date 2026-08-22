@@ -195,7 +195,7 @@ Ask of each thing in their standing file, in this order. **Is it binding?** If y
 **Before that, drop what is not knowledge at all.** Standing files accumulate parked state — a current task, a sprint note, an open question someone left mid-thought. It is not binding, so the sort would file it as a fact and Monet would carry it forever as if it were durable. Ask instead of guessing: *"this reads like something you were in the middle of, not something you want remembered — leave it in the file, or is it done?"* Their answer decides; what it must not do is become a fact by default.
 
 - **Principles** are few and always present. They are what a good agent re-derives the rest from. They cost residency forever, so they are the one species reviewed in full text, one at a time.
-- **Rules** bind to a moment and arrive when that moment comes — a command about to run, a delegation, a plan, a failure. A rule at its gate is nearly free; the same rule always-on is the thing that ruins standing files.
+- **Rules** bind to a moment — a command about to run, a delegation, a plan, a failure — and the agent fetches them when it comes. A rule fetched at its moment is nearly free; the same rule always-on is the thing that ruins standing files.
 - **Facts** are found when needed. Bulk-reviewed, low ceremony.
 
 Most of what is in a bloated standing file is a rule that has been paying always-on rent. Saying that out loud is usually the moment the user gets it.
@@ -209,12 +209,12 @@ entrances, and they are not interchangeable:
   with `species: "principle"` — never on your own initiative, always on their explicit yes, because
   entering the skeleton is agreeing to a permanent per-request cost.
 - **A rule** binds to the moment that triggers it. `memory_declare` with `species: "rule"` and the
-  `stage` it fires at — again user-authorized, and the only entrance that can make a rule
-  **blocking**. Reserve blocking for lines where softness is dangerous, and it needs the
-  prevented-failure reason in their words, not yours.
+  `stage` it belongs to — again user-authorized, and the only entrance that can make a rule
+  **blocking**, the one severity an agent may not depart from. Reserve blocking for lines where
+  softness is dangerous, and it needs the prevented-failure reason in their words, not yours.
   **Carry the path scope into the norm's own text — for a principle exactly as much as for a rule.** A nested `AGENTS.md`, a Copilot `applyTo`, a
   Cursor glob — the file said *where* the line applies, and a stage says only *when*. Declaring the
-  trigger alone widens a rule that was scoped to one subtree into one that fires across the repo. Put
+  trigger alone widens a rule that was scoped to one subtree into one that applies across the repo. Put
   the scope in the rule itself ("in `packages/api/**`, …") so it survives the move, and say so while
   sorting: the user chose that scope once and should not lose it silently.
 - **A fact** is an ordinary `memory_store` — with `sourceRefs` naming the exact line or section it
@@ -228,16 +228,16 @@ protects is the rule; the steps are an artifact the host loads on demand (a skil
 Sort the constraint to its stage with a pointer, and leave the steps where they execute — unless
 they execute from the standing file itself: then write them into a concrete on-demand artifact
 first and confirm it reads back, because the shrink below removes the file's copy, and a rule
-pointing at an artifact that was never created fires into nothing.
+pointing at an artifact that was never created leads nowhere.
 
-**Ratify each principle AND each rule before the file shrinks.** `memory_declare` places it; `memory_ratify` records the verdict and how it was reached — `entrance: "declaration"` when the user's word settled it, `entrance: "extraction"` with the four gates answered when the battery did. That distinction is the point of the whole exercise: once the always-on file is gone, the record of WHY a line governs is the only thing left that can be argued with. Declared and unratified, a norm still fires and nobody can say what admitted it — and that is as true of a staged rule, whose original line the shrink is about to remove, as of a principle.
+**Ratify each principle AND each rule before the file shrinks.** `memory_declare` places it; `memory_ratify` records the verdict and how it was reached — `entrance: "declaration"` when the user's word settled it, `entrance: "extraction"` with the four gates answered when the battery did. That distinction is the point of the whole exercise: once the always-on file is gone, the record of WHY a line governs is the only thing left that can be argued with. Declared and unratified, a norm still governs and nobody can say what admitted it — and that is as true of a staged rule, whose original line the shrink is about to remove, as of a principle.
 
 **And the entrance the sort will need most, which is not the sort at all:** later, in real work,
 they will correct you — and that correction *is* a rule being born, at the moment its evidence
 exists. `memory_store` with `kind: "rule"` captures it on the spot: the `stage` it belongs to, the
 `instance` that just went wrong, and the `reason` naming the failure it prevents. Rules captured
 this way are **advisory**; only their declaration can make one blocking, which is the right
-asymmetry — an agent may notice a rule, but only the user may hand one teeth.
+asymmetry — an agent may notice a rule, but only the user may make one the agent cannot depart from.
 
 Tell them this once, during the sort, because it is the part that makes Monet keep working after
 onboarding ends: the file they just dissolved was static, and this is not.
@@ -254,7 +254,7 @@ Lead with the mirror. When the sort is drafted, show them the short list first: 
 
 ### Then shrink the file
 
-The payoff is visible or it didn't happen. Once the sort is ratified, rewrite their standing file down to a bootstrap line plus the principles Monet now materializes into it. Show them the diff. A file that went from hundreds of lines to a handful, with nothing lost — the rules still fire, at their moments — is the whole argument for Monet in one screen.
+The payoff is visible or it didn't happen. Once the sort is ratified, rewrite their standing file down to a bootstrap line plus the principles Monet now materializes into it. Show them the diff. A file that went from hundreds of lines to a handful, with nothing lost — the rules still reach you, at their moments — is the whole argument for Monet in one screen.
 
 **Read back every fact before removing its line.** A `memory_store` can fail, and it can return `ambiguous` — which the consolidation playbook already treats as too uncertain to retire a source on. Shrinking on the strength of the call having been *made* removes a live instruction whose replacement may not be fetchable, and the only way back is the backup. Fetch or search each stored fact, confirm it comes back, and leave any line that does not in the file — then say which ones stayed and why.
 
@@ -306,8 +306,7 @@ and the record should say so:
 - **Rule at "fix a bug" (advisory)** — *Name the cause before shipping the fix.* Reason:
   prevents symptom patches that return.
 - **Rule at "commit changes" (advisory)** — *If a secret, key, or token is about to enter a
-  file or commit, stop and say so.* Reason: prevents credential leakage into history —
-  advisory, not blocking, because conditional text cannot carry a hard deny.
+  file or commit, stop and say so.* Reason: prevents credential leakage into history.
 
 A fresh store has no stages; declaring the first rule at a moment brings its stage with it.
 Principles need a delivery surface. Where the host reads a standing file, register it first —
@@ -338,11 +337,11 @@ own words.
 
 If it is missing — they skipped the ask, the sort was deferred, they took only staged rules from
 the pack, or something didn't come back — narrate what *is* there. An empty-on-purpose skeleton
-with armed stages is a success state, not a miss: name an approved rule and the moment it fires
-instead of forcing a principle. Say so plainly if the store is still near-empty ("this grows as
-we work"). A real miss you can fix beats a faked memory, and this is the first moment the install
-pays off; don't let it read as a status line. Something like: *"Four lines govern me now — [one of
-them], from your own file."* Then continue as Stig.
+with rules on their stages is a success state, not a miss: name an approved rule and the moment you
+would look it up instead of forcing a principle. Say so plainly if the store is still near-empty
+("this grows as we work"). A real miss you can fix beats a faked memory, and this is the first
+moment the install pays off; don't let it read as a status line. Something like: *"Four lines
+govern me now — [one of them], from your own file."* Then continue as Stig.
 
 (No restart available or practical in this host? Skip the reload framing and run the same `agent_context` call and narration in-band, right now — the demonstration is about what comes back, not about proving a fresh process. Source the narration strictly from what the tool call actually returns, not from what's already in this conversation; a real miss you can fix beats a convincing fake.)
 
@@ -363,7 +362,7 @@ Confirm both halves before wrapping up:
 1. **Memory reaches the lead agent.** Stig (the main agent) should be able to call Monet tools — a quick `agent_context` or `memory_search` that returns confirms the wiring. If those calls fail or time out, the server may be unregistered *or* registered-but-not-starting (missing `monet` binary, PATH/env, a crash, or a startup timeout) — check the host's MCP status/logs and the server's startup, not just the config entry.
 2. **Workers launch and run on their own.** Confirm each worker sub-agent still starts and completes a task — a worker that silently fails to start usually means its config got mangled during install (see Host notes). Workers don't use Monet — on hosts that support a per-subagent tool denylist (Claude Code: `disallowedTools: mcp__monet`), this is enforced at config level for every worker whose roster entry lacks `touchesMonet: true`; on hosts without a denylist mechanism, it is a behavioral guarantee (role prompts never call memory tools). On Codex, workers inherit the parent's Monet server and can see its tools but don't use them — this is expected and cannot be prevented at config level (see Host notes). (Lead-only installs: skip the worker check — instead verify the Stig block with its `with-monet:mode` marker is present at the persona surface, and after the reload confirm the session actually opens as Stig: it should identify as Stig and reach for `agent_context`, not behave as the host's default persona. A passing Monet check alone doesn't prove the persona loaded.)
 3. **Git/GitHub operations require explicit authorization.** Verify that the installed Stig's persona still requires the user's explicit go-ahead — per action or as a durable standing instruction — before commit, push, opening or replying to a PR, or merging. Without that, Stig prepares the change and hands over the exact command rather than performing the state-changing action. This invariant must survive every upgrade.
-4. **The installed block still carries its invariants.** Read the installed Stig block back and confirm the pieces an update must never lose — named here, with their canonical wording in `agents/stig.md`: the `agent_context`-at-session-start restore and the `memory_store` write discipline ("# Memory"); the skeleton offer with its never-declare-without-asking and ratify-what-admitted-it steps ("# Memory"); **the `stage_lookup`-before-acting clause** ("# Memory") — an update that drops it leaves a Stig that never consults staged rules, and Phase 5 has by then moved standing instructions into exactly those, so they stop firing with nothing to show it; the `with-monet:mode` marker; the git/GitHub authorization boundary ("# Boundaries"); and the voice rule ("# Voice"). On a `lead-only` install, confirm the lead-only line is present and that Stig does the work itself rather than looking for workers.
+4. **The installed block still carries its invariants.** Read the installed Stig block back and confirm the pieces an update must never lose — named here, with their canonical wording in `agents/stig.md`: the `agent_context`-at-session-start restore and the `memory_store` write discipline ("# Memory"); the skeleton offer with its never-declare-without-asking and ratify-what-admitted-it steps ("# Memory"); **the `stage_lookup`-before-acting clause** ("# Memory") — an update that drops it leaves a Stig that never consults staged rules, and Phase 5 has by then moved standing instructions into exactly those — nothing else delivers them, so they stop governing with nothing to show it; the `with-monet:mode` marker; the git/GitHub authorization boundary ("# Boundaries"); and the voice rule ("# Voice"). On a `lead-only` install, confirm the lead-only line is present and that Stig does the work itself rather than looking for workers.
 
 ### Host notes
 
