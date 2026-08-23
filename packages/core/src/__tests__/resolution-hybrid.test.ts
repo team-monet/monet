@@ -32,6 +32,7 @@ import { describe, it, expect } from "vitest";
 import { AmbiguousNominationError, MonetCore } from "../engine";
 import { HashingEmbeddingProvider, cosine, jsonToEmb } from "../embedding";
 import { scoreNativeConceptsByObservation } from "../retrieval";
+import { LEXICAL_COVERAGE_MIN, lexicalCoverage } from "../lexical-overlap";
 import { resolveIncoming, type ResolutionThresholds } from "../resolution";
 import { lexicalTokens } from "../lexical-overlap";
 import { NON_LATIN_LETTER_TOLERANCE, nonLatinLetterShare } from "../script-gate";
@@ -1182,6 +1183,36 @@ describe("the margin gate declines to fire", () => {
       await seedConcept(core, [A]);
       await seedConcept(core, [A + " on weekdays"]);
       expect(armContributed(core, PROBE)).toBe(false); // premise: English, yet silent
+      const before = rows(core);
+      const r = await core.store(PROBE, { circle: CIRCLE });
+      expect(["attached", "created", "ambiguous"]).toContain(r.action);
+      expect(rows(core)).toBe(before + 1);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("nor when a shared ASCII token is the ONLY thing the arm can read", async () => {
+    // Movement alone re-admits the case it was meant to close (Codex P1, round 7): a mostly-Korean
+    // probe sharing one identifier with its candidates gets a positive IDF boost, so `rank !== score`
+    // goes true while the Korean carries no lexical signal at all. Coverage and movement are
+    // independent necessary conditions, and the second arriving was not a reason to drop the first.
+    const core = armedCore(5);
+    try {
+      // `api` must sit in exactly ONE concept or tokenIdf clamps it: at N=3 a term in two or three
+      // concepts weighs log(3/3) or less, which is zero after the clamp.
+      const A = "API 페리는 매시 십오분에 섬으로 출발한다";
+      const B = "페리는 주말에 매시 십오분에 출발한다";
+      const C = "트램은 항구에서 다른 시간표로 운행한다";
+      const PROBE = "API 페리는 매시 십오분에 섬으로";
+      await seedConcept(core, [A]);
+      await seedConcept(core, [B]);
+      await seedConcept(core, [C]); // three concepts, so tokenIdf does not clamp to zero
+      // PREMISE: the arm DOES move a rank here — movement alone would call this comparable...
+      expect(armContributed(core, PROBE)).toBe(true);
+      // ...while the tokenizer reads almost none of it.
+      expect(lexicalCoverage(PROBE)).toBeLessThan(LEXICAL_COVERAGE_MIN);
+
       const before = rows(core);
       const r = await core.store(PROBE, { circle: CIRCLE });
       expect(["attached", "created", "ambiguous"]).toContain(r.action);

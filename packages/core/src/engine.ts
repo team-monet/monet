@@ -64,7 +64,7 @@ import {
 export type { ResolutionMode } from "./resolution";
 import { RELIABLE_EMBED_TOKENS, reliableSegmentTokensOf } from "./embed-budget";
 import { segmentObservation, segmentTokenBudget } from "./observation-segmenter";
-import { lexicalTokens } from "./lexical-overlap";
+import { LEXICAL_COVERAGE_MIN, lexicalCoverage, lexicalTokens } from "./lexical-overlap";
 import {
   inspectLiveEmbeddingPopulations,
   parseFiniteEmbeddingJson,
@@ -4547,9 +4547,16 @@ export class MonetCore {
             // So the margin is re-derived over legal landings only. If nothing legal is left behind
             // the winner there is exactly one destination, which is not an ambiguous choice at all —
             // and the write proceeds instead of spending a round-trip to say so.
-            const legal = rankedCandidates.filter(
-              (c) => c.conceptId === landed.id || this.isLegalLanding(opts, this.getRow(c.conceptId)!),
-            );
+            // FROM THE ROWS ALREADY IN HAND (Codex P2, round 7). `candidates` was loaded by the
+            // scan above; re-fetching each one made the ask — now roughly half of all stores — an
+            // N+1 pass of synchronous SQLite reads on top of a full observation scan, purely to
+            // refuse a write.
+            const byId = new Map(candidates.map((c) => [c.id, c]));
+            const legal = rankedCandidates.filter((c) => {
+              if (c.conceptId === landed.id) return true;
+              const row = byId.get(c.conceptId);
+              return row !== undefined && this.isLegalLanding(opts, row);
+            });
             const winnerRank = legal.find((c) => c.conceptId === landed.id)?.rank;
             const runnerUpRank = legal.find((c) => c.conceptId !== landed.id)?.rank;
             const legalMargin = winnerRank !== undefined && runnerUpRank !== undefined
@@ -15797,9 +15804,23 @@ export class MonetCore {
       })
       .sort((a, b) => (b.rank - a.rank) || (a.conceptId < b.conceptId ? -1 : 1));
 
+    // TWO INDEPENDENT NECESSARY CONDITIONS, and the mistake worth recording is that the second one
+    // arriving looked like a reason to drop the first (Codex P1, round 7). They answer different
+    // questions and neither implies the other:
+    //
+    //   CAN THE ARM READ THIS TEXT — a mostly-CJK probe sharing one ASCII token with a candidate
+    //   gets a positive IDF boost, so `rank !== score` goes true while the Korean carries no lexical
+    //   signal at all. Movement alone re-admits exactly the mixed-script case it was meant to close.
+    //
+    //   DID THE ARM SEPARATE ANYTHING HERE — in a two-concept circle `tokenIdf(2, df)` clamps every
+    //   weight to zero, so perfectly English text still ranks on raw cosine. Coverage alone cannot
+    //   see that, because it never looks at the circle.
+    //
+    // tauMargin was derived where both held. Requiring both is what keeps it applied only there.
     const armOn = this.embedder.needsLexicalArm === true;
     const armMoved = (c: RankedCandidate | undefined): boolean => c !== undefined && c.rank !== c.score;
-    const marginIsComparable = !armOn || armMoved(ranked[0]) || armMoved(ranked[1]);
+    const marginIsComparable = !armOn
+      || (lexicalCoverage(text) >= LEXICAL_COVERAGE_MIN && (armMoved(ranked[0]) || armMoved(ranked[1])));
     if (best !== null && runnerUpRank > -Infinity && marginIsComparable) best.margin = bestRank - runnerUpRank;
     return { nomination: best, ranked };
   }

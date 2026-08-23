@@ -67,7 +67,7 @@
  *      large one would mean the confirm band is cutting into ordinary consolidation and tauAmbiguous
  *      is the wrong number for this job.
  */
-import { MonetCore } from "../src/engine";
+import { AmbiguousNominationError, MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider, cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
 import { resolveIncoming, type ResolutionMode, type ResolutionNomination } from "../src/resolution";
 import { STARTER_SUITE, BACKGROUND, type Seed } from "../src/eval/scenarios";
@@ -181,6 +181,7 @@ async function measure(
     const centroidScores: number[] = [];
     const oldDecision = { attached: 0, ambiguous: 0, created: 0 };
     const newModes = new Map<ResolutionMode, number>();
+    let asks = 0;
     let blurAttractor = 0;
     let blurEdge = 0;
     let forkSignal = 0;
@@ -218,7 +219,27 @@ async function measure(
       });
       newModes.set(decision.mode, (newModes.get(decision.mode) ?? 0) + 1);
 
-      await core.store(item.content, { circle: CIRCLE, kind: item.kind });
+      // THE STREAM MUST NOT STOP ON AN ASK (Codex P1, PR #87 round 7). `tauMargin` on the shipping
+      // profile means the real store can now refuse an ambiguous write, while the local `nominate()`
+      // above never computes a margin and so `resolveIncoming` here can never report one. Left
+      // unhandled, the first ambiguous probe aborted the entire replay; recorded as an attach, the
+      // run would claim a decision production refuses.
+      //
+      // So the ask is counted as its own outcome and the stream continues by naming the concept the
+      // engine itself nominated — which is what a caller would do, and keeps the corpus growing the
+      // way the rest of this measurement assumes. The count is reported beside the modes rather than
+      // folded into them: an ask is not a resolution, and hiding it inside one would restate the
+      // conflation this script exists to expose.
+      try {
+        await core.store(item.content, { circle: CIRCLE, kind: item.kind });
+      } catch (e) {
+        if (!(e instanceof AmbiguousNominationError)) throw e;
+        asks++;
+        const chosen = e.candidates[0]?.conceptId;
+        await core.store(item.content, chosen === undefined
+          ? { circle: CIRCLE, kind: item.kind, resolution: "forceNew" }
+          : { circle: CIRCLE, kind: item.kind, attachTo: chosen });
+      }
     }
 
     // Member confirmation: every live observation against its OWN concept's centroid.
@@ -247,6 +268,9 @@ async function measure(
     console.log(`\n2. DECISION MIX on identical inputs`);
     console.log(`   OLD (centroid only)  attached=${oldDecision.attached}  ambiguous=${oldDecision.ambiguous}  created=${oldDecision.created}`);
     console.log(`   NEW (hybrid)         ${[...newModes].sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m}=${n}`).join("  ")}`);
+    // BESIDE the modes, never inside one: an ask is not a resolution, and folding it into "attach"
+    // would restate the conflation this script exists to expose.
+    console.log(`   ASKS (refused, then answered by naming the engine's own top candidate)  ${asks}`);
     console.log(`\n3. DEFECT CLASSES on real inputs`);
     console.log(`   blur attractor  (old ABSORBED with no observation-level support):         ${blurAttractor}`);
     console.log(`     ^ now mode "blur-duplicate": created and PAIRED, never absorbed`);

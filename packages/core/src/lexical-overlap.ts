@@ -49,6 +49,36 @@ const TOKEN = /[a-z0-9][a-z0-9_-]{2,}/gu;
  * branch reached for an adjacent quantity, which is why the measure now lives beside the regex it
  * measures rather than being borrowed from a module that documents its own unsuitability.
  */
+/**
+ * Below this share of a text readable by TOKEN, a rank gap is not the quantity a lexically-blended
+ * threshold was calibrated against, and any such threshold must stand down (see tauMargin).
+ *
+ * MEASURED, NOT PICKED. On the corpus tauMargin was derived from (monet-hq, n=1011 live
+ * observations) coverage runs min 0.845, p01 0.902, p05 0.920, p50 0.955 — so every observation that
+ * produced the threshold clears this bar with room. The cases it has to exclude sit far below:
+ * Korean scores 0.000, Korean carrying an ASCII identifier 0.200, and accented French 0.571. The
+ * band between 0.571 and 0.845 is empty on both sides, and this sits inside it.
+ *
+ * That emptiness is why the value is a floor rather than a tuned point: anywhere in that band admits
+ * 100% of the derivation population and refuses all three contrast cases, so nothing here is being
+ * traded off. Re-measure it on any corpus this threshold is re-derived against.
+ */
+export const LEXICAL_COVERAGE_MIN = 0.8;
+
+export function lexicalCoverage(text: string): number {
+  const lower = text.toLowerCase();
+  const alnum = lower.match(/[\p{L}\p{N}]/gu);
+  if (alnum === null || alnum.length === 0) return 1; // nothing to read: vacuously comparable
+  // COUNTED THE SAME WAY ON BOTH SIDES (Codex P2, PR #87 round 5). `m[0].length` includes the `-`
+  // and `_` a token may carry, while the denominator counts letters and digits only — so a token
+  // like `api____________________` reported more covered characters than it has readable ones and
+  // could push a mostly-CJK probe to full coverage on three ASCII letters. The numerator now counts
+  // what the denominator counts.
+  let covered = 0;
+  for (const m of lower.matchAll(TOKEN)) covered += (m[0].match(/[\p{L}\p{N}]/gu) ?? []).length;
+  return Math.min(1, covered / alnum.length);
+}
+
 /** The token set of one text. A SET, not a bag: this measures whether a term is shared, not how
  *  often it is repeated, so a long observation cannot outscore a short one by restating itself. */
 export function lexicalTokens(text: string): Set<string> {
