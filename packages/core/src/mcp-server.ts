@@ -1296,10 +1296,18 @@ export function registerMonetCoreTools(
               title: c.title,
               score: Number(c.score.toFixed(3)),
             })),
+            // NOT AN EXHAUSTIVE SET, and the instruction must not pretend otherwise (Codex P1,
+            // round 6). These are the closest legal landings, capped at three, and the true home is
+            // among the top three for about 80% of asks — so "none of these" is not the same claim as
+            // "this is new". Telling the caller to reach for forceNew on that basis sends the other
+            // 20% down the one branch that records no link at all, which is how an unlinked twin of an
+            // existing concept gets created by following the instructions exactly.
             instruction:
-              'Re-send this exact content with attachTo set to one of the conceptIds above, or ' +
-              'resolution="forceNew" if it belongs to none of them. forceNew records no link to ' +
-              'these candidates, so prefer attachTo when unsure.',
+              'Re-send this exact content with attachTo set to one of the conceptIds above. These are ' +
+              'the three closest matches, not every concept — if none looks right, memory_search for ' +
+              'the right one and pass its id to attachTo instead. Use resolution="forceNew" only to ' +
+              'assert this is genuinely new: it records no link to anything, so an unlinked duplicate ' +
+              'is invisible to curation afterwards.',
           }, null, 2));
         }
         return err(`store failed: ${msg(e)}`);

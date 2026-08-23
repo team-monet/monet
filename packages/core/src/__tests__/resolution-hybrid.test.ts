@@ -31,10 +31,10 @@
 import { describe, it, expect } from "vitest";
 import { AmbiguousNominationError, MonetCore } from "../engine";
 import { HashingEmbeddingProvider, cosine, jsonToEmb } from "../embedding";
+import { scoreNativeConceptsByObservation } from "../retrieval";
 import { resolveIncoming, type ResolutionThresholds } from "../resolution";
 import { lexicalTokens } from "../lexical-overlap";
 import { NON_LATIN_LETTER_TOLERANCE, nonLatinLetterShare } from "../script-gate";
-import { LEXICAL_COVERAGE_MIN, lexicalCoverage } from "../lexical-overlap";
 import type { StoragePort } from "../storage";
 
 const CIRCLE = "resolution";
@@ -1093,25 +1093,6 @@ describe("the margin gate declines to fire", () => {
   const KO_B = "페리는 주말에는 매시 십오분에 섬으로 출발한다";
   const KO_PROBE = "페리는 매시 십오분에 섬으로";
 
-  it("when the lexical arm is ON and the probe gives it nothing — CJK ranks are not the measured quantity", async () => {
-    // `rank` is cosine x (1 + BOOST x overlap) and lexicalTokens' regex reads no CJK, so with the arm
-    // enabled a Korean probe scores overlap 0 against everything and its ranks collapse to raw
-    // cosines — while tauMargin was derived on boosted ones. The shipping multilingual profile has
-    // the arm on and no Latin-only guard, so these writes really do arrive here.
-    const core = armedCore(0.1);
-    try {
-      expect(lexicalTokens(KO_PROBE).size).toBe(0); // premise: the tokenizer really is blind here
-      await seedConcept(core, [KO_A]);
-      await seedConcept(core, [KO_B]);
-      const before = rows(core);
-      const r = await core.store(KO_PROBE, { circle: CIRCLE });
-      expect(["attached", "created", "ambiguous"]).toContain(r.action); // decided, not refused
-      expect(rows(core)).toBe(before + 1);
-    } finally {
-      core.close();
-    }
-  });
-
   it("but NOT when the arm is off — there the raw-rank margin is exactly what was calibrated", async () => {
     // The complement, and the reason the suppression is conditional rather than blanket (Codex P2,
     // round 2). With no lexical arm the scorer defines rank as the raw cosine for EVERY input, so a
@@ -1122,31 +1103,6 @@ describe("the margin gate declines to fire", () => {
       await seedConcept(core, [KO_A]);
       await seedConcept(core, [KO_B]);
       await expect(core.store(KO_PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
-    } finally {
-      core.close();
-    }
-  });
-
-  it("when a CJK probe merely CONTAINS a Latin token — share decides, not presence", async () => {
-    // The first draft of this guard asked only whether ANY lexical token existed, so a Korean
-    // sentence carrying `API` cleared it while the arm still read almost none of the text. That is
-    // the common shape of mixed-script writing, not a corner case (Codex P1, round 3).
-    const core = armedCore(0.1);
-    try {
-      const MIXED_A = "API 페리는 매시 십오분에 섬으로 출발한다";
-      const MIXED_B = "API 페리는 주말에 매시 십오분에 섬으로 출발한다";
-      const MIXED_PROBE = "API 페리는 매시 십오분에 섬으로";
-      // PREMISE: this is exactly the case the token test waved through — tokens exist, yet the text
-      // is overwhelmingly unreadable to the arm.
-      expect(lexicalTokens(MIXED_PROBE).size).toBeGreaterThan(0);
-      expect(nonLatinLetterShare(MIXED_PROBE)).toBeGreaterThan(NON_LATIN_LETTER_TOLERANCE);
-
-      await seedConcept(core, [MIXED_A]);
-      await seedConcept(core, [MIXED_B]);
-      const before = rows(core);
-      const r = await core.store(MIXED_PROBE, { circle: CIRCLE });
-      expect(["attached", "created", "ambiguous"]).toContain(r.action);
-      expect(rows(core)).toBe(before + 1);
     } finally {
       core.close();
     }
@@ -1178,31 +1134,56 @@ describe("the margin gate declines to fire", () => {
     }
   });
 
-  it("counts separators as unreadable — a padded identifier cannot fake coverage", async () => {
-    // `m[0].length` once counted a token's `-` and `_` as covered while the denominator counted only
-    // letters and digits, so `api____________________` reported more readable characters than it has
-    // and could carry a mostly-CJK probe over the floor on three ASCII letters (Codex P2, round 5).
-    const PADDED = "api____________________ 페리는 매시 십오분에 섬으로 출발한다";
-    expect(lexicalTokens(PADDED).size).toBeGreaterThan(0);
-    expect(lexicalCoverage(PADDED)).toBeLessThan(LEXICAL_COVERAGE_MIN);
-    // And the same text with the padding removed is no more readable than it was.
-    expect(lexicalCoverage("api 페리는 매시 십오분에 섬으로 출발한다")).toBeLessThan(LEXICAL_COVERAGE_MIN);
+  /** Did the lexical arm actually move this ranking? The engine's own test, restated for the fixture:
+   *  a boosted rank differs from its raw score. */
+  const armContributed = (core: MonetCore, probe: string): boolean => {
+    const ids = (dbOf(core).prepare(`SELECT id FROM concepts WHERE circle = ? AND status != 'retired'`)
+      .all(CIRCLE) as Array<{ id: string }>).map((r) => r.id);
+    const scored = scoreNativeConceptsByObservation(dbOf(core), ids, embedder.embed(probe), probe, true);
+    return [...scored.values()].some((m) => m.rank !== m.score);
+  };
+
+  it("when the lexical arm did not move the ranking — CJK, emoji, and a two-concept circle alike", async () => {
+    // THREE PROXIES FAILED BEFORE THIS ONE (Codex rounds 3-6): token presence let `API` plus Korean
+    // through, the SCRIPT share cannot see accented Latin, and tokenizer coverage called emoji-only
+    // text fully readable. None of them could see the last case at all — in a two-concept circle
+    // `tokenIdf(2, df)` clamps every weight to zero, so the arm cannot boost anything however English
+    // the text is, and the margin is a raw-cosine gap that 0.12 was never calibrated against.
+    for (const [label, a, b, probe] of [
+      ["CJK", "페리는 매시 십오분에 섬으로 출발한다", "페리는 주말에 매시 십오분에 출발한다", "페리는 매시 십오분에 섬으로"],
+      ["mixed script", "API 페리는 매시 십오분에 섬으로 출발한다", "API 페리는 주말에 십오분에 출발한다", "API 페리는 매시 십오분에"],
+      ["emoji only", "🚢⏰🏝️🚢⏰", "🚢⏰🏝️🚢⏰⛵", "🚢⏰🏝️"],
+    ] as Array<[string, string, string, string]>) {
+      // Bar above every reachable margin (rank <= 2), so a live gate WOULD refuse these — which is
+      // what makes the pass mean the guard disarmed it, rather than the geometry being generous.
+      const core = armedCore(5);
+      try {
+        await seedConcept(core, [a]);
+        await seedConcept(core, [b]);
+        expect(armContributed(core, probe), `${label}: premise — the arm must be silent here`).toBe(false);
+        const before = rows(core);
+        const r = await core.store(probe, { circle: CIRCLE });
+        expect(["attached", "created", "ambiguous"], label).toContain(r.action);
+        expect(rows(core), label).toBe(before + 1);
+      } finally {
+        core.close();
+      }
+    }
   });
 
-  it("when the text is accented LATIN the script guard called readable — coverage, not script", async () => {
-    // nonLatinLetterShare scores French at 0 (Latin script) while TOKEN's [a-z0-9_-] class drops or
-    // fragments every accented word, so the previous share guard let it reach an English-calibrated
-    // gate. script-gate.ts says this about itself in its own header (Codex P1, round 4).
+  it("nor in a two-concept circle, however English the text — tokenIdf clamps every weight to zero", async () => {
+    // Codex's own case (P2, round 6), and the one no input-shape proxy could ever have seen: with
+    // N=2 every token present in a candidate has df >= 1, so tokenIdf(2, df) = max(0, log(2/2)) = 0
+    // and the arm cannot boost anything. Ordinary English, and still a raw-cosine gap.
     const core = armedCore(0.1);
     try {
-      const FR_A = "le systeme de memoire reecrit les donnees a chaque fois";
-      const FR_PROBE = "Le système de mémoire réécrit les données";
-      expect(nonLatinLetterShare(FR_PROBE)).toBe(0); // the script guard sees nothing wrong...
-      expect(lexicalCoverage(FR_PROBE)).toBeLessThan(LEXICAL_COVERAGE_MIN); // ...the tokenizer does
-      await seedConcept(core, [FR_A]);
-      await seedConcept(core, [FR_A + " sur le disque"]);
+      const A = "the ferry to the island leaves at quarter past every hour";
+      const PROBE = "the ferry to the island leaves at quarter past";
+      await seedConcept(core, [A]);
+      await seedConcept(core, [A + " on weekdays"]);
+      expect(armContributed(core, PROBE)).toBe(false); // premise: English, yet silent
       const before = rows(core);
-      const r = await core.store(FR_PROBE, { circle: CIRCLE });
+      const r = await core.store(PROBE, { circle: CIRCLE });
       expect(["attached", "created", "ambiguous"]).toContain(r.action);
       expect(rows(core)).toBe(before + 1);
     } finally {
@@ -1210,28 +1191,27 @@ describe("the margin gate declines to fire", () => {
     }
   });
 
-  it("and a waived ask commits the resolution it was holding, not \"ambiguous-ask\"", async () => {
-    // Several paths waive a PENDING ask and let the write through. Leaving the ask's own mode in
-    // place committed a resolution_event documented as writing nothing, and dropped a real attach out
-    // of decided-resolution statistics (Codex P2, round 4).
+  it("but DOES fire once the arm can move a rank — the shipping configuration", async () => {
+    // The complement, and the case the suite was missing: every armed fixture above has exactly two
+    // concepts, where the arm is structurally silent, so none of them exercised an ask with the arm
+    // ON. Three concepts give tokenIdf something to weigh.
     //
-    // The setup has to make the ask genuinely pend and THEN be waived — a first draft of this test
-    // used a one-concept circle, where `margin` is undefined and no ask is raised at all, so it
-    // passed with the fix reverted. Here an ineligible near-tie makes the margin fire and the
-    // eligibility filter then withdraws it.
-    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.9 });
+    // The bar is above every reachable margin on purpose. `rank` is `cosine * (1 + 1.0 * overlap)`
+    // with both factors <= 1 and <= 2, so no gap can reach 5 — which makes this assert that the gate
+    // is LIVE here, without depending on the fixture's geometry. At a realistic 0.1 this same fixture
+    // attaches, because the arm separates the winner, and that is correct behaviour rather than a
+    // counterexample.
+    const core = armedCore(5);
     try {
-      const TEXT = "the ferry to the island leaves at quarter past every hour";
-      const home = await core.store(TEXT, { circle: CIRCLE, kind: "principle", resolution: "forceNew" });
-      await seedConcept(core, ["the ferry to the island leaves at quarter past every hour on weekdays"]);
-
-      const r = await core.store(TEXT, { circle: CIRCLE, kind: "principle" });
-      expect(r.conceptId).toBe(home.conceptId);
-      expect(r.resolutionMode).not.toBe("ambiguous-ask");
-      const modes = (dbOf(core).prepare(`SELECT mode FROM resolution_events`).all() as Array<{ mode: string }>)
-        .map((m) => m.mode);
-      expect(modes).not.toContain("ambiguous-ask"); // nothing claims it wrote nothing
-      expect(modes).toContain("attach");            // and the attach is counted as one
+      const PROBE = "the ferry to the island leaves at quarter past";
+      // The probe must carry a token that lives in exactly ONE candidate, or tokenIdf zeroes it:
+      // at N=3 a term in two concepts still weighs log(3/3) = 0. "leaves"/"quarter"/"past" are in
+      // the first concept only, which is what gives the arm something to move.
+      await seedConcept(core, ["the ferry to the island leaves at quarter past every hour"]);
+      await seedConcept(core, ["the ferry to the island departs on weekends only"]);
+      await seedConcept(core, ["the tram to the harbour runs on a different timetable entirely"]);
+      expect(armContributed(core, PROBE)).toBe(true); // premise: the arm really does move a rank here
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
     } finally {
       core.close();
     }

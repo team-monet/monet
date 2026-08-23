@@ -64,7 +64,7 @@ import {
 export type { ResolutionMode } from "./resolution";
 import { RELIABLE_EMBED_TOKENS, reliableSegmentTokensOf } from "./embed-budget";
 import { segmentObservation, segmentTokenBudget } from "./observation-segmenter";
-import { LEXICAL_COVERAGE_MIN, lexicalCoverage, lexicalTokens } from "./lexical-overlap";
+import { lexicalTokens } from "./lexical-overlap";
 import {
   inspectLiveEmbeddingPopulations,
   parseFiniteEmbeddingJson,
@@ -15770,32 +15770,37 @@ export class MonetCore {
     //     calibrated in that same raw space and stays valid for a tokenless probe. Suppressing there
     //     would silently ignore an explicit override; the mismatch only exists when the arm is
     //     enabled and this particular probe gave it nothing to work with.
-    //     AND IT IS THE TOKENIZER'S OWN COVERAGE (Codex, rounds 3 and 4). Two earlier attempts asked
-    //     neighbouring questions: whether ANY token existed — which a Korean sentence carrying `API`
-    //     clears — and then the SCRIPT share, which `script-gate.ts` says in its own header cannot
-    //     answer this, because French, Vietnamese and Turkish score 0 there while TOKEN's `[a-z0-9_-]`
-    //     class still drops or fragments most of their words. The readable share is a property of the
-    //     regex, so it is measured beside the regex.
-    const armOn = this.embedder.needsLexicalArm === true;
-    const marginIsComparable = !armOn || lexicalCoverage(text) >= LEXICAL_COVERAGE_MIN;
-    if (best !== null && runnerUpRank > -Infinity && marginIsComparable) best.margin = bestRank - runnerUpRank;
-    // The shortlist the caller chooses from, ordered the way the argmax ordered them. THREE, because
-    // the true home is in the top 3 for 80% of asks on the corpus this was measured on (top 5 buys
-    // 86%) and a longer list costs every ask a longer read for a smaller share. A miss here is not a
-    // wrong merge: the caller answers forceNew and the write forks, which is recoverable.
+    //     ASKED DIRECTLY, AFTER THREE PROXIES FAILED (Codex, rounds 3-6). The question is whether the
+    //     lexical arm contributed to THIS ranking, and every attempt to infer that from the input was
+    //     a different near-miss: token presence let `API` plus Korean through; the SCRIPT share cannot
+    //     see accented Latin, which `script-gate.ts` says about itself; tokenizer coverage still
+    //     called emoji-only text fully readable, and none of the three could see that `tokenIdf(2, df)`
+    //     clamps every weight to zero in a two-concept circle, where the arm cannot boost anything no
+    //     matter how English the text is.
+    //
+    //     A boosted rank differs from its own raw score. That is the whole test, it needs no constant,
+    //     and it is true exactly when the calibrated regime applies — because tauMargin was derived on
+    //     gaps between ranks the arm had moved.
+
+    // The shortlist the caller chooses from, ordered the way the argmax ordered them, and the input to
+    // the comparability test above — so it is built before the margin is decided.
+    //
+    // DELIBERATELY UNCAPPED (Codex P2, round 3). Any cap here is applied BEFORE the ask site knows
+    // which landings are legal, so a normative write with enough ineligible neighbours above the cap
+    // loses its eligible runner-up, computes an infinite margin and attaches silently — the exact
+    // decision this gate exists to refuse. Capping is the caller-facing payload's job, downstream of
+    // the filter.
     const ranked = candidates
       .flatMap((c) => {
         const m = scored.get(c.id);
         return m === undefined ? [] : [{ conceptId: c.id, title: c.title, score: m.score, rank: m.rank }];
       })
-      .sort((a, b) => (b.rank - a.rank) || (a.conceptId < b.conceptId ? -1 : 1))
-      ;
-    // DELIBERATELY UNCAPPED (Codex P2, round 3). Any cap here is applied BEFORE the ask site knows
-    // which landings are legal, so a normative write with enough ineligible neighbours above the cap
-    // loses its eligible runner-up, computes an infinite margin and attaches silently — the exact
-    // decision this gate exists to refuse. Capping is the caller-facing payload's job, downstream of
-    // the filter. The list is one entry per nominatable concept in the circle, which is the same
-    // population the scan just walked.
+      .sort((a, b) => (b.rank - a.rank) || (a.conceptId < b.conceptId ? -1 : 1));
+
+    const armOn = this.embedder.needsLexicalArm === true;
+    const armMoved = (c: RankedCandidate | undefined): boolean => c !== undefined && c.rank !== c.score;
+    const marginIsComparable = !armOn || armMoved(ranked[0]) || armMoved(ranked[1]);
+    if (best !== null && runnerUpRank > -Infinity && marginIsComparable) best.margin = bestRank - runnerUpRank;
     return { nomination: best, ranked };
   }
 
