@@ -406,8 +406,16 @@ export interface AmbiguousCandidate {
  * a write and tell the caller how to succeed on the retry.
  *
  * The retry is `attachTo` with one of `candidates`, or `resolution: "forceNew"` to assert the
- * evidence is about something new. forceNew is not a fallback that loses information: it creates
- * and records a `possible_duplicate_of` edge to the near match, which is the recoverable branch.
+ * evidence is about something new.
+ *
+ * WHAT forceNew ACTUALLY COSTS, corrected (Codex P2, PR #87 — the first draft of this comment
+ * claimed the opposite): forceNew skips the nomination scan and records NO `possible_duplicate_of`
+ * edge, by long-standing design — the caller asserted distinctness, and that assertion is taken at
+ * its word. So the concept it creates is UNLINKED: the near-miss that triggered this ask is not
+ * carried forward, and nothing puts the pair in front of curation. That is the right price for an
+ * assertion, but it is a price, and a caller that is unsure should prefer `attachTo` — a wrong
+ * attach is visible in the concept and undone by `detach`, where an unlinked twin is visible to
+ * nobody.
  */
 export class AmbiguousNominationError extends Error {
   constructor(
@@ -4466,14 +4474,16 @@ export class MonetCore {
           kind: opts.kind,
           thresholds: { tauAttach: this.tauAttach, tauAmbiguous: this.tauAmbiguous, tauMargin: this.tauMargin },
         });
-        if (decision.action === "ask") {
-          // NOTHING HAS BEEN WRITTEN YET at this point — the scans above are reads — and throwing
-          // out of the transaction is what keeps that true no matter what is added below it later.
-          // Returning an "ask" through the normal result would put the burden on every future edit
-          // to this function to remember not to write first.
-          throw new AmbiguousNominationError(rankedCandidates, decision.score, nomination?.margin ?? 0);
-        }
-        action = decision.action;
+        // HELD, NOT RAISED YET (Codex P2, PR #87). The margin said the winner is not distinguishable
+        // from the runner-up, but the five refusals below can still say it was never a legal landing
+        // at all — and those fork, they do not fail. Asking about a concept the write would have
+        // forked away from spends a round-trip to arrive at the same fork. So the ask waits until
+        // `forkReason` has spoken, and everything from here to there runs on the ordinary attach
+        // path with the winner resolution named.
+        const askPending = decision.action === "ask";
+        // Narrowed inline rather than through `askPending`: the compiler cannot see that the const
+        // and the discriminant are the same test, and a cast here would hide a real future mismatch.
+        action = decision.action === "ask" ? "attached" : decision.action;
         mode = decision.mode;
         nearMatchId = decision.nearMatchId;
         nearMatchScore = decision.nearMatchScore;
@@ -4523,6 +4533,19 @@ export class MonetCore {
             // to the battery, which is what the design asks the substrate to notice.
             : this.capturesAtADifferentStage(opts, landed) ? "stage"
             : null;
+          // NOW the ask is real: this landing survived every refusal, so the only thing standing
+          // between the evidence and this concept is that the evidence does not single it out.
+          //
+          // NOTHING HAS BEEN WRITTEN YET — everything above is reads and one pure decision — and
+          // throwing out of the transaction is what keeps that true no matter what a later edit adds
+          // between here and the first write. Returning an ask through the normal result would put
+          // that burden on every future editor of this function instead.
+          //
+          // An INELIGIBLE winner falls through deliberately: the branches below fork it, pair it,
+          // and hand the pair to curation, which is the answer the caller would have reached anyway.
+          if (askPending && verdict !== "supersede" && forkReason === null) {
+            throw new AmbiguousNominationError(rankedCandidates, decision.score, nomination?.margin ?? 0);
+          }
           if (verdict === "supersede") {
             supersededRule = landed;
             landedOnExisting = false;
@@ -15652,8 +15675,24 @@ export class MonetCore {
         centroidScore: cosine(emb, jsonToEmb(candidate.embedding)),
       };
     }
-    // Left undefined when nothing else was nominatable: one candidate is not an ambiguous choice.
-    if (best !== null && runnerUpRank > -Infinity) best.margin = bestRank - runnerUpRank;
+    // LEFT UNDEFINED — meaning "do not gate" — for two different reasons, and both are honest.
+    //
+    // (1) NOTHING TO CHOOSE BETWEEN: no runner-up was nominatable, so the winner is not competing
+    //     with anything and the tauAttach verdict stands on its own.
+    //
+    // (2) NOT THE MEASURED QUANTITY (Codex P1, PR #87). `rank` is `cosine * (1 + LEXICAL_BOOST *
+    //     overlap)`, and tauMargin was derived on ranks the lexical arm had actually boosted. A
+    //     probe that yields NO lexical tokens gets overlap 0 against every candidate, so its ranks
+    //     collapse to raw cosines and the gap between two of them is a different quantity in a
+    //     different scale. `lexicalTokens`' TOKEN regex reads no CJK, so this is exactly the Korean
+    //     case — and the shipping bge-m3 profile is multilingual by intent and carries no
+    //     Latin-only script guard, so those writes DO reach here. Refusing them against a cutoff
+    //     measured on English would reject valid multilingual memories on a number that never
+    //     described them. Documenting that hazard beside the constant was not the same as handling
+    //     it; this is the handling. A CJK-derived margin can arm this path later — the profile
+    //     field is already per-model — but no corpus exists to derive one from yet.
+    const lexicalArmScored = lexicalTokens(text).size > 0;
+    if (best !== null && runnerUpRank > -Infinity && lexicalArmScored) best.margin = bestRank - runnerUpRank;
     // The shortlist the caller chooses from, ordered the way the argmax ordered them. THREE, because
     // the true home is in the top 3 for 80% of asks on the corpus this was measured on (top 5 buys
     // 86%) and a longer list costs every ask a longer read for a smaller share. A miss here is not a

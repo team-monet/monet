@@ -32,6 +32,7 @@ import { describe, it, expect } from "vitest";
 import { AmbiguousNominationError, MonetCore } from "../engine";
 import { HashingEmbeddingProvider, cosine, jsonToEmb } from "../embedding";
 import { resolveIncoming, type ResolutionThresholds } from "../resolution";
+import { lexicalTokens } from "../lexical-overlap";
 import type { StoragePort } from "../storage";
 
 const CIRCLE = "resolution";
@@ -902,8 +903,11 @@ describe("the margin gate", () => {
     const d = resolveIncoming({ nomination: nominate(0.05), thresholds: BANDS });
     expect(d.action).toBe("ask");
     expect(d.mode).toBe("ambiguous-ask");
-    // An ask names no destination: that is the whole point of refusing to guess one.
-    expect(d.attachToConceptId).toBeUndefined();
+    // It DOES name the winner — not as a destination, but because the engine has to settle whether
+    // landing there was even legal (blocking rule / superseded / wrong species / another stage)
+    // before it may raise the ask. Asking about a concept the write would have forked away from
+    // spends a round-trip to reach the same fork.
+    expect(d.attachToConceptId).toBe("c0001");
     expect(d.score).toBe(0.9);
   });
 
@@ -1023,15 +1027,26 @@ describe("an ambiguous store writes nothing", () => {
     }
   });
 
-  it("forks WITH a duplicate edge on forceNew — the recoverable branch, not a silent orphan", async () => {
+  it("creates an UNLINKED concept on forceNew — the price of the assertion, asserted not assumed", async () => {
+    // This test replaces one whose title claimed a possible_duplicate_of edge and whose assertion
+    // never looked for it (`nearMatchId ?? score` is always defined). Codex caught it on PR #87.
+    // forceNew records no such edge — engine.ts's forceNew branch says so — so the honest pin is
+    // that the edge is ABSENT, which is what a reader needs to know before choosing this retry.
     const { core } = await fixture(0.1);
     try {
       await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+      const before = (dbOf(core).prepare(
+        `SELECT COUNT(*) n FROM memory_edge WHERE type = 'possible_duplicate_of'`,
+      ).get() as { n: number }).n;
+
       const r = await core.store(PROBE, { circle: CIRCLE, resolution: "forceNew" });
       expect(r.action).toBe("created");
-      // forceNew asserts distinctness and deliberately records no possible_duplicate_of edge, so the
-      // near match is what carries the relation forward for whoever reads this later.
-      expect(r.nearMatchId ?? r.score).toBeDefined();
+
+      const after = (dbOf(core).prepare(
+        `SELECT COUNT(*) n FROM memory_edge WHERE type = 'possible_duplicate_of'`,
+      ).get() as { n: number }).n;
+      expect(after).toBe(before); // no pairing edge — the new concept stands alone
+      expect(r.nearMatchId).toBeUndefined();
     } finally {
       core.close();
     }
@@ -1044,6 +1059,67 @@ describe("an ambiguous store writes nothing", () => {
     try {
       const r = await core.store(PROBE, { circle: CIRCLE });
       expect(r.action).toBe("attached");
+    } finally {
+      core.close();
+    }
+  });
+});
+
+/**
+ * WHAT THE REVIEW OF PR #87 ADDED. Both are cases where the gate must NOT fire, and both were
+ * shipped wrong in the first draft: one refused writes on a number that never described them, the
+ * other asked about a concept the write would have refused anyway.
+ */
+describe("the margin gate declines to fire", () => {
+  const rows = (core: MonetCore) =>
+    (dbOf(core).prepare(`SELECT COUNT(*) n FROM observations`).get() as { n: number }).n;
+
+  it("when the probe yields no lexical tokens — the margin is not the quantity tauMargin measured", async () => {
+    // `rank` is cosine x (1 + BOOST x overlap) and lexicalTokens' regex reads no CJK, so a Korean
+    // probe scores overlap 0 against everything and its ranks collapse to raw cosines. tauMargin was
+    // derived on boosted ranks. Gating one with the other refuses valid multilingual writes against
+    // a cutoff that never described them — and the shipping multilingual profile carries no
+    // Latin-only guard, so these writes really do arrive here.
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.1 });
+    try {
+      const KO_A = "페리는 매시 십오분에 섬으로 출발한다";
+      const KO_B = "페리는 주말에는 매시 십오분에 섬으로 출발한다";
+      const KO_PROBE = "페리는 매시 십오분에 섬으로";
+      // PREMISE: the tokenizer really is blind here. If it ever stops being, this test is testing
+      // nothing and should fail loudly rather than pass.
+      expect(lexicalTokens(KO_PROBE).size).toBe(0);
+
+      await seedConcept(core, [KO_A]);
+      await seedConcept(core, [KO_B]);
+      const before = rows(core);
+      const r = await core.store(KO_PROBE, { circle: CIRCLE });
+      expect(["attached", "created", "ambiguous"]).toContain(r.action); // decided, not refused
+      expect(rows(core)).toBe(before + 1); // and it actually landed
+    } finally {
+      core.close();
+    }
+  });
+
+  it("when the winner was never a legal landing — an ineligible match forks instead of asking", async () => {
+    // A principle whose top semantic match is an ordinary observation cannot attach there: the
+    // cross-species guard forks it. Raising the ask first would put that concept in front of the
+    // caller, who would choose it, and the retry would fork anyway — a round-trip that changes
+    // nothing. So eligibility settles before the ask does.
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.9 }); // 0.9 = ask on nearly anything
+    try {
+      const A = "the ferry to the island leaves at quarter past every hour";
+      const B = "the ferry to the island leaves at quarter past the hour on weekends";
+      await seedConcept(core, [A]);
+      await seedConcept(core, [B]);
+
+      // Same probe, but stored as a principle: resolution nominates one of the two statements above,
+      // and the species guard refuses that landing.
+      const r = await core.store("the ferry to the island leaves at quarter past", {
+        circle: CIRCLE,
+        kind: "principle",
+      });
+      expect(r.action).toBe("created");
+      expect(r.resolutionMode).toBe("species-fork");
     } finally {
       core.close();
     }

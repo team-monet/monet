@@ -1276,12 +1276,31 @@ export function registerMonetCoreTools(
         // what this call already computed. `resolutionMode` says which decision produced this so it
         // reads in the same vocabulary as an ordinary ack.
         if (e instanceof AmbiguousNominationError) {
-          return err(
-            `${e.message}\n\n` +
-              e.candidates.map((c, i) => `  ${i + 1}. ${c.conceptId}  (${c.score.toFixed(3)})  ${c.title}`).join("\n") +
-              `\n\nNothing was stored. Re-send this content with attachTo set to one of the ids above, ` +
-              `or resolution:"forceNew" if it belongs to none of them.`,
-          );
+          // STRUCTURED, so the candidates are machine-readable rather than scraped out of prose —
+          // Codex P2, PR #87, taken. What is NOT taken from that finding is dropping `isError`.
+          //
+          // The review asked for a normal success result carrying `resolutionMode`. But `isError`
+          // is not a claim about who is at fault, it is the one bit that says THE CALL DID NOT DO
+          // WHAT YOU ASKED — and here it did not: no memory exists. This whole change exists to stop
+          // a store from ending in a quiet wrong outcome, and an ok-shaped envelope is exactly how
+          // an agent skims past `action: "ask"` and walks away believing the write landed. A host
+          // classifying this as a failed tool execution is classifying it correctly.
+          return err(JSON.stringify({
+            action: "ask",
+            resolutionMode: "ambiguous-ask",
+            stored: false,
+            reason: e.message,
+            margin: Number(e.margin.toFixed(4)),
+            candidates: e.candidates.map((c) => ({
+              conceptId: c.conceptId,
+              title: c.title,
+              score: Number(c.score.toFixed(3)),
+            })),
+            instruction:
+              'Re-send this exact content with attachTo set to one of the conceptIds above, or ' +
+              'resolution="forceNew" if it belongs to none of them. forceNew records no link to ' +
+              'these candidates, so prefer attachTo when unsure.',
+          }, null, 2));
         }
         return err(`store failed: ${msg(e)}`);
       }

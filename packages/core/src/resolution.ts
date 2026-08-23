@@ -343,7 +343,13 @@ export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
       // so the tauAttach verdict stands. `tauMargin === undefined` is an embedder nobody measured
       // this in — the gate is off rather than borrowing a number from another space.
       if (tauMargin !== undefined && nomination.margin !== undefined && nomination.margin < tauMargin) {
-        return { action: "ask", mode: "ambiguous-ask", score: obsScore };
+        // CARRIES ITS WINNER, and the engine needs it before it may raise the ask. Landing on this
+        // concept can still be REFUSED downstream — a blocking or superseded rule, the wrong
+        // species, another stage — and those refusals fork rather than fail. Asking first would put
+        // a concept in front of the caller that was never a legal target: choosing it then forks
+        // anyway, so the question cost a round-trip and changed nothing. The engine therefore reads
+        // this id, settles eligibility, and only then decides whether the ask is real.
+        return { action: "ask", mode: "ambiguous-ask", attachToConceptId: conceptId, score: obsScore };
       }
       return { action: "attached", mode: "attach", attachToConceptId: conceptId, score: obsScore };
     }
