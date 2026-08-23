@@ -1178,6 +1178,17 @@ describe("the margin gate declines to fire", () => {
     }
   });
 
+  it("counts separators as unreadable — a padded identifier cannot fake coverage", async () => {
+    // `m[0].length` once counted a token's `-` and `_` as covered while the denominator counted only
+    // letters and digits, so `api____________________` reported more readable characters than it has
+    // and could carry a mostly-CJK probe over the floor on three ASCII letters (Codex P2, round 5).
+    const PADDED = "api____________________ 페리는 매시 십오분에 섬으로 출발한다";
+    expect(lexicalTokens(PADDED).size).toBeGreaterThan(0);
+    expect(lexicalCoverage(PADDED)).toBeLessThan(LEXICAL_COVERAGE_MIN);
+    // And the same text with the padding removed is no more readable than it was.
+    expect(lexicalCoverage("api 페리는 매시 십오분에 섬으로 출발한다")).toBeLessThan(LEXICAL_COVERAGE_MIN);
+  });
+
   it("when the text is accented LATIN the script guard called readable — coverage, not script", async () => {
     // nonLatinLetterShare scores French at 0 (Latin script) while TOKEN's [a-z0-9_-] class drops or
     // fragments every accented word, so the previous share guard let it reach an English-calibrated
