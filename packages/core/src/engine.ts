@@ -171,9 +171,6 @@ const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in ov
 // and top 5 raises that only to 86%. A miss forks rather than mis-merges, so the extra two buy
 // little and are read on every ask.
 const AMBIGUOUS_CANDIDATES_MAX = 3;
-// How many the SCAN keeps before eligibility filtering. Wider than what the caller sees, because a
-// normative write can have several of its top neighbours refused outright.
-const AMBIGUOUS_SCAN_MAX = 12;
 /** Pair/contradiction/gate-exception queues stay top-10; counts or omission fields carry true totals. */
 export const OVERVIEW_EXCEPTION_LIMIT = 10;
 /** Opt-in dirty/stale enumeration reuses the existing checkpoint-scale worklist bound. */
@@ -4518,7 +4515,21 @@ export class MonetCore {
           //
           // An INELIGIBLE winner falls through deliberately: the branches below fork it, pair it,
           // and hand the pair to curation, which is the answer the caller would have reached anyway.
-          if (askPending && verdict !== "supersede" && forkReason === null) {
+          // DECLARATIONS ARE EXEMPT (John's ruling, PR #87 round 3). `declare()` writes through
+          // store(), but neither `DeclareInput` nor the `memory_declare` schema carries `attachTo` or
+          // `forceNew` — so an ask on this path aborted the declaration with no way to answer it, and
+          // declaration is the only door a norm enters through. Reaching for `memory_store` instead
+          // would drop the declaration-only effects (blocking bindings, skeleton ratification).
+          //
+          // The exemption is not merely a hole cut to unblock a caller. The ask exists to pull a
+          // human in at the moment the substrate cannot tell concepts apart; a declaration is a write
+          // where the human is ALREADY there, settling a norm in their own words. Asking them which
+          // concept they meant, in the one place they are unambiguously present, is asking a question
+          // that has already been answered. Eligibility still narrows the landing — a declaration
+          // names its own species and stage, and the guards above run unchanged.
+          const isDeclaration =
+            opts.skeletonEntry?.entrance === "declaration" || opts.rule?.declaration === true;
+          if (askPending && !isDeclaration && verdict !== "supersede" && forkReason === null) {
             // THE RUNNER-UP HAS TO BE A LANDING THE CALLER COULD ACTUALLY CHOOSE (Codex P2, round 2).
             // The scan ranks every semantic neighbour, kind-blind by design — so for a principle or a
             // rule the second place can be a concept that legally cannot receive it. Two things went
@@ -15752,8 +15763,15 @@ export class MonetCore {
     //     calibrated in that same raw space and stays valid for a tokenless probe. Suppressing there
     //     would silently ignore an explicit override; the mismatch only exists when the arm is
     //     enabled and this particular probe gave it nothing to work with.
+    //     AND IT IS A SHARE, NOT A BINARY (Codex P1, round 3). The first fix asked only whether the
+    //     probe produced ANY lexical token, so a Korean sentence carrying `API` or a three-digit
+    //     number cleared it while the lexical arm still saw almost none of the text — the common
+    //     case, where the first fix caught only the extreme one. The same tolerance the script guard
+    //     already uses decides it, so "how much of this can the arm read" has one answer in this
+    //     codebase rather than two.
     const armOn = this.embedder.needsLexicalArm === true;
-    const marginIsComparable = !armOn || lexicalTokens(text).size > 0;
+    const marginIsComparable = !armOn
+      || (lexicalTokens(text).size > 0 && nonLatinLetterShare(text) <= NON_LATIN_LETTER_TOLERANCE);
     if (best !== null && runnerUpRank > -Infinity && marginIsComparable) best.margin = bestRank - runnerUpRank;
     // The shortlist the caller chooses from, ordered the way the argmax ordered them. THREE, because
     // the true home is in the top 3 for 80% of asks on the corpus this was measured on (top 5 buys
@@ -15765,9 +15783,13 @@ export class MonetCore {
         return m === undefined ? [] : [{ conceptId: c.id, title: c.title, score: m.score, rank: m.rank }];
       })
       .sort((a, b) => (b.rank - a.rank) || (a.conceptId < b.conceptId ? -1 : 1))
-      // CAPPED WIDE, not at the caller-facing three: ineligible landings are filtered out at the ask
-      // site, and filtering a list already cut to three can leave one candidate where four existed.
-      .slice(0, AMBIGUOUS_SCAN_MAX);
+      ;
+    // DELIBERATELY UNCAPPED (Codex P2, round 3). Any cap here is applied BEFORE the ask site knows
+    // which landings are legal, so a normative write with enough ineligible neighbours above the cap
+    // loses its eligible runner-up, computes an infinite margin and attaches silently — the exact
+    // decision this gate exists to refuse. Capping is the caller-facing payload's job, downstream of
+    // the filter. The list is one entry per nominatable concept in the circle, which is the same
+    // population the scan just walked.
     return { nomination: best, ranked };
   }
 

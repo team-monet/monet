@@ -521,10 +521,17 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
      * CREATE. At tauAttach 0.70 with no margin gate the second population is absorbed 87.9% of the
      * time; the first misfiles 26.1% raw, ~17% after blinded adjudication of 60 disagreements.
      *
-     * Swept together, unrecoverable merges (wrong home + absorbed new topic) run 39.6% at d=0,
-     * 25.7% at 0.02, 16.9% at 0.05, 11.4% at 0.08, 6.6% at 0.12. 0.12 is where the ASK path takes
-     * 54.7% of stores and the silent band still files 42.3% — past it the asks dominate without
-     * buying much (0.20 -> 4.2% unrecoverable but only 23.6% still filed correctly).
+     * Swept together, unrecoverable merges (wrong home + absorbed new topic) run 36.5% at d=0,
+     * 24.6% at 0.02, 13.0% at 0.05, 7.3% at 0.08, 4.3% at 0.12. Past 0.12 the asks dominate without
+     * buying much: 0.20 reaches 2.1% but files only 23.8% of placeable memories correctly.
+     *
+     * THOSE FIGURES ARE THE CORRECTED ONES (Codex rounds 2-3 on PR #87). Three separate ways the
+     * first sweep failed to reproduce the shipped decision were found and fixed: it skipped the
+     * centroid confirmation the margin gate sits inside (measured inert here — 2 of 1011 winners fall
+     * below tauAmbiguous — but the omission was real), it maximised over the PROBE's segments where
+     * the store embeds content once and compares that single vector against stored segments, and it
+     * priced normative writes whose landings production filters before the margin is ever consulted.
+     * Every correction moved the numbers in the same direction, and none moved which delta to pick.
      *
      * WHY NOT JUST RAISE tauAttach: at MATCHED risk the margin gate keeps far more correct
      * attaches — 16.9% unrecoverable at d=0.05 leaves 62.7% filed to the right home, where

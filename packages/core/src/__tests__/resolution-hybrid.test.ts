@@ -33,6 +33,7 @@ import { AmbiguousNominationError, MonetCore } from "../engine";
 import { HashingEmbeddingProvider, cosine, jsonToEmb } from "../embedding";
 import { resolveIncoming, type ResolutionThresholds } from "../resolution";
 import { lexicalTokens } from "../lexical-overlap";
+import { NON_LATIN_LETTER_TOLERANCE, nonLatinLetterShare } from "../script-gate";
 import type { StoragePort } from "../storage";
 
 const CIRCLE = "resolution";
@@ -1120,6 +1121,57 @@ describe("the margin gate declines to fire", () => {
       await seedConcept(core, [KO_A]);
       await seedConcept(core, [KO_B]);
       await expect(core.store(KO_PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("when a CJK probe merely CONTAINS a Latin token — share decides, not presence", async () => {
+    // The first draft of this guard asked only whether ANY lexical token existed, so a Korean
+    // sentence carrying `API` cleared it while the arm still read almost none of the text. That is
+    // the common shape of mixed-script writing, not a corner case (Codex P1, round 3).
+    const core = armedCore(0.1);
+    try {
+      const MIXED_A = "API 페리는 매시 십오분에 섬으로 출발한다";
+      const MIXED_B = "API 페리는 주말에 매시 십오분에 섬으로 출발한다";
+      const MIXED_PROBE = "API 페리는 매시 십오분에 섬으로";
+      // PREMISE: this is exactly the case the token test waved through — tokens exist, yet the text
+      // is overwhelmingly unreadable to the arm.
+      expect(lexicalTokens(MIXED_PROBE).size).toBeGreaterThan(0);
+      expect(nonLatinLetterShare(MIXED_PROBE)).toBeGreaterThan(NON_LATIN_LETTER_TOLERANCE);
+
+      await seedConcept(core, [MIXED_A]);
+      await seedConcept(core, [MIXED_B]);
+      const before = rows(core);
+      const r = await core.store(MIXED_PROBE, { circle: CIRCLE });
+      expect(["attached", "created", "ambiguous"]).toContain(r.action);
+      expect(rows(core)).toBe(before + 1);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("when the write is a DECLARATION — the human settling a norm is already the answer", async () => {
+    // declare() writes through store(), but neither DeclareInput nor the memory_declare schema
+    // carries attachTo or forceNew, so an ask here aborted the declaration outright with no way to
+    // answer it — and declaration is the only door a norm enters through (Codex P1, round 3; John
+    // ruled exemption over extending the declare contract).
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.9 }); // ask on nearly anything
+    try {
+      const TEXT = "batch questions and ask them once rather than one at a time";
+      await core.store(TEXT, { circle: CIRCLE, kind: "principle", resolution: "forceNew" });
+      await core.store("batch questions and ask them once rather than one by one", {
+        circle: CIRCLE, kind: "principle", resolution: "forceNew",
+      });
+
+      // The same content through the DECLARATION entrance must land, not refuse.
+      const r = await core.declare({
+        species: "principle",
+        content: "batch questions and ask them once rather than one at a time",
+        circle: CIRCLE,
+        declaredBy: "john",
+      });
+      expect(r).toBeDefined();
     } finally {
       core.close();
     }

@@ -66,6 +66,13 @@ const segmentRows = db.prepare(
     ORDER BY o.id, s.segment_index`,
 ).all(circle) as Array<{ cid: string; oid: string; emb: string }>;
 
+const kindRows = db.prepare(
+  `SELECT o.id AS oid, o.kind AS kind
+     FROM observations o JOIN concepts c ON c.id = o.concept_id
+    WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
+      AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?`,
+).all(circle) as Array<{ oid: string; kind: string | null }>;
+
 const obsVecRows = db.prepare(
   `SELECT o.id AS oid, o.concept_id AS cid, o.embedding AS emb
      FROM observations o JOIN concepts c ON c.id = o.concept_id
@@ -100,7 +107,20 @@ for (const r of obsVecRows) {
   const v = jsonToEmb(r.emb);
   if (!isZeroVector(v)) entry.whole = v;
 }
-const observations = [...byObs.values()];
+/**
+ * NORMATIVE PROBES ARE OUT OF THE CALIBRATION (Codex P2, round 3, and John's declaration ruling).
+ * The shipped path filters illegal landings — wrong species, another stage, a blocking or superseded
+ * rule — before it looks at the margin, and this sweep cannot reproduce those without rule bindings
+ * and supersession state. Counting them anyway prices an ineligible winner as a wrong merge where
+ * production takes species-fork, and lets an ineligible runner-up inflate the ask rate.
+ *
+ * Excluding them is not a convenience: declarations are exempt from the gate outright, and the
+ * remaining normative captures are the population whose landings the eligibility filter narrows
+ * hardest. What is left is the population the threshold actually governs.
+ */
+const NORMATIVE_KINDS = new Set(["rule", "principle", "preference", "correction"]);
+const kindOf = new Map(kindRows.map((r) => [r.oid, r.kind ?? ""]));
+const observations = [...byObs.values()].filter((o) => !NORMATIVE_KINDS.has(kindOf.get(o.oid) ?? ""));
 const byConcept = new Map<string, Obs[]>();
 for (const o of observations) byConcept.set(o.cid, [...(byConcept.get(o.cid) ?? []), o]);
 
@@ -113,10 +133,22 @@ for (const members of byConcept.values()) {
 }
 const idfOf = (t: string): number => tokenIdf(byConcept.size, df.get(t) ?? 0);
 
-/** Best cosine between a probe's segments and any segment of `other`. The scorer's own statistic. */
+/**
+ * The scorer's own statistic: the incoming observation's WHOLE-CONTENT vector against each stored
+ * segment, max over the segments.
+ *
+ * NOT max over the probe's segments too (Codex P1, round 3). storeInternal embeds the content once
+ * (`checkedEmbed`) and hands that single vector to scoreNativeConceptsByObservation, which cosines
+ * it against stored segment vectors — so letting any probe segment win measures a comparison the
+ * store never makes, and it can move the winner, the tauAttach verdict and especially the margin.
+ * measure-attach-thresholds.ts has the same shape and the same defect; re-deriving tauAttach is a
+ * separate exercise from this one.
+ */
 const best = (probe: Obs, other: Obs): number => {
+  const p = probe.whole;
+  if (p === undefined) return -Infinity;
   let m = -Infinity;
-  for (const x of probe.vecs) for (const y of other.vecs) { const c = cosine(x, y); if (c > m) m = c; }
+  for (const y of other.vecs) { const c = cosine(p, y); if (c > m) m = c; }
   return m;
 };
 
