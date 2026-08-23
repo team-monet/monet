@@ -162,7 +162,13 @@ export type ResolutionMode =
   | "blur-duplicate"
   | "new"
   | "direct-attach"
-  | "force-new";
+  | "force-new"
+  /**
+   * The evidence cleared tauAttach but did not identify WHICH concept (#86). Nothing is written and
+   * the caller is handed the candidates; the write that follows records "direct-attach" or
+   * "force-new" like any other caller-directed one.
+   */
+  | "ambiguous-ask";
 
 /**
  * The modes that record an actual RESOLUTION DECISION, as opposed to a caller who bypassed scoring
@@ -174,14 +180,38 @@ export const DECIDED_RESOLUTION_MODES: readonly ResolutionMode[] = [
   "attach", "fork-signal", "species-fork", "stage-fork", "ambiguous-fork", "correction-attach", "blur-duplicate", "new",
 ];
 
+/*
+ * "ambiguous-ask" is ABSENT from the list above because it writes NOTHING — there is no
+ * resolution_event to be the numerator or denominator of. The first draft of this note went on to
+ * claim "the decision it defers is recorded by the follow-up call", and that is FALSE (Codex P2,
+ * round 2 on PR #87): the retry records `direct-attach` or `force-new`, and both of those are
+ * excluded too, for their own older reason. So a store that crosses the ambiguity gate is counted by
+ * NEITHER event, and every rate that divides by `decidedTotal` is measured over the cases the gate
+ * let through silently — a selection bias toward exactly the population this gate was built to
+ * shrink, and one that grows as the gate does more work.
+ *
+ * NOT FIXED HERE, and the reason is scope rather than judgement. Recording the ask needs a row where
+ * `resolution_events.observation_id` is NOT NULL and the throw has already rolled the transaction
+ * back; correlating the retry instead needs the caller to say that it IS a retry, which is a
+ * contract change. Both are wider than this branch. Tracked as its own issue; until it lands, read
+ * `decidedTotal` as "decisions the substrate made alone", not as "stores".
+ */
+
 /** Whether `mode` recorded a resolution decision rather than a caller-directed bypass. */
 export const isDecidedResolutionMode = (mode: string): boolean =>
   (DECIDED_RESOLUTION_MODES as readonly string[]).includes(mode);
 
-/** The two embedder-derived bands the decision reads. Mirrors EmbeddingThresholds (embedding.ts). */
+/** The embedder-derived bands the decision reads. Mirrors EmbeddingThresholds (embedding.ts). */
 export interface ResolutionThresholds {
   tauAttach: number;
   tauAmbiguous: number;
+  /**
+   * Minimum rank gap between the nominated winner and the runner-up before an attach is taken
+   * silently (#86). Omitted disables the gate entirely — every above-tau nomination attaches, the
+   * pre-#86 behaviour — which is what an unmeasured embedder gets rather than a borrowed number.
+   * Derivation and the CJK limit live with the profile that carries it (embedding-onnx.ts).
+   */
+  tauMargin?: number;
 }
 
 /**
@@ -203,6 +233,21 @@ export interface ResolutionNomination {
   observationId: string;
   /** cosine(incoming, nominated concept's centroid) — the CONFIRMATION signal. */
   centroidScore: number;
+  /**
+   * `rank(winner) - rank(runnerUp)`, where rank is the lexically-blended score the nomination
+   * argmax actually sorted on — the SEPARATION signal (#86). Computed at the scan site because
+   * only that site holds every candidate's rank; this function sees one nomination.
+   *
+   * `undefined` means there was no runner-up to be separated from — a circle holding exactly one
+   * nominatable concept. That is not ambiguity and must never ASK: there is nothing to choose
+   * between, so the tauAttach decision stands on its own.
+   *
+   * NOT the raw cosine gap. The winner is chosen on rank, so the distance that decided the argmax
+   * is the distance in rank space; a cosine gap would be measuring a comparison the scan did not
+   * make. (They disagree in the population that matters: 21.8% of residual misfiles at
+   * LEXICAL_BOOST 1.0 are won on a LOWER raw cosine.)
+   */
+  margin?: number;
 }
 
 /**
@@ -241,8 +286,11 @@ export interface ResolutionInput {
 /** What the engine must execute. Exactly one of attachToConceptId / duplicateEdge is set (or neither, for a plain create). */
 export interface ResolutionDecision {
   /** UNCHANGED public vocabulary. A fork signal reports "ambiguous" — behaviorally it IS one
-   *  (create + possible_duplicate_of edge + nearMatch fields); `mode` carries the distinction. */
-  action: "created" | "attached" | "ambiguous";
+   *  (create + possible_duplicate_of edge + nearMatch fields); `mode` carries the distinction.
+   *
+   *  "ask" is the one action that WRITES NOTHING. Every other value describes a row that now
+   *  exists; this one describes a decision the caller has to make before any row does. */
+  action: "created" | "attached" | "ambiguous" | "ask";
   mode: ResolutionMode;
   /** Set iff this decision lands the observation on an EXISTING concept. */
   attachToConceptId?: string;
@@ -277,7 +325,7 @@ export interface ResolutionDecision {
  */
 export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
   const { nomination } = input;
-  const { tauAttach, tauAmbiguous } = input.thresholds;
+  const { tauAttach, tauAmbiguous, tauMargin } = input.thresholds;
 
   // Nothing in the circle's evidence matched at all. The centroid still cannot ATTACH anything —
   // it has no nomination power (defect 1) — but it can still PAIR: see createOrPair below.
@@ -288,6 +336,30 @@ export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
   if (obsScore >= tauAttach) {
     // Evidence says "same concept". Ask identity whether that concept is still coherent.
     if (centroidScore >= tauAmbiguous) {
+      // SIMILAR ENOUGH IS NOT THE SAME QUESTION AS SURE IT IS THIS ONE (#86). tauAttach answered
+      // the first; nothing had ever asked the second, and the second is the one that separates —
+      // precision of attaches is flat at ~74% across the whole tauAttach range, while the winner's
+      // margin over the runner-up puts misfiles' median (0.0335) below correct decisions' p10
+      // (0.0346). Under this bar the winner is wrong ~64% of the time.
+      //
+      // So the decision is NOT taken. It is handed back with the candidates, and the caller either
+      // names one (attachTo) or asserts distinctness (forceNew). Writing first and letting the
+      // caller move it afterwards was the alternative and is worse: a caller that ignores the
+      // candidates silently converts every ambiguous store into a fork, which is the high-tauAttach
+      // outcome this gate exists to avoid. Blocking the write is what forces the decision.
+      //
+      // `margin === undefined` is a circle with one nominatable concept: nothing to choose between,
+      // so the tauAttach verdict stands. `tauMargin === undefined` is an embedder nobody measured
+      // this in — the gate is off rather than borrowing a number from another space.
+      if (tauMargin !== undefined && nomination.margin !== undefined && nomination.margin < tauMargin) {
+        // CARRIES ITS WINNER, and the engine needs it before it may raise the ask. Landing on this
+        // concept can still be REFUSED downstream — a blocking or superseded rule, the wrong
+        // species, another stage — and those refusals fork rather than fail. Asking first would put
+        // a concept in front of the caller that was never a legal target: choosing it then forks
+        // anyway, so the question cost a round-trip and changed nothing. The engine therefore reads
+        // this id, settles eligibility, and only then decides whether the ask is real.
+        return { action: "ask", mode: "ambiguous-ask", attachToConceptId: conceptId, score: obsScore };
+      }
       return { action: "attached", mode: "attach", attachToConceptId: conceptId, score: obsScore };
     }
     // THE FORK SIGNAL (defect 2): near the members, far from the centroid ⇒ bimodal. Fork and

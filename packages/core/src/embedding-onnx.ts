@@ -514,7 +514,44 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
      * edges. If they regain a ranking consumer, re-derive against THAT decision — and #175 is asking
      * the prior question of whether they should be written at all.
      */
-    thresholds: { tauAttach: 0.70, tauAmbiguous: 0.5, edgeSimMin: 0.60 },
+    /*
+     * MARGIN GATE 0.12, derived here and nowhere else (#86). scripts/measure-gate.ts replays every
+     * live monet-hq observation withheld from its own concept, and separately every SINGLETON-home
+     * observation — where withholding removes the home entirely, so the store's own answer was
+     * CREATE. At tauAttach 0.70 with no margin gate the second population is absorbed 87.9% of the
+     * time; the first misfiles 26.1% raw, ~17% after blinded adjudication of 60 disagreements.
+     *
+     * Swept together, unrecoverable merges (wrong home + absorbed new topic) run 38.9% at d=0,
+     * 26.4% at 0.02, 15.1% at 0.05, 9.1% at 0.08, 5.6% at 0.12. Past 0.12 the asks dominate without
+     * buying much: 0.20 reaches 2.8% but files only 22.4% of placeable memories correctly.
+     *
+     * THE DERIVATION WAS CORRECTED SEVEN TIMES ACROSS FOUR REVIEW ROUNDS (Codex, PR #87), every one
+     * of them a way the sweep failed to reproduce the shipped decision: it skipped the centroid
+     * confirmation the gate sits inside; it maximised over the PROBE's segments where the store
+     * embeds content once and compares that single vector against stored segments; it priced
+     * landings production refuses before the margin is consulted; it dropped corrections, which the
+     * gate does govern; it removed normative rows from candidate EVIDENCE and not just from probes;
+     * it counted retired concepts the candidate query excludes; and it lost pre-backfill
+     * observations whose scorer falls back to `observations.embedding`.
+     *
+     * WHAT SURVIVED ALL OF IT is the value. 0.12 measured 6.6% unrecoverable on the first sweep,
+     * 4.3% after the third round and 5.6% now — one band, and the curve's shape never moved. That is
+     * the strongest thing said for this number: it is not sensitive to the errors made deriving it.
+     * The harness that produced them is being rebuilt to drive the engine rather than restate it,
+     * because seven corrections in one review is a property of the tool, not of the reviewer.
+     *
+     * WHY NOT JUST RAISE tauAttach: at MATCHED risk the margin gate keeps far more correct
+     * attaches — 16.9% unrecoverable at d=0.05 leaves 62.7% filed to the right home, where
+     * tauAttach 0.80 reaches 16.3% but files only 52.2%.
+     *
+     * UNVALIDATED FOR CJK, and this corpus cannot validate it: monet-hq holds ZERO CJK-heavy
+     * observations (every durable artifact here is English by project convention). lexicalTokens'
+     * TOKEN regex scores a near-identical Korean pair at overlap 0.0 where its English equivalent
+     * scores 0.714, so a CJK `rank` IS its cosine while a Latin one is cosine * (1 + overlap) and
+     * can run up to twice as large. Those are not the same quantity and 0.12 was measured on only
+     * one of them. #38 is the prerequisite for any store that holds CJK content.
+     */
+    thresholds: { tauAttach: 0.70, tauAmbiguous: 0.5, tauMargin: 0.12, edgeSimMin: 0.60 },
     /*
      * CARD-EMISSION FLOOR 0.40, from scripts/measure-recall-floor.ts on the same STARTER_SUITE corpus
      * every other floor here came from — 20 probe queries, 9 junk queries, observation granularity.

@@ -64,7 +64,7 @@ import {
 export type { ResolutionMode } from "./resolution";
 import { RELIABLE_EMBED_TOKENS, reliableSegmentTokensOf } from "./embed-budget";
 import { segmentObservation, segmentTokenBudget } from "./observation-segmenter";
-import { lexicalTokens } from "./lexical-overlap";
+import { LEXICAL_COVERAGE_MIN, lexicalCoverage, lexicalTokens } from "./lexical-overlap";
 import {
   inspectLiveEmbeddingPopulations,
   parseFiniteEmbeddingJson,
@@ -166,6 +166,11 @@ const CO_OCCURRED_WEIGHT = 0.85;
 const FOLLOWS_WEIGHT = 0.5;
 const ASSERTED_WEIGHT = 0.95;
 const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
+// How many concepts an ambiguous nomination offers the caller (#86). Measured, not chosen for
+// roundness: the true home is in the top 3 for 80% of asks on the corpus tauMargin was derived on,
+// and top 5 raises that only to 86%. A miss forks rather than mis-merges, so the extra two buy
+// little and are read on every ask.
+const AMBIGUOUS_CANDIDATES_MAX = 3;
 /** Pair/contradiction/gate-exception queues stay top-10; counts or omission fields carry true totals. */
 export const OVERVIEW_EXCEPTION_LIMIT = 10;
 /** Opt-in dirty/stale enumeration reuses the existing checkpoint-scale worklist bound. */
@@ -379,6 +384,56 @@ export class ContentScriptUnsupportedError extends Error {
         `later cannot recover it.`,
     );
     this.name = "ContentScriptUnsupportedError";
+  }
+}
+
+/** One concept the ambiguous nomination could not choose between. */
+export interface AmbiguousCandidate {
+  conceptId: string;
+  title: string;
+  /** Raw cosine against this concept's own evidence — the same quantity IngestResult.score reports. */
+  score: number;
+}
+
+/** A scan-internal candidate: an AmbiguousCandidate plus the rank the argmax actually sorted on. */
+interface RankedCandidate extends AmbiguousCandidate { rank: number }
+
+/**
+ * The evidence cleared `tauAttach` but did not identify WHICH concept (#86): the winner's rank was
+ * within `tauMargin` of the runner-up, and under that bar the winner is wrong about 64% of the time.
+ *
+ * THROWN RATHER THAN RETURNED, for the reason `recordResolutionEvent` states about its own absence
+ * of a try/catch: this runs inside the store transaction, so throwing is what makes "nothing was
+ * written" structurally true instead of true by call-site discipline. It is control flow, not a
+ * failure — the same species as ContentExceedsEmbedderWindowError, whose job is likewise to refuse
+ * a write and tell the caller how to succeed on the retry.
+ *
+ * The retry is `attachTo` with one of `candidates`, or `resolution: "forceNew"` to assert the
+ * evidence is about something new.
+ *
+ * WHAT forceNew ACTUALLY COSTS, corrected (Codex P2, PR #87 — the first draft of this comment
+ * claimed the opposite): forceNew skips the nomination scan and records NO `possible_duplicate_of`
+ * edge, by long-standing design — the caller asserted distinctness, and that assertion is taken at
+ * its word. So the concept it creates is UNLINKED: the near-miss that triggered this ask is not
+ * carried forward, and nothing puts the pair in front of curation. That is the right price for an
+ * assertion, but it is a price, and a caller that is unsure should prefer `attachTo` — a wrong
+ * attach is visible in the concept and undone by `detach`, where an unlinked twin is visible to
+ * nobody.
+ */
+export class AmbiguousNominationError extends Error {
+  constructor(
+    readonly candidates: AmbiguousCandidate[],
+    /** The winner's raw cosine — what would have driven the attach had it been unambiguous. */
+    readonly score: number,
+    /** rank(winner) - rank(runnerUp), the gap that failed the gate. */
+    readonly margin: number,
+  ) {
+    super(
+      `This evidence matches ${candidates.length} concepts closely enough that nothing distinguishes ` +
+        `them (top two are ${margin.toFixed(4)} apart). It was NOT stored. Name the one it belongs to ` +
+        `with attachTo, or pass resolution:"forceNew" if it is about something new.`,
+    );
+    this.name = "AmbiguousNominationError";
   }
 }
 
@@ -2266,6 +2321,12 @@ export interface MonetCoreOptions {
   synthesizer?: Synthesizer;
   tauAttach?: number;
   tauAmbiguous?: number;
+  /**
+   * Override the margin gate (#86). Its two neighbours fall back to a hardcoded number when neither
+   * the caller nor the profile supplies one; this one does not, so a caller that wants the gate over
+   * an unmeasured embedder has to say so — and say what value, in that embedder's own rank space.
+   */
+  tauMargin?: number;
   agentId?: string;
   /** Stable per-store sync identity override (primarily for deterministic tests). Persisted on first open. */
   syncDeviceId?: string;
@@ -2435,6 +2496,14 @@ export class MonetCore {
   private tauAttach!: number;
   private tauAmbiguous!: number;
   /**
+   * NO FALLBACK, unlike its two neighbours (#86). They fall back because a store must resolve
+   * SOMEHOW even under an unmeasured embedder; this one gates whether a decision is taken at all,
+   * and a borrowed margin would refuse writes in a space it was never derived in. Undefined means
+   * the gate is off and every above-tau nomination attaches — the pre-#86 behaviour, which is the
+   * honest default for an embedder nobody has swept.
+   */
+  private tauMargin?: number;
+  /**
    * The RAW tauAttach/tauAmbiguous/edgeSimMin opts as passed to the constructor (undefined where
    * not explicitly set) — captured once, verbatim, so applyEmbedderDerivedThresholds can re-apply
    * the constructor's documented precedence (explicit opt → embedder's recommendedThresholds →
@@ -2443,7 +2512,7 @@ export class MonetCore {
    * honored on re-derivation — there would be no way to tell "explicitly 0.55" from "defaulted to
    * 0.55 because the original embedder happened to recommend it".
    */
-  private explicitThresholdOpts: Pick<MonetCoreOptions, "tauAttach" | "tauAmbiguous" | "edgeSimMin">;
+  private explicitThresholdOpts: Pick<MonetCoreOptions, "tauAttach" | "tauAmbiguous" | "tauMargin" | "edgeSimMin">;
   /**
    * Constructor-time pin guard (embedder-pin ADR, review hardening): armed at the end of the
    * constructor when this store already has a recorded pin that does NOT match the
@@ -2524,7 +2593,7 @@ export class MonetCore {
     // applyEmbedderDerivedThresholds). tauAttach/tauAmbiguous/edgeSimMin are set as a side effect of
     // that call below, not assigned directly here, so there is exactly one place that implements
     // the precedence rule.
-    this.explicitThresholdOpts = { tauAttach: opts.tauAttach, tauAmbiguous: opts.tauAmbiguous, edgeSimMin: opts.edgeSimMin };
+    this.explicitThresholdOpts = { tauAttach: opts.tauAttach, tauAmbiguous: opts.tauAmbiguous, tauMargin: opts.tauMargin, edgeSimMin: opts.edgeSimMin };
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
     this.momentSpoolPath = opts.momentSpoolPath ?? null;
@@ -4282,8 +4351,8 @@ export class MonetCore {
       // CONSOLIDATION works — an import that attaches thousands of observations to named concepts
       // would pay for a nomination it discards on every single one. Measured at 250 concepts /
       // 2,500 observations, running it unconditionally made attachTo writes ~2.4x slower.
-      const nomination = opts.attachTo || opts.resolution === "forceNew"
-        ? null
+      const { nomination, ranked: rankedCandidates } = opts.attachTo || opts.resolution === "forceNew"
+        ? { nomination: null, ranked: [] as RankedCandidate[] }
         : this.nominateByObservation(candidates, emb, content);
       // Keep the documented epoch-ms `since` contract even when this instance reuses a session
       // after a long idle. In logical maintenance mode this is still only a persisted +1.
@@ -4406,10 +4475,26 @@ export class MonetCore {
             ? { conceptId: liveMatches[0].match.id, centroidScore: liveMatches[0].score }
             : null,
           kind: opts.kind,
-          thresholds: { tauAttach: this.tauAttach, tauAmbiguous: this.tauAmbiguous },
+          thresholds: { tauAttach: this.tauAttach, tauAmbiguous: this.tauAmbiguous, tauMargin: this.tauMargin },
         });
-        action = decision.action;
-        mode = decision.mode;
+        // HELD, NOT RAISED YET (Codex P2, PR #87). The margin said the winner is not distinguishable
+        // from the runner-up, but the five refusals below can still say it was never a legal landing
+        // at all — and those fork, they do not fail. Asking about a concept the write would have
+        // forked away from spends a round-trip to arrive at the same fork. So the ask waits until
+        // `forkReason` has spoken, and everything from here to there runs on the ordinary attach
+        // path with the winner resolution named.
+        const askPending = decision.action === "ask";
+        // A HELD ASK CARRIES THE RESOLUTION IT IS HOLDING, never its own mode (Codex P2, round 4).
+        // Several paths below waive the ask and let the write proceed — a declaration, a winner with
+        // no eligible runner-up, a rule supersession — and leaving "ambiguous-ask" in place committed
+        // a resolution_event whose mode is documented as writing nothing, while excluding a real
+        // attach from decided-resolution statistics. So the pending ask presents as the attach it
+        // would have been; the fork branches below overwrite both fields as they already do, and the
+        // only place the ask's own identity matters is the throw, which ends the write anyway.
+        // Narrowed inline rather than through `askPending`: the compiler cannot see that the const
+        // and the discriminant are the same test, and a cast here would hide a real future mismatch.
+        action = decision.action === "ask" ? "attached" : decision.action;
+        mode = decision.action === "ask" ? "attach" : decision.mode;
         nearMatchId = decision.nearMatchId;
         nearMatchScore = decision.nearMatchScore;
         autoScore = decision.score;
@@ -4426,38 +4511,83 @@ export class MonetCore {
           // another moment, would discard an observation the agent never asked to put there.
           // Forking keeps the evidence and puts the near-match in front of a human, which is what
           // the substrate already does whenever it declines to merge.
-          const forkReason: "blocking-rule" | "superseded-rule" | "species" | "stage" | null =
-            verdict === "blocking" ? "blocking-rule"
-            : verdict === "superseded" ? "superseded-rule"
-            : opts.kind === "rule" && !this.canCarryRuleEvidence(landed) ? "species"
-            // A NORMATIVE SPECIES NEVER MISFILES ACROSS KINDS (skeleton-entrances slice, review
-            // round 1, item 1). Resolution is kind-blind, so without this an incoming principle
-            // auto-attached to ANY governable concept above tauAttach — a fact it paraphrases, or a
-            // live blocking RULE — and the declaration entrance then stamped verdict "approve" onto
-            // that foreign row: the skeleton stayed empty (membership reads kind principle|
-            // preference), the response still claimed success, and the misfiled row became
-            // un-consolidatable (F4 refuses to strand its ratification) while memory_ratify refused
-            // to retire it (not a skeleton candidate). Forking instead of attaching is the rule
-            // precedent applied one species over.
+          const forkReason = this.landingForkReason(opts, landed, verdict);
+          // NOW the ask is real: this landing survived every refusal, so the only thing standing
+          // between the evidence and this concept is that the evidence does not single it out.
+          //
+          // NOTHING HAS BEEN WRITTEN YET — everything above is reads and one pure decision — and
+          // throwing out of the transaction is what keeps that true no matter what a later edit adds
+          // between here and the first write. Returning an ask through the normal result would put
+          // that burden on every future editor of this function instead.
+          //
+          // An INELIGIBLE winner falls through deliberately: the branches below fork it, pair it,
+          // and hand the pair to curation, which is the answer the caller would have reached anyway.
+          // DECLARATIONS ARE EXEMPT (John's ruling, PR #87 round 3). `declare()` writes through
+          // store(), but neither `DeclareInput` nor the `memory_declare` schema carries `attachTo` or
+          // `forceNew` — so an ask on this path aborted the declaration with no way to answer it, and
+          // declaration is the only door a norm enters through. Reaching for `memory_store` instead
+          // would drop the declaration-only effects (blocking bindings, skeleton ratification).
+          //
+          // The exemption is not merely a hole cut to unblock a caller. The ask exists to pull a
+          // human in at the moment the substrate cannot tell concepts apart; a declaration is a write
+          // where the human is ALREADY there, settling a norm in their own words. Asking them which
+          // concept they meant, in the one place they are unambiguously present, is asking a question
+          // that has already been answered. Eligibility still narrows the landing — a declaration
+          // names its own species and stage, and the guards above run unchanged.
+          const isDeclaration =
+            opts.skeletonEntry?.entrance === "declaration" || opts.rule?.declaration === true;
+          if (askPending && !isDeclaration && verdict !== "supersede" && forkReason === null) {
+            // THE RUNNER-UP HAS TO BE A LANDING THE CALLER COULD ACTUALLY CHOOSE (Codex P2, round 2).
+            // The scan ranks every semantic neighbour, kind-blind by design — so for a principle or a
+            // rule the second place can be a concept that legally cannot receive it. Two things went
+            // wrong: an eligible winner was refused because an ineligible near-tie sat behind it, and
+            // the shortlist offered that concept even though an `attachTo` retry to it is rejected by
+            // the same guard that just forked it here.
             //
-            // SAME species still ATTACHES, deliberately: re-declaring the same principle is one
-            // concept gaining a second approve — idempotent membership, which is the correct
-            // semantics — so this narrows to a CROSS-kind guard, not a blanket forceNew. forceNew
-            // would abandon dedupe entirely and double the skeleton on every re-declaration.
-            : (opts.kind === "principle" || opts.kind === "preference") && landed.kind !== opts.kind ? "species"
-            // A RULE REPEATING ACROSS STAGES IS STILL A RULE (review fix — Codex 5-B round 2, R2-6),
-            // and this is the species guard one property over: resolution is ADDRESS-blind exactly
-            // as it is kind-blind, so an incoming capture for stage B above tauAttach against a rule
-            // bound to stage A used to attach — and `captureRuleBinding` then KEPT the stage-A
-            // binding, deliberately ("a rule's address does not move because an incidental repeat
-            // named a different stage"). The result was the worst outcome available: stage B got no
-            // rule, and because `landedOnExisting` went true the extraction flag — which rides rule
-            // BIRTH — never ran either. The strongest evidence of one reason repeating across
-            // moments produced nothing, while the WEAKER ambiguous-band version of the same event
-            // forked and flagged correctly. Forking here creates stage B's rule and hands the pair
-            // to the battery, which is what the design asks the substrate to notice.
-            : this.capturesAtADifferentStage(opts, landed) ? "stage"
-            : null;
+            // So the margin is re-derived over legal landings only. If nothing legal is left behind
+            // the winner there is exactly one destination, which is not an ambiguous choice at all —
+            // and the write proceeds instead of spending a round-trip to say so.
+            // FROM THE ROWS ALREADY IN HAND (Codex P2, round 7). `candidates` was loaded by the
+            // scan above; re-fetching each one made the ask — now roughly half of all stores — an
+            // N+1 pass of synchronous SQLite reads on top of a full observation scan, purely to
+            // refuse a write.
+            const byId = new Map(candidates.map((c) => [c.id, c]));
+            const legal = rankedCandidates.filter((c) => {
+              if (c.conceptId === landed.id) return true;
+              const row = byId.get(c.conceptId);
+              return row !== undefined && this.isLegalLanding(opts, row);
+            });
+            const legalWinner = legal.find((c) => c.conceptId === landed.id);
+            const legalRunnerUp = legal.find((c) => c.conceptId !== landed.id);
+            const legalMargin = legalWinner !== undefined && legalRunnerUp !== undefined
+              ? legalWinner.rank - legalRunnerUp.rank
+              : Infinity;
+            // COMPARABILITY, DECIDED OVER THE SAME PAIR THE MARGIN CAME FROM (Codex P2, round 8).
+            // Two independent necessary conditions, and neither implies the other:
+            //
+            //   CAN THE ARM READ THIS TEXT — a mostly-CJK probe sharing one ASCII identifier with a
+            //   candidate earns a positive IDF boost, so a movement test alone goes true while the
+            //   CJK carries no lexical signal at all.
+            //
+            //   DID THE ARM SEPARATE THESE TWO — in a two-concept circle `tokenIdf(2, df)` clamps
+            //   every weight to zero, so perfectly English text still ranks on raw cosine. Coverage
+            //   alone cannot see that, because it never looks at the circle.
+            //
+            // tauMargin was derived where both held, over a lexically-blended gap. Requiring both,
+            // on the legal pair, is what keeps it applied only there.
+            const armOn = this.embedder.needsLexicalArm === true;
+            const armMoved = (c: RankedCandidate | undefined): boolean => c !== undefined && c.rank !== c.score;
+            const comparable = !armOn
+              || (lexicalCoverage(content) >= LEXICAL_COVERAGE_MIN
+                && (armMoved(legalWinner) || armMoved(legalRunnerUp)));
+            if (comparable && this.tauMargin !== undefined && legalMargin < this.tauMargin) {
+              throw new AmbiguousNominationError(
+                legal.slice(0, AMBIGUOUS_CANDIDATES_MAX).map(({ conceptId, title, score }) => ({ conceptId, title, score })),
+                decision.score,
+                legalMargin,
+              );
+            }
+          }
           if (verdict === "supersede") {
             supersededRule = landed;
             landedOnExisting = false;
@@ -8885,6 +9015,9 @@ export class MonetCore {
   private applyEmbedderDerivedThresholds(embedder: EmbeddingProvider): void {
     this.tauAttach = this.explicitThresholdOpts.tauAttach ?? embedder.recommendedThresholds?.tauAttach ?? 0.55;
     this.tauAmbiguous = this.explicitThresholdOpts.tauAmbiguous ?? embedder.recommendedThresholds?.tauAmbiguous ?? 0.4;
+    // Deliberately without the `?? <number>` tail the two above carry: see the field's own
+    // declaration for why an unmeasured embedder gets no gate rather than a borrowed one.
+    this.tauMargin = this.explicitThresholdOpts.tauMargin ?? embedder.recommendedThresholds?.tauMargin;
     /*
      * A `related` edge needs more overlap than a semantic model implies. The MEASURED per-model
      * value wins; the class split below is the fallback for a model nobody has swept, and it is a
@@ -10740,6 +10873,63 @@ export class MonetCore {
    * The earlier version threw from inside the predicate, which meant the nominated case discarded
    * the correction entirely — a safety guard that ate data.
    */
+
+  /**
+   * Would landing this write on `landed` be REFUSED, and why? The `forkReason` chain from
+   * storeInternal, lifted so the shortlist filter and the write site cannot drift apart (Codex P2,
+   * round 2 on PR #87). It answers only the kind/address question — `verdict` carries the rule
+   * lifecycle half, which the write site still reads separately because "supersede" is not a
+   * refusal there, it is a different write.
+   */
+  private landingForkReason(
+    opts: StoreOpts,
+    landed: ConceptRow,
+    verdict: RuleCorrectionVerdict,
+  ): "blocking-rule" | "superseded-rule" | "species" | "stage" | null {
+  // FIVE WAYS A NOMINATED LANDING CAN BE REFUSED, and all of them fork rather than fail.
+  // Resolution chose this concept, not the caller: refusing the WRITE because the concept
+  // resolution picked turns out to be a deny, or dead, or the wrong species, or bound to
+  // another moment, would discard an observation the agent never asked to put there.
+  // Forking keeps the evidence and puts the near-match in front of a human.
+  // A NORMATIVE SPECIES NEVER MISFILES ACROSS KINDS (skeleton-entrances slice, review
+  // round 1, item 1). Resolution is kind-blind, so without this an incoming principle
+  // auto-attached to ANY governable concept above tauAttach — a fact it paraphrases, or a
+  // live blocking RULE — and the declaration entrance then stamped verdict "approve" onto
+  // that foreign row: the skeleton stayed empty (membership reads kind principle|
+  // preference), the response still claimed success, and the misfiled row became
+  // un-consolidatable (F4 refuses to strand its ratification) while memory_ratify refused
+  // to retire it (not a skeleton candidate). Forking instead of attaching is the rule
+  // precedent applied one species over.
+  //
+  // SAME species still ATTACHES, deliberately: re-declaring the same principle is one
+  // concept gaining a second approve — idempotent membership, which is the correct
+  // semantics — so this narrows to a CROSS-kind guard, not a blanket forceNew. forceNew
+  // would abandon dedupe entirely and double the skeleton on every re-declaration.
+  // A RULE REPEATING ACROSS STAGES IS STILL A RULE (review fix — Codex 5-B round 2, R2-6),
+  // and this is the species guard one property over: resolution is ADDRESS-blind exactly
+  // as it is kind-blind, so an incoming capture for stage B above tauAttach against a rule
+  // bound to stage A used to attach — and `captureRuleBinding` then KEPT the stage-A
+  // binding, deliberately ("a rule's address does not move because an incidental repeat
+  // named a different stage"). The result was the worst outcome available: stage B got no
+  // rule, and because `landedOnExisting` went true the extraction flag — which rides rule
+  // BIRTH — never ran either. The strongest evidence of one reason repeating across
+  // moments produced nothing, while the WEAKER ambiguous-band version of the same event
+  // forked and flagged correctly. Forking here creates stage B's rule and hands the pair
+  // to the battery, which is what the design asks the substrate to notice.
+    return verdict === "blocking" ? "blocking-rule"
+      : verdict === "superseded" ? "superseded-rule"
+      : opts.kind === "rule" && !this.canCarryRuleEvidence(landed) ? "species"
+      : (opts.kind === "principle" || opts.kind === "preference") && landed.kind !== opts.kind ? "species"
+      : this.capturesAtADifferentStage(opts, landed) ? "stage"
+      : null;
+  }
+
+  /** Whether an ordinary attach to `landed` would be allowed to stand — the shortlist's admission test. */
+  private isLegalLanding(opts: StoreOpts, landed: ConceptRow): boolean {
+    const verdict = this.ruleCorrectionVerdict(opts.kind, landed);
+    return verdict !== "supersede" && this.landingForkReason(opts, landed, verdict) === null;
+  }
+
   private ruleCorrectionVerdict(kind: string | undefined, row: ConceptRow): RuleCorrectionVerdict {
     if (kind !== "correction" || row.kind !== "rule") return "not-a-rule";
     const binding = getRuleBinding(this.db, row.id);
@@ -15543,11 +15733,25 @@ export class MonetCore {
    * Ties break on the lexicographically smaller concept id (the codebase's determinism convention —
    * rankByCentroid above, and the observation-level tie-break inside the scorer itself).
    */
-  private nominateByObservation(candidates: readonly ConceptRow[], emb: Float32Array, text: string): ResolutionNomination | null {
-    if (candidates.length === 0) return null;
+  /**
+   * Returns the winner AND the top few by rank. The second half exists only for the ambiguous-ask
+   * payload (#86): this loop is the one place every candidate's rank is known at once, so building
+   * the shortlist here costs nothing, where a second scan on the ask path would cost a full
+   * re-score on roughly half of all stores.
+   */
+  private nominateByObservation(
+    candidates: readonly ConceptRow[],
+    emb: Float32Array,
+    text: string,
+  ): { nomination: ResolutionNomination | null; ranked: RankedCandidate[] } {
+    if (candidates.length === 0) return { nomination: null, ranked: [] };
     const scored = scoreNativeConceptsByObservation(this.db, candidates.map((c) => c.id), emb, text, this.embedder.needsLexicalArm === true);
     let best: ResolutionNomination | null = null;
     let bestRank = -Infinity;
+    // The RUNNER-UP's rank, for the margin gate (#86). Tracked here rather than by re-scanning
+    // because this loop is the only place every candidate's rank exists at once, and the margin has
+    // to be the gap in the space the argmax was actually decided in.
+    let runnerUpRank = -Infinity;
     for (const candidate of candidates) {
       const match = scored.get(candidate.id);
       if (match === undefined) continue;
@@ -15555,7 +15759,13 @@ export class MonetCore {
       // that measurement showed picks the right concept 46.3% -> 59.1% of the time. WHAT the
       // decision then reads is `score`, the raw cosine, because tauAttach/tauAmbiguous are
       // calibrated against cosine and nothing measured says where they belong under a blend.
-      if (best !== null && (match.rank < bestRank || (match.rank === bestRank && candidate.id > best.conceptId))) continue;
+      if (best !== null && (match.rank < bestRank || (match.rank === bestRank && candidate.id > best.conceptId))) {
+        if (match.rank > runnerUpRank) runnerUpRank = match.rank;
+        continue;
+      }
+      // A displaced winner is the strongest loser so far — it must not be forgotten, or a circle
+      // whose candidates arrive in ascending rank order would report no runner-up at all.
+      if (best !== null && bestRank > runnerUpRank) runnerUpRank = bestRank;
       bestRank = match.rank;
       best = {
         conceptId: candidate.id,
@@ -15564,7 +15774,67 @@ export class MonetCore {
         centroidScore: cosine(emb, jsonToEmb(candidate.embedding)),
       };
     }
-    return best;
+    // LEFT UNDEFINED — meaning "do not gate" — for two different reasons, and both are honest.
+    //
+    // (1) NOTHING TO CHOOSE BETWEEN: no runner-up was nominatable, so the winner is not competing
+    //     with anything and the tauAttach verdict stands on its own.
+    //
+    // (2) NOT THE MEASURED QUANTITY (Codex P1, PR #87). `rank` is `cosine * (1 + LEXICAL_BOOST *
+    //     overlap)`, and tauMargin was derived on ranks the lexical arm had actually boosted. A
+    //     probe that yields NO lexical tokens gets overlap 0 against every candidate, so its ranks
+    //     collapse to raw cosines and the gap between two of them is a different quantity in a
+    //     different scale. `lexicalTokens`' TOKEN regex reads no CJK, so this is exactly the Korean
+    //     case — and the shipping bge-m3 profile is multilingual by intent and carries no
+    //     Latin-only script guard, so those writes DO reach here. Refusing them against a cutoff
+    //     measured on English would reject valid multilingual memories on a number that never
+    //     described them. Documenting that hazard beside the constant was not the same as handling
+    //     it; this is the handling. A CJK-derived margin can arm this path later — the profile
+    //     field is already per-model — but no corpus exists to derive one from yet.
+    //     ONLY WHEN THE ARM IS ACTUALLY ON (Codex P2, round 2). With `needsLexicalArm` false the
+    //     scorer defines rank as the raw cosine for EVERY input, so a caller-supplied tauMargin was
+    //     calibrated in that same raw space and stays valid for a tokenless probe. Suppressing there
+    //     would silently ignore an explicit override; the mismatch only exists when the arm is
+    //     enabled and this particular probe gave it nothing to work with.
+    //     ASKED DIRECTLY, AFTER THREE PROXIES FAILED (Codex, rounds 3-6). The question is whether the
+    //     lexical arm contributed to THIS ranking, and every attempt to infer that from the input was
+    //     a different near-miss: token presence let `API` plus Korean through; the SCRIPT share cannot
+    //     see accented Latin, which `script-gate.ts` says about itself; tokenizer coverage still
+    //     called emoji-only text fully readable, and none of the three could see that `tokenIdf(2, df)`
+    //     clamps every weight to zero in a two-concept circle, where the arm cannot boost anything no
+    //     matter how English the text is.
+    //
+    //     A boosted rank differs from its own raw score. That is the whole test, it needs no constant,
+    //     and it is true exactly when the calibrated regime applies — because tauMargin was derived on
+    //     gaps between ranks the arm had moved.
+
+    // The shortlist the caller chooses from, ordered the way the argmax ordered them, and the input to
+    // the comparability test above — so it is built before the margin is decided.
+    //
+    // DELIBERATELY UNCAPPED (Codex P2, round 3). Any cap here is applied BEFORE the ask site knows
+    // which landings are legal, so a normative write with enough ineligible neighbours above the cap
+    // loses its eligible runner-up, computes an infinite margin and attaches silently — the exact
+    // decision this gate exists to refuse. Capping is the caller-facing payload's job, downstream of
+    // the filter.
+    const ranked = candidates
+      .flatMap((c) => {
+        const m = scored.get(c.id);
+        return m === undefined ? [] : [{ conceptId: c.id, title: c.title, score: m.score, rank: m.rank }];
+      })
+      .sort((a, b) => (b.rank - a.rank) || (a.conceptId < b.conceptId ? -1 : 1));
+
+    // MARGIN HERE IS A FACT, NOT A VERDICT (Codex P2, round 8). Comparability used to be decided
+    // here, over the unfiltered top two — but the pair whose gap actually decides anything is the
+    // LEGAL one, and legality needs the incoming kind and the candidate rows, neither of which this
+    // scan has. Judging the raw pair could call a boosted-but-illegal neighbour comparable, or call
+    // an entirely raw legal pair incomparable.
+    //
+    // Deciding it downstream is safe in one direction only, and this is that direction: the legal
+    // runner-up sits at or below the raw runner-up in rank order, so `legalMargin >= rawMargin`
+    // always. A raw margin that clears tauMargin therefore guarantees the legal one does too, and
+    // gating provisionally on the raw value can never miss an ask — it can only raise one the ask
+    // site then withdraws, which is exactly what that site is for.
+    if (best !== null && runnerUpRank > -Infinity) best.margin = bestRank - runnerUpRank;
+    return { nomination: best, ranked };
   }
 
   /**

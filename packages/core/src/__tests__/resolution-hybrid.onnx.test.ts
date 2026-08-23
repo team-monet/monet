@@ -100,7 +100,7 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
     // bge-small-en-v1.5's, measured on a corpus this default no longer serves. NOTE tauAmbiguous is
     // 0.5 in EVERY profile, and the bge-m3 sweep found out WHY on both of its corpora: no fork scores
     // below it, so it is inert rather than tuned (#174).
-    expect(embedder.recommendedThresholds).toEqual({ tauAttach: 0.70, tauAmbiguous: 0.5, edgeSimMin: 0.60 });
+    expect(embedder.recommendedThresholds).toEqual({ tauAttach: 0.70, tauAmbiguous: 0.5, tauMargin: 0.12, edgeSimMin: 0.60 });
   });
 
   // SKIPPED — STALE FIXTURE, not a stale number (monet-core#170). This fixture was hand-sized to

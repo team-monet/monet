@@ -12,7 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { MonetCore, WorkstreamAddressRequiredError } from "./engine";
+import { AmbiguousNominationError, MonetCore, WorkstreamAddressRequiredError } from "./engine";
 import type { MemoryOverview, MergeConceptResult, RetirementBlocker, RuleSuccession, SearchCard, StageView, WorkstreamItem } from "./engine";
 import {
   BREADTH_CIRCLE,
@@ -1079,7 +1079,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_store",
-    'Store durable knowledge. Similar evidence normally attaches to an existing concept; novel, incoherent, species-mismatched, or stage-mismatched evidence creates a concept. The acknowledgement returns `circle`, `action`, and `conceptId`; anomalous forks also return `resolutionMode` and `score`, flagged pairs add `nearMatchId`/`nearMatchScore`, and correction/rule outcomes add `contradiction`, `ruleSuccession`, or `extractionCandidate` only when present, and a store into an archived circle adds `guidance` naming what recall will not reach. Use `attachTo` only when identity is known, or `resolution="forceNew"` for known-distinct items. Use kind="correction" to challenge prior memory. Use kind="rule" with `rule`; stored rules are advisory because blocking severity is declaration-only in memory_declare. Synthesis happens later on explicit read.',
+    'Store durable knowledge. Similar evidence normally attaches to an existing concept; novel, incoherent, species-mismatched, or stage-mismatched evidence creates a concept. Evidence that matches several concepts equally is REFUSED rather than guessed: the error names the candidates, and you re-send with `attachTo` or `resolution="forceNew"`. The acknowledgement returns `circle`, `action`, and `conceptId`; anomalous forks also return `resolutionMode` and `score`, flagged pairs add `nearMatchId`/`nearMatchScore`, and correction/rule outcomes add `contradiction`, `ruleSuccession`, or `extractionCandidate` only when present, and a store into an archived circle adds `guidance` naming what recall will not reach. Use `attachTo` only when identity is known, or `resolution="forceNew"` for known-distinct items. Use kind="correction" to challenge prior memory. Use kind="rule" with `rule`; stored rules are advisory because blocking severity is declaration-only in memory_declare. Synthesis happens later on explicit read.',
     {
       content: z
         .string()
@@ -1267,6 +1267,49 @@ export function registerMonetCoreTools(
         };
         return mutOk(envelope, "memory_store", capturedBlock);
       } catch (e) {
+        // NOT A FAILURE, and it must not read as one (#86). The evidence matched several concepts
+        // closely enough that nothing distinguished them, so the write was refused rather than
+        // guessed — under that bar the guess is wrong about 64% of the time. The caller is the only
+        // party that knows which of these it meant, and it knows now, in this turn.
+        //
+        // The candidates ARE the payload: an instruction alone would send the agent to search for
+        // what this call already computed. `resolutionMode` says which decision produced this so it
+        // reads in the same vocabulary as an ordinary ack.
+        if (e instanceof AmbiguousNominationError) {
+          // STRUCTURED, so the candidates are machine-readable rather than scraped out of prose —
+          // Codex P2, PR #87, taken. What is NOT taken from that finding is dropping `isError`.
+          //
+          // The review asked for a normal success result carrying `resolutionMode`. But `isError`
+          // is not a claim about who is at fault, it is the one bit that says THE CALL DID NOT DO
+          // WHAT YOU ASKED — and here it did not: no memory exists. This whole change exists to stop
+          // a store from ending in a quiet wrong outcome, and an ok-shaped envelope is exactly how
+          // an agent skims past `action: "ask"` and walks away believing the write landed. A host
+          // classifying this as a failed tool execution is classifying it correctly.
+          return err(JSON.stringify({
+            action: "ask",
+            resolutionMode: "ambiguous-ask",
+            stored: false,
+            reason: e.message,
+            margin: Number(e.margin.toFixed(4)),
+            candidates: e.candidates.map((c) => ({
+              conceptId: c.conceptId,
+              title: c.title,
+              score: Number(c.score.toFixed(3)),
+            })),
+            // NOT AN EXHAUSTIVE SET, and the instruction must not pretend otherwise (Codex P1,
+            // round 6). These are the closest legal landings, capped at three, and the true home is
+            // among the top three for about 80% of asks — so "none of these" is not the same claim as
+            // "this is new". Telling the caller to reach for forceNew on that basis sends the other
+            // 20% down the one branch that records no link at all, which is how an unlinked twin of an
+            // existing concept gets created by following the instructions exactly.
+            instruction:
+              'Re-send this exact content with attachTo set to one of the conceptIds above. These are ' +
+              'the three closest matches, not every concept — if none looks right, memory_search for ' +
+              'the right one and pass its id to attachTo instead. Use resolution="forceNew" only to ' +
+              'assert this is genuinely new: it records no link to anything, so an unlinked duplicate ' +
+              'is invisible to curation afterwards.',
+          }, null, 2));
+        }
         return err(`store failed: ${msg(e)}`);
       }
     },

@@ -21,8 +21,12 @@ export {
   EmbedderMigrationFailedError,
   EmbedderMigrationAbandonRefusedError,
   EmbedderMigrationAbandonUnsupportedError,
+  // Expected control flow on store(), not a failure — a direct MonetCore caller needs `instanceof`
+  // to implement the retry (Codex P2, PR #87), and cannot reach an internal path to get it.
+  AmbiguousNominationError,
 } from "./engine";
 export type {
+  AmbiguousCandidate,
   Concept,
   SearchCard,
   IngestResult,

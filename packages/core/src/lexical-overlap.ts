@@ -38,6 +38,47 @@
  */
 const TOKEN = /[a-z0-9][a-z0-9_-]{2,}/gu;
 
+/**
+ * The share of a text's letters and digits that `TOKEN` above actually consumes — "how much of this
+ * can the lexical arm read", answered by the tokenizer itself.
+ *
+ * WHY NOT nonLatinLetterShare (Codex P1, PR #87 round 4). That function detects SCRIPT, and says so
+ * in its own header: French, Vietnamese and Turkish score 0 there and are still largely invisible to
+ * TOKEN, whose class is `[a-z0-9_-]`. Anything accented is dropped or fragmented. Using the script
+ * guard to decide lexical comparability answered a neighbouring question — the third time this
+ * branch reached for an adjacent quantity, which is why the measure now lives beside the regex it
+ * measures rather than being borrowed from a module that documents its own unsuitability.
+ */
+/**
+ * Below this share of a text readable by TOKEN, a rank gap is not the quantity a lexically-blended
+ * threshold was calibrated against, and any such threshold must stand down (see tauMargin).
+ *
+ * MEASURED, NOT PICKED. On the corpus tauMargin was derived from (monet-hq, n=1011 live
+ * observations) coverage runs min 0.845, p01 0.902, p05 0.920, p50 0.955 — so every observation that
+ * produced the threshold clears this bar with room. The cases it has to exclude sit far below:
+ * Korean scores 0.000, Korean carrying an ASCII identifier 0.200, and accented French 0.571. The
+ * band between 0.571 and 0.845 is empty on both sides, and this sits inside it.
+ *
+ * That emptiness is why the value is a floor rather than a tuned point: anywhere in that band admits
+ * 100% of the derivation population and refuses all three contrast cases, so nothing here is being
+ * traded off. Re-measure it on any corpus this threshold is re-derived against.
+ */
+export const LEXICAL_COVERAGE_MIN = 0.8;
+
+export function lexicalCoverage(text: string): number {
+  const lower = text.toLowerCase();
+  const alnum = lower.match(/[\p{L}\p{N}]/gu);
+  if (alnum === null || alnum.length === 0) return 1; // nothing to read: vacuously comparable
+  // COUNTED THE SAME WAY ON BOTH SIDES (Codex P2, PR #87 round 5). `m[0].length` includes the `-`
+  // and `_` a token may carry, while the denominator counts letters and digits only — so a token
+  // like `api____________________` reported more covered characters than it has readable ones and
+  // could push a mostly-CJK probe to full coverage on three ASCII letters. The numerator now counts
+  // what the denominator counts.
+  let covered = 0;
+  for (const m of lower.matchAll(TOKEN)) covered += (m[0].match(/[\p{L}\p{N}]/gu) ?? []).length;
+  return Math.min(1, covered / alnum.length);
+}
+
 /** The token set of one text. A SET, not a bag: this measures whether a term is shared, not how
  *  often it is repeated, so a long observation cannot outscore a short one by restating itself. */
 export function lexicalTokens(text: string): Set<string> {
@@ -102,11 +143,19 @@ export function lexicalOverlap(
  * the floor of the decision and lets the lexical arm only re-order candidates that already have
  * semantic support. A concept the embedding rejects cannot be talked into winning by vocabulary.
  *
- * THE WEIGHT IS A PLATEAU, NOT A POINT. Measured at the shipped observation-unit overlap, argmax
- * accuracy runs 0.5 -> 67.1%, 1.0 -> 72.1%, 2.0 -> 72.7%, 4.0 -> 73.2% on the current embedder, and
- * 72.8 / 73.9 / 74.2 / 73.3 on bge-small-en. Everything from 1.0 upward is one plateau inside the
- * ~1.8pt standard error at n=739; 0.5 is measurably BELOW it. 1.0 is the conservative point on that
- * plateau — enough boost to capture the gain, little enough that cosine keeps most of the decision.
+ * THE WEIGHT WAS A PLATEAU ON THE EMBEDDERS IT WAS MEASURED ON, AND IS A PEAK ON THE ONE THAT
+ * SHIPS. Measured at the shipped observation-unit overlap, argmax accuracy ran 0.5 -> 67.1%,
+ * 1.0 -> 72.1%, 2.0 -> 72.7%, 4.0 -> 73.2% on the then-current embedder, and 72.8 / 73.9 / 74.2 /
+ * 73.3 on bge-small-en — one plateau from 1.0 upward, inside the ~1.8pt standard error at n=739.
+ *
+ * RE-MEASURED 2026-08-23 ON bge-m3 (the shipping embedder) over the live monet-hq corpus, n=788:
+ * 0 -> 66.0%, 0.25 -> 71.6%, 0.5 -> 72.8%, 1.0 -> 73.9%, 2.0 -> 72.8%, 4.0 -> 72.1%. There is no
+ * plateau in this space — accuracy falls monotonically above 1.0, which inverts the ordering the
+ * paragraph above reports. 1.0 remains correct, but as the PEAK, not as a conservative point on a
+ * flat region; do not read the plateau as licence to raise it. The zero point was never measured
+ * before this: the lexical arm is worth +62 observations (66.0% -> 73.9%) and is net positive in
+ * every home-concept size bin, so it earns its place — 21.8% of the residual misfiles at 1.0 are
+ * won on a LOWER raw cosine, and that is the price of the gain rather than a defect to remove.
  *
  * An earlier draft of this file claimed 0.5 was optimal and that higher weights scored worse. That
  * came from measuring overlap against a concept's token UNION, whose size bias inverted the ordering.

@@ -32,6 +32,26 @@ export interface EmbeddingThresholds {
    */
   tauAmbiguous: number;
   /**
+   * How far the nomination's winner must stand ABOVE the runner-up before the attach is taken
+   * without asking. A separate question from tauAttach, and the one that actually discriminates:
+   * `score >= tauAttach` asks "is this similar enough", never "am I sure it is THIS one".
+   *
+   * WHY A SECOND GATE RATHER THAN A HIGHER FIRST ONE. Precision of attaches is FLAT at ~74% across
+   * the whole tauAttach range (measured 0.50 -> 0.75 on the live monet-hq corpus, n=788): raising
+   * tauAttach trades correct attaches for forks without improving which concept wins. The margin
+   * does separate — among misfiles its median is 0.0335, below the p10 of 0.0346 for correct
+   * decisions. Below this bar the winner is wrong ~64% of the time, which is worse than a coin
+   * flip, so the decision is handed to the caller (see resolution.ts's ASK outcome) instead of
+   * being taken on evidence that does not identify a unique target.
+   *
+   * PER-MODEL, AND NOT OPTIONAL-BY-ACCIDENT: this is a gap between two `rank` values, and `rank` is
+   * `cosine * (1 + LEXICAL_BOOST * overlap)` — so it scales with the space AND with how much
+   * lexical signal the space's tokenizer can see. Omitted means no margin gate at all (every
+   * above-tau nomination attaches, the pre-#86 behaviour), which is the honest default for a model
+   * nobody has measured: a borrowed margin would gate a space it was never derived in.
+   */
+  tauMargin?: number;
+  /**
    * Lower bound of the `related` edge band, `edgeSimMin <= cos < tauAttach`. Per-model because it
    * is a raw cosine and cosine scales differ by space; omitted means the engine's embedder-class
    * fallback, which is a guess about the class rather than a measurement of the model.

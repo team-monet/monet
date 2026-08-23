@@ -29,9 +29,13 @@
  * recommendedThresholds), and the tests assert the relation numerically before asserting behavior.
  */
 import { describe, it, expect } from "vitest";
-import { MonetCore } from "../engine";
+import { AmbiguousNominationError, MonetCore } from "../engine";
 import { HashingEmbeddingProvider, cosine, jsonToEmb } from "../embedding";
+import { scoreNativeConceptsByObservation } from "../retrieval";
+import { LEXICAL_COVERAGE_MIN, lexicalCoverage } from "../lexical-overlap";
 import { resolveIncoming, type ResolutionThresholds } from "../resolution";
+import { lexicalTokens } from "../lexical-overlap";
+import { NON_LATIN_LETTER_TOLERANCE, nonLatinLetterShare } from "../script-gate";
 import type { StoragePort } from "../storage";
 
 const CIRCLE = "resolution";
@@ -47,6 +51,7 @@ function newCore(thresholds: ResolutionThresholds): MonetCore {
     embedder: new HashingEmbeddingProvider(),
     tauAttach: thresholds.tauAttach,
     tauAmbiguous: thresholds.tauAmbiguous,
+    tauMargin: thresholds.tauMargin,
     idGen: () => `c${(seq++).toString().padStart(4, "0")}`,
   });
 }
@@ -870,6 +875,424 @@ describe("resolution — the instrumentation log", () => {
       const stats = core.resolutionStats(CIRCLE);
       expect(stats.windowTotal).toBe(1); // the 40-day-old row is out of the window...
       expect(stats.total).toBe(2); //     ...but never out of the log
+    } finally {
+      core.close();
+    }
+  });
+});
+
+/**
+ * THE MARGIN GATE (#86): "similar enough" and "sure it is THIS one" are different questions, and
+ * only the first was ever asked. These pin the SECOND, and they pin the middle of the band rather
+ * than its two ends — an ask that fires only on a lone perfect match and a lone total miss would
+ * be green over the entire population the gate exists for.
+ *
+ * The unit tests below drive resolveIncoming directly because the gate is a property of the
+ * DECISION, not of any geometry: the margin arrives pre-computed from the nomination scan (the one
+ * place every candidate's rank exists at once), so a fixture that had to manufacture two
+ * near-equally-ranked concepts would be testing the scorer instead.
+ */
+describe("the margin gate", () => {
+  const BANDS = { tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.1 };
+  const nominate = (margin?: number) => ({
+    conceptId: "c0001",
+    obsScore: 0.9, // clears tauAttach comfortably — this band is not what is under test
+    observationId: "o1",
+    centroidScore: 0.8, // clears tauAmbiguous — so the attach branch is genuinely reached
+    ...(margin === undefined ? {} : { margin }),
+  });
+
+  it("asks instead of attaching when the winner is not separated from the runner-up", () => {
+    const d = resolveIncoming({ nomination: nominate(0.05), thresholds: BANDS });
+    expect(d.action).toBe("ask");
+    expect(d.mode).toBe("ambiguous-ask");
+    // It DOES name the winner — not as a destination, but because the engine has to settle whether
+    // landing there was even legal (blocking rule / superseded / wrong species / another stage)
+    // before it may raise the ask. Asking about a concept the write would have forked away from
+    // spends a round-trip to reach the same fork.
+    expect(d.attachToConceptId).toBe("c0001");
+    expect(d.score).toBe(0.9);
+  });
+
+  it("attaches when the winner IS separated", () => {
+    const d = resolveIncoming({ nomination: nominate(0.2), thresholds: BANDS });
+    expect(d.action).toBe("attached");
+    expect(d.attachToConceptId).toBe("c0001");
+  });
+
+  it("attaches exactly ON the bar — inclusive at the bottom, like every other band here", () => {
+    const d = resolveIncoming({ nomination: nominate(0.1), thresholds: BANDS });
+    expect(d.action).toBe("attached");
+  });
+
+  it("never asks when there was no runner-up to be separated from", () => {
+    // One nominatable concept in the circle. Not ambiguity — there is nothing to choose BETWEEN —
+    // and treating a missing margin as zero would refuse every write into a one-concept circle.
+    const d = resolveIncoming({ nomination: nominate(undefined), thresholds: BANDS });
+    expect(d.action).toBe("attached");
+  });
+
+  it("is off entirely for an embedder nobody measured it in", () => {
+    const d = resolveIncoming({ nomination: nominate(0.001), thresholds: { tauAttach: 0.5, tauAmbiguous: 0.3 } });
+    expect(d.action).toBe("attached"); // pre-#86 behaviour, not a borrowed number
+  });
+
+  it("does not reach into the bands below it — a sub-tauAttach score still forks on its own terms", () => {
+    // The gate lives INSIDE the attach branch. A tiny margin down here must not turn a fork into an
+    // ask: the decision not to attach was already made on evidence, and asking would offer the
+    // caller a concept the evidence just rejected.
+    const d = resolveIncoming({
+      nomination: { conceptId: "c0001", obsScore: 0.4, observationId: "o1", centroidScore: 0.35, margin: 0.001 },
+      thresholds: BANDS,
+    });
+    expect(d.action).not.toBe("ask");
+    expect(d.mode).toBe("ambiguous-fork");
+  });
+
+  it("does not reach into the fork signal either", () => {
+    // Evidence says attach, identity says the concept has drifted. That disagreement IS the answer;
+    // a margin question on top of it would ask the caller to arbitrate a fork it cannot see.
+    const d = resolveIncoming({
+      nomination: { conceptId: "c0001", obsScore: 0.9, observationId: "o1", centroidScore: 0.1, margin: 0.001 },
+      thresholds: BANDS,
+    });
+    expect(d.action).not.toBe("ask");
+    expect(d.mode).toBe("fork-signal");
+  });
+});
+
+/**
+ * THE ASK, THROUGH THE REAL ENGINE. The unit suite above pins the decision; this pins the thing the
+ * decision exists to guarantee — that an ambiguous store leaves the database exactly as it found it.
+ * That invariant cannot be unit-tested: it is a property of where the refusal happens relative to
+ * the write transaction, not of what resolveIncoming returns.
+ *
+ * Geometry first, as everywhere in this file: the fixture asserts that its two concepts really are
+ * near-equally ranked before asserting that the store refuses to choose between them. A fixture that
+ * drifted apart would fail on its premise instead of passing vacuously.
+ */
+describe("an ambiguous store writes nothing", () => {
+  const rows = (core: MonetCore) => ({
+    concepts: (dbOf(core).prepare(`SELECT COUNT(*) n FROM concepts`).get() as { n: number }).n,
+    observations: (dbOf(core).prepare(`SELECT COUNT(*) n FROM observations`).get() as { n: number }).n,
+    events: (dbOf(core).prepare(`SELECT COUNT(*) n FROM resolution_events`).get() as { n: number }).n,
+  });
+
+  /** Two concepts about the same thing, plus a probe that belongs to neither more than the other. */
+  const A = "the ferry to the island leaves at quarter past every hour";
+  const B = "the ferry to the island leaves at quarter past the hour on weekends";
+  const PROBE = "the ferry to the island leaves at quarter past";
+
+  async function fixture(tauMargin?: number) {
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin });
+    const a = await seedConcept(core, [A]);
+    const b = await seedConcept(core, [B]);
+    return { core, a, b };
+  }
+
+  it("refuses, names the candidates, and leaves every table untouched", async () => {
+    const { core, a, b } = await fixture(0.1);
+    try {
+      // PREMISE: both clear tauAttach and nothing separates them by more than the gate.
+      const ga = geometry(core, a, PROBE), gb = geometry(core, b, PROBE);
+      expect(ga.bestObservation).toBeGreaterThanOrEqual(0.5);
+      expect(gb.bestObservation).toBeGreaterThanOrEqual(0.5);
+      expect(Math.abs(ga.bestObservation - gb.bestObservation)).toBeLessThan(0.1);
+
+      const before = rows(core);
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+
+      // THE INVARIANT. Not just "no concept" — no observation, and no resolution_event either: an
+      // ask resolved nothing, so counting it would charge one store twice once the caller retries.
+      expect(rows(core)).toEqual(before);
+
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toMatchObject({
+        candidates: expect.arrayContaining([
+          expect.objectContaining({ conceptId: a }),
+          expect.objectContaining({ conceptId: b }),
+        ]),
+      });
+    } finally {
+      core.close();
+    }
+  });
+
+  it("attaches on the retry once the caller names one — the ask is answerable, not a dead end", async () => {
+    const { core, a } = await fixture(0.1);
+    try {
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+      const r = await core.store(PROBE, { circle: CIRCLE, attachTo: a });
+      expect(r.action).toBe("attached");
+      expect(r.conceptId).toBe(a);
+      expect(liveObservations(core, a)).toBe(2);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("creates an UNLINKED concept on forceNew — the price of the assertion, asserted not assumed", async () => {
+    // This test replaces one whose title claimed a possible_duplicate_of edge and whose assertion
+    // never looked for it (`nearMatchId ?? score` is always defined). Codex caught it on PR #87.
+    // forceNew records no such edge — engine.ts's forceNew branch says so — so the honest pin is
+    // that the edge is ABSENT, which is what a reader needs to know before choosing this retry.
+    const { core } = await fixture(0.1);
+    try {
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+      const before = (dbOf(core).prepare(
+        `SELECT COUNT(*) n FROM memory_edge WHERE type = 'possible_duplicate_of'`,
+      ).get() as { n: number }).n;
+
+      const r = await core.store(PROBE, { circle: CIRCLE, resolution: "forceNew" });
+      expect(r.action).toBe("created");
+
+      const after = (dbOf(core).prepare(
+        `SELECT COUNT(*) n FROM memory_edge WHERE type = 'possible_duplicate_of'`,
+      ).get() as { n: number }).n;
+      expect(after).toBe(before); // no pairing edge — the new concept stands alone
+      expect(r.nearMatchId).toBeUndefined();
+    } finally {
+      core.close();
+    }
+  });
+
+  it("stores the same content silently when the gate is off — the fixture is not ambiguous by accident", async () => {
+    // The control. Same two concepts, same probe, gate disarmed: if this ALSO refused, the tests
+    // above would be pinning something other than the margin.
+    const { core } = await fixture(undefined);
+    try {
+      const r = await core.store(PROBE, { circle: CIRCLE });
+      expect(r.action).toBe("attached");
+    } finally {
+      core.close();
+    }
+  });
+});
+
+/**
+ * WHAT THE REVIEW OF PR #87 ADDED. Both are cases where the gate must NOT fire, and both were
+ * shipped wrong in the first draft: one refused writes on a number that never described them, the
+ * other asked about a concept the write would have refused anyway.
+ */
+describe("the margin gate declines to fire", () => {
+  const rows = (core: MonetCore) =>
+    (dbOf(core).prepare(`SELECT COUNT(*) n FROM observations`).get() as { n: number }).n;
+
+  /** Same vectors, lexical arm ON — the shipping configuration's shape, which the plain hashing
+   *  provider does not have (its `needsLexicalArm` is undefined). */
+  class LexicalArmProvider extends HashingEmbeddingProvider {
+    readonly needsLexicalArm = true;
+  }
+  const armedCore = (tauMargin: number): MonetCore => {
+    let seq = 0;
+    return new MonetCore(":memory:", {
+      embedder: new LexicalArmProvider(),
+      tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin,
+      idGen: () => `k${(seq++).toString().padStart(4, "0")}`,
+    });
+  };
+  const KO_A = "페리는 매시 십오분에 섬으로 출발한다";
+  const KO_B = "페리는 주말에는 매시 십오분에 섬으로 출발한다";
+  const KO_PROBE = "페리는 매시 십오분에 섬으로";
+
+  it("but NOT when the arm is off — there the raw-rank margin is exactly what was calibrated", async () => {
+    // The complement, and the reason the suppression is conditional rather than blanket (Codex P2,
+    // round 2). With no lexical arm the scorer defines rank as the raw cosine for EVERY input, so a
+    // caller-supplied tauMargin lives in that same space and a tokenless probe is not a special case.
+    // Suppressing here would silently discard an explicit override.
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.1 });
+    try {
+      await seedConcept(core, [KO_A]);
+      await seedConcept(core, [KO_B]);
+      await expect(core.store(KO_PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("when the write is a DECLARATION — the human settling a norm is already the answer", async () => {
+    // declare() writes through store(), but neither DeclareInput nor the memory_declare schema
+    // carries attachTo or forceNew, so an ask here aborted the declaration outright with no way to
+    // answer it — and declaration is the only door a norm enters through (Codex P1, round 3; John
+    // ruled exemption over extending the declare contract).
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.9 }); // ask on nearly anything
+    try {
+      const TEXT = "batch questions and ask them once rather than one at a time";
+      await core.store(TEXT, { circle: CIRCLE, kind: "principle", resolution: "forceNew" });
+      await core.store("batch questions and ask them once rather than one by one", {
+        circle: CIRCLE, kind: "principle", resolution: "forceNew",
+      });
+
+      // The same content through the DECLARATION entrance must land, not refuse.
+      const r = await core.declare({
+        species: "principle",
+        content: "batch questions and ask them once rather than one at a time",
+        circle: CIRCLE,
+        declaredBy: "john",
+      });
+      expect(r).toBeDefined();
+    } finally {
+      core.close();
+    }
+  });
+
+  /** Did the lexical arm actually move this ranking? The engine's own test, restated for the fixture:
+   *  a boosted rank differs from its raw score. */
+  const armContributed = (core: MonetCore, probe: string): boolean => {
+    const ids = (dbOf(core).prepare(`SELECT id FROM concepts WHERE circle = ? AND status != 'retired'`)
+      .all(CIRCLE) as Array<{ id: string }>).map((r) => r.id);
+    const scored = scoreNativeConceptsByObservation(dbOf(core), ids, embedder.embed(probe), probe, true);
+    return [...scored.values()].some((m) => m.rank !== m.score);
+  };
+
+  it("when the lexical arm did not move the ranking — CJK, emoji, and a two-concept circle alike", async () => {
+    // THREE PROXIES FAILED BEFORE THIS ONE (Codex rounds 3-6): token presence let `API` plus Korean
+    // through, the SCRIPT share cannot see accented Latin, and tokenizer coverage called emoji-only
+    // text fully readable. None of them could see the last case at all — in a two-concept circle
+    // `tokenIdf(2, df)` clamps every weight to zero, so the arm cannot boost anything however English
+    // the text is, and the margin is a raw-cosine gap that 0.12 was never calibrated against.
+    for (const [label, a, b, probe] of [
+      ["CJK", "페리는 매시 십오분에 섬으로 출발한다", "페리는 주말에 매시 십오분에 출발한다", "페리는 매시 십오분에 섬으로"],
+      ["mixed script", "API 페리는 매시 십오분에 섬으로 출발한다", "API 페리는 주말에 십오분에 출발한다", "API 페리는 매시 십오분에"],
+      ["emoji only", "🚢⏰🏝️🚢⏰", "🚢⏰🏝️🚢⏰⛵", "🚢⏰🏝️"],
+    ] as Array<[string, string, string, string]>) {
+      // Bar above every reachable margin (rank <= 2), so a live gate WOULD refuse these — which is
+      // what makes the pass mean the guard disarmed it, rather than the geometry being generous.
+      const core = armedCore(5);
+      try {
+        await seedConcept(core, [a]);
+        await seedConcept(core, [b]);
+        expect(armContributed(core, probe), `${label}: premise — the arm must be silent here`).toBe(false);
+        const before = rows(core);
+        const r = await core.store(probe, { circle: CIRCLE });
+        expect(["attached", "created", "ambiguous"], label).toContain(r.action);
+        expect(rows(core), label).toBe(before + 1);
+      } finally {
+        core.close();
+      }
+    }
+  });
+
+  it("nor in a two-concept circle, however English the text — tokenIdf clamps every weight to zero", async () => {
+    // Codex's own case (P2, round 6), and the one no input-shape proxy could ever have seen: with
+    // N=2 every token present in a candidate has df >= 1, so tokenIdf(2, df) = max(0, log(2/2)) = 0
+    // and the arm cannot boost anything. Ordinary English, and still a raw-cosine gap.
+    const core = armedCore(0.1);
+    try {
+      const A = "the ferry to the island leaves at quarter past every hour";
+      const PROBE = "the ferry to the island leaves at quarter past";
+      await seedConcept(core, [A]);
+      await seedConcept(core, [A + " on weekdays"]);
+      expect(armContributed(core, PROBE)).toBe(false); // premise: English, yet silent
+      const before = rows(core);
+      const r = await core.store(PROBE, { circle: CIRCLE });
+      expect(["attached", "created", "ambiguous"]).toContain(r.action);
+      expect(rows(core)).toBe(before + 1);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("nor when a shared ASCII token is the ONLY thing the arm can read", async () => {
+    // Movement alone re-admits the case it was meant to close (Codex P1, round 7): a mostly-Korean
+    // probe sharing one identifier with its candidates gets a positive IDF boost, so `rank !== score`
+    // goes true while the Korean carries no lexical signal at all. Coverage and movement are
+    // independent necessary conditions, and the second arriving was not a reason to drop the first.
+    const core = armedCore(5);
+    try {
+      // `api` must sit in exactly ONE concept or tokenIdf clamps it: at N=3 a term in two or three
+      // concepts weighs log(3/3) or less, which is zero after the clamp.
+      const A = "API 페리는 매시 십오분에 섬으로 출발한다";
+      const B = "페리는 주말에 매시 십오분에 출발한다";
+      const C = "트램은 항구에서 다른 시간표로 운행한다";
+      const PROBE = "API 페리는 매시 십오분에 섬으로";
+      await seedConcept(core, [A]);
+      await seedConcept(core, [B]);
+      await seedConcept(core, [C]); // three concepts, so tokenIdf does not clamp to zero
+      // PREMISE: the arm DOES move a rank here — movement alone would call this comparable...
+      expect(armContributed(core, PROBE)).toBe(true);
+      // ...while the tokenizer reads almost none of it.
+      expect(lexicalCoverage(PROBE)).toBeLessThan(LEXICAL_COVERAGE_MIN);
+
+      const before = rows(core);
+      const r = await core.store(PROBE, { circle: CIRCLE });
+      expect(["attached", "created", "ambiguous"]).toContain(r.action);
+      expect(rows(core)).toBe(before + 1);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("but DOES fire once the arm can move a rank — the shipping configuration", async () => {
+    // The complement, and the case the suite was missing: every armed fixture above has exactly two
+    // concepts, where the arm is structurally silent, so none of them exercised an ask with the arm
+    // ON. Three concepts give tokenIdf something to weigh.
+    //
+    // The bar is above every reachable margin on purpose. `rank` is `cosine * (1 + 1.0 * overlap)`
+    // with both factors <= 1 and <= 2, so no gap can reach 5 — which makes this assert that the gate
+    // is LIVE here, without depending on the fixture's geometry. At a realistic 0.1 this same fixture
+    // attaches, because the arm separates the winner, and that is correct behaviour rather than a
+    // counterexample.
+    const core = armedCore(5);
+    try {
+      const PROBE = "the ferry to the island leaves at quarter past";
+      // The probe must carry a token that lives in exactly ONE candidate, or tokenIdf zeroes it:
+      // at N=3 a term in two concepts still weighs log(3/3) = 0. "leaves"/"quarter"/"past" are in
+      // the first concept only, which is what gives the arm something to move.
+      await seedConcept(core, ["the ferry to the island leaves at quarter past every hour"]);
+      await seedConcept(core, ["the ferry to the island departs on weekends only"]);
+      await seedConcept(core, ["the tram to the harbour runs on a different timetable entirely"]);
+      expect(armContributed(core, PROBE)).toBe(true); // premise: the arm really does move a rank here
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("ignores an ineligible near-tie — one legal destination is not an ambiguous choice", async () => {
+    // The scan is kind-blind by design, so for a principle the runner-up can be an ordinary
+    // statement that legally cannot receive it. Counting that as competition refused an eligible
+    // winner, and the shortlist then offered a concept whose `attachTo` retry the same guard
+    // rejects. The margin is re-derived over legal landings only (Codex P2, round 2).
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.9 }); // ask on nearly anything
+    try {
+      const TEXT = "the ferry to the island leaves at quarter past every hour";
+      // An eligible destination for a principle...
+      const home = await core.store(TEXT, { circle: CIRCLE, kind: "principle", resolution: "forceNew" });
+      // ...and a near-tied statement, which is not one.
+      await seedConcept(core, ["the ferry to the island leaves at quarter past every hour on weekdays"]);
+
+      const r = await core.store("the ferry to the island leaves at quarter past every hour", {
+        circle: CIRCLE,
+        kind: "principle",
+      });
+      // Attached rather than asked: the statement was never a destination, so nothing competed.
+      expect(r.action).toBe("attached");
+      expect(r.conceptId).toBe(home.conceptId);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("when the winner was never a legal landing — an ineligible match forks instead of asking", async () => {
+    // A principle whose top semantic match is an ordinary observation cannot attach there: the
+    // cross-species guard forks it. Raising the ask first would put that concept in front of the
+    // caller, who would choose it, and the retry would fork anyway — a round-trip that changes
+    // nothing. So eligibility settles before the ask does.
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.9 }); // 0.9 = ask on nearly anything
+    try {
+      const A = "the ferry to the island leaves at quarter past every hour";
+      const B = "the ferry to the island leaves at quarter past the hour on weekends";
+      await seedConcept(core, [A]);
+      await seedConcept(core, [B]);
+
+      // Same probe, but stored as a principle: resolution nominates one of the two statements above,
+      // and the species guard refuses that landing.
+      const r = await core.store("the ferry to the island leaves at quarter past", {
+        circle: CIRCLE,
+        kind: "principle",
+      });
+      expect(r.action).toBe("created");
+      expect(r.resolutionMode).toBe("species-fork");
     } finally {
       core.close();
     }
