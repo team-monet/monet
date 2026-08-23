@@ -64,7 +64,7 @@ import {
 export type { ResolutionMode } from "./resolution";
 import { RELIABLE_EMBED_TOKENS, reliableSegmentTokensOf } from "./embed-budget";
 import { segmentObservation, segmentTokenBudget } from "./observation-segmenter";
-import { lexicalTokens } from "./lexical-overlap";
+import { LEXICAL_COVERAGE_MIN, lexicalCoverage, lexicalTokens } from "./lexical-overlap";
 import {
   inspectLiveEmbeddingPopulations,
   parseFiniteEmbeddingJson,
@@ -4484,10 +4484,17 @@ export class MonetCore {
         // `forkReason` has spoken, and everything from here to there runs on the ordinary attach
         // path with the winner resolution named.
         const askPending = decision.action === "ask";
+        // A HELD ASK CARRIES THE RESOLUTION IT IS HOLDING, never its own mode (Codex P2, round 4).
+        // Several paths below waive the ask and let the write proceed — a declaration, a winner with
+        // no eligible runner-up, a rule supersession — and leaving "ambiguous-ask" in place committed
+        // a resolution_event whose mode is documented as writing nothing, while excluding a real
+        // attach from decided-resolution statistics. So the pending ask presents as the attach it
+        // would have been; the fork branches below overwrite both fields as they already do, and the
+        // only place the ask's own identity matters is the throw, which ends the write anyway.
         // Narrowed inline rather than through `askPending`: the compiler cannot see that the const
         // and the discriminant are the same test, and a cast here would hide a real future mismatch.
         action = decision.action === "ask" ? "attached" : decision.action;
-        mode = decision.mode;
+        mode = decision.action === "ask" ? "attach" : decision.mode;
         nearMatchId = decision.nearMatchId;
         nearMatchScore = decision.nearMatchScore;
         autoScore = decision.score;
@@ -15763,15 +15770,14 @@ export class MonetCore {
     //     calibrated in that same raw space and stays valid for a tokenless probe. Suppressing there
     //     would silently ignore an explicit override; the mismatch only exists when the arm is
     //     enabled and this particular probe gave it nothing to work with.
-    //     AND IT IS A SHARE, NOT A BINARY (Codex P1, round 3). The first fix asked only whether the
-    //     probe produced ANY lexical token, so a Korean sentence carrying `API` or a three-digit
-    //     number cleared it while the lexical arm still saw almost none of the text — the common
-    //     case, where the first fix caught only the extreme one. The same tolerance the script guard
-    //     already uses decides it, so "how much of this can the arm read" has one answer in this
-    //     codebase rather than two.
+    //     AND IT IS THE TOKENIZER'S OWN COVERAGE (Codex, rounds 3 and 4). Two earlier attempts asked
+    //     neighbouring questions: whether ANY token existed — which a Korean sentence carrying `API`
+    //     clears — and then the SCRIPT share, which `script-gate.ts` says in its own header cannot
+    //     answer this, because French, Vietnamese and Turkish score 0 there while TOKEN's `[a-z0-9_-]`
+    //     class still drops or fragments most of their words. The readable share is a property of the
+    //     regex, so it is measured beside the regex.
     const armOn = this.embedder.needsLexicalArm === true;
-    const marginIsComparable = !armOn
-      || (lexicalTokens(text).size > 0 && nonLatinLetterShare(text) <= NON_LATIN_LETTER_TOLERANCE);
+    const marginIsComparable = !armOn || lexicalCoverage(text) >= LEXICAL_COVERAGE_MIN;
     if (best !== null && runnerUpRank > -Infinity && marginIsComparable) best.margin = bestRank - runnerUpRank;
     // The shortlist the caller chooses from, ordered the way the argmax ordered them. THREE, because
     // the true home is in the top 3 for 80% of asks on the corpus this was measured on (top 5 buys

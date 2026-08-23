@@ -34,6 +34,7 @@ import { HashingEmbeddingProvider, cosine, jsonToEmb } from "../embedding";
 import { resolveIncoming, type ResolutionThresholds } from "../resolution";
 import { lexicalTokens } from "../lexical-overlap";
 import { NON_LATIN_LETTER_TOLERANCE, nonLatinLetterShare } from "../script-gate";
+import { LEXICAL_COVERAGE_MIN, lexicalCoverage } from "../lexical-overlap";
 import type { StoragePort } from "../storage";
 
 const CIRCLE = "resolution";
@@ -1172,6 +1173,54 @@ describe("the margin gate declines to fire", () => {
         declaredBy: "john",
       });
       expect(r).toBeDefined();
+    } finally {
+      core.close();
+    }
+  });
+
+  it("when the text is accented LATIN the script guard called readable — coverage, not script", async () => {
+    // nonLatinLetterShare scores French at 0 (Latin script) while TOKEN's [a-z0-9_-] class drops or
+    // fragments every accented word, so the previous share guard let it reach an English-calibrated
+    // gate. script-gate.ts says this about itself in its own header (Codex P1, round 4).
+    const core = armedCore(0.1);
+    try {
+      const FR_A = "le systeme de memoire reecrit les donnees a chaque fois";
+      const FR_PROBE = "Le système de mémoire réécrit les données";
+      expect(nonLatinLetterShare(FR_PROBE)).toBe(0); // the script guard sees nothing wrong...
+      expect(lexicalCoverage(FR_PROBE)).toBeLessThan(LEXICAL_COVERAGE_MIN); // ...the tokenizer does
+      await seedConcept(core, [FR_A]);
+      await seedConcept(core, [FR_A + " sur le disque"]);
+      const before = rows(core);
+      const r = await core.store(FR_PROBE, { circle: CIRCLE });
+      expect(["attached", "created", "ambiguous"]).toContain(r.action);
+      expect(rows(core)).toBe(before + 1);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("and a waived ask commits the resolution it was holding, not \"ambiguous-ask\"", async () => {
+    // Several paths waive a PENDING ask and let the write through. Leaving the ask's own mode in
+    // place committed a resolution_event documented as writing nothing, and dropped a real attach out
+    // of decided-resolution statistics (Codex P2, round 4).
+    //
+    // The setup has to make the ask genuinely pend and THEN be waived — a first draft of this test
+    // used a one-concept circle, where `margin` is undefined and no ask is raised at all, so it
+    // passed with the fix reverted. Here an ineligible near-tie makes the margin fire and the
+    // eligibility filter then withdraws it.
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.9 });
+    try {
+      const TEXT = "the ferry to the island leaves at quarter past every hour";
+      const home = await core.store(TEXT, { circle: CIRCLE, kind: "principle", resolution: "forceNew" });
+      await seedConcept(core, ["the ferry to the island leaves at quarter past every hour on weekdays"]);
+
+      const r = await core.store(TEXT, { circle: CIRCLE, kind: "principle" });
+      expect(r.conceptId).toBe(home.conceptId);
+      expect(r.resolutionMode).not.toBe("ambiguous-ask");
+      const modes = (dbOf(core).prepare(`SELECT mode FROM resolution_events`).all() as Array<{ mode: string }>)
+        .map((m) => m.mode);
+      expect(modes).not.toContain("ambiguous-ask"); // nothing claims it wrote nothing
+      expect(modes).toContain("attach");            // and the attach is counted as one
     } finally {
       core.close();
     }

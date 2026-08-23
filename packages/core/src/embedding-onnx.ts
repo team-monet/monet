@@ -521,17 +521,24 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
      * CREATE. At tauAttach 0.70 with no margin gate the second population is absorbed 87.9% of the
      * time; the first misfiles 26.1% raw, ~17% after blinded adjudication of 60 disagreements.
      *
-     * Swept together, unrecoverable merges (wrong home + absorbed new topic) run 36.5% at d=0,
-     * 24.6% at 0.02, 13.0% at 0.05, 7.3% at 0.08, 4.3% at 0.12. Past 0.12 the asks dominate without
-     * buying much: 0.20 reaches 2.1% but files only 23.8% of placeable memories correctly.
+     * Swept together, unrecoverable merges (wrong home + absorbed new topic) run 38.9% at d=0,
+     * 26.4% at 0.02, 15.1% at 0.05, 9.1% at 0.08, 5.6% at 0.12. Past 0.12 the asks dominate without
+     * buying much: 0.20 reaches 2.8% but files only 22.4% of placeable memories correctly.
      *
-     * THOSE FIGURES ARE THE CORRECTED ONES (Codex rounds 2-3 on PR #87). Three separate ways the
-     * first sweep failed to reproduce the shipped decision were found and fixed: it skipped the
-     * centroid confirmation the margin gate sits inside (measured inert here — 2 of 1011 winners fall
-     * below tauAmbiguous — but the omission was real), it maximised over the PROBE's segments where
-     * the store embeds content once and compares that single vector against stored segments, and it
-     * priced normative writes whose landings production filters before the margin is ever consulted.
-     * Every correction moved the numbers in the same direction, and none moved which delta to pick.
+     * THE DERIVATION WAS CORRECTED SEVEN TIMES ACROSS FOUR REVIEW ROUNDS (Codex, PR #87), every one
+     * of them a way the sweep failed to reproduce the shipped decision: it skipped the centroid
+     * confirmation the gate sits inside; it maximised over the PROBE's segments where the store
+     * embeds content once and compares that single vector against stored segments; it priced
+     * landings production refuses before the margin is consulted; it dropped corrections, which the
+     * gate does govern; it removed normative rows from candidate EVIDENCE and not just from probes;
+     * it counted retired concepts the candidate query excludes; and it lost pre-backfill
+     * observations whose scorer falls back to `observations.embedding`.
+     *
+     * WHAT SURVIVED ALL OF IT is the value. 0.12 measured 6.6% unrecoverable on the first sweep,
+     * 4.3% after the third round and 5.6% now — one band, and the curve's shape never moved. That is
+     * the strongest thing said for this number: it is not sensitive to the errors made deriving it.
+     * The harness that produced them is being rebuilt to drive the engine rather than restate it,
+     * because seven corrections in one review is a property of the tool, not of the reviewer.
      *
      * WHY NOT JUST RAISE tauAttach: at MATCHED risk the margin gate keeps far more correct
      * attaches — 16.9% unrecoverable at d=0.05 leaves 62.7% filed to the right home, where

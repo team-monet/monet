@@ -53,7 +53,7 @@ const DELTAS = (process.env.DELTAS ?? "0,0.01,0.02,0.03,0.05,0.08,0.12,0.20")
 
 const db = new Database(DB, { readonly: true });
 const circle = process.env.CIRCLE ?? (db.prepare(
-  `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
+  `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' AND status!='retired' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
 
 const segmentRows = db.prepare(
@@ -62,7 +62,7 @@ const segmentRows = db.prepare(
      JOIN observations o ON o.id = s.observation_id
      JOIN concepts c ON c.id = o.concept_id
     WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
-      AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?
+      AND o.kind != 'source' AND c.kind != 'source' AND c.status != 'retired' AND c.circle = ?
     ORDER BY o.id, s.segment_index`,
 ).all(circle) as Array<{ cid: string; oid: string; emb: string }>;
 
@@ -70,42 +70,46 @@ const kindRows = db.prepare(
   `SELECT o.id AS oid, o.kind AS kind
      FROM observations o JOIN concepts c ON c.id = o.concept_id
     WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
-      AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?`,
+      AND o.kind != 'source' AND c.kind != 'source' AND c.status != 'retired' AND c.circle = ?`,
 ).all(circle) as Array<{ oid: string; kind: string | null }>;
 
 const obsVecRows = db.prepare(
   `SELECT o.id AS oid, o.concept_id AS cid, o.embedding AS emb
      FROM observations o JOIN concepts c ON c.id = o.concept_id
     WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
-      AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?`,
+      AND o.kind != 'source' AND c.kind != 'source' AND c.status != 'retired' AND c.circle = ?`,
 ).all(circle) as Array<{ oid: string; cid: string; emb: string }>;
 
 const contentRows = db.prepare(
   `SELECT o.id AS oid, o.content AS content
      FROM observations o JOIN concepts c ON c.id = o.concept_id
     WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
-      AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?`,
+      AND o.kind != 'source' AND c.kind != 'source' AND c.status != 'retired' AND c.circle = ?`,
 ).all(circle) as Array<{ oid: string; content: string }>;
 db.close();
 
 interface Obs { oid: string; cid: string; vecs: Float32Array[]; toks: Set<string>; whole?: Float32Array }
 const byObs = new Map<string, Obs>();
+// SEEDED FROM WHOLE-OBSERVATION ROWS, not from segments (Codex P2, round 4). A pre-backfill store
+// holds observations with no `observation_segments` at all, and the production scorer explicitly
+// falls back to `observations.embedding` for exactly those. Seeding from segments dropped them as
+// probes AND as candidate evidence, so the sweep silently replayed a different corpus than the one
+// the store resolves.
+for (const r of obsVecRows) {
+  const vec = jsonToEmb(r.emb);
+  if (isZeroVector(vec)) continue;
+  byObs.set(r.oid, { oid: r.oid, cid: r.cid, vecs: [], toks: new Set<string>(), whole: vec });
+}
 for (const r of segmentRows) {
   const vec = jsonToEmb(r.emb);
   if (isZeroVector(vec)) continue;
-  const entry = byObs.get(r.oid) ?? { oid: r.oid, cid: r.cid, vecs: [], toks: new Set<string>() };
-  entry.vecs.push(vec);
-  byObs.set(r.oid, entry);
+  byObs.get(r.oid)?.vecs.push(vec);
 }
+// The candidate unit falls back to the whole-observation vector where no segment exists.
+for (const o of byObs.values()) if (o.vecs.length === 0 && o.whole !== undefined) o.vecs.push(o.whole);
 for (const r of contentRows) {
   const entry = byObs.get(r.oid);
   if (entry !== undefined) entry.toks = lexicalTokens(r.content);
-}
-for (const r of obsVecRows) {
-  const entry = byObs.get(r.oid);
-  if (entry === undefined) continue;
-  const v = jsonToEmb(r.emb);
-  if (!isZeroVector(v)) entry.whole = v;
 }
 /**
  * NORMATIVE PROBES ARE OUT OF THE CALIBRATION (Codex P2, round 3, and John's declaration ruling).
@@ -118,9 +122,18 @@ for (const r of obsVecRows) {
  * remaining normative captures are the population whose landings the eligibility filter narrows
  * hardest. What is left is the population the threshold actually governs.
  */
-const NORMATIVE_KINDS = new Set(["rule", "principle", "preference", "correction"]);
+const DECLARED_KINDS = new Set(["rule", "principle", "preference"]);
 const kindOf = new Map(kindRows.map((r) => [r.oid, r.kind ?? ""]));
-const observations = [...byObs.values()].filter((o) => !NORMATIVE_KINDS.has(kindOf.get(o.oid) ?? ""));
+// EVERY live observation stays as candidate EVIDENCE. Filtering the set before `byConcept` is built
+// removed normative rows from the corpus itself, changing max cosines, lexical overlap, centroids
+// and even homeSize for ordinary probes — production's scorer and centroid recomputation read every
+// live observation regardless of kind (Codex P2, round 4).
+const observations = [...byObs.values()];
+// Only the PROBE iteration narrows, and only to the kinds the gate cannot govern: rule, principle
+// and preference arrive through `declare()`, which is exempt outright. CORRECTIONS ARE BACK IN —
+// grouping them with declarations was wrong, since a correction landing on an ordinary concept has
+// no fork reason and reaches the ask exactly like any other write (Codex P2, round 4).
+const probeSet = observations.filter((o) => !DECLARED_KINDS.has(kindOf.get(o.oid) ?? ""));
 const byConcept = new Map<string, Obs[]>();
 for (const o of observations) byConcept.set(o.cid, [...(byConcept.get(o.cid) ?? []), o]);
 
@@ -173,7 +186,7 @@ const centroidWithout = (members: Obs[], excludeOid: string): Float32Array | nul
 interface Candidate { cid: string; score: number; rank: number; centroid: number }
 interface Probe { homeCid: string; homeSize: number; candidates: Candidate[] }
 const probes: Probe[] = [];
-for (const probe of observations) {
+for (const probe of probeSet) {
   const homeSize = (byConcept.get(probe.cid) ?? []).length;
   const candidates: Candidate[] = [];
   for (const [cid, members] of byConcept) {
