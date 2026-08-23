@@ -1074,27 +1074,77 @@ describe("the margin gate declines to fire", () => {
   const rows = (core: MonetCore) =>
     (dbOf(core).prepare(`SELECT COUNT(*) n FROM observations`).get() as { n: number }).n;
 
-  it("when the probe yields no lexical tokens — the margin is not the quantity tauMargin measured", async () => {
-    // `rank` is cosine x (1 + BOOST x overlap) and lexicalTokens' regex reads no CJK, so a Korean
-    // probe scores overlap 0 against everything and its ranks collapse to raw cosines. tauMargin was
-    // derived on boosted ranks. Gating one with the other refuses valid multilingual writes against
-    // a cutoff that never described them — and the shipping multilingual profile carries no
-    // Latin-only guard, so these writes really do arrive here.
-    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.1 });
-    try {
-      const KO_A = "페리는 매시 십오분에 섬으로 출발한다";
-      const KO_B = "페리는 주말에는 매시 십오분에 섬으로 출발한다";
-      const KO_PROBE = "페리는 매시 십오분에 섬으로";
-      // PREMISE: the tokenizer really is blind here. If it ever stops being, this test is testing
-      // nothing and should fail loudly rather than pass.
-      expect(lexicalTokens(KO_PROBE).size).toBe(0);
+  /** Same vectors, lexical arm ON — the shipping configuration's shape, which the plain hashing
+   *  provider does not have (its `needsLexicalArm` is undefined). */
+  class LexicalArmProvider extends HashingEmbeddingProvider {
+    readonly needsLexicalArm = true;
+  }
+  const armedCore = (tauMargin: number): MonetCore => {
+    let seq = 0;
+    return new MonetCore(":memory:", {
+      embedder: new LexicalArmProvider(),
+      tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin,
+      idGen: () => `k${(seq++).toString().padStart(4, "0")}`,
+    });
+  };
+  const KO_A = "페리는 매시 십오분에 섬으로 출발한다";
+  const KO_B = "페리는 주말에는 매시 십오분에 섬으로 출발한다";
+  const KO_PROBE = "페리는 매시 십오분에 섬으로";
 
+  it("when the lexical arm is ON and the probe gives it nothing — CJK ranks are not the measured quantity", async () => {
+    // `rank` is cosine x (1 + BOOST x overlap) and lexicalTokens' regex reads no CJK, so with the arm
+    // enabled a Korean probe scores overlap 0 against everything and its ranks collapse to raw
+    // cosines — while tauMargin was derived on boosted ones. The shipping multilingual profile has
+    // the arm on and no Latin-only guard, so these writes really do arrive here.
+    const core = armedCore(0.1);
+    try {
+      expect(lexicalTokens(KO_PROBE).size).toBe(0); // premise: the tokenizer really is blind here
       await seedConcept(core, [KO_A]);
       await seedConcept(core, [KO_B]);
       const before = rows(core);
       const r = await core.store(KO_PROBE, { circle: CIRCLE });
       expect(["attached", "created", "ambiguous"]).toContain(r.action); // decided, not refused
-      expect(rows(core)).toBe(before + 1); // and it actually landed
+      expect(rows(core)).toBe(before + 1);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("but NOT when the arm is off — there the raw-rank margin is exactly what was calibrated", async () => {
+    // The complement, and the reason the suppression is conditional rather than blanket (Codex P2,
+    // round 2). With no lexical arm the scorer defines rank as the raw cosine for EVERY input, so a
+    // caller-supplied tauMargin lives in that same space and a tokenless probe is not a special case.
+    // Suppressing here would silently discard an explicit override.
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.1 });
+    try {
+      await seedConcept(core, [KO_A]);
+      await seedConcept(core, [KO_B]);
+      await expect(core.store(KO_PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("ignores an ineligible near-tie — one legal destination is not an ambiguous choice", async () => {
+    // The scan is kind-blind by design, so for a principle the runner-up can be an ordinary
+    // statement that legally cannot receive it. Counting that as competition refused an eligible
+    // winner, and the shortlist then offered a concept whose `attachTo` retry the same guard
+    // rejects. The margin is re-derived over legal landings only (Codex P2, round 2).
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.9 }); // ask on nearly anything
+    try {
+      const TEXT = "the ferry to the island leaves at quarter past every hour";
+      // An eligible destination for a principle...
+      const home = await core.store(TEXT, { circle: CIRCLE, kind: "principle", resolution: "forceNew" });
+      // ...and a near-tied statement, which is not one.
+      await seedConcept(core, ["the ferry to the island leaves at quarter past every hour on weekdays"]);
+
+      const r = await core.store("the ferry to the island leaves at quarter past every hour", {
+        circle: CIRCLE,
+        kind: "principle",
+      });
+      // Attached rather than asked: the statement was never a destination, so nothing competed.
+      expect(r.action).toBe("attached");
+      expect(r.conceptId).toBe(home.conceptId);
     } finally {
       core.close();
     }

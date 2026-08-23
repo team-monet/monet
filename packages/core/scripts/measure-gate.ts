@@ -47,6 +47,7 @@ import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/le
 
 const DB = process.env.MONET_DB!;
 const TAU = Number(process.env.TAU ?? "0.70");
+const TAU_AMBIGUOUS = Number(process.env.TAU_AMBIGUOUS ?? "0.50");
 const DELTAS = (process.env.DELTAS ?? "0,0.01,0.02,0.03,0.05,0.08,0.12,0.20")
   .split(",").map((s) => Number(s.trim()));
 
@@ -65,6 +66,13 @@ const segmentRows = db.prepare(
     ORDER BY o.id, s.segment_index`,
 ).all(circle) as Array<{ cid: string; oid: string; emb: string }>;
 
+const obsVecRows = db.prepare(
+  `SELECT o.id AS oid, o.concept_id AS cid, o.embedding AS emb
+     FROM observations o JOIN concepts c ON c.id = o.concept_id
+    WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
+      AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?`,
+).all(circle) as Array<{ oid: string; cid: string; emb: string }>;
+
 const contentRows = db.prepare(
   `SELECT o.id AS oid, o.content AS content
      FROM observations o JOIN concepts c ON c.id = o.concept_id
@@ -73,7 +81,7 @@ const contentRows = db.prepare(
 ).all(circle) as Array<{ oid: string; content: string }>;
 db.close();
 
-interface Obs { oid: string; cid: string; vecs: Float32Array[]; toks: Set<string> }
+interface Obs { oid: string; cid: string; vecs: Float32Array[]; toks: Set<string>; whole?: Float32Array }
 const byObs = new Map<string, Obs>();
 for (const r of segmentRows) {
   const vec = jsonToEmb(r.emb);
@@ -85,6 +93,12 @@ for (const r of segmentRows) {
 for (const r of contentRows) {
   const entry = byObs.get(r.oid);
   if (entry !== undefined) entry.toks = lexicalTokens(r.content);
+}
+for (const r of obsVecRows) {
+  const entry = byObs.get(r.oid);
+  if (entry === undefined) continue;
+  const v = jsonToEmb(r.emb);
+  if (!isZeroVector(v)) entry.whole = v;
 }
 const observations = [...byObs.values()];
 const byConcept = new Map<string, Obs[]>();
@@ -107,7 +121,24 @@ const best = (probe: Obs, other: Obs): number => {
 };
 
 /** One probe's full candidate table, computed ONCE; every sweep below is arithmetic over it. */
-interface Candidate { cid: string; score: number; rank: number }
+/**
+ * The concept's centroid with the probe WITHHELD — what the shipped decision confirms against, and
+ * what the first draft of this script omitted entirely (Codex P1, PR #87). `concepts.embedding` is
+ * the blend of everything the concept has absorbed INCLUDING the probe, so reading it would leak the
+ * withheld observation back into its own confirmation. recomputeNativeConceptProjection derives a
+ * native concept's vector by centroiding its live observations, so the mean of the survivors is the
+ * reconstruction of that same quantity.
+ */
+const centroidWithout = (members: Obs[], excludeOid: string): Float32Array | null => {
+  const vecs = members.filter((m) => m.oid !== excludeOid && m.whole !== undefined).map((m) => m.whole!);
+  if (vecs.length === 0) return null;
+  const out = new Float32Array(vecs[0]!.length);
+  for (const v of vecs) for (let i = 0; i < out.length; i++) out[i]! += v[i]!;
+  for (let i = 0; i < out.length; i++) out[i]! /= vecs.length;
+  return out;
+};
+
+interface Candidate { cid: string; score: number; rank: number; centroid: number }
 interface Probe { homeCid: string; homeSize: number; candidates: Candidate[] }
 const probes: Probe[] = [];
 for (const probe of observations) {
@@ -124,10 +155,18 @@ for (const probe of observations) {
       if (o > bestOverlap) bestOverlap = o;
     }
     if (bestCos === -Infinity) continue; // the home of a singleton vanishes here, by construction
-    candidates.push({ cid, score: bestCos, rank: blendLexical(bestCos, bestOverlap) });
+    const c = centroidWithout(members, probe.oid);
+    const probeWhole = probe.whole;
+    candidates.push({
+      cid,
+      score: bestCos,
+      rank: blendLexical(bestCos, bestOverlap),
+      centroid: c !== null && probeWhole !== undefined ? cosine(probeWhole, c) : -Infinity,
+    });
   }
   if (candidates.length > 0) probes.push({ homeCid: probe.cid, homeSize, candidates });
 }
+
 
 const hasHome = probes.filter((p) => p.homeSize >= 2);
 const noHome = probes.filter((p) => p.homeSize === 1);
@@ -146,7 +185,9 @@ for (const delta of DELTAS) {
   for (const p of hasHome) {
     const r = ranked(p, false);
     const sep = r[1] !== undefined ? r[0]!.rank - r[1]!.rank : Infinity;
-    if (r[0]!.score < TAU || sep < delta) fork++;
+    // THE SHIPPED ORDER: tauAttach, then the centroid confirmation, then the margin. Skipping the
+    // middle one counted fork-signal cases as attaches and contaminated every column.
+    if (r[0]!.score < TAU || r[0]!.centroid < TAU_AMBIGUOUS || sep < delta) fork++;
     else if (r[0]!.cid === p.homeCid) right++;
     else wrong++;
   }
@@ -154,7 +195,7 @@ for (const delta of DELTAS) {
     const r = ranked(p, true);
     if (r.length === 0) { created++; continue; }
     const sep = r[1] !== undefined ? r[0]!.rank - r[1]!.rank : Infinity;
-    if (r[0]!.score >= TAU && sep >= delta) absorbed++;
+    if (r[0]!.score >= TAU && r[0]!.centroid >= TAU_AMBIGUOUS && sep >= delta) absorbed++;
     else created++;
   }
   const total = hasHome.length + noHome.length;

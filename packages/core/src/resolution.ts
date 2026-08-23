@@ -181,11 +181,20 @@ export const DECIDED_RESOLUTION_MODES: readonly ResolutionMode[] = [
 ];
 
 /*
- * "ambiguous-ask" is DELIBERATELY ABSENT from the list above, and not for the reason attachTo and
- * forceNew are. Those are excluded because the caller bypassed scoring; this one is excluded
- * because it writes NOTHING — there is no resolution_event to be the numerator or denominator of.
- * The decision it defers is recorded by the follow-up call, and counting the ask as well would
- * charge one store twice.
+ * "ambiguous-ask" is ABSENT from the list above because it writes NOTHING — there is no
+ * resolution_event to be the numerator or denominator of. The first draft of this note went on to
+ * claim "the decision it defers is recorded by the follow-up call", and that is FALSE (Codex P2,
+ * round 2 on PR #87): the retry records `direct-attach` or `force-new`, and both of those are
+ * excluded too, for their own older reason. So a store that crosses the ambiguity gate is counted by
+ * NEITHER event, and every rate that divides by `decidedTotal` is measured over the cases the gate
+ * let through silently — a selection bias toward exactly the population this gate was built to
+ * shrink, and one that grows as the gate does more work.
+ *
+ * NOT FIXED HERE, and the reason is scope rather than judgement. Recording the ask needs a row where
+ * `resolution_events.observation_id` is NOT NULL and the throw has already rolled the transaction
+ * back; correlating the retry instead needs the caller to say that it IS a retry, which is a
+ * contract change. Both are wider than this branch. Tracked as its own issue; until it lands, read
+ * `decidedTotal` as "decisions the substrate made alone", not as "stores".
  */
 
 /** Whether `mode` recorded a resolution decision rather than a caller-directed bypass. */
