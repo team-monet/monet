@@ -4557,12 +4557,30 @@ export class MonetCore {
               const row = byId.get(c.conceptId);
               return row !== undefined && this.isLegalLanding(opts, row);
             });
-            const winnerRank = legal.find((c) => c.conceptId === landed.id)?.rank;
-            const runnerUpRank = legal.find((c) => c.conceptId !== landed.id)?.rank;
-            const legalMargin = winnerRank !== undefined && runnerUpRank !== undefined
-              ? winnerRank - runnerUpRank
+            const legalWinner = legal.find((c) => c.conceptId === landed.id);
+            const legalRunnerUp = legal.find((c) => c.conceptId !== landed.id);
+            const legalMargin = legalWinner !== undefined && legalRunnerUp !== undefined
+              ? legalWinner.rank - legalRunnerUp.rank
               : Infinity;
-            if (this.tauMargin !== undefined && legalMargin < this.tauMargin) {
+            // COMPARABILITY, DECIDED OVER THE SAME PAIR THE MARGIN CAME FROM (Codex P2, round 8).
+            // Two independent necessary conditions, and neither implies the other:
+            //
+            //   CAN THE ARM READ THIS TEXT — a mostly-CJK probe sharing one ASCII identifier with a
+            //   candidate earns a positive IDF boost, so a movement test alone goes true while the
+            //   CJK carries no lexical signal at all.
+            //
+            //   DID THE ARM SEPARATE THESE TWO — in a two-concept circle `tokenIdf(2, df)` clamps
+            //   every weight to zero, so perfectly English text still ranks on raw cosine. Coverage
+            //   alone cannot see that, because it never looks at the circle.
+            //
+            // tauMargin was derived where both held, over a lexically-blended gap. Requiring both,
+            // on the legal pair, is what keeps it applied only there.
+            const armOn = this.embedder.needsLexicalArm === true;
+            const armMoved = (c: RankedCandidate | undefined): boolean => c !== undefined && c.rank !== c.score;
+            const comparable = !armOn
+              || (lexicalCoverage(content) >= LEXICAL_COVERAGE_MIN
+                && (armMoved(legalWinner) || armMoved(legalRunnerUp)));
+            if (comparable && this.tauMargin !== undefined && legalMargin < this.tauMargin) {
               throw new AmbiguousNominationError(
                 legal.slice(0, AMBIGUOUS_CANDIDATES_MAX).map(({ conceptId, title, score }) => ({ conceptId, title, score })),
                 decision.score,
@@ -15804,24 +15822,18 @@ export class MonetCore {
       })
       .sort((a, b) => (b.rank - a.rank) || (a.conceptId < b.conceptId ? -1 : 1));
 
-    // TWO INDEPENDENT NECESSARY CONDITIONS, and the mistake worth recording is that the second one
-    // arriving looked like a reason to drop the first (Codex P1, round 7). They answer different
-    // questions and neither implies the other:
+    // MARGIN HERE IS A FACT, NOT A VERDICT (Codex P2, round 8). Comparability used to be decided
+    // here, over the unfiltered top two — but the pair whose gap actually decides anything is the
+    // LEGAL one, and legality needs the incoming kind and the candidate rows, neither of which this
+    // scan has. Judging the raw pair could call a boosted-but-illegal neighbour comparable, or call
+    // an entirely raw legal pair incomparable.
     //
-    //   CAN THE ARM READ THIS TEXT — a mostly-CJK probe sharing one ASCII token with a candidate
-    //   gets a positive IDF boost, so `rank !== score` goes true while the Korean carries no lexical
-    //   signal at all. Movement alone re-admits exactly the mixed-script case it was meant to close.
-    //
-    //   DID THE ARM SEPARATE ANYTHING HERE — in a two-concept circle `tokenIdf(2, df)` clamps every
-    //   weight to zero, so perfectly English text still ranks on raw cosine. Coverage alone cannot
-    //   see that, because it never looks at the circle.
-    //
-    // tauMargin was derived where both held. Requiring both is what keeps it applied only there.
-    const armOn = this.embedder.needsLexicalArm === true;
-    const armMoved = (c: RankedCandidate | undefined): boolean => c !== undefined && c.rank !== c.score;
-    const marginIsComparable = !armOn
-      || (lexicalCoverage(text) >= LEXICAL_COVERAGE_MIN && (armMoved(ranked[0]) || armMoved(ranked[1])));
-    if (best !== null && runnerUpRank > -Infinity && marginIsComparable) best.margin = bestRank - runnerUpRank;
+    // Deciding it downstream is safe in one direction only, and this is that direction: the legal
+    // runner-up sits at or below the raw runner-up in rank order, so `legalMargin >= rawMargin`
+    // always. A raw margin that clears tauMargin therefore guarantees the legal one does too, and
+    // gating provisionally on the raw value can never miss an ask — it can only raise one the ask
+    // site then withdraws, which is exactly what that site is for.
+    if (best !== null && runnerUpRank > -Infinity) best.margin = bestRank - runnerUpRank;
     return { nomination: best, ranked };
   }
 
