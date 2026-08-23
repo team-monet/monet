@@ -102,11 +102,19 @@ export function lexicalOverlap(
  * the floor of the decision and lets the lexical arm only re-order candidates that already have
  * semantic support. A concept the embedding rejects cannot be talked into winning by vocabulary.
  *
- * THE WEIGHT IS A PLATEAU, NOT A POINT. Measured at the shipped observation-unit overlap, argmax
- * accuracy runs 0.5 -> 67.1%, 1.0 -> 72.1%, 2.0 -> 72.7%, 4.0 -> 73.2% on the current embedder, and
- * 72.8 / 73.9 / 74.2 / 73.3 on bge-small-en. Everything from 1.0 upward is one plateau inside the
- * ~1.8pt standard error at n=739; 0.5 is measurably BELOW it. 1.0 is the conservative point on that
- * plateau — enough boost to capture the gain, little enough that cosine keeps most of the decision.
+ * THE WEIGHT WAS A PLATEAU ON THE EMBEDDERS IT WAS MEASURED ON, AND IS A PEAK ON THE ONE THAT
+ * SHIPS. Measured at the shipped observation-unit overlap, argmax accuracy ran 0.5 -> 67.1%,
+ * 1.0 -> 72.1%, 2.0 -> 72.7%, 4.0 -> 73.2% on the then-current embedder, and 72.8 / 73.9 / 74.2 /
+ * 73.3 on bge-small-en — one plateau from 1.0 upward, inside the ~1.8pt standard error at n=739.
+ *
+ * RE-MEASURED 2026-08-23 ON bge-m3 (the shipping embedder) over the live monet-hq corpus, n=788:
+ * 0 -> 66.0%, 0.25 -> 71.6%, 0.5 -> 72.8%, 1.0 -> 73.9%, 2.0 -> 72.8%, 4.0 -> 72.1%. There is no
+ * plateau in this space — accuracy falls monotonically above 1.0, which inverts the ordering the
+ * paragraph above reports. 1.0 remains correct, but as the PEAK, not as a conservative point on a
+ * flat region; do not read the plateau as licence to raise it. The zero point was never measured
+ * before this: the lexical arm is worth +62 observations (66.0% -> 73.9%) and is net positive in
+ * every home-concept size bin, so it earns its place — 21.8% of the residual misfiles at 1.0 are
+ * won on a LOWER raw cosine, and that is the price of the gain rather than a defect to remove.
  *
  * An earlier draft of this file claimed 0.5 was optimal and that higher weights scored worse. That
  * came from measuring overlap against a concept's token UNION, whose size bias inverted the ordering.

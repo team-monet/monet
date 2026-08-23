@@ -21,6 +21,34 @@
  * concepts — i.e. can noise alone drive a real attach decision?
  *
  * Read-only on a COPY of the live store. Never mutates, never writes to ~/.monet.
+ *
+ * WHAT THIS SCRIPT ESTABLISHED, AND WHY THE OBVIOUS REMEDY IS A DEAD END (measured 2026-08-23 on
+ * bge-m3 over live monet-hq). The bias is REAL: best-observation cosine on off-topic text rises
+ * monotonically with concept size (bin 1 mean -0.0192 -> bin 20+ mean 0.0190), and concepts of
+ * size>=20 are 2.1% of the circle while winning 16.7% of junk argmaxes — 7.9x over-represented.
+ *
+ * It is NOT, however, what causes the misfiles, so do not reach for the correction named above.
+ * Junk never approaches the bands (0.0% of pairs reach tauAmbiguous 0.5 or tauAttach 0.7), so noise
+ * alone cannot drive an attach; the bias decides WHICH concept wins, not WHETHER one does. And the
+ * margin it would have to close is too large: among misfiles the median rank(winner) - rank(home)
+ * is 0.0767, roughly twice the ~0.04 total span of the size effect itself. Measured directly, a
+ * log-size penalty (rank - alpha*ln(size)) is net NEGATIVE at every strength tried — 0.002 -> -4
+ * observations, 0.01 -> -14, 0.03 -> -88, 0.12 -> -404 — even though it does exactly what it was
+ * meant to (blob capture 34.0% -> 0.0%, mean wrong-winner size 29.7 -> 1.1). It removes the intended
+ * misfiles and creates more new ones than it fixes.
+ *
+ * The two corrections search applies do not transfer either. Per-concept dedupe is a no-op here:
+ * scoreNativeConceptsByObservation already yields ONE score per concept, so there is no slot
+ * occupancy to collapse — search's dedupe fixes result-list crowding, which is a different failure
+ * that happens to share the name. The emission floor is inert: 0 of 788 nomination winners fall
+ * below 0.12, the lowest being 0.6748.
+ *
+ * WHAT REMAINS OPEN is not a knob. This replay's ground truth is the store's own past placements,
+ * and 91.4% of them were made under MiniLM before the bge pin — so the 26% disagreement mixes
+ * scorer error with the scorer correctly rejecting an old misfile. Splitting agreement by placement
+ * era points the right way in all three comparable size bins (+3.3 / +16.2 / +6.4 pt for bge-era
+ * placements) but every gap sits inside its own standard error at n=28/12/4. Separating label noise
+ * from scorer error needs hand-adjudicated ground truth, not another statistic.
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";

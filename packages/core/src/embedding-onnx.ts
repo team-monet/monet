@@ -514,7 +514,30 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
      * edges. If they regain a ranking consumer, re-derive against THAT decision — and #175 is asking
      * the prior question of whether they should be written at all.
      */
-    thresholds: { tauAttach: 0.70, tauAmbiguous: 0.5, edgeSimMin: 0.60 },
+    /*
+     * MARGIN GATE 0.12, derived here and nowhere else (#86). scripts/measure-gate.ts replays every
+     * live monet-hq observation withheld from its own concept, and separately every SINGLETON-home
+     * observation — where withholding removes the home entirely, so the store's own answer was
+     * CREATE. At tauAttach 0.70 with no margin gate the second population is absorbed 87.9% of the
+     * time; the first misfiles 26.1% raw, ~17% after blinded adjudication of 60 disagreements.
+     *
+     * Swept together, unrecoverable merges (wrong home + absorbed new topic) run 39.6% at d=0,
+     * 25.7% at 0.02, 16.9% at 0.05, 11.4% at 0.08, 6.6% at 0.12. 0.12 is where the ASK path takes
+     * 54.7% of stores and the silent band still files 42.3% — past it the asks dominate without
+     * buying much (0.20 -> 4.2% unrecoverable but only 23.6% still filed correctly).
+     *
+     * WHY NOT JUST RAISE tauAttach: at MATCHED risk the margin gate keeps far more correct
+     * attaches — 16.9% unrecoverable at d=0.05 leaves 62.7% filed to the right home, where
+     * tauAttach 0.80 reaches 16.3% but files only 52.2%.
+     *
+     * UNVALIDATED FOR CJK, and this corpus cannot validate it: monet-hq holds ZERO CJK-heavy
+     * observations (every durable artifact here is English by project convention). lexicalTokens'
+     * TOKEN regex scores a near-identical Korean pair at overlap 0.0 where its English equivalent
+     * scores 0.714, so a CJK `rank` IS its cosine while a Latin one is cosine * (1 + overlap) and
+     * can run up to twice as large. Those are not the same quantity and 0.12 was measured on only
+     * one of them. #38 is the prerequisite for any store that holds CJK content.
+     */
+    thresholds: { tauAttach: 0.70, tauAmbiguous: 0.5, tauMargin: 0.12, edgeSimMin: 0.60 },
     /*
      * CARD-EMISSION FLOOR 0.40, from scripts/measure-recall-floor.ts on the same STARTER_SUITE corpus
      * every other floor here came from — 20 probe queries, 9 junk queries, observation granularity.

@@ -166,6 +166,11 @@ const CO_OCCURRED_WEIGHT = 0.85;
 const FOLLOWS_WEIGHT = 0.5;
 const ASSERTED_WEIGHT = 0.95;
 const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
+// How many concepts an ambiguous nomination offers the caller (#86). Measured, not chosen for
+// roundness: the true home is in the top 3 for 80% of asks on the corpus tauMargin was derived on,
+// and top 5 raises that only to 86%. A miss forks rather than mis-merges, so the extra two buy
+// little and are read on every ask.
+const AMBIGUOUS_CANDIDATES_MAX = 3;
 /** Pair/contradiction/gate-exception queues stay top-10; counts or omission fields carry true totals. */
 export const OVERVIEW_EXCEPTION_LIMIT = 10;
 /** Opt-in dirty/stale enumeration reuses the existing checkpoint-scale worklist bound. */
@@ -379,6 +384,45 @@ export class ContentScriptUnsupportedError extends Error {
         `later cannot recover it.`,
     );
     this.name = "ContentScriptUnsupportedError";
+  }
+}
+
+/** One concept the ambiguous nomination could not choose between. */
+export interface AmbiguousCandidate {
+  conceptId: string;
+  title: string;
+  /** Raw cosine against this concept's own evidence — the same quantity IngestResult.score reports. */
+  score: number;
+}
+
+/**
+ * The evidence cleared `tauAttach` but did not identify WHICH concept (#86): the winner's rank was
+ * within `tauMargin` of the runner-up, and under that bar the winner is wrong about 64% of the time.
+ *
+ * THROWN RATHER THAN RETURNED, for the reason `recordResolutionEvent` states about its own absence
+ * of a try/catch: this runs inside the store transaction, so throwing is what makes "nothing was
+ * written" structurally true instead of true by call-site discipline. It is control flow, not a
+ * failure — the same species as ContentExceedsEmbedderWindowError, whose job is likewise to refuse
+ * a write and tell the caller how to succeed on the retry.
+ *
+ * The retry is `attachTo` with one of `candidates`, or `resolution: "forceNew"` to assert the
+ * evidence is about something new. forceNew is not a fallback that loses information: it creates
+ * and records a `possible_duplicate_of` edge to the near match, which is the recoverable branch.
+ */
+export class AmbiguousNominationError extends Error {
+  constructor(
+    readonly candidates: AmbiguousCandidate[],
+    /** The winner's raw cosine — what would have driven the attach had it been unambiguous. */
+    readonly score: number,
+    /** rank(winner) - rank(runnerUp), the gap that failed the gate. */
+    readonly margin: number,
+  ) {
+    super(
+      `This evidence matches ${candidates.length} concepts closely enough that nothing distinguishes ` +
+        `them (top two are ${margin.toFixed(4)} apart). It was NOT stored. Name the one it belongs to ` +
+        `with attachTo, or pass resolution:"forceNew" if it is about something new.`,
+    );
+    this.name = "AmbiguousNominationError";
   }
 }
 
@@ -2266,6 +2310,12 @@ export interface MonetCoreOptions {
   synthesizer?: Synthesizer;
   tauAttach?: number;
   tauAmbiguous?: number;
+  /**
+   * Override the margin gate (#86). Its two neighbours fall back to a hardcoded number when neither
+   * the caller nor the profile supplies one; this one does not, so a caller that wants the gate over
+   * an unmeasured embedder has to say so — and say what value, in that embedder's own rank space.
+   */
+  tauMargin?: number;
   agentId?: string;
   /** Stable per-store sync identity override (primarily for deterministic tests). Persisted on first open. */
   syncDeviceId?: string;
@@ -2435,6 +2485,14 @@ export class MonetCore {
   private tauAttach!: number;
   private tauAmbiguous!: number;
   /**
+   * NO FALLBACK, unlike its two neighbours (#86). They fall back because a store must resolve
+   * SOMEHOW even under an unmeasured embedder; this one gates whether a decision is taken at all,
+   * and a borrowed margin would refuse writes in a space it was never derived in. Undefined means
+   * the gate is off and every above-tau nomination attaches — the pre-#86 behaviour, which is the
+   * honest default for an embedder nobody has swept.
+   */
+  private tauMargin?: number;
+  /**
    * The RAW tauAttach/tauAmbiguous/edgeSimMin opts as passed to the constructor (undefined where
    * not explicitly set) — captured once, verbatim, so applyEmbedderDerivedThresholds can re-apply
    * the constructor's documented precedence (explicit opt → embedder's recommendedThresholds →
@@ -2443,7 +2501,7 @@ export class MonetCore {
    * honored on re-derivation — there would be no way to tell "explicitly 0.55" from "defaulted to
    * 0.55 because the original embedder happened to recommend it".
    */
-  private explicitThresholdOpts: Pick<MonetCoreOptions, "tauAttach" | "tauAmbiguous" | "edgeSimMin">;
+  private explicitThresholdOpts: Pick<MonetCoreOptions, "tauAttach" | "tauAmbiguous" | "tauMargin" | "edgeSimMin">;
   /**
    * Constructor-time pin guard (embedder-pin ADR, review hardening): armed at the end of the
    * constructor when this store already has a recorded pin that does NOT match the
@@ -2524,7 +2582,7 @@ export class MonetCore {
     // applyEmbedderDerivedThresholds). tauAttach/tauAmbiguous/edgeSimMin are set as a side effect of
     // that call below, not assigned directly here, so there is exactly one place that implements
     // the precedence rule.
-    this.explicitThresholdOpts = { tauAttach: opts.tauAttach, tauAmbiguous: opts.tauAmbiguous, edgeSimMin: opts.edgeSimMin };
+    this.explicitThresholdOpts = { tauAttach: opts.tauAttach, tauAmbiguous: opts.tauAmbiguous, tauMargin: opts.tauMargin, edgeSimMin: opts.edgeSimMin };
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
     this.momentSpoolPath = opts.momentSpoolPath ?? null;
@@ -4282,8 +4340,8 @@ export class MonetCore {
       // CONSOLIDATION works — an import that attaches thousands of observations to named concepts
       // would pay for a nomination it discards on every single one. Measured at 250 concepts /
       // 2,500 observations, running it unconditionally made attachTo writes ~2.4x slower.
-      const nomination = opts.attachTo || opts.resolution === "forceNew"
-        ? null
+      const { nomination, ranked: rankedCandidates } = opts.attachTo || opts.resolution === "forceNew"
+        ? { nomination: null, ranked: [] as AmbiguousCandidate[] }
         : this.nominateByObservation(candidates, emb, content);
       // Keep the documented epoch-ms `since` contract even when this instance reuses a session
       // after a long idle. In logical maintenance mode this is still only a persisted +1.
@@ -4406,8 +4464,15 @@ export class MonetCore {
             ? { conceptId: liveMatches[0].match.id, centroidScore: liveMatches[0].score }
             : null,
           kind: opts.kind,
-          thresholds: { tauAttach: this.tauAttach, tauAmbiguous: this.tauAmbiguous },
+          thresholds: { tauAttach: this.tauAttach, tauAmbiguous: this.tauAmbiguous, tauMargin: this.tauMargin },
         });
+        if (decision.action === "ask") {
+          // NOTHING HAS BEEN WRITTEN YET at this point — the scans above are reads — and throwing
+          // out of the transaction is what keeps that true no matter what is added below it later.
+          // Returning an "ask" through the normal result would put the burden on every future edit
+          // to this function to remember not to write first.
+          throw new AmbiguousNominationError(rankedCandidates, decision.score, nomination?.margin ?? 0);
+        }
         action = decision.action;
         mode = decision.mode;
         nearMatchId = decision.nearMatchId;
@@ -8885,6 +8950,9 @@ export class MonetCore {
   private applyEmbedderDerivedThresholds(embedder: EmbeddingProvider): void {
     this.tauAttach = this.explicitThresholdOpts.tauAttach ?? embedder.recommendedThresholds?.tauAttach ?? 0.55;
     this.tauAmbiguous = this.explicitThresholdOpts.tauAmbiguous ?? embedder.recommendedThresholds?.tauAmbiguous ?? 0.4;
+    // Deliberately without the `?? <number>` tail the two above carry: see the field's own
+    // declaration for why an unmeasured embedder gets no gate rather than a borrowed one.
+    this.tauMargin = this.explicitThresholdOpts.tauMargin ?? embedder.recommendedThresholds?.tauMargin;
     /*
      * A `related` edge needs more overlap than a semantic model implies. The MEASURED per-model
      * value wins; the class split below is the fallback for a model nobody has swept, and it is a
@@ -15543,11 +15611,25 @@ export class MonetCore {
    * Ties break on the lexicographically smaller concept id (the codebase's determinism convention —
    * rankByCentroid above, and the observation-level tie-break inside the scorer itself).
    */
-  private nominateByObservation(candidates: readonly ConceptRow[], emb: Float32Array, text: string): ResolutionNomination | null {
-    if (candidates.length === 0) return null;
+  /**
+   * Returns the winner AND the top few by rank. The second half exists only for the ambiguous-ask
+   * payload (#86): this loop is the one place every candidate's rank is known at once, so building
+   * the shortlist here costs nothing, where a second scan on the ask path would cost a full
+   * re-score on roughly half of all stores.
+   */
+  private nominateByObservation(
+    candidates: readonly ConceptRow[],
+    emb: Float32Array,
+    text: string,
+  ): { nomination: ResolutionNomination | null; ranked: AmbiguousCandidate[] } {
+    if (candidates.length === 0) return { nomination: null, ranked: [] };
     const scored = scoreNativeConceptsByObservation(this.db, candidates.map((c) => c.id), emb, text, this.embedder.needsLexicalArm === true);
     let best: ResolutionNomination | null = null;
     let bestRank = -Infinity;
+    // The RUNNER-UP's rank, for the margin gate (#86). Tracked here rather than by re-scanning
+    // because this loop is the only place every candidate's rank exists at once, and the margin has
+    // to be the gap in the space the argmax was actually decided in.
+    let runnerUpRank = -Infinity;
     for (const candidate of candidates) {
       const match = scored.get(candidate.id);
       if (match === undefined) continue;
@@ -15555,7 +15637,13 @@ export class MonetCore {
       // that measurement showed picks the right concept 46.3% -> 59.1% of the time. WHAT the
       // decision then reads is `score`, the raw cosine, because tauAttach/tauAmbiguous are
       // calibrated against cosine and nothing measured says where they belong under a blend.
-      if (best !== null && (match.rank < bestRank || (match.rank === bestRank && candidate.id > best.conceptId))) continue;
+      if (best !== null && (match.rank < bestRank || (match.rank === bestRank && candidate.id > best.conceptId))) {
+        if (match.rank > runnerUpRank) runnerUpRank = match.rank;
+        continue;
+      }
+      // A displaced winner is the strongest loser so far — it must not be forgotten, or a circle
+      // whose candidates arrive in ascending rank order would report no runner-up at all.
+      if (best !== null && bestRank > runnerUpRank) runnerUpRank = bestRank;
       bestRank = match.rank;
       best = {
         conceptId: candidate.id,
@@ -15564,7 +15652,21 @@ export class MonetCore {
         centroidScore: cosine(emb, jsonToEmb(candidate.embedding)),
       };
     }
-    return best;
+    // Left undefined when nothing else was nominatable: one candidate is not an ambiguous choice.
+    if (best !== null && runnerUpRank > -Infinity) best.margin = bestRank - runnerUpRank;
+    // The shortlist the caller chooses from, ordered the way the argmax ordered them. THREE, because
+    // the true home is in the top 3 for 80% of asks on the corpus this was measured on (top 5 buys
+    // 86%) and a longer list costs every ask a longer read for a smaller share. A miss here is not a
+    // wrong merge: the caller answers forceNew and the write forks, which is recoverable.
+    const ranked = candidates
+      .flatMap((c) => {
+        const m = scored.get(c.id);
+        return m === undefined ? [] : [{ conceptId: c.id, title: c.title, score: m.score, rank: m.rank }];
+      })
+      .sort((a, b) => (b.rank - a.rank) || (a.conceptId < b.conceptId ? -1 : 1))
+      .slice(0, AMBIGUOUS_CANDIDATES_MAX)
+      .map(({ conceptId, title, score }) => ({ conceptId, title, score }));
+    return { nomination: best, ranked };
   }
 
   /**

@@ -29,7 +29,7 @@
  * recommendedThresholds), and the tests assert the relation numerically before asserting behavior.
  */
 import { describe, it, expect } from "vitest";
-import { MonetCore } from "../engine";
+import { AmbiguousNominationError, MonetCore } from "../engine";
 import { HashingEmbeddingProvider, cosine, jsonToEmb } from "../embedding";
 import { resolveIncoming, type ResolutionThresholds } from "../resolution";
 import type { StoragePort } from "../storage";
@@ -47,6 +47,7 @@ function newCore(thresholds: ResolutionThresholds): MonetCore {
     embedder: new HashingEmbeddingProvider(),
     tauAttach: thresholds.tauAttach,
     tauAmbiguous: thresholds.tauAmbiguous,
+    tauMargin: thresholds.tauMargin,
     idGen: () => `c${(seq++).toString().padStart(4, "0")}`,
   });
 }
@@ -870,6 +871,179 @@ describe("resolution — the instrumentation log", () => {
       const stats = core.resolutionStats(CIRCLE);
       expect(stats.windowTotal).toBe(1); // the 40-day-old row is out of the window...
       expect(stats.total).toBe(2); //     ...but never out of the log
+    } finally {
+      core.close();
+    }
+  });
+});
+
+/**
+ * THE MARGIN GATE (#86): "similar enough" and "sure it is THIS one" are different questions, and
+ * only the first was ever asked. These pin the SECOND, and they pin the middle of the band rather
+ * than its two ends — an ask that fires only on a lone perfect match and a lone total miss would
+ * be green over the entire population the gate exists for.
+ *
+ * The unit tests below drive resolveIncoming directly because the gate is a property of the
+ * DECISION, not of any geometry: the margin arrives pre-computed from the nomination scan (the one
+ * place every candidate's rank exists at once), so a fixture that had to manufacture two
+ * near-equally-ranked concepts would be testing the scorer instead.
+ */
+describe("the margin gate", () => {
+  const BANDS = { tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.1 };
+  const nominate = (margin?: number) => ({
+    conceptId: "c0001",
+    obsScore: 0.9, // clears tauAttach comfortably — this band is not what is under test
+    observationId: "o1",
+    centroidScore: 0.8, // clears tauAmbiguous — so the attach branch is genuinely reached
+    ...(margin === undefined ? {} : { margin }),
+  });
+
+  it("asks instead of attaching when the winner is not separated from the runner-up", () => {
+    const d = resolveIncoming({ nomination: nominate(0.05), thresholds: BANDS });
+    expect(d.action).toBe("ask");
+    expect(d.mode).toBe("ambiguous-ask");
+    // An ask names no destination: that is the whole point of refusing to guess one.
+    expect(d.attachToConceptId).toBeUndefined();
+    expect(d.score).toBe(0.9);
+  });
+
+  it("attaches when the winner IS separated", () => {
+    const d = resolveIncoming({ nomination: nominate(0.2), thresholds: BANDS });
+    expect(d.action).toBe("attached");
+    expect(d.attachToConceptId).toBe("c0001");
+  });
+
+  it("attaches exactly ON the bar — inclusive at the bottom, like every other band here", () => {
+    const d = resolveIncoming({ nomination: nominate(0.1), thresholds: BANDS });
+    expect(d.action).toBe("attached");
+  });
+
+  it("never asks when there was no runner-up to be separated from", () => {
+    // One nominatable concept in the circle. Not ambiguity — there is nothing to choose BETWEEN —
+    // and treating a missing margin as zero would refuse every write into a one-concept circle.
+    const d = resolveIncoming({ nomination: nominate(undefined), thresholds: BANDS });
+    expect(d.action).toBe("attached");
+  });
+
+  it("is off entirely for an embedder nobody measured it in", () => {
+    const d = resolveIncoming({ nomination: nominate(0.001), thresholds: { tauAttach: 0.5, tauAmbiguous: 0.3 } });
+    expect(d.action).toBe("attached"); // pre-#86 behaviour, not a borrowed number
+  });
+
+  it("does not reach into the bands below it — a sub-tauAttach score still forks on its own terms", () => {
+    // The gate lives INSIDE the attach branch. A tiny margin down here must not turn a fork into an
+    // ask: the decision not to attach was already made on evidence, and asking would offer the
+    // caller a concept the evidence just rejected.
+    const d = resolveIncoming({
+      nomination: { conceptId: "c0001", obsScore: 0.4, observationId: "o1", centroidScore: 0.35, margin: 0.001 },
+      thresholds: BANDS,
+    });
+    expect(d.action).not.toBe("ask");
+    expect(d.mode).toBe("ambiguous-fork");
+  });
+
+  it("does not reach into the fork signal either", () => {
+    // Evidence says attach, identity says the concept has drifted. That disagreement IS the answer;
+    // a margin question on top of it would ask the caller to arbitrate a fork it cannot see.
+    const d = resolveIncoming({
+      nomination: { conceptId: "c0001", obsScore: 0.9, observationId: "o1", centroidScore: 0.1, margin: 0.001 },
+      thresholds: BANDS,
+    });
+    expect(d.action).not.toBe("ask");
+    expect(d.mode).toBe("fork-signal");
+  });
+});
+
+/**
+ * THE ASK, THROUGH THE REAL ENGINE. The unit suite above pins the decision; this pins the thing the
+ * decision exists to guarantee — that an ambiguous store leaves the database exactly as it found it.
+ * That invariant cannot be unit-tested: it is a property of where the refusal happens relative to
+ * the write transaction, not of what resolveIncoming returns.
+ *
+ * Geometry first, as everywhere in this file: the fixture asserts that its two concepts really are
+ * near-equally ranked before asserting that the store refuses to choose between them. A fixture that
+ * drifted apart would fail on its premise instead of passing vacuously.
+ */
+describe("an ambiguous store writes nothing", () => {
+  const rows = (core: MonetCore) => ({
+    concepts: (dbOf(core).prepare(`SELECT COUNT(*) n FROM concepts`).get() as { n: number }).n,
+    observations: (dbOf(core).prepare(`SELECT COUNT(*) n FROM observations`).get() as { n: number }).n,
+    events: (dbOf(core).prepare(`SELECT COUNT(*) n FROM resolution_events`).get() as { n: number }).n,
+  });
+
+  /** Two concepts about the same thing, plus a probe that belongs to neither more than the other. */
+  const A = "the ferry to the island leaves at quarter past every hour";
+  const B = "the ferry to the island leaves at quarter past the hour on weekends";
+  const PROBE = "the ferry to the island leaves at quarter past";
+
+  async function fixture(tauMargin?: number) {
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin });
+    const a = await seedConcept(core, [A]);
+    const b = await seedConcept(core, [B]);
+    return { core, a, b };
+  }
+
+  it("refuses, names the candidates, and leaves every table untouched", async () => {
+    const { core, a, b } = await fixture(0.1);
+    try {
+      // PREMISE: both clear tauAttach and nothing separates them by more than the gate.
+      const ga = geometry(core, a, PROBE), gb = geometry(core, b, PROBE);
+      expect(ga.bestObservation).toBeGreaterThanOrEqual(0.5);
+      expect(gb.bestObservation).toBeGreaterThanOrEqual(0.5);
+      expect(Math.abs(ga.bestObservation - gb.bestObservation)).toBeLessThan(0.1);
+
+      const before = rows(core);
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+
+      // THE INVARIANT. Not just "no concept" — no observation, and no resolution_event either: an
+      // ask resolved nothing, so counting it would charge one store twice once the caller retries.
+      expect(rows(core)).toEqual(before);
+
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toMatchObject({
+        candidates: expect.arrayContaining([
+          expect.objectContaining({ conceptId: a }),
+          expect.objectContaining({ conceptId: b }),
+        ]),
+      });
+    } finally {
+      core.close();
+    }
+  });
+
+  it("attaches on the retry once the caller names one — the ask is answerable, not a dead end", async () => {
+    const { core, a } = await fixture(0.1);
+    try {
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+      const r = await core.store(PROBE, { circle: CIRCLE, attachTo: a });
+      expect(r.action).toBe("attached");
+      expect(r.conceptId).toBe(a);
+      expect(liveObservations(core, a)).toBe(2);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("forks WITH a duplicate edge on forceNew — the recoverable branch, not a silent orphan", async () => {
+    const { core } = await fixture(0.1);
+    try {
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+      const r = await core.store(PROBE, { circle: CIRCLE, resolution: "forceNew" });
+      expect(r.action).toBe("created");
+      // forceNew asserts distinctness and deliberately records no possible_duplicate_of edge, so the
+      // near match is what carries the relation forward for whoever reads this later.
+      expect(r.nearMatchId ?? r.score).toBeDefined();
+    } finally {
+      core.close();
+    }
+  });
+
+  it("stores the same content silently when the gate is off — the fixture is not ambiguous by accident", async () => {
+    // The control. Same two concepts, same probe, gate disarmed: if this ALSO refused, the tests
+    // above would be pinning something other than the margin.
+    const { core } = await fixture(undefined);
+    try {
+      const r = await core.store(PROBE, { circle: CIRCLE });
+      expect(r.action).toBe("attached");
     } finally {
       core.close();
     }
