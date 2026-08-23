@@ -289,22 +289,29 @@ describe("deriveCircle — resolution order", () => {
   });
 });
 
-describe("deriveCircle — storeDir (P1-2, Codex round 3 on PR #42)", () => {
-  it("identity resolves from projectDir (the worktree); store consultation resolves from storeDir (the invoking project) — a DIFFERENT store's own row wins, never the identity root's own store", async () => {
-    // The follow-on to P1-B (round 1 on this PR): source-cli's `--path /other/repo` derives the
-    // circle against the WORKTREE's own store while createSource writes into the INVOKING
-    // project's store — circle from store B, row into store A. This proves the underlying
-    // resolution split directly: given the SAME remote (so the lookup KEY is identical either
-    // way — isolating "which store" as the only variable), two REAL, separate project-local
-    // stores each carry a DIFFERENT circle for that key, and deriveCircle(identity, {storeDir})
-    // must return the ONE living in storeDir, never identity's own.
+describe("deriveCircle — which store answers (P1-2's surviving half, Codex round 3 on PR #42)", () => {
+  /**
+   * WHAT THIS USED TO ASSERT, and why it now asserts less: P1-2 added an `opts.storeDir` that let a
+   * caller root the SQLITE CONSULTATION somewhere other than the git-identity root, for source-cli's
+   * `--path /other/repo` (circle resolved from the worktree's store, source row written into the
+   * invoking project's). Both that option and its only two call sites are gone, so the divergence
+   * itself is no longer reachable and asserting on it would be asserting on a parameter this
+   * function does not have.
+   *
+   * THE FIXTURE STILL PROVES SOMETHING REAL, which is why it is kept rather than deleted: two REAL,
+   * separate project-local stores carry DIFFERENT circles for the SAME remote key (so the lookup key
+   * is identical and "which store" is the only variable), and the directory this function is given
+   * is the one whose store answers. A neighbouring project's row must not leak in. That is the
+   * property a future caller reintroducing the split would be building on top of.
+   */
+  it("consults the project-local store of the directory it was given — never a different project's store carrying its own row for the same remote", async () => {
     const REMOTE_URL = "git@github.com:acme/p1-2-fixture.git";
-    const invokingProjectDir = makeRepo(REMOTE_URL, "p1-2-invoking"); // "store A"'s own identity dir
+    const otherProjectDir = makeRepo(REMOTE_URL, "p1-2-invoking"); // "store A"'s own identity dir
     const worktreeDir = makeRepo(REMOTE_URL, "p1-2-worktree"); // "store B"'s own identity dir
 
-    // MONET_STORAGE_DIR (this file's own global beforeEach override) would force BOTH projectDir
-    // and storeDir onto the SAME single tmpHome store, masking the exact divergence under test —
-    // cleared here so each directory's own project-local .monet is what actually gets consulted.
+    // MONET_STORAGE_DIR (this file's own global beforeEach override) would force every directory
+    // onto the SAME single tmpHome store, masking the divergence under test — cleared here so each
+    // directory's own project-local .monet is what actually gets consulted.
     const savedStorageDir = process.env.MONET_STORAGE_DIR;
     delete process.env.MONET_STORAGE_DIR;
     try {
@@ -323,19 +330,14 @@ describe("deriveCircle — storeDir (P1-2, Codex round 3 on PR #42)", () => {
         db.prepare(`INSERT INTO remote_circle_map (remote_url, circle) VALUES (?, ?)`).run(key, circle);
         db.close();
       };
-      seedStore(invokingProjectDir, "circle-from-A-the-invoking-store");
-      seedStore(worktreeDir, "circle-from-B-the-worktree-store");
+      seedStore(otherProjectDir, "circle-from-A-the-other-store");
+      seedStore(worktreeDir, "circle-from-B-the-given-store");
 
-      // Matches source-cli.ts's own two worktree call sites exactly: identity=worktreeDir,
-      // storeDir=invokingProjectDir.
-      const result = deriveCircle(worktreeDir, { storeDir: invokingProjectDir });
-      expect(result).toBe("circle-from-A-the-invoking-store"); // consulted A (storeDir) — the fix
-      expect(result).not.toBe("circle-from-B-the-worktree-store"); // never B (identity's own store)
-
-      // Sanity: WITHOUT storeDir (both roots = worktreeDir, the pre-P1-2 shape), B's own row wins
-      // instead — confirming the two stores really do disagree and this isn't a vacuous check.
-      const withoutStoreDir = deriveCircle(worktreeDir);
-      expect(withoutStoreDir).toBe("circle-from-B-the-worktree-store");
+      const result = deriveCircle(worktreeDir);
+      expect(result).toBe("circle-from-B-the-given-store");
+      // NOT vacuous: A really does hold a different circle for the identical key, and it stays out.
+      expect(result).not.toBe("circle-from-A-the-other-store");
+      expect(deriveCircle(otherProjectDir)).toBe("circle-from-A-the-other-store");
     } finally {
       if (savedStorageDir !== undefined) process.env.MONET_STORAGE_DIR = savedStorageDir;
       else delete process.env.MONET_STORAGE_DIR;

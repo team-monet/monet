@@ -45,7 +45,7 @@ facts; that was the old flow and it is what put rules into the always-on layer i
 and you read them (see the top of this file). What remains for capture-and-retire is the narrow
 case it was always best at: **another tool's memory bank**, which has no reader but that tool.
 
-Set expectations in a line: *"I can sort your agent rules into Monet — principles that always apply, rules bound to the moment they fire — and pull in any prior memory store you have. Your notes and decision docs stay exactly where they are; I read those in place. I'll show you every step, capture before I touch anything, and never delete something you read at runtime — those become a short pointer. Want to do a pass?"*
+Set expectations in a line: *"I can sort your agent rules into Monet — principles that always apply, rules bound to the moment they apply — and pull in any prior memory store you have. Your notes and decision docs stay exactly where they are; I read those in place. I'll show you every step, capture before I touch anything, and never delete something you read at runtime — those become a short pointer. Want to do a pass?"*
 
 ## Phase 1 — Discover the sources
 With your own file tools (`Glob`/`Read`/`Bash`), build a map of candidate sources. Scan the repo; ask before reaching outside it. Group what you find by **class**:

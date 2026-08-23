@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { atomicWriteFile } from "./install-cli.js";
+import { atomicWriteFile, byteSnapshotStillMatches } from "./atomic-write.js";
 import path from "node:path";
 import { Command } from "commander";
 import { MonetCore, type SkeletonBody } from "@team-monet/core";
@@ -205,22 +205,6 @@ function readMaterializeManifestSnapshot(filePath: string): MaterializeManifestS
 
 export function readMaterializeManifest(filePath: string): MaterializeRegistryManifest {
   return readMaterializeManifestSnapshot(filePath).manifest;
-}
-
-function byteSnapshotStillMatches(pathname: string, snapshot: Buffer | null): boolean {
-  if (snapshot !== null) {
-    try {
-      return fs.readFileSync(pathname).equals(snapshot);
-    } catch {
-      return false;
-    }
-  }
-  try {
-    fs.lstatSync(pathname);
-    return false; // Something now exists — notably a newly-created dangling link.
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
-  }
 }
 
 function writeMaterializeManifest(

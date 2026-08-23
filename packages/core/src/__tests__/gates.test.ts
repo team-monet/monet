@@ -16,10 +16,10 @@
  * reads to predict firing, so they are asserted directly rather than through the engine.
  */
 import { describe, it, expect, afterEach, beforeAll, afterAll, vi } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync, statSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import * as nodeCrypto from "node:crypto";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -32,26 +32,17 @@ import {
   BREADTH_CIRCLE,
   COMMAND_BOUNDARY,
   createGateSchema,
-  evaluateGate,
-  evaluateGateFromMirror,
   evaluateStageLookup,
-  formatTriggerPattern,
-  gateGeneration,
-  gateQuery,
   gateCoverage,
-  GATE_MIRROR_FORMAT,
   LEGACY_STAR_CIRCLE,
   migrateGateColumns,
-  readTriggerPatterns,
   upsertStage,
   liveStageIndex,
-  matchesTriggerPattern,
   MODEL_TAG_MAX_CHARS,
   normalizeMatchToken,
   normalizeStageName,
+  RETIRED_TRIGGER_PATTERNS,
   parseActionContext,
-  parseTriggerPatterns,
-  seedTriggerPattern,
   stageLookup as standaloneStageLookup,
   STAGE_INDEX_CAP,
   STAGE_LOOKUP_BODY_CAP,
@@ -59,7 +50,6 @@ import {
   STAGE_LOOKUP_RULES_CAP,
   STAGE_NAME_MAX_CHARS,
 } from "../gates";
-import type { GateMirror, SidecarMaterialization } from "../gates";
 import type { EmbeddingProvider } from "../embedding";
 import type { StoragePort } from "../storage";
 import { BetterSqlitePort, type Statement } from "../storage";
@@ -103,6 +93,26 @@ class ConstantEmbeddingProvider implements EmbeddingProvider {
 
 type RawDb = { prepare(sql: string): { run(...p: unknown[]): unknown; get(...p: unknown[]): unknown; all(...p: unknown[]): unknown[] } };
 const raw = (c: MonetCore): RawDb => (c as unknown as { db: RawDb }).db;
+
+/**
+ * Bump a stage row's sync revision WITHOUT touching its patterns — a RAW FIXTURE, because no engine
+ * path produces this shape: `upsertStage` returns early when the serialized patterns are unchanged
+ * ("no-op: nothing to bump for"), so an identical-pattern row never gets a revision of its own.
+ *
+ * WHY IT HAS TO EXIST. A pattern-identical relay otherwise always LOSES the (revision, writer)
+ * contest and lands in `skipped` — whether the re-aim guard refused it or the upsert simply found
+ * nothing to change. Those two are indistinguishable at the counter, which is exactly the ambiguity
+ * a test of the guard's scoping must remove. Stamped off the SAME persisted sync clock
+ * (`sync_meta.last_mutation_at`, advanced exactly as `nextSyncTimestamp()` advances it) so the row
+ * exports and grafts like any other engine write.
+ */
+function bumpStageRevision(c: MonetCore, stageId: string): void {
+  const db = raw(c);
+  db.prepare(`UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at + 1, ?) WHERE singleton = 1`).run(Date.now());
+  const stamp = (db.prepare(`SELECT last_mutation_at AS t FROM sync_meta WHERE singleton = 1`).get() as { t: number }).t;
+  db.prepare(`UPDATE stages SET sync_revision = sync_revision + 1, sync_updated_at = ? WHERE id = ?`)
+    .run(stamp, stageId);
+}
 
 const tmpDirs: string[] = [];
 function mkTmp(): string {
@@ -187,84 +197,31 @@ async function withdrawDeny(c: MonetCore, conceptId: string, stage: string, circ
 }
 
 // ---------------------------------------------------------------------------
-// the pattern format — the contract a human reads
+// the action-context tokenizer — what survived the matcher
 // ---------------------------------------------------------------------------
-describe("trigger pattern format", () => {
-  it("seeds `Bash: git push --force` from the instance the correction was captured on", () => {
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    expect(pattern).toEqual({ tool: "bash", tokens: ["git", "push", "--force"] });
-    expect(formatTriggerPattern(pattern)).toBe("bash: git push --force");
-  });
-
-  it("fires on the dangerous shape and stays silent on its safe siblings (the slice's fixtures)", () => {
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    const fires = (context: string): boolean => matchesTriggerPattern(pattern, parseActionContext(context));
-
-    // Fires: a prefix of the captured instance...
-    expect(fires("Bash:git push --force")).toBe(true);
-    // ...and the same command buried mid-chain behind a `cd`, with different operands.
-    expect(fires("Bash:cd /x && git push --force origin dev")).toBe(true);
-    // Silent: the same tool and the same leading word, but not this command.
-    expect(fires("Bash:git status")).toBe(false);
-    // Silent: a different tool entirely.
-    expect(fires("Read:/etc/hosts")).toBe(false);
-  });
-
-  it("fires a declared `terraform apply` stage on `Bash:terraform apply -auto-approve`", () => {
-    // A declaration authored from a bare command name gets no tool constraint, which is what lets
-    // it fire on whichever host surface actually runs it.
-    const pattern = seedTriggerPattern("terraform apply");
-    expect(pattern).toEqual({ tool: null, tokens: ["terraform", "apply"] });
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:terraform apply -auto-approve"))).toBe(true);
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:terraform plan"))).toBe(false);
-  });
-
-  it("seeds from the substantive command in a chain, whichever end it sits at", () => {
-    expect(seedTriggerPattern("Bash:cd /x && git push --force origin dev").tokens)
-      .toEqual(["git", "push", "--force"]);
-    expect(seedTriggerPattern("Bash:git push --force && echo done").tokens)
-      .toEqual(["git", "push", "--force"]);
-  });
-
-  it("keeps a quoted run as one token, so message text never leaks into a pattern", () => {
+//
+// THE TRIGGER-PATTERN SUITE THAT STOOD HERE WENT WITH THE PATTERNS (2026-08-22): seeding, the
+// rendered contract, tool-constraint firing, the contiguous-run match, the empty-run refusal, the
+// corrupt-row read, and the padding test that proved matching never runs on a prefix. Nothing
+// matches an action any more, so none of them had a subject left.
+//
+// WHAT REMAINS HAS A LIVE READER. `parseActionContext` still answers one question — is this
+// declared content shaped like a command? — for `declareAdvisories`, so its tokenizer's decisions
+// are still load-bearing and still pinned here. Every assertion below is about the TOKENIZER
+// alone; not one of them mentions a pattern.
+describe("action-context tokenizer", () => {
+  it("keeps a quoted run as one token, so message text never leaks into a token stream", () => {
     // ONE token, and it carries the quoted CONTENT rather than the quotes: `-m "a b"` can never be
     // confused with the three-token `-m a b`, and the quotes themselves are not part of the word.
     expect(parseActionContext(`Bash:git commit -m "fix the thing"`).tokens)
       .toEqual(["git", "commit", "-m", "fix the thing"]);
-    expect(seedTriggerPattern(`Bash:git commit -m "fix the thing"`).tokens)
-      .toEqual(["git", "commit", "-m"]);
-  });
-
-  it("sees through quoting and escaping — the same command to the shell is the same command here", () => {
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    const fires = (context: string): boolean => matchesTriggerPattern(pattern, parseActionContext(context));
-    expect(fires(`Bash:git "push" --force origin main`)).toBe(true);
-    expect(fires(`Bash:git 'push' '--force' origin main`)).toBe(true);
-    expect(fires(`Bash:git push \\-\\-force origin main`)).toBe(true);
-    expect(fires("Bash:GIT PUSH --FORCE origin main")).toBe(true);
-    // ACCEPTED NON-MATCHES, documented in the module header rather than half-fixed.
-    // Genuinely different tokens — teaching the matcher otherwise means teaching it every tool's
-    // flag grammar, which is how a deterministic matcher becomes a heuristic one.
-    expect(fires("Bash:git push --force=true origin main")).toBe(false);
-    expect(fires("Bash:git push -f origin main")).toBe(false);
-    // ANSI-C quoting. `$'...'` carries its own escape table, and a partial implementation is worse
-    // than none: stripping the `$` and treating the run as literal would render `$'a\nb'` as four
-    // characters where the shell produces two words. Left alone, deliberately, and pinned here so
-    // the day someone implements the escape table in full, this test is what they update.
-    expect(fires("Bash:$'git' push --force origin main")).toBe(false);
   });
 
   it("processes shell escapes EXACTLY ONCE, so a literal backslash survives", () => {
     // `foo\\bar` is the five characters `foo\bar` to the shell. The tokenizer resolved that
     // correctly and then normalizeMatchToken unescaped the result a SECOND time, yielding
-    // `foobar` — a token that matches things it should not and misses the one it should.
+    // `foobar` — a token that means something other than what was written.
     expect(parseActionContext("Bash:foo\\\\bar").tokens).toEqual(["foo\\bar"]);
-    expect(seedTriggerPattern("Bash:foo\\\\bar --flag").tokens).toEqual(["foo\\bar", "--flag"]);
-    // Seed and match agree because both come through the same tokenizer.
-    expect(matchesTriggerPattern(
-      seedTriggerPattern("Bash:foo\\\\bar --flag"),
-      parseActionContext("Bash:foo\\\\bar --flag now"),
-    )).toBe(true);
     // ...and a token whose literal content IS a quoted string keeps its quotes.
     expect(parseActionContext(`Bash:echo '"quoted"'`).tokens).toEqual(["echo", '"quoted"']);
     // The single-escape cases still resolve, once.
@@ -272,53 +229,18 @@ describe("trigger pattern format", () => {
     expect(parseActionContext("Bash:git push \\-\\-force").tokens).toEqual(["git", "push", "--force"]);
   });
 
-  it("normalizes BOTH sides with one function, so a stored pattern cannot drift from the matcher", () => {
-    // The shared form is CASE FOLDING ONLY, and that is what makes it idempotent. Quote-stripping
-    // and unescaping belong to the TOKENIZER, which is the only layer that knows which characters
-    // were syntax and which were data — see the double-processing test below.
+  it("folds case and nothing else — the one normalization, still applied exactly once", () => {
+    // CASE FOLDING ONLY, which is what makes it idempotent. Quote-stripping and unescaping belong
+    // to the TOKENIZER, the only layer that knows which characters were syntax and which were data
+    // — see the double-processing test above.
     expect(normalizeMatchToken('"push"')).toBe('"push"');
     expect(normalizeMatchToken("--Force")).toBe("--force");
-    // What matters is that both sides agree, which they do because both come through the tokenizer.
-    const stored = readTriggerPatterns(JSON.stringify([{ tool: "Bash", tokens: ["GIT", "Push"] }])).patterns;
-    expect(stored).toEqual([{ tool: "bash", tokens: ["git", "push"] }]);
-    expect(matchesTriggerPattern(stored[0]!, parseActionContext("Bash:git push --force"))).toBe(true);
-  });
-
-  it("refuses a seed that is nothing but flags — that stage would address every command", () => {
-    // K1: `--force` alone fires on `rm -rf --force`, on `git push --force`, on anything carrying
-    // the flag. Born pattern-less and inert instead, visible in the dead-pattern watchlist.
-    expect(seedTriggerPattern("Bash:--force").tokens).toEqual([]);
-    expect(seedTriggerPattern("--force -v").tokens).toEqual([]);
-    expect(matchesTriggerPattern(seedTriggerPattern("Bash:--force"), parseActionContext("Bash:rm -rf --force")))
-      .toBe(false);
-    // A flag run that DOES have a word reaches for it rather than giving up.
-    expect(seedTriggerPattern("Bash:-v --force rm").tokens).toEqual(["-v", "--force", "rm"]);
-  });
-
-  it("matches the whole context — a wall of padding cannot push the command out of view", () => {
-    // F1: the old token clamp meant N tokens of padding silenced every gate in the store. A cap
-    // that turns "long" into "ungoverned" is worse than no cap.
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    const padding = Array.from({ length: 4000 }, (_, i) => `arg${i}`).join(" ");
-    expect(matchesTriggerPattern(pattern, parseActionContext(`Bash:${padding} && git push --force origin main`)))
-      .toBe(true);
+    expect(parseActionContext("Bash:GIT PUSH --FORCE").tokens).toEqual(["git", "push", "--force"]);
   });
 
   it("only reads a tool prefix when the text before the colon is a bare identifier", () => {
     expect(parseActionContext(`psql -c "select 1:2"`).tool).toBeNull();
     expect(parseActionContext("Bash:ls").tool).toBe("bash");
-  });
-
-  it("never matches on an empty token run — a stage that fires on everything is worse than none", () => {
-    expect(matchesTriggerPattern({ tool: null, tokens: [] }, parseActionContext("Bash:anything at all"))).toBe(false);
-    expect(matchesTriggerPattern({ tool: "bash", tokens: [] }, parseActionContext("Bash:anything at all"))).toBe(false);
-  });
-
-  it("reads a corrupt stage row as zero patterns instead of throwing on the firing path", () => {
-    expect(parseTriggerPatterns("not json at all")).toEqual([]);
-    expect(parseTriggerPatterns('{"tool":"bash"}')).toEqual([]);
-    expect(parseTriggerPatterns('[{"tool":"Bash","tokens":["GIT","Push"]},{"nope":1}]'))
-      .toEqual([{ tool: "bash", tokens: ["git", "push"] }]);
   });
 });
 
@@ -332,7 +254,6 @@ describe("rule capture", () => {
       kind: "rule",
       rule: {
         stage: "git force push",
-        instance: "Bash:git push --force origin main",
         reason: "it destroys teammates' commits",
         ...AGENT_RULE,
       },
@@ -350,11 +271,11 @@ describe("rule capture", () => {
     });
 
     // The stage did not exist a moment ago: the correction's landing on an unstaged action IS its
-    // creation, and its pattern comes from the instance that was visible at that moment.
+    // creation. The stage is its NAME — since trigger patterns retired there is nothing else about
+    // it for the capture moment to author.
     const stages = c.stages();
     expect(stages).toHaveLength(1);
-    expect(stages[0]).toMatchObject({ name: "git force push", origin: "correction", verified: false });
-    expect(stages[0]!.patterns).toEqual([{ tool: "bash", tokens: ["git", "push", "--force"] }]);
+    expect(stages[0]).toMatchObject({ name: "git force push", origin: "correction" });
     expect(stored.concept.kind).toBe("rule");
     c.close();
   });
@@ -362,17 +283,20 @@ describe("rule capture", () => {
   it("takes the rule's address from an existing stage rather than creating a second one", async () => {
     const c = core();
     const first = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
+    const incumbent = c.stages()[0]!;
     const second = await c.store("Announce in the channel before any force push.", {
       // Named by a DIFFERENT spelling of the same stage — normalization is what keeps the stage set
       // "finite, slow-growing, countable".
-      kind: "rule", rule: { stage: "  Git   Force Push ", instance: "Bash:git push --force -u origin x", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "  Git   Force Push ", ...AGENT_RULE },
     });
     expect(c.stages()).toHaveLength(1);
     expect(c.ruleBinding(first.conceptId)!.stage_id).toBe(c.ruleBinding(second.conceptId)!.stage_id);
-    // The incumbent stage keeps its own patterns: a later capture does not re-author an address.
-    expect(c.stages()[0]!.patterns).toEqual([{ tool: "bash", tokens: ["git", "push", "--force"] }]);
+    // THE INCUMBENT ROW IS UNTOUCHED — a later capture does not re-author an address. This used to
+    // be asserted about the stage's trigger patterns; with those retired the claim is stronger and
+    // simpler, because the whole row is what must not move.
+    expect(c.stages()[0]).toEqual(incumbent);
     c.close();
   });
 
@@ -388,19 +312,20 @@ describe("rule capture", () => {
   it("a rule corrected twice at ONE stage is two observations, one rule — and its address does not move", async () => {
     const c = resolvingCore();
     const first = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
+    const incumbent = c.stages()[0]!;
     const second = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force -u origin x", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
 
     expect(second.conceptId).toBe(first.conceptId);
     expect(second.action).toBe("attached");
     expect(second.concept.supportCount).toBe(2);
-    // The rule's address did NOT move, and the repeat's own instance did not re-author the stage's
-    // patterns either: a later capture does not re-address a live rule by either mechanism.
+    // The rule's address did NOT move, and the repeat did not re-author the stage row either: a
+    // later capture does not re-address a live rule by either mechanism.
     expect(c.stages().map((s) => s.name)).toEqual(["git force push"]);
-    expect(c.stages()[0]!.patterns).toEqual([{ tool: "bash", tokens: ["git", "push", "--force"] }]);
+    expect(c.stages()[0]).toEqual(incumbent);
     const bound = c.stages().find((s) => s.id === c.ruleBinding(first.conceptId)!.stage_id)!;
     expect(bound.name).toBe("git force push");
     c.close();
@@ -417,21 +342,22 @@ describe("rule capture", () => {
   it("creates no orphan stage when the binding it would serve is kept", async () => {
     const c = resolvingCore();
     const first = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     // A named attach whose rule options name a DIFFERENT action keeps the incumbent binding — and
-    // used to leave the newly named stage behind, unbound: it fires nothing, can never fire
-    // anything, and sits on the dead-pattern watchlist forever.
+    // used to leave the newly named stage behind, unbound: it delivers nothing and can never
+    // deliver anything, a permanent dead entry in the registry.
     await c.store("Never force-push to a shared branch.", {
-      kind: "rule", attachTo: first.conceptId, rule: { stage: "some other gate", instance: "Bash:rm -rf", ...AGENT_RULE },
+      kind: "rule", attachTo: first.conceptId, rule: { stage: "some other gate", ...AGENT_RULE },
     });
     expect(c.stages().map((s) => s.name)).toEqual(["git force push"]);
-    expect(c.gateCoverage().unverifiedPatterns.map((u) => u.stageName)).toEqual(["git force push"]);
+    // The registry's own live-stage list is the surviving witness: one stage, and it is the bound one.
+    expect(c.gateCoverage().liveStages.map((s) => s.stageName)).toEqual(["git force push"]);
     expect(c.ruleBinding(first.conceptId)!.stage_id).toBe(c.stages()[0]!.id);
 
     // A DECLARATION still moves the address, stage and all — that is the sovereign path.
     await c.declare({
-      species: "rule", stage: "some other gate", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "some other gate",
       content: "Never force-push to a shared branch.", ...AGENT_RULE,
     });
     expect(c.stages().map((s) => s.name).sort()).toEqual(["git force push", "some other gate"]);
@@ -463,12 +389,12 @@ describe("rule capture", () => {
     // Identical text, so the nomination scan picks the fact — but a binding on a fact would be
     // accepted, stored, and never delivered, because the gate only ever returns kind='rule'.
     const rule = await c.store("Always run terraform plan before apply.", {
-      kind: "rule", rule: { stage: "terraform apply", instance: "Bash:terraform apply", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "terraform apply", ...AGENT_RULE },
     });
     expect(rule.conceptId).not.toBe(fact.conceptId);
     expect(rule.action).toBe("created");
     expect(rule.concept.kind).toBe("rule");
-    expect(c.gate({ actionContext: "Bash:terraform apply -auto-approve" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "terraform apply" }).rules).toHaveLength(1);
     // The near-match is not discarded: the pair goes to the same curation surface every other
     // non-merge goes to.
     expect(rule.nearMatchId).toBe(fact.conceptId);
@@ -480,7 +406,7 @@ describe("rule capture", () => {
   it("will not attach fresh rule evidence to a SUPERSEDED rule — history takes no new evidence", async () => {
     const c = resolvingCore();
     const original = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     await c.store("Force-push is fine on your own branch; never on a shared one.", {
       kind: "correction", attachTo: original.conceptId,
@@ -491,7 +417,7 @@ describe("rule capture", () => {
       kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     expect(recaptured.conceptId).not.toBe(original.conceptId);
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId))
       .toContain(recaptured.conceptId);
 
     // And naming the dead rule explicitly is a caller error, not something to route around quietly.
@@ -525,7 +451,7 @@ describe("rule death — a correction supersedes rather than attaches", () => {
   it("treats a NOMINATED landing on a rule exactly like a named one", async () => {
     const c = resolvingCore();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     // No attachTo: the resolution hybrid decides WHICH concept this lands on; what landing MEANS is
     // a property of what it landed on.
@@ -580,7 +506,7 @@ describe("rule provenance", () => {
     const rule = await c.store("Never force-push to a shared branch.", {
       kind: "rule",
       sourceRefs: [SPAN, "src/deploy.ts"],
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      rule: { stage: "git force push", ...AGENT_RULE },
     });
     const provenance = c.getLifecycleEdges(rule.conceptId, { direction: "out", family: "provenance" });
     expect(provenance).toHaveLength(1);
@@ -616,20 +542,19 @@ describe("rule provenance", () => {
 // declaration
 // ---------------------------------------------------------------------------
 describe("declaration — the sovereign entrance", () => {
-  it("declares a stage, then a rule at it, and replaces patterns on re-declaration", async () => {
+  it("declares a stage, then a rule at it, and re-declaring the stage is a no-op", async () => {
     const c = core();
-    const stage = await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
+    const stage = await c.declare({ species: "stage", stage: "terraform apply" });
     expect(stage).toMatchObject({ species: "stage" });
-    expect(c.stages()[0]).toMatchObject({ name: "terraform apply", origin: "declaration", verified: false });
-    expect(c.stages()[0]!.patterns).toEqual([{ tool: null, tokens: ["terraform", "apply"] }]);
+    expect(c.stages()[0]).toMatchObject({ name: "terraform apply", origin: "declaration" });
+    const declared = c.stages()[0]!;
 
-    // Re-declaration REPLACES: this is how a mis-seeded pattern is fixed.
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["Bash:terraform apply", "Bash:terraform destroy"] });
+    // RE-DECLARATION IS CREATE-OR-FETCH. It used to REPLACE the stage's trigger patterns, which was
+    // the only editable thing a stage carried; with those retired a stage is its name, so a second
+    // declaration of the same name returns the same row rather than re-authoring anything.
+    await c.declare({ species: "stage", stage: "terraform apply" });
     expect(c.stages()).toHaveLength(1);
-    expect(c.stages()[0]!.patterns).toEqual([
-      { tool: "bash", tokens: ["terraform", "apply"] },
-      { tool: "bash", tokens: ["terraform", "destroy"] },
-    ]);
+    expect(c.stages()[0]).toEqual(declared);
 
     const rule = await c.declare({
       species: "rule", stage: "terraform apply", content: "Always run plan first.",
@@ -720,7 +645,7 @@ describe("declaration — the sovereign entrance", () => {
     // that omits it never rules on severity and never reaches this check. This one names `blocking`
     // explicitly on a rule that is currently advisory — deny power actually being acquired.
     const first = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", ...AGENT_RULE,
     });
     if (first.species !== "rule") throw new Error("unreachable");
@@ -733,16 +658,16 @@ describe("declaration — the sovereign entrance", () => {
     // The incumbent is exactly as it was found — including its own (absent) reason, which the
     // refused declaration did not get to overwrite.
     expect(c.ruleBinding(first.conceptId)).toMatchObject({ severity: "advisory", reason: null });
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]!.severity).toBe("advisory");
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]!.severity).toBe("advisory");
 
-    // With the reason supplied the same upgrade goes through, and the gate delivers it alongside.
+    // With the reason supplied the same upgrade goes through, and delivery carries it alongside.
     const upgraded = await c.declare({
       species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (upgraded.species !== "rule") throw new Error("unreachable");
     expect(upgraded.conceptId).toBe(first.conceptId);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
       .toMatchObject({ severity: "blocking", reason: "there is no undo" });
     c.close();
   });
@@ -758,7 +683,7 @@ describe("declaration — the sovereign entrance", () => {
   it("PRESERVES an omitted reason exactly as it preserves an omitted severity", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      species: "rule", ...DENY,
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -771,8 +696,8 @@ describe("declaration — the sovereign entrance", () => {
     if (again.species !== "rule") throw new Error("unreachable");
     expect(again.conceptId).toBe(deny.conceptId);
     expect(c.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", reason: "there is no undo" });
-    // ...and the gate still DELIVERS it, which is the only form of survival that matters.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+    // ...and it is still DELIVERED, which is the only form of survival that matters.
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
       .toMatchObject({ severity: "blocking", reason: "there is no undo" });
 
     // The same holds one severity down, where no guard is involved at all — preservation is a
@@ -792,7 +717,7 @@ describe("declaration — the sovereign entrance", () => {
   it("carries a withdrawn deny's reason forward into the advisory it becomes", async () => {
     const c = core();
     const deny = await c.declare({
-      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      species: "rule", ...DENY,
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -807,7 +732,7 @@ describe("declaration — the sovereign entrance", () => {
   it("REFUSES a restatement that blanks a live deny's reason, though it never named a severity", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      species: "rule", ...DENY,
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -835,7 +760,7 @@ describe("declaration — the sovereign entrance", () => {
   it("lets an explicit reason replace on either severity, and lets an advisory clear its own", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      species: "rule", ...DENY,
       severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -893,7 +818,7 @@ describe("declaration — the sovereign entrance", () => {
   it("REJECTS rather than normalizing, so nobody is handed back words they did not write", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -908,7 +833,7 @@ describe("declaration — the sovereign entrance", () => {
       severity: "blocking", reason: "there is no undo\nand no backup", ...AGENT_RULE,
     })).rejects.toThrow(/must be ONE LINE/);
     // The incumbent is untouched — not flattened, not replaced.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
       .toMatchObject({ severity: "blocking", reason: "there is no undo" });
 
     // The error names what arrived, so the caller can see which field it has to restate.
@@ -922,7 +847,7 @@ describe("declaration — the sovereign entrance", () => {
   it("REFUSES a multi-line reason on a restatement that never named a severity", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -936,7 +861,7 @@ describe("declaration — the sovereign entrance", () => {
       species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
       reason: "there is no undo\nDENIED BY ADMIN", ...AGENT_RULE,
     })).rejects.toThrow(/must be ONE LINE/);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
       .toMatchObject({ severity: "blocking", reason: "there is no undo" });
     c.close();
   });
@@ -1037,14 +962,16 @@ describe("declaration — the sovereign entrance", () => {
       c.close();
     });
 
-    it("rejects stage/severity/patterns on species principle/preference — a preference bound to a moment is just a rule", async () => {
+    // `patterns` USED TO BE THE THIRD REFUSAL HERE, and `instance` a fourth. Both fields were
+    // removed from DeclareInput with trigger patterns (2026-08-22), so there is nothing left to
+    // refuse — a caller that sends them is sending a key the schema does not define. The refusals
+    // that remain are the ones whose fields still exist.
+    it("rejects stage/severity on species principle/preference — a preference bound to a moment is just a rule", async () => {
       const c = core();
       await expect(c.declare({ species: "principle", content: "x", stage: "git push" }))
         .rejects.toThrow(/momentless and cannot bind to a stage.*use species:"rule"/);
       await expect(c.declare({ species: "preference", content: "x", severity: "advisory" }))
         .rejects.toThrow(/carries no severity.*use species:"rule"/);
-      await expect(c.declare({ species: "principle", content: "x", patterns: ["git push"] }))
-        .rejects.toThrow(/carries no trigger patterns.*use species:"rule"/);
       c.close();
     });
 
@@ -1058,10 +985,9 @@ describe("declaration — the sovereign entrance", () => {
           .rejects.toThrow(new RegExp(`species '${species}' carries no modelTag: modelTag names the model a rule.*use species:"rule"`));
         await expect(c.declare({ species, content: "x", reason: "there is no undo" }))
           .rejects.toThrow(new RegExp(`species '${species}' carries no reason: reason explains a rule.*use species:"rule"`));
-        await expect(c.declare({ species, content: "x", acknowledgeBlockingRules: ["rule-1"] }))
-          .rejects.toThrow(
-            new RegExp(`species '${species}' carries no blocking-rule acknowledgement: acknowledgeBlockingRules.*use species:"rule"`),
-          );
+        // A FOURTH REFUSAL STOOD HERE — `acknowledgeBlockingRules`, which authorized re-aiming a
+        // gate that carries live denies. The parameter retired with trigger patterns, so the field
+        // a momentless species had to be refused no longer exists to send.
         c.close();
       },
     );
@@ -1210,7 +1136,7 @@ describe("declaration — the sovereign entrance", () => {
         const c = resolvingCore();
         const text = "Never delete a directory tree unattended.";
         const deny = await c.declare({
-          species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+          species: "rule", stage: "rm -rf",
           content: text, severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
         });
         if (deny.species !== "rule") throw new Error("unreachable");
@@ -1219,11 +1145,11 @@ describe("declaration — the sovereign entrance", () => {
         if (declared.species !== "principle") throw new Error("unreachable");
         expect(declared.conceptId).not.toBe(deny.conceptId);
 
-        // NO FOREIGN RATIFICATION on the rule, and the deny still fires exactly as before.
+        // NO FOREIGN RATIFICATION on the rule, and the deny is still delivered exactly as before.
         expect(c.getRatifications(deny.conceptId)).toHaveLength(0);
         expect(raw(c).prepare(`SELECT kind FROM concepts WHERE id = ?`).get(deny.conceptId))
           .toMatchObject({ kind: "rule" });
-        expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+        expect(c.stageLookup({ stage: "rm -rf" }).rules[0])
           .toMatchObject({ severity: "blocking", reason: "there is no undo" });
         c.close();
       });
@@ -1290,21 +1216,11 @@ describe("declaration — the sovereign entrance", () => {
     });
 
     describe("warning-light advisories — mechanical only, NEVER block the write", () => {
-      it('advises when content matches an EXISTING stage\'s own trigger patterns, naming the stage', async () => {
-        const c = core();
-        await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-        const r = await c.declare({
-          species: "principle",
-          content: "Always run terraform apply only after a clean plan.",
-        });
-        if (r.species !== "principle") throw new Error("unreachable");
-        // NEVER BLOCKS: the write proceeded despite looking rule-shaped.
-        expect(r.conceptId).toBeTruthy();
-        expect(r.advisories).toContainEqual(
-          expect.objectContaining({ kind: "stage_shaped", stage: "terraform apply" }),
-        );
-        c.close();
-      });
+      // THE STRONGER HALF OF `stage_shaped` WAS REMOVED HERE (2026-08-22). It swept the registry
+      // for a stage whose trigger patterns matched the declared content and named that stage in the
+      // advisory (`{ kind: "stage_shaped", stage: "terraform apply" }`). Nothing matches a stage any
+      // more, so the general half below — the content's own command SHAPE — is the whole check, and
+      // the advisory it emits carries no `stage` field. That absence is asserted there.
 
       it("advises on command-shaped content (Tool:command convention) when no stage matches", async () => {
         const c = core();
@@ -1381,10 +1297,11 @@ describe("declaration — the sovereign entrance", () => {
 
       it("never blocks the write even when multiple advisories fire at once", async () => {
         const c = core();
-        await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-        // Stage-shaped (matches the "terraform apply" stage) AND missing-exits-evidence (none
-        // given) both fire on this one write, and it still proceeds — advisories never block.
-        const r = await c.declare({ species: "principle", content: "Always run terraform apply only after a clean plan." });
+        // Command-shaped (the `Tool:` prefix) AND missing-exits-evidence (none given) both fire on
+        // this one write, and it still proceeds — advisories never block. This used to be triggered
+        // by content MATCHING a registered stage's patterns; with those retired, the content's own
+        // shape is what raises `stage_shaped`, and firing two at once is still the property here.
+        const r = await c.declare({ species: "principle", content: "Bash:terraform apply only after a clean plan" });
         if (r.species !== "principle") throw new Error("unreachable");
         expect(r.conceptId).toBeTruthy();
         expect(r.advisories.length).toBeGreaterThanOrEqual(2);
@@ -1445,7 +1362,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     // The parent edge, written the way memory_ratify writes it: the human named this rule as a
     // member of the principle's evidence.
@@ -1479,10 +1396,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const incumbent = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const successor = await c.store("Force-push is fine on your own branch; never on a shared one.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force-with-lease", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     await c.ratify({
       candidateId: principle, verdict: "re-ratify", memberRuleIds: [incumbent.conceptId], ratifiedBy: "john",
@@ -1529,10 +1446,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const incumbent = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const successor = await c.store("Force-push is fine on your own branch; never on a shared one.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force-with-lease", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({
       family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction",
@@ -1571,10 +1488,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
         `SELECT id FROM observations WHERE concept_id = ? LIMIT 1`,
       ).get(principle) as { id: string }).id;
       const incumbent = await c.store(`Never force-push to a shared branch (${scenario.name}).`, {
-        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, instance: `Bash:${scenario.name}`, ...AGENT_RULE },
+        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, ...AGENT_RULE },
       });
       const successor = await c.store(`Lease-push instead on shared branches (${scenario.name}).`, {
-        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, instance: `Bash:s-${scenario.name}`, ...AGENT_RULE },
+        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, ...AGENT_RULE },
       });
       c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
       c.addLifecycleEdge({
@@ -1599,10 +1516,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     for (const shape of ["retired", "disputed"] as const) {
       const principle = await principleOf(c, `Irreversible acts get a confirmation (${shape}).`);
       const incumbent = await c.store(`Never force-push to a shared branch (${shape}).`, {
-        kind: "rule", rule: { stage: `live successor ${shape}`, instance: `Bash:${shape}`, ...AGENT_RULE },
+        kind: "rule", rule: { stage: `live successor ${shape}`, ...AGENT_RULE },
       });
       const successor = await c.store(`Lease-push instead on shared branches (${shape}).`, {
-        kind: "rule", rule: { stage: `live successor ${shape}`, instance: `Bash:s-${shape}`, ...AGENT_RULE },
+        kind: "rule", rule: { stage: `live successor ${shape}`, ...AGENT_RULE },
       });
       c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
       if (shape === "retired") {
@@ -1641,10 +1558,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (cross-stage).");
     const incumbent = await c.store("Never force-push to a shared branch (cross-stage).", {
-      kind: "rule", rule: { stage: "cross-stage gate", instance: "Bash:cross-stage", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "cross-stage gate", ...AGENT_RULE },
     });
     const elsewhere = await c.store("Snapshot volumes before stateful deletes (cross-stage).", {
-      kind: "rule", rule: { stage: "cross-stage other gate", instance: "Bash:cross-stage-other", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "cross-stage other gate", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
 
@@ -1653,8 +1570,8 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     })).toThrow(/does not stand where the incumbent stands/);
     expect(c.getLifecycleEdges(incumbent.conceptId, { direction: "out", family: "supersession" })).toEqual([]);
     expect(openImpeachments(c, principle)).toEqual([]);
-    // The incumbent still fires at its own gate — nothing was removed without a replacement.
-    expect(c.gate({ actionContext: "Bash:cross-stage", record: false }).rules.map((r) => r.conceptId)).toContain(incumbent.conceptId);
+    // The incumbent still stands at its own gate — nothing was removed without a replacement.
+    expect(c.stageLookup({ stage: "cross-stage gate", record: false }).rules.map((r) => r.conceptId)).toContain(incumbent.conceptId);
     c.close();
   });
 
@@ -1667,10 +1584,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (audience).");
     const incumbent = await c.store("Never force-push to a shared branch (audience).", {
-      kind: "rule", rule: { stage: "audience gate", instance: "Bash:audience", scope: "domain" },
+      kind: "rule", rule: { stage: "audience gate", scope: "domain" },
     });
     const narrower = await c.store("Lease-push instead on shared branches (audience).", {
-      kind: "rule", rule: { stage: "audience gate", instance: "Bash:audience-2", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "audience gate", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
 
@@ -1691,10 +1608,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (retired incumbent).");
     const incumbent = await c.store("Never force-push to a shared branch (retired incumbent).", {
-      kind: "rule", rule: { stage: "retired incumbent gate", instance: "Bash:ri", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "retired incumbent gate", ...AGENT_RULE },
     });
     const successor = await c.store("Lease-push instead on shared branches (retired incumbent).", {
-      kind: "rule", rule: { stage: "retired incumbent gate", instance: "Bash:ri-2", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "retired incumbent gate", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
     c.retireConcept(incumbent.conceptId);
@@ -1716,10 +1633,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (disputed incumbent).");
     const incumbent = await c.store("Never force-push to a shared branch (disputed incumbent).", {
-      kind: "rule", rule: { stage: "disputed incumbent gate", instance: "Bash:di", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "disputed incumbent gate", ...AGENT_RULE },
     });
     const successor = await c.store("Lease-push instead on shared branches (disputed incumbent).", {
-      kind: "rule", rule: { stage: "disputed incumbent gate", instance: "Bash:di-2", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "disputed incumbent gate", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
     // The supported route to a disputed advisory rule: detach carries an open dispute onto it.
@@ -1749,10 +1666,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation (chained).");
     const other = await c.store("Never force-push to a shared branch (chained).", {
-      kind: "rule", rule: { stage: "chained gate", instance: "Bash:chained", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "chained gate", ...AGENT_RULE },
     });
     const dead = await c.store("Lease-push instead on shared branches (chained).", {
-      kind: "rule", rule: { stage: "chained gate", instance: "Bash:chained-2", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "chained gate", ...AGENT_RULE },
     });
     // Overturn `dead` through the ordinary path: still active, still bound, but no gate delivers it.
     await c.store("Force-push freely on throwaway spikes (chained).", { kind: "correction", attachTo: dead.conceptId });
@@ -1774,7 +1691,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     // exists for this case, and that is the property under test.
     const projected = await c.store("Rebuild the image before deploying after a lockfile change.", {
       kind: "rule",
-      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "docker build", scope: "domain", projectedFromPrincipleId: principle },
     });
     expect(raw(c).prepare(
       `SELECT born_of FROM lifecycle_edges WHERE family='derivation' AND src_concept_id=? AND dst_concept_id=?`,
@@ -1798,14 +1715,14 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const pref = await c.declare({ species: "preference", content: "Write as a peer." });
     if (pref.species !== "preference") throw new Error("unreachable");
     const ruleA = await c.store("Address the reader directly in commit messages.", {
-      kind: "rule", rule: { stage: "git commit", instance: "Bash:git commit -m x", scope: "domain" },
+      kind: "rule", rule: { stage: "git commit", scope: "domain" },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: pref.conceptId, dstConceptId: ruleA.conceptId, bornOf: "extraction" });
 
     // (2) A parent that does not resolve locally — the relayed-edge case walkDerivation's own doc
     //     comment warns about. Written straight to the table, exactly as a graft would land it.
     const ruleB = await c.store("Squash before merging a long branch.", {
-      kind: "rule", rule: { stage: "git merge", instance: "Bash:git merge --no-ff", scope: "domain" },
+      kind: "rule", rule: { stage: "git merge", scope: "domain" },
     });
     raw(c).prepare(
       `INSERT INTO lifecycle_edges (id, family, src_concept_id, dst_concept_id, born_of, event_ref, circle, created_at, sync_updated_at)
@@ -1834,7 +1751,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     /** A principle, a rule, a derivation edge between them, and the correction that kills the rule. */
     const impeachAttempt = async (principle: string, stage: string, text: string) => {
-      const rule = await c.store(text, { kind: "rule", rule: { stage, instance: `Bash:${stage}`, scope: "domain" } });
+      const rule = await c.store(text, { kind: "rule", rule: { stage, scope: "domain" } });
       c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
       return c.store(`${text} — except on the first run.`, { kind: "correction", attachTo: rule.conceptId });
     };
@@ -1874,7 +1791,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
 
@@ -1903,7 +1820,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     // Derivation is deliberately NON-unique (lifecycle-edges.ts): a rule projected from a principle
     // and later named in that same principle's ratification packet legitimately carries two.
@@ -1934,10 +1851,10 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const ruleA = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const ruleB = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain" },
     });
     await c.ratify({
       candidateId: principle, verdict: "re-ratify", ratifiedBy: "john",
@@ -1986,7 +1903,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
     // An impeachment naming THIS child is already open, and the parent is disputed by it — the
@@ -2009,7 +1926,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
     await c.store("Force-push is fine on your own branch; never on a shared one.", { kind: "correction", attachTo: rule.conceptId });
@@ -2055,7 +1972,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
     await c.store("Force-push is fine on your own branch; never on a shared one.", { kind: "correction", attachTo: rule.conceptId });
@@ -2098,7 +2015,7 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: rule.conceptId, bornOf: "extraction" });
     await c.store("Force-push is fine on your own branch; never on a shared one.", { kind: "correction", attachTo: rule.conceptId });
@@ -2165,7 +2082,7 @@ describe("5-B: the projection write path", () => {
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     });
 
     const edges = raw(c).prepare(
@@ -2182,7 +2099,7 @@ describe("5-B: the projection write path", () => {
 
     // "A firing projected rule announces its provenance" — the whole reason projection needs no
     // approval gate is that a wrong one misfires in front of the human.
-    const fired = c.gate({ actionContext: "Bash:helm delete my-release" });
+    const fired = c.stageLookup({ stage: "helm delete" });
     expect(fired.rules[0]).toMatchObject({ conceptId: projected.conceptId, projectedFromPrincipleId: principle, origin: "projection" });
     // Nothing is disputed yet, so no doubt is announced (D5's own field, omitted rather than false).
     expect(fired.rules[0]!.parentDisputed).toBeUndefined();
@@ -2247,15 +2164,13 @@ describe("5-B: the projection write path", () => {
     const c = core();
     const legalParent = await principleOf(c, "Irreversible acts get a confirmation.");
     const legalRule = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain" },
     });
-    const generationBefore = c.sidecarGeneration();
     c.addLifecycleEdge({
       family: "derivation", srcConceptId: legalParent, dstConceptId: legalRule.conceptId,
       bornOf: "projection", eventRef: legalRule.observationId,
     });
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    expect(c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0])
+    expect(c.stageLookup({ stage: "helm delete", record: false }).rules[0])
       .toMatchObject({ conceptId: legalRule.conceptId, projectedFromPrincipleId: legalParent });
 
     const project = (srcConceptId: string, dstConceptId: string) => () => c.addLifecycleEdge({
@@ -2281,7 +2196,7 @@ describe("5-B: the projection write path", () => {
       .toThrow(/is not a current skeleton member \(no ratification on record\)/);
 
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"], scope: "domain",
+      species: "rule", stage: "rm -rf", scope: "domain",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", declaredBy: "john",
     });
@@ -2301,7 +2216,7 @@ describe("5-B: the projection write path", () => {
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const text = "Confirm the target namespace before deleting a release.";
     const first = await c.store(text, {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     });
     const second = await c.store(text, {
       kind: "rule", rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
@@ -2325,7 +2240,7 @@ describe("5-B: the projection write path", () => {
     // the slice's own operative test ("ever projected onto = excluded from extraction evidence")
     // depend on which edge happened to land first. Both acts are now on record, oldest first.
     const other = await c.store("Announce a release deletion in the ops channel.", {
-      kind: "rule", rule: { stage: "helm announce", instance: "Bash:helm list", scope: "domain" },
+      kind: "rule", rule: { stage: "helm announce", scope: "domain" },
     });
     await c.ratify({ candidateId: principle, verdict: "re-ratify", memberRuleIds: [other.conceptId] });
     await c.store("Announce a release deletion in the ops channel.", {
@@ -2340,7 +2255,7 @@ describe("5-B: the projection write path", () => {
     // AND THE HUMAN'S RULING IS STILL THE ONE DELIVERY NAMES — the parent pick is a correlated
     // scalar ordered oldest-first with LIMIT 1, so two acts still report exactly one parent, and
     // walkDerivation is DISTINCT, so the principle's member list does not repeat the rule.
-    expect(c.gate({ actionContext: "Bash:helm list", record: false }).rules[0])
+    expect(c.stageLookup({ stage: "helm announce", record: false }).rules[0])
       .toMatchObject({ conceptId: other.conceptId, projectedFromPrincipleId: principle });
     expect(c.walkDerivation(principle, "out").filter((id) => id === other.conceptId)).toEqual([other.conceptId]);
     c.close();
@@ -2366,10 +2281,10 @@ describe("5-B: the projection write path", () => {
     // The ambiguous band, so two near-matching rules at different stages fork into a flagged pair;
     // identical text still ATTACHES, which is how the later projection lands on an existing rule.
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
-    const ruleAt = (text: string, stage: string, instance: string) =>
-      c.store(text, { kind: "rule", rule: { stage, instance, scope: "domain" } });
-    const first = await ruleAt("Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt("After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const ruleAt = (text: string, stage: string) =>
+      c.store(text, { kind: "rule", rule: { stage, scope: "domain" } });
+    const first = await ruleAt("Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt("After the source changes, verify the artifact itself.", "npm install");
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
@@ -2384,7 +2299,7 @@ describe("5-B: the projection write path", () => {
     // (2) THE PROJECTION LANDS SECOND, onto that very rule — a cache hit on the attach path.
     const projection = await c.store("Verify the built artifact after the source changes.", {
       kind: "rule",
-      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "docker build", scope: "domain", projectedFromPrincipleId: principle },
     });
     expect(projection.action).toBe("attached");
     expect(projection.conceptId).toBe(first.conceptId);
@@ -2417,7 +2332,7 @@ describe("5-B: the projection write path", () => {
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     });
     expect(raw(c).prepare(
       `SELECT born_of FROM lifecycle_edges WHERE family='derivation' AND src_concept_id=? AND dst_concept_id=?`,
@@ -2435,7 +2350,7 @@ describe("5-B: the projection write path", () => {
     ).all(principle, projected.conceptId) as Array<{ born_of: string }>;
     expect(bornOf.map((e) => e.born_of)).toEqual(["projection", "ratification"]);
     // The rule is projection-born either way — a human agreeing does not un-manufacture the support.
-    expect(c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0])
+    expect(c.stageLookup({ stage: "helm delete", record: false }).rules[0])
       .toMatchObject({ conceptId: projected.conceptId, projectedFromPrincipleId: principle, origin: "projection" });
     c.close();
   });
@@ -2458,7 +2373,7 @@ describe("5-B: the projection write path", () => {
     const c = core();
     const principle = await principleOf(c, "Irreversible acts get a confirmation.");
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"], scope: "domain",
+      species: "rule", stage: "rm -rf", scope: "domain",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", declaredBy: "john",
     });
@@ -2534,7 +2449,7 @@ describe("5-B: the projection write path", () => {
 
     await expect(c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     })).rejects.toThrow(/is 'disputed', not active: a contested or retired principle governs nothing/);
 
     // NOTHING LANDED. The refusal is the same named error the preflight raises, and the transaction
@@ -2559,7 +2474,7 @@ describe("5-B: the projection write path", () => {
 
     await expect(c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     })).rejects.toThrow(/is not a current skeleton member \(latest verdict 'retire'\)/);
     expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM lifecycle_edges WHERE family='derivation'`).get()).toMatchObject({ n: 0 });
     race.restore();
@@ -2582,8 +2497,8 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   const bandCore = (): MonetCore => new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
 
-  const ruleAt = (c: MonetCore, text: string, stage: string, instance: string, extra: Record<string, unknown> = {}) =>
-    c.store(text, { kind: "rule", rule: { stage, instance, scope: "domain", ...extra } });
+  const ruleAt = (c: MonetCore, text: string, stage: string, extra: Record<string, unknown> = {}) =>
+    c.store(text, { kind: "rule", rule: { stage, scope: "domain", ...extra } });
 
   /** The PAIR FLAGS between two concepts — the ordinary derived graph (related/co_occurred/follows)
    *  is not this suite's subject and would only make the assertions brittle to edge derivation. */
@@ -2596,8 +2511,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("flags a pair of near-matching rules bound to DIFFERENT stages — the breadth precondition, at rule birth", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
 
     expect(second.action).toBe("ambiguous"); // forked, so this really is a rule BIRTH
     expect(second.extractionCandidate).toEqual({ pairedRuleId: first.conceptId, score: second.nearMatchScore });
@@ -2619,7 +2534,7 @@ describe("5-B: extraction-candidate flagging", () => {
     // a rule came through — two rules at different stages restating one reason are extraction
     // evidence whether a correction or a human put them there.
     const declared = await c.declare({
-      species: "rule", stage: "kubectl apply", instance: "Bash:kubectl apply -f x", scope: "domain",
+      species: "rule", stage: "kubectl apply", scope: "domain",
       content: "Verify the artifact that was built once the source changes.",
     });
     if (declared.species !== "rule") throw new Error("unreachable");
@@ -2640,8 +2555,8 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("stops reporting a pair once a re-declaration puts both rules at ONE stage — and reports it again when the binding moves back", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
@@ -2680,8 +2595,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("stops reporting a pair while either endpoint is disputed, then restores it after mediation", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
@@ -2726,7 +2641,7 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("refuses to flag a new pair when the near-match rule is already disputed", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     const disputedEvidence = await c.store("A separate evidence packet is internally contested.", {
       kind: "fact", resolution: "forceNew",
     });
@@ -2743,7 +2658,7 @@ describe("5-B: extraction-candidate flagging", () => {
       destConceptId: first.conceptId,
     });
     expect((await c.getConcept(first.conceptId))!.status).toBe("disputed");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(second.nearMatchId).toBe(first.conceptId);
     expect(second.extractionCandidate).toBeUndefined();
     expect(c.overview("default").counts.extractionCandidates).toBe(0);
@@ -2752,8 +2667,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("does NOT flag two rules at the SAME stage — that is a duplicate or a supersession, not breadth", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "docker build");
     expect(second.action).toBe("ambiguous");
     expect(second.extractionCandidate).toBeUndefined();
     expect(edgeTypesBetween(c, first.conceptId, second.conceptId)).toEqual(["possible_duplicate_of"]);
@@ -2768,16 +2683,16 @@ describe("5-B: extraction-candidate flagging", () => {
     const principle = declared.conceptId;
 
     // (1) THE OLD SIDE is projection-born.
-    const projected = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .", {
+    const projected = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", {
       projectedFromPrincipleId: principle,
     });
-    const fresh = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const fresh = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(fresh.nearMatchId).toBe(projected.conceptId); // the near-match really did happen
     expect(fresh.extractionCandidate).toBeUndefined();
 
     // (2) THE NEW SIDE is projection-born — checked separately, because "excluded from extraction
     //     evidence" is a property of the rule, not of which end of the pair it lands on.
-    const newProjection = await ruleAt(c, "Once the source has changed, verify what was built.", "terraform apply", "Bash:terraform apply", {
+    const newProjection = await ruleAt(c, "Once the source has changed, verify what was built.", "terraform apply", {
       projectedFromPrincipleId: principle,
     });
     expect(newProjection.nearMatchId).toBeTruthy();
@@ -2808,15 +2723,15 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("stops reporting a pair once EITHER rule becomes projection-born — checked at read time, on both endpoints", async () => {
     const specs = [
-      { text: "Verify the built artifact after the source changes.", stage: "docker build", instance: "Bash:docker build ." },
-      { text: "After the source changes, verify the artifact itself.", stage: "npm install", instance: "Bash:npm install" },
+      { text: "Verify the built artifact after the source changes.", stage: "docker build" },
+      { text: "After the source changes, verify the artifact itself.", stage: "npm install" },
     ] as const;
 
     /** Flag an ordinary cross-stage pair, then project onto whichever rule fills `role`. */
     const projectOntoEndpoint = async (role: "ca" | "cb"): Promise<void> => {
       const c = bandCore();
-      const first = await ruleAt(c, specs[0].text, specs[0].stage, specs[0].instance);
-      const second = await ruleAt(c, specs[1].text, specs[1].stage, specs[1].instance);
+      const first = await ruleAt(c, specs[0].text, specs[0].stage);
+      const second = await ruleAt(c, specs[1].text, specs[1].stage);
       // THE PREMISE: an ORDINARY pair — neither rule is projection-born, so it is flagged and shown.
       expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
       expect(c.overview("default").counts.extractionCandidates).toBe(1);
@@ -2838,7 +2753,7 @@ describe("5-B: extraction-candidate flagging", () => {
       const projection = await c.store(target.spec.text, {
         kind: "rule",
         rule: {
-          stage: target.spec.stage, instance: target.spec.instance, scope: "domain",
+          stage: target.spec.stage, scope: "domain",
           projectedFromPrincipleId: declared.conceptId,
         },
       });
@@ -2886,10 +2801,10 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("flags a FORCE-NEW rule birth against its cross-stage nearest neighbour — distinctness is not the extraction question", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     const opts = {
       kind: "rule", resolution: "forceNew" as const, operationId: "bulk-import-1",
-      rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" as const },
+      rule: { stage: "npm install", scope: "domain" as const },
     };
     const forced = await c.store("After the source changes, verify the artifact itself.", opts);
 
@@ -2919,10 +2834,10 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("does NOT flag a FORCE-NEW rule birth against a SAME-stage neighbour — the qualifiers are unchanged", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     const forced = await c.store("After the source changes, verify the artifact itself.", {
       kind: "rule", resolution: "forceNew",
-      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain" },
+      rule: { stage: "docker build", scope: "domain" },
     });
     expect(forced.action).toBe("created");
     expect(forced.conceptId).not.toBe(first.conceptId);
@@ -2946,10 +2861,10 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("does NOT flag a FORCE-NEW rule birth whose nearest neighbour is below tauAmbiguous — the floor is the band's", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.95 });
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     const forced = await c.store("After the source changes, verify the artifact itself.", {
       kind: "rule", resolution: "forceNew",
-      rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      rule: { stage: "npm install", scope: "domain" },
     });
     expect(forced.action).toBe("created");
     expect(forced.conceptId).not.toBe(first.conceptId);
@@ -2970,7 +2885,7 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("does NOT flag a birth against a SUPERSEDED rule — active status is not gate liveness", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
     // Overturn it: the correction births its successor at the same gate and supersedes it in one act.
     const overturn = await c.store("Skip verification entirely on throwaway spike branches.", {
       kind: "correction", attachTo: first.conceptId,
@@ -2981,7 +2896,7 @@ describe("5-B: extraction-candidate flagging", () => {
     expect(c.ruleBinding(first.conceptId)).not.toBeNull();
 
     // A cross-stage birth whose nearest is the SUPERSEDED incumbent (its text, not the successor's).
-    const probe = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const probe = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(probe.nearMatchId).toBe(first.conceptId);
     expect(probe.extractionCandidate).toBeUndefined();
     // NO extraction flag. The possible_duplicate_of pair the ambiguous-fork records is untouched —
@@ -2999,8 +2914,8 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("stops reporting a pair once EITHER rule is superseded — checked at read time, edge and dismissal intact", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
@@ -3024,7 +2939,7 @@ describe("5-B: extraction-candidate flagging", () => {
     const c = bandCore();
     // A FACT the rule paraphrases: the possible-duplicate machinery's business, not extraction's.
     const fact = await c.store("The build artifact is a snapshot of the source at build time.");
-    const rule = await ruleAt(c, "A built artifact is a snapshot of its source at build time.", "docker build", "Bash:docker build .");
+    const rule = await ruleAt(c, "A built artifact is a snapshot of its source at build time.", "docker build");
     expect(rule.nearMatchId).toBe(fact.conceptId);
     expect(rule.extractionCandidate).toBeUndefined();
 
@@ -3038,8 +2953,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("dismisses an extraction candidate through the SAME pair-dismissal path duplicates use", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
 
     // Widened from possible_duplicate_of alone in 5-B: without this, the flag had no exit, and
@@ -3057,9 +2972,9 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("survives a detach/rederive cycle with its dismissal intact — pair flags are snapshotted, not re-derived", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
-    const third = await ruleAt(c, "Check the deployed bundle after a source change.", "kubectl apply", "Bash:kubectl apply -f x");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
+    const third = await ruleAt(c, "Check the deployed bundle after a source change.", "kubectl apply");
     expect(c.overview("default").counts.extractionCandidates).toBeGreaterThanOrEqual(2);
     c.dismissPossibleDuplicate(first.conceptId, second.conceptId, "john");
 
@@ -3081,8 +2996,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("renders as its own curation heading, not folded into possible duplicates", async () => {
     const c = bandCore();
-    await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     const rendered = renderOverview(c.overview("default"), { color: false, width: 200 });
     expect(rendered).toContain("EXTRACTION CANDIDATES");
     expect(rendered).toContain("rules at different stages that may share one reason");
@@ -3117,8 +3032,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("a ratification naming BOTH rules of a flagged pair resolves the flag, stamped with the ratifier", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
     const principle = await principleFor(c, "A build artifact is a snapshot; re-materialize after the source changes.");
 
@@ -3156,9 +3071,9 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("resolves EVERY flagged pair among three or more member rules, not just adjacent ones", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
-    const third = await ruleAt(c, "Check the deployed bundle after a source change.", "kubectl apply", "Bash:kubectl apply -f x");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
+    const third = await ruleAt(c, "Check the deployed bundle after a source change.", "kubectl apply");
     const open = c.overview("default").counts.extractionCandidates;
     expect(open).toBeGreaterThanOrEqual(2); // which births paired with which is the fixture's business
     const principle = await principleFor(c, "A build artifact is a snapshot; re-materialize after the source changes.");
@@ -3179,8 +3094,8 @@ describe("5-B: extraction-candidate flagging", () => {
 
   it("leaves the flag open when only ONE of the pair is named — half an answer is not an answer", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     const principle = await principleFor(c, "A build artifact is a snapshot; re-materialize after the source changes.");
 
     const ratified = await c.ratify({
@@ -3210,8 +3125,8 @@ describe("5-B: extraction-candidate flagging", () => {
    */
   it("resolves the flags inside the verdict's own transaction — an injected failure rolls the verdict back", async () => {
     const c = bandCore();
-    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install");
     const principle = await principleFor(c, "A build artifact is a snapshot; re-materialize after the source changes.");
     const verdictsBefore = c.getRatifications(principle).length;
 
@@ -3268,14 +3183,14 @@ describe("5-B: extraction-candidate flagging", () => {
  */
 describe("5-B: a rule repeating across stages forks instead of absorbing", () => {
   /** SHIPPING THRESHOLDS: identical text scores far above tauAttach, which is the case under test. */
-  const ruleAt = (c: MonetCore, text: string, stage: string, instance: string, extra: Record<string, unknown> = {}) =>
-    c.store(text, { kind: "rule", rule: { stage, instance, scope: "domain", ...extra } });
+  const ruleAt = (c: MonetCore, text: string, stage: string, extra: Record<string, unknown> = {}) =>
+    c.store(text, { kind: "rule", rule: { stage, scope: "domain", ...extra } });
   const TEXT = "Verify the built artifact after the source changes.";
 
   it("forks a cross-stage rule capture, binds each rule to its own stage, and flags the extraction candidate", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, TEXT, "npm install", "Bash:npm install");
+    const first = await ruleAt(c, TEXT, "docker build");
+    const second = await ruleAt(c, TEXT, "npm install");
 
     // A FORK, not an attach — and it reports itself as one.
     expect(second.conceptId).not.toBe(first.conceptId);
@@ -3288,8 +3203,8 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
     const stageOf = (name: string) => c.stages().find((s) => s.name === name)!.id;
     expect(c.ruleBinding(first.conceptId)!.stage_id).toBe(stageOf("docker build"));
     expect(c.ruleBinding(second.conceptId)!.stage_id).toBe(stageOf("npm install"));
-    expect(c.gate({ actionContext: "Bash:npm install" }).rules.map((r) => r.conceptId)).toEqual([second.conceptId]);
-    expect(c.gate({ actionContext: "Bash:docker build ." }).rules.map((r) => r.conceptId)).toEqual([first.conceptId]);
+    expect(c.stageLookup({ stage: "npm install" }).rules.map((r) => r.conceptId)).toEqual([second.conceptId]);
+    expect(c.stageLookup({ stage: "docker build" }).rules.map((r) => r.conceptId)).toEqual([first.conceptId]);
 
     // ...AND THE PAIR IS EXTRACTION EVIDENCE, which is the whole reason the fork is worth having.
     expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
@@ -3308,8 +3223,8 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
 
   it("does NOT fork at the SAME stage — that is one rule gaining a second observation", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
-    const second = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, TEXT, "docker build");
+    const second = await ruleAt(c, TEXT, "docker build");
     expect(second.conceptId).toBe(first.conceptId);
     expect(second.action).toBe("attached");
     expect(second.resolutionMode).toBe("attach");
@@ -3320,7 +3235,7 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
 
   it("leaves an EXPLICIT attachTo alone — the caller asserted identity, so the incumbent address stands", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, TEXT, "docker build");
     const attached = await c.store(TEXT, {
       kind: "rule", attachTo: first.conceptId, rule: { stage: "npm install", scope: "domain" },
     });
@@ -3343,7 +3258,7 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
    */
   it("leaves a DECLARATION alone — re-addressing a live rule is the sovereign act, not a fork", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, TEXT, "docker build");
     const moved = await c.declare({ species: "rule", stage: "npm install", scope: "domain", content: TEXT });
     if (moved.species !== "rule") throw new Error("unreachable");
     expect(moved.conceptId).toBe(first.conceptId);
@@ -3354,56 +3269,51 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
 
   it("forks onto a stage that does not exist yet — a to-be-created stage differs from every incumbent", async () => {
     const c = resolvingCore();
-    const first = await ruleAt(c, TEXT, "docker build", "Bash:docker build .");
+    const first = await ruleAt(c, TEXT, "docker build");
     expect(c.stages().map((s) => s.name)).toEqual(["docker build"]);
-    const second = await ruleAt(c, TEXT, "terraform apply", "Bash:terraform apply");
+    const second = await ruleAt(c, TEXT, "terraform apply");
     expect(second.resolutionMode).toBe("stage-fork");
     expect(second.conceptId).not.toBe(first.conceptId);
     // The stage is born with the forked rule, exactly as any other rule birth births its stage.
     expect(c.stages().map((s) => s.name).sort()).toEqual(["docker build", "terraform apply"]);
-    expect(c.gate({ actionContext: "Bash:terraform apply" }).rules.map((r) => r.conceptId)).toEqual([second.conceptId]);
+    expect(c.stageLookup({ stage: "terraform apply" }).rules.map((r) => r.conceptId)).toEqual([second.conceptId]);
     c.close();
   });
 });
 
 describe("5-B: fire-time doubt disclosure", () => {
-  it("a projected rule whose parent is under impeachment says so — on the gate and on the wire", async () => {
+  it("a projected rule whose parent is under impeachment says so — on delivery and on the wire", async () => {
     const c = core();
     const declared = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
     if (declared.species !== "principle") throw new Error("unreachable");
     const principle = declared.conceptId;
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle },
     });
     // BEFORE: a parent in good standing announces provenance and nothing else.
-    expect(c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!.parentDisputed).toBeUndefined();
     expect(c.stageLookup({ stage: "helm delete" }).rules[0]!.parentDisputed).toBeUndefined();
 
     // A SECOND rule under the same principle is corrected — that is what impeaches the parent, and
     // it is a different rule from the one firing below, which is the whole point: the rule that
     // fires is untouched and still governs.
     const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: principle },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain", projectedFromPrincipleId: principle },
     });
     await c.store("Snapshot the volume AND drain the node before deleting a stateful set.", {
       kind: "correction", attachTo: sibling.conceptId,
     });
     expect((await c.getConcept(principle))!.status).toBe("disputed");
 
-    // AFTER: same rule, same severity, still delivered — plus the disclosure.
-    const fired = c.gate({ actionContext: "Bash:helm delete my-release", record: false });
+    // AFTER: same rule, same severity, still delivered — plus the disclosure. The MCP wire shaping
+    // of that same disclosure is pinned separately, in the MCP surface block below.
+    const fired = c.stageLookup({ stage: "helm delete", record: false });
     expect(fired.rules).toHaveLength(1);
     expect(fired.rules[0]).toMatchObject({
       conceptId: projected.conceptId,
       severity: "advisory",
       projectedFromPrincipleId: principle,
       parentDisputed: true,
-    });
-    // The recognized surface carries it identically — the MCP wire shaping is pinned separately,
-    // in the MCP surface block below.
-    expect(c.stageLookup({ stage: "helm delete" }).rules[0]).toMatchObject({
-      conceptId: projected.conceptId, parentDisputed: true,
     });
     c.close();
   });
@@ -3414,12 +3324,12 @@ describe("5-B: fire-time doubt disclosure", () => {
     const later = await c.declare({ species: "principle", content: "Risk belongs with the actor who can reverse it." });
     if (earliest.species !== "principle" || later.species !== "principle") throw new Error("unreachable");
     const shared = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain" },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: earliest.conceptId, dstConceptId: shared.conceptId, bornOf: "extraction" });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: later.conceptId, dstConceptId: shared.conceptId, bornOf: "extraction" });
     const laterSibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain" },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain" },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: later.conceptId, dstConceptId: laterSibling.conceptId, bornOf: "extraction" });
 
@@ -3428,15 +3338,11 @@ describe("5-B: fire-time doubt disclosure", () => {
     });
     expect((await c.getConcept(earliest.conceptId))!.status).toBe("active");
     expect((await c.getConcept(later.conceptId))!.status).toBe("disputed");
-    const firing = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
-    expect(firing.projectedFromPrincipleId).toBe(earliest.conceptId);
-    expect(firing.parentDisputed).toBe(true);
-    // THE PATH SPLIT (PR #112 round 8): the mechanical gate carries the flag alone — the hook
-    // renders title + reason and never these ids, so the hot path pays no identity aggregation.
-    expect(firing.disputedParentIds).toBeUndefined();
-    // The recovery path the flag advertises (PR #112 round 2): WHICH parent, not just "one of
-    // them" — delivered where the recovery lives, on the budget-fitted lookup path.
+    // The display parent stays the EARLIEST one, and the doubt is disclosed alongside it. The
+    // recovery path the flag advertises (PR #112 round 2): WHICH parent, not just "one of them" —
+    // delivered where the recovery lives, on the budget-fitted lookup path.
     const looked = c.stageLookup({ stage: "helm delete" }).rules[0]!;
+    expect(looked.projectedFromPrincipleId).toBe(earliest.conceptId);
     expect(looked.parentDisputed).toBe(true);
     expect(looked.disputedParentIds).toEqual([later.conceptId]);
 
@@ -3444,7 +3350,7 @@ describe("5-B: fire-time doubt disclosure", () => {
       `SELECT id FROM contradictions WHERE concept_id = ? AND kind = 'impeachment' AND status = 'open'`,
     ).get(later.conceptId) as { id: string }).id;
     c.resolveContradiction(impeachmentId, { decision: "dismiss", by: "john" });
-    const mediated = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    const mediated = c.stageLookup({ stage: "helm delete", record: false }).rules[0]!;
     expect(mediated.projectedFromPrincipleId).toBe(earliest.conceptId);
     expect(mediated.parentDisputed).toBeUndefined();
     expect(mediated.disputedParentIds).toBeUndefined();
@@ -3464,18 +3370,18 @@ describe("5-B: fire-time doubt disclosure", () => {
     const parent = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
     if (parent.species !== "principle") throw new Error("unreachable");
     const child = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: parent.conceptId },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: parent.conceptId },
     });
     // Half 1: an impeachment answered by REJECT closes, and the projection recomputes to active.
     const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: parent.conceptId },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain", projectedFromPrincipleId: parent.conceptId },
     });
     await c.store("Snapshot AND drain before deleting a stateful set.", { kind: "correction", attachTo: sibling.conceptId });
     expect((await c.getConcept(parent.conceptId))!.status).toBe("disputed");
     const rejected = await c.ratify({ candidateId: parent.conceptId, verdict: "reject", ratifiedBy: "john" });
     expect(rejected.impeachmentsClosed).toBe(1);
     expect((await c.getConcept(parent.conceptId))!.status).toBe("active");
-    const afterReject = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    const afterReject = c.stageLookup({ stage: "helm delete", record: false }).rules[0]!;
     expect(afterReject.conceptId).toBe(child.conceptId);
     expect(afterReject.parentDisputed).toBeUndefined();
 
@@ -3483,22 +3389,21 @@ describe("5-B: fire-time doubt disclosure", () => {
     // a settled membership question — the read side must not direct anyone to mediate it as doubt.
     c.flagContradiction(parent.conceptId, { detail: "content dispute, not an impeachment" });
     expect((await c.getConcept(parent.conceptId))!.status).toBe("disputed");
-    const stillSettled = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    const stillSettled = c.stageLookup({ stage: "helm delete", record: false }).rules[0]!;
     expect(stillSettled.parentDisputed).toBeUndefined();
     expect(stillSettled.disputedParentIds).toBeUndefined();
     c.close();
   });
 
   /**
-   * BOUNDED ON THE HOT PATH (review fix — PR #112 round 5): the disputed-parents scalar rides the
-   * mechanical gate, derivation rows are append-only with no per-rule cap, so the aggregation
-   * fetches at most DISPUTED_PARENTS_CAP + 1 ids and the mapper delivers the cap plus a
-   * truncation signal.
+   * BOUNDED AT DELIVERY (review fix — PR #112 round 5): derivation rows are append-only with no
+   * per-rule cap, so the aggregation fetches at most DISPUTED_PARENTS_CAP + 1 ids and the mapper
+   * delivers the cap plus a truncation signal.
    */
   it("caps disputedParentIds and signals truncation past the cap", async () => {
     const c = core();
     const child = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+      kind: "rule", rule: { stage: "helm delete", scope: "domain" },
     });
     const parents: string[] = [];
     for (let i = 0; i < 9; i++) {
@@ -3508,11 +3413,7 @@ describe("5-B: fire-time doubt disclosure", () => {
       c.flagContradiction(p.conceptId, { kind: "impeachment", detail: `impeachment evidence for parent ${i}` });
       parents.push(p.conceptId);
     }
-    // The mechanical gate carries the flag alone (PR #112 round 8's path split)…
-    const firing = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
-    expect(firing.parentDisputed).toBe(true);
-    expect(firing.disputedParentIds).toBeUndefined();
-    // …and the lookup path pays for — and caps — the identity aggregation.
+    // The lookup path pays for — and caps — the identity aggregation.
     const looked = c.stageLookup({ stage: "helm delete" }).rules[0]!;
     expect(looked.parentDisputed).toBe(true);
     expect(looked.disputedParentIds).toHaveLength(8);
@@ -3526,9 +3427,9 @@ describe("5-B: fire-time doubt disclosure", () => {
   it("omits the flag entirely when the parent is fine, and when there is no parent at all", async () => {
     const c = core();
     const plain = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", scope: "domain" },
+      kind: "rule", rule: { stage: "git force push", scope: "domain" },
     });
-    const rule = c.gate({ actionContext: "Bash:git push --force", record: false }).rules[0]!;
+    const rule = c.stageLookup({ stage: "git force push", record: false }).rules[0]!;
     expect(rule.conceptId).toBe(plain.conceptId);
     expect(rule.projectedFromPrincipleId).toBeUndefined();
     expect(rule.parentDisputed).toBeUndefined();
@@ -3542,584 +3443,23 @@ describe("5-B: fire-time doubt disclosure", () => {
     if (declared.species !== "principle") throw new Error("unreachable");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: declared.conceptId },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: declared.conceptId },
     });
     const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: declared.conceptId },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain", projectedFromPrincipleId: declared.conceptId },
     });
     await c.store("Snapshot the volume AND drain the node first.", { kind: "correction", attachTo: sibling.conceptId });
-    expect(c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!.parentDisputed).toBe(true);
+    expect(c.stageLookup({ stage: "helm delete", record: false }).rules[0]!.parentDisputed).toBe(true);
 
     const contradictionId = (raw(c).prepare(
       `SELECT id FROM contradictions WHERE concept_id = ? AND kind = 'impeachment'`,
     ).get(declared.conceptId) as { id: string }).id;
     c.resolveContradiction(contradictionId, { decision: "dismiss", by: "john" });
 
-    const after = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    const after = c.stageLookup({ stage: "helm delete", record: false }).rules[0]!;
     expect(after.conceptId).toBe(projected.conceptId);
     expect(after.projectedFromPrincipleId).toBe(declared.conceptId);
     expect(after.parentDisputed).toBeUndefined();
-    c.close();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// the gate mirror
-// ---------------------------------------------------------------------------
-describe("gate mirror — the materialized mirror", () => {
-  const read = (path: string): GateMirror => JSON.parse(readFileSync(path, "utf8")) as GateMirror;
-
-  /** stageName moved off the entry and onto the mirror's own stage registry in format 4 — cross-
-   *  reference by stageId, the same join `evaluateGateFromMirror` does at read time. */
-  const stageNamesOf = (mirror: GateMirror): string[] =>
-    mirror.entries.map((e) => mirror.stages.find((s) => s.id === e.stageId)!.name);
-
-  it("regenerates on every declaration, atomically, leaving no temp file behind", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
-
-    // An advisory declaration still rebuilds the mirror — and, as of format 4, writes an entry for
-    // it: entries carries every live rule, not only blocking ones, so an all-advisory store is no
-    // longer indistinguishable from an empty one. It ALSO rebuilds the stage registry: the new stage
-    // appears in `stages` regardless of severity, since a rule-less-here stage can still MATCH —
-    // see GateMirror.stages' own comment.
-    await c.declare({ species: "rule", stage: "terraform apply", content: "Always run plan first.", ...AGENT_RULE });
-    expect(read(path)).toMatchObject({
-      storeIdentity: "machine-a",
-      entries: [expect.objectContaining({ severity: "advisory", text: "Always run plan first" })],
-    });
-    expect(read(path).stages).toEqual([expect.objectContaining({ name: "terraform apply" })]);
-
-    const declared = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a directory tree unattended.",
-      severity: "blocking", reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
-    });
-    if (declared.species !== "rule") throw new Error("unreachable");
-
-    const sidecar = read(path);
-    // TWO now: the earlier advisory "terraform apply" rule is still here (format 4 never drops an
-    // advisory rule the way the blocking-only mirror implicitly did), plus this new blocking one.
-    // Blocking sorts first regardless of creation order (gate-delivery order — see
-    // listGateMirrorEntries), so entries[0] is still the one this test is pinning field-for-field.
-    expect(sidecar.entries).toHaveLength(2);
-    expect(sidecar.entries[0]).toMatchObject({
-      conceptId: declared.conceptId,
-      stageId: declared.binding.stage_id,
-      severity: "blocking",
-      text: "Never delete a directory tree unattended",
-      reason: "there is no undo",
-      circle: "default",
-      scope: "agent",
-      modelTag: "test-model-1",
-      origin: "declaration",
-    });
-    // declaredBy is NOT projected into the mirror — GateRule (the live delivery shape this mirror
-    // promises to match) never carries it either; it stays queryable via c.ruleBinding() instead.
-    expect(sidecar.entries[0]).not.toHaveProperty("declaredBy");
-    const rmStage = sidecar.stages.find((s) => s.id === declared.binding.stage_id)!;
-    expect(rmStage.name).toBe("rm -rf");
-    expect(parseTriggerPatterns(rmStage.triggerPatterns)).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
-    expect(typeof sidecar.generatedAt).toBe("number");
-
-    // Atomic: tmp+rename, so the directory holds exactly the finished file.
-    expect(readdirSync(dir)).toEqual(["gate-sidecar.json"]);
-
-    // A second deny joins it, in the gate's own deterministic order — blocking-first, then
-    // created_at ASC: "rm -rf" was declared first, so it sorts before "git force push" even though
-    // the latter's NAME sorts first alphabetically.
-    await c.declare({
-      species: "rule", stage: "git force push", patterns: ["Bash:git push --force"],
-      content: "Never force-push to main.", severity: "blocking",
-      reason: "a rewritten history cannot be recovered from a teammate's clone", ...AGENT_RULE,
-    });
-    // Three now: the two blocking rules (created-order, since severity ties within them) precede
-    // the standing advisory "terraform apply" one from the top of this test — severity dominates the
-    // sort, so it sorts last regardless of when it was declared.
-    expect(stageNamesOf(read(path))).toEqual(["rm -rf", "git force push", "terraform apply"]);
-
-    // The mirror follows the store — but a live deny cannot simply be retired any more (the
-    // chokepoint refuses), so withdrawing it is a declaration first and ordinary cleanup after.
-    expect(() => c.retireConcept(declared.conceptId)).toThrow(/would remove the blocking rule/);
-    await withdrawDeny(c, declared.conceptId, "rm -rf");
-    c.retireConcept(declared.conceptId);
-    // "rm -rf" is gone (retired); "git force push" (still blocking) sorts before "terraform apply"
-    // (advisory, untouched throughout).
-    expect(stageNamesOf(c.materializeGateMirror().sidecar)).toEqual(["git force push", "terraform apply"]);
-    expect(stageNamesOf(read(path))).toEqual(["git force push", "terraform apply"]);
-    c.close();
-  });
-
-  it("downgrades a deny to advisory in the mirror rather than dropping the rule — the DENY leaves, the RULE stays", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    // Dedup ON, so a re-declaration of the same rule text lands on the same concept — which is what
-    // makes it an EDIT of the existing rule rather than a second one.
-    const c = new MonetCore(":memory:", { gateSidecarPath: path, syncDeviceId: "machine-a" });
-    const first = await c.declare({
-      species: "rule", stage: "rm -rf", content: "Never delete a directory tree unattended.",
-      severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (first.species !== "rule") throw new Error("unreachable");
-    expect(read(path).entries).toHaveLength(1);
-    expect(read(path).entries[0]).toMatchObject({ conceptId: first.conceptId, severity: "blocking" });
-
-    const again = await c.declare({
-      species: "rule", stage: "rm -rf", content: "Never delete a directory tree unattended.",
-      severity: "advisory", ...AGENT_RULE,
-    });
-    if (again.species !== "rule") throw new Error("unreachable");
-    expect(again.conceptId).toBe(first.conceptId);
-    // NOT empty as of format 4: the mirror carries every live rule, both severities, so the rule
-    // stays visible — only its DENY POWER left. A v3 reader would have seen entries go empty here;
-    // a v4 reader sees the same one entry, now advisory.
-    expect(read(path).entries).toHaveLength(1);
-    expect(read(path).entries[0]).toMatchObject({ conceptId: first.conceptId, severity: "advisory" });
-    c.close();
-  });
-
-  it("carries scope and model tag so the offline hook can filter exactly as the live gate does", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const compensation = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Old model deletes without confirming.", severity: "blocking", scope: "agent", modelTag: "model-1",
-      reason: "this model deletes without asking first",
-    });
-    await c.declare({
-      species: "rule", stage: "rm -rf",
-      content: "Deleting a tree is irreversible.", severity: "blocking", scope: "domain",
-      reason: "a deleted tree is not in any trash",
-    });
-    if (compensation.species !== "rule") throw new Error("unreachable");
-
-    const sidecar = read(path);
-    // 4 since the mirror stopped being blocking-only: `entries` now carries every live rule, both
-    // severities, and gained stage/circle-map siblings. A v3 reader pointed at this file would read
-    // `entries` as blocking-only and MISS every advisory rule silently — the shape change earns the
-    // bump for the same reason the v2→v3 one did.
-    expect(sidecar.format).toBe(4);
-    // Without these fields the hook cannot apply the runtime-model filter gateQuery applies, so a
-    // compensation for a retired model keeps denying whenever the server is unreachable — live and
-    // offline disagreeing exactly when it is hardest to notice.
-    expect(sidecar.entries.map((e) => [e.scope, e.modelTag]).sort()).toEqual([["agent", "model-1"], ["domain", null]]);
-
-    // The live gate's answer under model-2 is the one the hook must be able to reproduce.
-    const live = c.gate({ actionContext: "Bash:rm -rf /tmp/x", runtimeModelTag: "model-2" });
-    expect(live.rules).toHaveLength(1);
-    expect(live.rules[0]!.scope).toBe("domain");
-    const offline = sidecar.entries.filter((e) => e.scope === "domain" || e.modelTag === "model-2");
-    expect(offline.map((e) => e.conceptId)).toEqual(live.rules.map((r) => r.conceptId));
-    c.close();
-  });
-
-  it("writes nothing when no path was configured, and rebuilds on demand from an explicit one", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "sidecar.json");
-    const c = core();
-    await c.declare({
-      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.", severity: "blocking",
-      reason: "there is no undo", ...AGENT_RULE,
-    });
-    // No gateSidecarPath: a MonetCore must never write into somebody's real store directory just
-    // because it was constructed.
-    expect(existsSync(path)).toBe(false);
-    expect(() => c.materializeGateMirror()).toThrow(/needs a path/);
-
-    const rebuilt = c.materializeGateMirror(path);
-    // Explicit recovery against a path that held no file: this is the caller install tooling is,
-    // and "written" is the answer that entitles it to say the mirror was regenerated.
-    expect(rebuilt.outcome).toBe("written");
-    expect(rebuilt.sidecar.entries).toHaveLength(1);
-    expect(read(path).entries[0]!.text).toBe("Never delete a tree unattended");
-    c.close();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// evaluateGateFromMirror — parity with live gateQuery
-// ---------------------------------------------------------------------------
-/**
- * THE SLICE'S CORRECTNESS BAR. `evaluateGateFromMirror` exists to answer the SAME question
- * `MonetCore.gate()` does, from a materialized `GateMirror` alone — this is the property-style test
- * 4b-C's CLI stands on: for every action context in a representative battery, against a
- * representative rule/stage population, the offline verdict must equal the live one, field-for-field.
- *
- * COMPARED AGAINST `c.gate()`, NOT raw `gateQuery` (review fix — MATERIAL M3; this battery compared
- * `gateQuery` directly until this fix). `gateQuery`/`evaluateGate` are PRE-resolution — they take a
- * circle literally and never touch `circle_aliases` — because circle-alias resolution is
- * `MonetCore.gate()`'s own job (`resolveCircle`, called before `evaluateGate`), not gateInternal's.
- * `evaluateGateFromMirror` now resolves aliases itself (this same fix — see its own comment), which
- * means it does MORE than raw `gateQuery` does: comparing it against `gateQuery` directly would
- * FALSELY DISAGREE for a renamed circle's old name (offline resolves and delivers; raw gateQuery
- * does not, on purpose) while HIDING the actual bug this fix closes — that comparing it against raw
- * `gateQuery` in the first place could never catch a renamed circle going invisible offline, because
- * neither side resolved. `c.gate()` is the surface a real caller actually uses, live; it is the one
- * `evaluateGateFromMirror` must match.
- *
- * REPRESENTATION DIFFERENCES, enumerated rather than silently allowed to pass by coincidence:
- *
- *   `source` — "live" vs "sidecar". The ONE field the two are SUPPOSED to disagree on; asserted
- *   explicitly below rather than compared for equality.
- *
- *   `GateRule.projectedFromPrincipleId` — WAS a gap, CLOSED in slice 5-B (D4). `GateMirrorEntry`
- *   now carries the parent principle, populated by the same correlated pick the live path uses, so
- *   the battery below no longer merely permits the two to agree by coincidence: fixture (12) is a
- *   genuinely projected rule with a live parent, and the field-for-field comparison covers it. If
- *   the mirror ever stops carrying it, this test fails rather than going quiet.
- *
- *   `GateRule.parentDisputed` — the ONE remaining difference, and deliberately permanent (slice
- *   5-B, D5). It reads the parent principle's LIVE status, which is not an act and therefore not
- *   something a build artifact may freeze: a mirrored copy would keep announcing doubt after a
- *   human resolved it. The battery's parent principle is deliberately kept UNDISPUTED so both sides
- *   agree here; the divergence itself is pinned by its own test just below, so "they agree" is a
- *   fixture property this file states out loud rather than an accident nobody checked.
- */
-describe("evaluateGateFromMirror — parity with live gate()", () => {
-  const dbOf = (c: MonetCore): StoragePort => (c as unknown as { db: StoragePort }).db;
-
-  it("answers THE SAME verdict as live gateQuery, field-for-field, across a representative population", async () => {
-    const c = core({ circle: "default" });
-    const db = dbOf(c);
-
-    // ---- the population ---------------------------------------------------
-    // (1) "git force push" — narrow, BLOCKING, agent-scoped, tag "model-a".
-    const forcePush = await c.declare({
-      species: "rule", stage: "git force push", patterns: ["Bash:git push --force"],
-      content: "Never force-push to a shared branch.", severity: "blocking",
-      reason: "a rewritten history cannot be recovered from a teammate's clone",
-      scope: "agent", modelTag: "model-a",
-    });
-    if (forcePush.species !== "rule") throw new Error("unreachable");
-
-    // (2) "git push" — BROAD, overlaps with (1)'s contexts, advisory, domain (always fires). Tests
-    //     the multi-stage union: a broad advisory stage and a narrow blocking stage both firing on
-    //     one action, blocking ranked first regardless of which stage is "broader".
-    await c.declare({
-      species: "rule", stage: "git push", patterns: ["Bash:git push"],
-      content: "Prefer a merge over a rebase on a shared branch.", severity: "advisory", scope: "domain",
-    });
-
-    // (3) "rm -rf" — ONE stage, TWO rules: domain blocking (always fires) + agent advisory (tag
-    //     "model-a"). Tests severity union WITHIN one stage and the domain-always-fires rule.
-    await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Deleting a tree is irreversible.", severity: "blocking",
-      reason: "a deleted tree is not in any trash", scope: "domain",
-    });
-    await c.declare({
-      species: "rule", stage: "rm -rf",
-      content: "Confirm the target path before deleting.", severity: "advisory",
-      scope: "agent", modelTag: "model-a",
-    });
-
-    // (4) "npm publish" — agent-only, tag "model-b", FOREIGN relative to "model-a". Tests
-    //     tag-filtered stage-hit-no-rules (the stage matches; the only rule bound to it does not
-    //     deliver for a foreign runtime tag).
-    await c.declare({
-      species: "rule", stage: "npm publish", patterns: ["Bash:npm publish"],
-      content: "Run the dry-run publish first.", severity: "advisory", scope: "agent", modelTag: "model-b",
-    });
-
-    // (5) "terraform apply" — a TOOL-LESS pattern (fires under any tool prefix), advisory, domain,
-    //     NO reason (advisory + no reason is ordinary, never reasonMissing).
-    await c.declare({
-      species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
-      content: "Always run plan before apply.", severity: "advisory", scope: "domain",
-    });
-
-    // (6) "kubectl delete" — a stage with ZERO rules bound. Tests stage-hit-no-rules the OTHER way:
-    //     no tag filtering involved, the stage simply has nothing bound to it anywhere.
-    await c.declare({ species: "stage", stage: "kubectl delete", patterns: ["kubectl delete"] });
-
-    // (7) "docker prune" — one SUPERSEDED rule, one live successor on the SAME stage/pattern.
-    const dockerOriginal = await c.store("Never prune without checking what is running.", {
-      kind: "rule", rule: { stage: "docker prune", instance: "Bash:docker system prune -a", scope: "domain" },
-    });
-    const dockerSuccessor = await c.store("Confirm containers are stopped before pruning.", {
-      kind: "correction", attachTo: dockerOriginal.conceptId,
-    });
-
-    // (8) "eslint --fix" — TWO advisory rules on one stage, one RETIRED. Tests that retirement
-    //     excludes exactly the retired rule, not its still-live stage-mate.
-    const eslintKeep = await c.store("Run eslint --fix only on staged files.", {
-      kind: "rule", rule: { stage: "eslint --fix", instance: "Bash:eslint --fix .", scope: "domain" },
-    });
-    const eslintRetired = await c.store("Review the diff after autofixing.", {
-      kind: "rule", rule: { stage: "eslint --fix", scope: "domain" },
-    });
-    c.retireConcept(eslintRetired.conceptId);
-
-    // (9) cross-circle — a blocking rule living in a DIFFERENT circle, on its own stage. Tests that
-    //     GateMirrorEntry.circle is respected exactly like RULE_LIVENESS_WHERE's c.circle = ?.
-    await c.declare({
-      circle: "other-circle", species: "rule", stage: "azure delete", patterns: ["Bash:az group delete"],
-      content: "Never delete a resource group without a snapshot.", severity: "blocking",
-      reason: "a deleted resource group has no undo", scope: "domain",
-    });
-
-    // (10) BREADTH — a global blocking rule (circle: "*") sharing a stage with a LOCAL advisory
-    //      rule in "default". Tests the union itself (both arrive, blocking-first, in the circle
-    //      that also has the local rule) AND that breadth alone reaches a circle with NOTHING local
-    //      bound to this stage at all — the whole point of "*", not merely a side effect of it.
-    const breadthDeny = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Never install without a lockfile present.", severity: "blocking",
-      reason: "an unlocked install can pull an unreviewed transitive dependency", scope: "domain",
-    });
-    if (breadthDeny.species !== "rule") throw new Error("unreachable");
-    // THE CONCEPT/BINDING SPLIT ITSELF, checked directly: the CONCEPT lives at the caller's own
-    // circle ("default", searchable/listable there like any other) while only the BINDING carries
-    // the breadth marker — the whole premise `RuleBindingRow.circle`'s own comment states.
-    expect((raw(c).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(breadthDeny.conceptId) as { circle: string }).circle)
-      .toBe("default");
-    expect(c.ruleBinding(breadthDeny.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE });
-    await c.declare({
-      circle: "default", species: "rule", stage: "npm install",
-      content: "Prefer `npm ci` over `npm install` in automation.", severity: "advisory", scope: "domain",
-    });
-
-    // (11) ALIAS — a rule declared in "proj", then the circle renamed to "project" (review fix —
-    //      MATERIAL M3). After the rename, `mirror.entries[].circle` reads "project" — the CANONICAL
-    //      name — same as the live concept row does; only `mirror.circleAliases` still remembers
-    //      "proj". A caller querying "proj" reaches the live rule ONLY because MonetCore.gate()
-    //      resolves through circle_aliases before ever calling evaluateGate; evaluateGateFromMirror
-    //      must resolve identically or a renamed circle's rules go permanently invisible offline
-    //      under the name every existing caller still has cached. This is the exact fixture that
-    //      would have caught the gap M3 closed — see evaluateGateFromMirror's own comment.
-    const aliasRule = await c.declare({
-      circle: "proj", species: "rule", stage: "helm delete", patterns: ["Bash:helm delete"],
-      content: "Never delete a release without checking its dependents.", severity: "blocking",
-      reason: "a dangling dependent release fails silently on its next upgrade", scope: "domain",
-    });
-    if (aliasRule.species !== "rule") throw new Error("unreachable");
-    c.renameCircle("proj", "project");
-
-    // (12) PROJECTION (slice 5-B, D4) — a ratified principle and a rule projected from it, so the
-    //      battery actually exercises `projectedFromPrincipleId` on both sides instead of passing
-    //      because every rule in it happens to be parentless. The parent stays UNDISPUTED on
-    //      purpose: `parentDisputed` is live-only by design (see this block's own comment).
-    const parentPrinciple = await c.declare({
-      species: "principle", content: "A build artifact is a snapshot — re-materialize after the source changes.",
-    });
-    if (parentPrinciple.species !== "principle") throw new Error("unreachable");
-    const projectedRule = await c.store("Rebuild the image before deploying after a lockfile change.", {
-      kind: "rule",
-      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain", projectedFromPrincipleId: parentPrinciple.conceptId },
-    });
-
-    const materialized = c.materializeGateMirror(join(mkTmp(), "gate-mirror.json"));
-    expect(materialized.outcome).toBe("written");
-    const mirror = materialized.sidecar;
-    expect(mirror.format).toBe(GATE_MIRROR_FORMAT);
-
-    // ---- the battery: hits, misses, stage-hit-no-rules, overflow, tag-filtered, quoting/case -----
-    const scenarios: Array<{ label: string; actionContext: string; circle?: string; runtimeModelTag?: string }> = [
-      // multi-stage union (narrow blocking + broad advisory), across the tag axis
-      { label: "narrow+broad both match, tag matches the narrow rule", actionContext: "Bash:git push --force origin main", runtimeModelTag: "model-a" },
-      { label: "narrow+broad both match, unconfigured tag", actionContext: "Bash:git push --force origin main" },
-      { label: "narrow rule filtered by a foreign tag, broad advisory still fires", actionContext: "Bash:git push --force origin main", runtimeModelTag: "model-b" },
-      { label: "an ordinary push matches only the broad stage", actionContext: "Bash:git push origin main", runtimeModelTag: "model-a" },
-
-      // one stage, two rules (domain always-fires + agent tag-filtered)
-      { label: "rm -rf: domain+agent union, matching tag", actionContext: "Bash:rm -rf /tmp/x", runtimeModelTag: "model-a" },
-      { label: "rm -rf: domain only, foreign tag", actionContext: "Bash:rm -rf /tmp/x", runtimeModelTag: "model-b" },
-      { label: "rm -rf: domain+agent union, unconfigured tag", actionContext: "Bash:rm -rf /tmp/x" },
-
-      // tag-filtered stage-hit-no-rules
-      { label: "npm publish: tag matches", actionContext: "Bash:npm publish --access public", runtimeModelTag: "model-b" },
-      { label: "npm publish: foreign tag -> stage-hit-no-rules", actionContext: "Bash:npm publish --access public", runtimeModelTag: "model-a" },
-      { label: "npm publish: unconfigured -> delivers", actionContext: "Bash:npm publish --access public" },
-
-      // tool-less pattern
-      { label: "terraform apply via a tool-less pattern", actionContext: "Bash:terraform apply -auto-approve" },
-      { label: "terraform plan does not match", actionContext: "Bash:terraform plan" },
-
-      // pure stage-hit-no-rules (no rule bound anywhere, no tag involved)
-      { label: "kubectl delete: stage-hit-no-rules", actionContext: "Bash:kubectl delete pod x" },
-
-      // supersession / retirement exclusion
-      { label: "docker prune: only the successor delivers", actionContext: "Bash:docker system prune -a" },
-      { label: "eslint --fix: only the live sibling delivers", actionContext: "Bash:eslint --fix ." },
-
-      // miss and overflow
-      { label: "a plain miss", actionContext: "Bash:ls -la" },
-      { label: "overflow past the refusal threshold", actionContext: `Bash:${"x".repeat(4 * 1024 * 1024 + 16)} && git push --force` },
-
-      // quoting/case variants the matcher normalizes — same underlying command as the first scenario
-      { label: "case-folded", actionContext: "Bash:GIT PUSH --FORCE origin main", runtimeModelTag: "model-a" },
-      { label: "double-quoted", actionContext: `Bash:git "push" --force origin main`, runtimeModelTag: "model-a" },
-      { label: "single-quoted", actionContext: "Bash:git 'push' '--force' origin main", runtimeModelTag: "model-a" },
-      { label: "backslash-escaped", actionContext: "Bash:git push \\-\\-force origin main", runtimeModelTag: "model-a" },
-
-      // circle scoping
-      { label: "cross-circle rule invisible from default (stage-hit-no-rules)", actionContext: "Bash:az group delete --yes", circle: "default" },
-      { label: "cross-circle rule visible from its own circle", actionContext: "Bash:az group delete --yes", circle: "other-circle" },
-
-      // BREADTH: the global deny unions with the local advisory in "default", and reaches
-      // "other-circle" and a THIRD circle with nothing local bound to this stage at all — the
-      // reach is not an accident of which circles happen to already appear elsewhere in this test.
-      { label: "breadth: unions with the local advisory in the circle that has one", actionContext: "Bash:npm install", circle: "default" },
-      { label: "breadth: alone, reaching a circle with a local rule on OTHER stages but not this one", actionContext: "Bash:npm install", circle: "other-circle" },
-      { label: "breadth: alone, reaching a circle that has never appeared in this fixture at all", actionContext: "Bash:npm install", circle: "a-circle-nothing-else-ever-touches" },
-
-      // ALIAS (MATERIAL M3): the renamed-away name and the canonical name both deliver, identically,
-      // on both surfaces — the fixture that would have caught evaluateGateFromMirror answering
-      // "proj" with nothing while c.gate() answered it with the rule.
-      { label: "alias: the renamed-away name ('proj') still resolves and delivers", actionContext: "Bash:helm delete my-release", circle: "proj" },
-      { label: "alias: the canonical name ('project') delivers directly", actionContext: "Bash:helm delete my-release", circle: "project" },
-
-      // PROJECTION (5-B, D4): the parent principle must reach the offline answer too.
-      { label: "projection: the parent principle rides the mirror", actionContext: "Bash:docker build ." },
-    ];
-
-    for (const scenario of scenarios) {
-      const opts = { actionContext: scenario.actionContext, circle: scenario.circle ?? "default", runtimeModelTag: scenario.runtimeModelTag };
-      const live = c.gate({ ...opts, record: false });
-      const offline = evaluateGateFromMirror(mirror, opts);
-      expect(offline.silence, scenario.label).toBe(live.silence);
-      expect(offline.overflow, scenario.label).toBe(live.overflow);
-      expect(offline.stage, scenario.label).toEqual(live.stage);
-      expect(offline.stages, scenario.label).toEqual(live.stages);
-      expect(offline.rules, scenario.label).toEqual(live.rules);
-      // The one deliberate, documented difference — see this describe block's own comment.
-      expect(live.source, scenario.label).toBe("live");
-      expect(offline.source, scenario.label).toBe("sidecar");
-    }
-
-    // ---- independent sanity checks on the LIVE side, so the battery is not "both sides share one
-    // bug" — parity alone cannot catch a mistake present in both gateInternal and the fixture's own
-    // assumptions about it. ------------------------------------------------------------------------
-    const union = gateQuery(db, { actionContext: "Bash:git push --force origin main", circle: "default", runtimeModelTag: "model-a", record: false });
-    expect(union.rules.map((r) => r.severity)).toEqual(["blocking", "advisory"]);
-    expect(union.rules.map((r) => r.conceptId)).toContain(forcePush.conceptId);
-
-    const rmUnion = gateQuery(db, { actionContext: "Bash:rm -rf /tmp/x", circle: "default", runtimeModelTag: "model-a", record: false });
-    expect(rmUnion.rules).toHaveLength(2);
-    expect(rmUnion.rules[0]!.severity).toBe("blocking");
-
-    const dockerLive = gateQuery(db, { actionContext: "Bash:docker system prune -a", circle: "default", record: false });
-    expect(dockerLive.rules.map((r) => r.conceptId)).toEqual([dockerSuccessor.conceptId]);
-
-    const eslintLive = gateQuery(db, { actionContext: "Bash:eslint --fix .", circle: "default", record: false });
-    expect(eslintLive.rules.map((r) => r.conceptId)).toEqual([eslintKeep.conceptId]);
-
-    const kubectlLive = gateQuery(db, { actionContext: "Bash:kubectl delete pod x", circle: "default", record: false });
-    expect(kubectlLive).toMatchObject({ silence: false, rules: [] });
-
-    const terraformLive = gateQuery(db, { actionContext: "Bash:terraform apply -auto-approve", circle: "default", record: false });
-    expect(terraformLive.rules[0]).toMatchObject({ severity: "advisory", reason: null, reasonMissing: false });
-
-    // BREADTH sanity: same global deny, three circles. Union + blocking-first where a local rule
-    // also matches; alone (but still delivered) everywhere else — including a circle this fixture
-    // never otherwise touches, proving the reach is the marker's, not an accident of overlap with
-    // some OTHER fixture data that happens to also live in "other-circle".
-    const npmDefault = gateQuery(db, { actionContext: "Bash:npm install", circle: "default", record: false });
-    expect(npmDefault.rules.map((r) => [r.severity, r.conceptId])).toEqual([
-      ["blocking", breadthDeny.conceptId],
-      ["advisory", expect.any(String)],
-    ]);
-    const npmOther = gateQuery(db, { actionContext: "Bash:npm install", circle: "other-circle", record: false });
-    expect(npmOther.rules.map((r) => r.conceptId)).toEqual([breadthDeny.conceptId]);
-    const npmElsewhere = gateQuery(db, { actionContext: "Bash:npm install", circle: "a-circle-nothing-else-ever-touches", record: false });
-    expect(npmElsewhere.rules.map((r) => r.conceptId)).toEqual([breadthDeny.conceptId]);
-    expect(npmElsewhere.silence).toBe(false);
-
-    // ALIAS sanity (MATERIAL M3), the representation difference made concrete: raw gateQuery is
-    // PRE-resolution and takes "proj" literally — it MUST come back empty, because nothing lives at
-    // that name any more, the rename moved the concept to "project". c.gate() resolves first and
-    // delivers. Both are correct; they are answering different questions, and evaluateGateFromMirror
-    // must agree with the SECOND one, not the first — which is exactly what the battery above pins.
-    expect(c.resolveCircleName("proj")).toBe("project");
-    const rawUnresolved = gateQuery(db, { actionContext: "Bash:helm delete my-release", circle: "proj", record: false });
-    expect(rawUnresolved.rules).toEqual([]);
-    const liveResolved = c.gate({ actionContext: "Bash:helm delete my-release", circle: "proj", record: false });
-    expect(liveResolved.rules.map((r) => r.conceptId)).toEqual([aliasRule.conceptId]);
-
-    // PROJECTION sanity (5-B, D4), so the battery's own agreement above is not "both sides carry
-    // nothing": the field is genuinely PRESENT on both, and it names the right principle.
-    const projectedLive = c.gate({ actionContext: "Bash:docker build .", circle: "default", record: false });
-    expect(projectedLive.rules.map((r) => r.conceptId)).toEqual([projectedRule.conceptId]);
-    expect(projectedLive.rules[0]!.projectedFromPrincipleId).toBe(parentPrinciple.conceptId);
-    const projectedOffline = evaluateGateFromMirror(mirror, { actionContext: "Bash:docker build .", circle: "default" });
-    expect(projectedOffline.rules[0]!.projectedFromPrincipleId).toBe(parentPrinciple.conceptId);
-    expect(mirror.entries.find((e) => e.conceptId === projectedRule.conceptId)!.projectedFromPrincipleId)
-      .toBe(parentPrinciple.conceptId);
-
-    c.close();
-  });
-
-  /**
-   * THE ONE PERMANENT DIVERGENCE, pinned rather than left to a comment (slice 5-B, D5). A frozen
-   * `parentDisputed` would go stale the moment a human mediates, which is worse than absent: the
-   * offline reader would announce doubt about a principle that is fine again, with no way to know.
-   * Omitting is the honest failure, so this test asserts the ASYMMETRY on purpose — live says
-   * `parentDisputed`, the mirror does not, and neither one's verdict, severity or rule set differs.
-   */
-  it("never freezes the parent's DISPUTED status into the mirror — live discloses it, offline stays silent", async () => {
-    const c = core({ circle: "default" });
-    const principle = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
-    if (principle.species !== "principle") throw new Error("unreachable");
-    const projected = await c.store("Confirm the target namespace before deleting a release.", {
-      kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle.conceptId },
-    });
-    // Impeach the parent through a SIBLING rule, leaving the rule under test untouched and live.
-    const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: principle.conceptId },
-    });
-    await c.store("Snapshot the volume AND drain the node first.", { kind: "correction", attachTo: sibling.conceptId });
-    expect((await c.getConcept(principle.conceptId))!.status).toBe("disputed");
-
-    const mirror = c.materializeGateMirror(join(mkTmp(), "gate-mirror.json")).sidecar;
-    const opts = { actionContext: "Bash:helm delete my-release", circle: "default" };
-    const live = c.gate({ ...opts, record: false });
-    const offline = evaluateGateFromMirror(mirror, opts);
-
-    // SAME VERDICT, SAME RULES, SAME SEVERITY — the divergence is disclosure only.
-    expect(offline.silence).toBe(live.silence);
-    expect(offline.rules.map((r) => [r.conceptId, r.severity])).toEqual(live.rules.map((r) => [r.conceptId, r.severity]));
-    expect(live.rules[0]).toMatchObject({ conceptId: projected.conceptId, parentDisputed: true });
-    // ...and the parent id IS carried, so this is a deliberate omission of ONE field, not the old gap.
-    expect(offline.rules[0]!.projectedFromPrincipleId).toBe(principle.conceptId);
-    expect(offline.rules[0]!.parentDisputed).toBeUndefined();
-    expect(Object.keys(mirror.entries[0]!)).not.toContain("parentDisputed");
-    c.close();
-  });
-
-  /**
-   * BACKWARD COMPATIBILITY, the reason `GATE_MIRROR_FORMAT` was NOT bumped for D4's new field: a
-   * format-4 file written before this slice carries no `projectedFromPrincipleId` on any entry, and
-   * must still parse and evaluate identically — the field decides nothing, so refusing such a file
-   * would have cost a working mirror to gain nothing.
-   */
-  it("reads a pre-5-B format-4 mirror whose entries have no parent field at all", async () => {
-    const c = core({ circle: "default" });
-    await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", scope: "domain" },
-    });
-    const path = join(mkTmp(), "gate-mirror.json");
-    const current = c.materializeGateMirror(path).sidecar;
-    expect(current.format).toBe(GATE_MIRROR_FORMAT);
-
-    // An OLD file: same format number, entries stripped of the key this build knows about.
-    const old: GateMirror = {
-      ...current,
-      entries: current.entries.map(({ projectedFromPrincipleId: _drop, ...rest }) => rest),
-    };
-    expect(Object.keys(old.entries[0]!)).not.toContain("projectedFromPrincipleId");
-
-    const offline = evaluateGateFromMirror(old, { actionContext: "Bash:git push --force origin main", circle: "default" });
-    expect(offline.rules).toHaveLength(1);
-    expect(offline.rules[0]!.projectedFromPrincipleId).toBeUndefined();
-    expect(offline).toMatchObject({ silence: false, overflow: false, source: "sidecar" });
-    // And it round-trips through the real reader, not only in memory.
-    writeFileSync(path, JSON.stringify(old));
-    const reread = JSON.parse(readFileSync(path, "utf8")) as GateMirror;
-    expect(evaluateGateFromMirror(reread, { actionContext: "Bash:git push --force origin main", circle: "default" }).rules)
-      .toHaveLength(1);
     c.close();
   });
 });
@@ -4133,14 +3473,14 @@ describe("breadth inherits into the recognized surfaces", () => {
     // some other circle's index, proving the test below is measuring breadth, not "every stage
     // shows up everywhere regardless".
     await c.declare({
-      species: "rule", stage: "eslint --fix all", patterns: ["Bash:eslint --fix --all"],
+      species: "rule", stage: "eslint --fix all",
       content: "Confirm the file count before a repo-wide autofix.", severity: "advisory", scope: "domain",
     });
 
     // The global rule: a BLOCKING breadth binding, plus a LOCAL advisory sharing its stage in
     // "default" — same union shape the parity test's own breadth fixture uses.
     const globalDeny = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "docker system prune --all", patterns: ["Bash:docker system prune --all --volumes"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "docker system prune --all",
       content: "Never prune with --volumes outside a maintenance window.", severity: "blocking",
       reason: "a volume prune destroys data no image rebuild can recover", scope: "domain",
     });
@@ -4159,8 +3499,8 @@ describe("breadth inherits into the recognized surfaces", () => {
     expect(home.names).toEqual(expect.arrayContaining(["docker system prune --all", "eslint --fix all"]));
 
     // stageLookup (the recognized matcher): from a circle with nothing local on this stage, the
-    // global deny alone still delivers — matching gateQuery's own union contract exactly, just
-    // reached by name instead of by pattern.
+    // global deny alone still delivers — the same circle-or-breadth union every delivery query in
+    // gates.ts embeds (`RULE_LIVENESS_WHERE`), reached by name.
     const recognizedElsewhere = c.stageLookup({ stage: "docker system prune --all", circle: "a-circle-with-nothing-of-its-own" });
     expect(recognizedElsewhere.matched).toBe(true);
     expect(recognizedElsewhere.rules.map((r) => r.conceptId)).toEqual([globalDeny.conceptId]);
@@ -4180,42 +3520,34 @@ describe("breadth inherits into the recognized surfaces", () => {
 // ---------------------------------------------------------------------------
 /**
  * CIRCLE '*' IS NOT A QUERYABLE CIRCLE, AT ANY ENTRANCE (Codex round 6, item 2, closing batch).
- * `RULE_LIVENESS_WHERE`'s own `(b.circle = ? OR b.circle = '*')` — and evaluateGateFromMirror's
- * identical JS-side twin — degenerates to matching ONLY global rules the instant `?` itself is bound
- * to '*': both halves of the OR become the identical clause, silently dropping every LOCAL rule the
- * caller actually meant to ask about, including a local DENY. Reachable only via a direct argument
- * (a pre-breadth `MONET_CIRCLE=*` config, or any caller passing '*' straight through) — `resolveCircle`
- * can never PRODUCE '*' from an ordinary circle name post-migration (round 4, item 4: no alias can
- * ever hold '*' on either side once a store has been through it — verified, not assumed, by reading
- * resolveCircle's own single-hop lookup and confirming no write path can create such a row anymore).
- * `MonetCore.gate()`/`stageLookup()` carry no guard of their own — checked directly: both resolve
- * their circle and pass it straight into evaluateGate/evaluateStageLookup unchanged, so the SHARED
- * chokepoint one layer down (assertQueryableCircle, gates.ts) is what actually refuses for them too,
- * proven here by calling the wrappers themselves, not only the functions they funnel through.
+ * `RULE_LIVENESS_WHERE`'s own `(b.circle = ? OR b.circle = '*')` degenerates to matching ONLY global
+ * rules the instant `?` itself is bound to '*': both halves of the OR become the identical clause,
+ * silently dropping every LOCAL rule the caller actually meant to ask about, including a local DENY.
+ * Reachable only via a direct argument (a pre-breadth `MONET_CIRCLE=*` config, or any caller passing
+ * '*' straight through) — `resolveCircle` can never PRODUCE '*' from an ordinary circle name
+ * post-migration (round 4, item 4: no alias can ever hold '*' on either side once a store has been
+ * through it — verified, not assumed, by reading resolveCircle's own single-hop lookup and confirming
+ * no write path can create such a row anymore). `MonetCore.stageLookup()` carries no guard of its own
+ * — checked directly: it resolves its circle and passes it straight into evaluateStageLookup
+ * unchanged, so the SHARED chokepoint one layer down (assertQueryableCircle, gates.ts) is what
+ * actually refuses for it too, proven here by calling the wrapper itself, not only the function it
+ * funnels through.
  */
 describe("circle '*' is refused as query input, everywhere a gate query can be scoped", () => {
-  it("refuses at every entrance — evaluateGate, gateQuery, MonetCore.gate(), evaluateStageLookup, stageLookup (standalone), MonetCore.stageLookup(), and evaluateGateFromMirror — each naming the same repair", async () => {
+  it("refuses at every entrance — evaluateStageLookup, stageLookup (standalone), and MonetCore.stageLookup() — each naming the same repair", async () => {
     const c = core();
     await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
     });
     const db = (c as unknown as { db: StoragePort }).db;
     const message = /circle '\*' is not a queryable circle.*reserved global-breadth marker.*Name a real circle/s;
 
-    // THE LIVE GATE FAMILY — the pure functions, then the MonetCore wrapper that funnels through them.
-    expect(() => evaluateGate(db, { actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
-    expect(() => gateQuery(db, { actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
-    expect(() => c.gate({ actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
-
-    // THE RECOGNIZED-MATCHER FAMILY — same shape, same three levels.
+    // THE RECOGNIZED-MATCHER FAMILY — the pure function, the standalone form, then the MonetCore
+    // wrapper that funnels through them.
     expect(() => evaluateStageLookup(db, { stage: "npm install", circle: BREADTH_CIRCLE })).toThrow(message);
     expect(() => standaloneStageLookup(db, { stage: "npm install", circle: BREADTH_CIRCLE })).toThrow(message);
     expect(() => c.stageLookup({ stage: "npm install", circle: BREADTH_CIRCLE })).toThrow(message);
-
-    // THE OFFLINE EVALUATOR — no shared internal to funnel through, checked directly.
-    const mirror = c.materializeGateMirror(join(mkTmp(), "s.json")).sidecar;
-    expect(() => evaluateGateFromMirror(mirror, { actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
 
     // THE CURATION FAMILY (post-merge review round, item 2) — round 6's OWN sweep missed these: NOT
     // because they are a different mechanism, but because `gateCoverage` restated
@@ -4233,38 +3565,29 @@ describe("circle '*' is refused as query input, everywhere a gate query can be s
     expect(() => c.overview(BREADTH_CIRCLE)).toThrow(message);
 
     // AN ORDINARY CIRCLE IS UNAFFECTED — the refusal is specific to '*', not a general regression.
-    // Stages are store-global (matched regardless of circle), so the stage itself still hits — the
-    // circle scoping shows up in `rules`, not `silence` (the stage-hit-no-rules case, not a miss).
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "an-ordinary-circle" })).toMatchObject({ silence: false, rules: [] });
-    expect(() => evaluateGateFromMirror(mirror, { actionContext: "Bash:npm install", circle: "default" })).not.toThrow();
+    // Stages are store-global (resolved regardless of circle), so the stage itself still hits — the
+    // circle scoping shows up in `rules`, not `matched` (the stage-hit-no-rules case, not a miss).
+    expect(c.stageLookup({ stage: "npm install", circle: "an-ordinary-circle" })).toMatchObject({ matched: true, rules: [] });
     expect(() => c.gateCoverage("an-ordinary-circle")).not.toThrow();
     expect(() => c.prewarm("an-ordinary-circle")).not.toThrow();
     c.close();
   });
 });
 
-describe("gateQuery", () => {
-  it("silence when nothing matches, and a stage with no rules is NOT silence", async () => {
-    const c = core();
-    expect(c.gate({ actionContext: "Bash:git status" })).toMatchObject({ stage: null, stages: [], rules: [], silence: true, source: "live" });
-
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-    const empty = c.gate({ actionContext: "Bash:terraform apply -auto-approve" });
-    // The projection hook: "stage X, no cached rules — skeleton applies."
-    expect(empty).toMatchObject({ silence: false, rules: [] });
-    expect(empty.stage).toMatchObject({ name: "terraform apply" });
-    c.close();
-  });
-
+describe("rule delivery through stageLookup", () => {
   it("delivers the rule with the reason that earns compliance", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "it destroys teammates' commits", ...AGENT_RULE },
+      rule: { stage: "git force push", reason: "it destroys teammates' commits", ...AGENT_RULE },
     });
-    const fired = c.gate({ actionContext: "Bash:cd /repo && git push --force origin dev" });
-    expect(fired.silence).toBe(false);
-    expect(fired.rules).toEqual([{
+    const fired = c.stageLookup({ stage: "git force push" });
+    expect(fired.matched).toBe(true);
+    expect(fired.rules).toHaveLength(1);
+    // `body` is stripped so the rest can be pinned exactly; it has its own test in the recognized
+    // matcher's own block.
+    const { body: _body, ...delivered } = fired.rules[0]!;
+    expect(delivered).toEqual({
       conceptId: rule.conceptId,
       text: "Never force-push to a shared branch",
       reason: "it destroys teammates' commits",
@@ -4277,58 +3600,63 @@ describe("gateQuery", () => {
       modelTag: "test-model-1",
       origin: "correction",
       stageId: c.ruleBinding(rule.conceptId)!.stage_id,
-    }]);
+    });
     c.close();
   });
 
-  it("unions the rules of EVERY matched stage, blocking first then oldest first", async () => {
+  /**
+   * THE DELIVERY ORDER, which is one SQL clause shared by every delivery path:
+   * `ORDER BY (b.severity = 'blocking') DESC, b.created_at ASC, b.concept_id ASC` (rulesForStages).
+   *
+   * This used to be asserted on the mechanical gate's multi-stage fan-out. That fan-out is gone —
+   * a lookup resolves ONE stage by name — but the ordering is not: several rules routinely share
+   * one stage, and both halves of the clause still decide what the agent reads first. A deny must
+   * lead, and among equals the OLDEST leads, so delivery does not reshuffle under the reader as
+   * rules accumulate.
+   */
+  it("orders one stage's rules blocking first, then oldest first", async () => {
     const c = core();
-    // A broad stage and a narrow one that both match the same action.
-    await c.declare({ species: "stage", stage: "git push", patterns: ["git push"] });
-    await c.declare({ species: "stage", stage: "git force push", patterns: ["git push --force"] });
-    const broad = await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", ...AGENT_RULE } });
-    const narrow = await c.store("Never force-push to a shared branch.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
+    const older = await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
+    const newer = await c.store("Never force-push to a shared branch.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
     const deny = await c.declare({
       species: "rule", stage: "git force push", content: "Never force-push to main.", severity: "blocking",
       reason: "a rewritten history cannot be recovered from a teammate's clone", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
 
-    const fired = c.gate({ actionContext: "Bash:git push --force origin main" });
-    expect(fired.stages.map((s) => s.name)).toEqual(["git push", "git force push"]);
-    // Blocking first — a deny must be the first thing an agent reads — then birth order.
-    expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId, broad.conceptId, narrow.conceptId]);
+    const fired = c.stageLookup({ stage: "git force push" });
+    // The deny leads despite being the LAST one written — severity outranks birth order.
+    expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId, older.conceptId, newer.conceptId]);
     expect(fired.rules[0]!.severity).toBe("blocking");
-
-    // The narrow stage alone answers the narrow action's sibling.
-    expect(c.gate({ actionContext: "Bash:git push origin main" }).rules.map((r) => r.conceptId)).toEqual([broad.conceptId]);
+    // And among the two equal-severity rules, the older one leads.
+    expect(fired.rules.slice(1).map((r) => r.severity)).toEqual(["advisory", "advisory"]);
     c.close();
   });
 
   it("is circle-scoped: a rule in circle A never fires in circle B", async () => {
     const c = core();
     const inA = await c.store("Never force-push to a shared branch.", {
-      circle: "a", kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      circle: "a", kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
-    // The STAGE is store-global — the same action in both circles — but the RULE is not.
-    expect(c.gate({ actionContext: "Bash:git push --force", circle: "a" }).rules.map((r) => r.conceptId)).toEqual([inA.conceptId]);
-    const inB = c.gate({ actionContext: "Bash:git push --force", circle: "b" });
+    // The STAGE is store-global — the same moment in both circles — but the RULE is not.
+    expect(c.stageLookup({ stage: "git force push", circle: "a" }).rules.map((r) => r.conceptId)).toEqual([inA.conceptId]);
+    const inB = c.stageLookup({ stage: "git force push", circle: "b" });
     expect(inB.rules).toEqual([]);
-    expect(inB.silence).toBe(false); // the stage still matched; only the rule is elsewhere
+    expect(inB.matched).toBe(true); // the stage still resolved; only the rule is elsewhere
     c.close();
   });
 
   it("never re-injects a superseded rule, and delivers its successor instead", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
+    expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
 
     const successor = await c.store("Force-push is fine on your own branch; never on a shared one.", {
       kind: "correction", attachTo: rule.conceptId,
     });
-    const after = c.gate({ actionContext: "Bash:git push --force" });
+    const after = c.stageLookup({ stage: "git force push" });
     expect(after.rules.map((r) => r.conceptId)).toEqual([successor.conceptId]);
     // The old rule is still there, still findable — it is the history and the impeachment evidence.
     expect((await c.getConcept(rule.conceptId))!.status).toBe("active");
@@ -4339,66 +3667,16 @@ describe("gateQuery", () => {
     const c = core();
     const principle = await c.store("Irreversible acts get a confirmation.", { kind: "insight" });
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle.conceptId, dstConceptId: rule.conceptId, bornOf: "extraction" });
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules[0]!.projectedFromPrincipleId).toBe(principle.conceptId);
+    expect(c.stageLookup({ stage: "git force push" }).rules[0]!.projectedFromPrincipleId).toBe(principle.conceptId);
 
     c.retireConcept(rule.conceptId);
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules).toEqual([]);
+    expect(c.stageLookup({ stage: "git force push" }).rules).toEqual([]);
     c.close();
   });
 
-  it("flips a stage from unverified to verified on its FIRST fire, rules or not", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-    expect(c.stages()[0]!.verified).toBe(false);
-    c.gate({ actionContext: "Bash:terraform plan" });
-    expect(c.stages()[0]!.verified).toBe(false); // no match, no proof
-    c.gate({ actionContext: "Bash:terraform apply -auto-approve" });
-    expect(c.stages()[0]!.verified).toBe(true); // the pattern matched something real
-    c.close();
-  });
-
-  it("lists the dead patterns — a stage authored from a name that has never matched anything", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "some action nobody performs", patterns: ["frobnicate --hard"] });
-    const stats = c.gateCoverage();
-    expect(stats.unverifiedPatterns).toEqual([{
-      stageId: c.stages()[0]!.id,
-      stageName: "some action nobody performs",
-      origin: "declaration",
-      patterns: ["*: frobnicate --hard"],
-    }]);
-    c.close();
-  });
-
-  it("record:false does not flip `verified` — a previewed match is not a real one", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-    const fired = c.gate({ actionContext: "Bash:terraform apply -auto-approve", record: false });
-    expect(fired.stages).toHaveLength(1); // it really did match
-    // The dead-pattern watchlist exists to say "this has never matched anything REAL". A measured
-    // or previewed match is not a real action, so it must not silence the watchlist.
-    expect(c.stages()[0]!.verified).toBe(false);
-    expect(c.gateCoverage().unverifiedPatterns).toHaveLength(1);
-
-    c.gate({ actionContext: "Bash:terraform apply -auto-approve" });
-    expect(c.stages()[0]!.verified).toBe(true);
-    c.close();
-  });
-
-  it("keeps overview READ-ONLY: reading the gate's own coverage fires no gate", async () => {
-    const c = core();
-    await c.store("Never force-push.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
-    c.overview("default");
-    c.overview("default");
-    // Reading a curation surface must not look like an intercepted action. `verified` is the
-    // observable that would move if it did: it flips on a stage's first REAL fire, and a reader
-    // that flipped it would silence the dead-pattern watchlist by being read.
-    expect(c.stages().every((stage) => stage.verified === false)).toBe(true);
-    c.close();
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4410,7 +3688,7 @@ describe("gate substrate sync", () => {
     const dst = core({ syncDeviceId: "machine-b" });
     const rule = await src.store("Never force-push to a shared branch.", {
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "destroys commits", ...AGENT_RULE },
+      rule: { stage: "git force push", reason: "destroys commits", ...AGENT_RULE },
     });
 
     const payload = src.exportDelta(0);
@@ -4422,8 +3700,8 @@ describe("gate substrate sync", () => {
     expect(result.inserted.stages).toBe(1);
     expect(result.inserted.rule_bindings).toBe(1);
 
-    // The gate answers identically on the receiver — the whole point of replicating the registry.
-    const fired = dst.gate({ actionContext: "Bash:git push --force origin main" });
+    // The receiver answers identically — the whole point of replicating the registry.
+    const fired = dst.stageLookup({ stage: "git force push" });
     expect(fired.rules).toMatchObject([{ conceptId: rule.conceptId, reason: "destroys commits", severity: "advisory" }]);
 
     const replay = await dst.graftRows(payload);
@@ -4438,41 +3716,11 @@ describe("gate substrate sync", () => {
     dst.close();
   });
 
-  /**
-   * A GRAFTED DERIVATION EDGE IS MIRROR CONTENT TOO (review fix — Codex 5-B round 2, R2-1).
-   * `GateMirrorEntry` carries `projectedFromPrincipleId` as of slice 5-B (D4), so an edge landing on
-   * an ALREADY-BOUND rule changes what the mirror would write while nothing about the binding moves.
-   * The three LOCAL entrances into the derivation family (addLifecycleEdge, recordProjectionEdge,
-   * ratifySkeletonMembership) all bump for that; the graft loop bumped only for `supersession`, so a
-   * relayed projection/ratification edge left graftRows' closing `refreshGateSidecar()` treating a
-   * parentless mirror as current while the live gate reported the parent.
-   */
-  it("converges `verified` as a grow-only fact: a peer who never fired cannot un-verify", async () => {
-    const src = core({ syncDeviceId: "machine-a" });
-    const dst = core({ syncDeviceId: "machine-b" });
-    await src.store("Never force-push.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    const unfired = src.exportDelta(0);
-    await dst.graftRows(unfired);
-    expect(dst.stages()[0]!.verified).toBe(false);
-
-    src.gate({ actionContext: "Bash:git push --force origin main" });
-    await dst.graftRows(src.exportDelta(0));
-    expect(dst.stages()[0]!.verified).toBe(true);
-
-    // Replaying the OLD (unverified) payload must not take the proof back.
-    await dst.graftRows(unfired);
-    expect(dst.stages()[0]!.verified).toBe(true);
-    src.close();
-    dst.close();
-  });
-
   it("relays a binding whose rule concept is retired — that record is what audit reads", async () => {
     const a = core({ syncDeviceId: "machine-a" });
     const b = core({ syncDeviceId: "machine-b" });
     const rule = await a.store("A rule that will be retired on machine A.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     a.retireConcept(rule.conceptId);
 
@@ -4482,7 +3730,7 @@ describe("gate substrate sync", () => {
     const result = await b.graftRows(payload);
     expect(result.inserted.rule_bindings).toBe(1);
     // It arrives dangling and simply never fires — the endpoint is not there to be governed.
-    expect(b.gate({ actionContext: "Bash:git push --force origin main" }).rules).toEqual([]);
+    expect(b.stageLookup({ stage: "git force push" }).rules).toEqual([]);
     a.close();
     b.close();
   });
@@ -4505,7 +3753,7 @@ describe("gate substrate sync", () => {
     // Declared legitimately HERE, because this build will not mint one without a reason. Stripping
     // the reason from the exported row is what a peer running the older build relays natively.
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4518,10 +3766,8 @@ describe("gate substrate sync", () => {
   };
 
   it("LANDS a relayed deny that carries no reason, fires it, and discloses it on every surface", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
     const dst = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-b", gateSidecarPath: path,
+      tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-b",
     });
     const { src, conceptId, inserted } = await relayReasonlessDeny(dst);
 
@@ -4531,26 +3777,11 @@ describe("gate substrate sync", () => {
 
     // ...and it GUARDS. A deny that landed but did not fire would be the same protection loss by a
     // quieter route.
-    const fired = dst.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    const fired = dst.stageLookup({ stage: "rm -rf" });
     expect(fired.rules).toHaveLength(1);
     expect(fired.rules[0]).toMatchObject({
       conceptId, severity: "blocking", reason: null, reasonMissing: true,
     });
-
-    // The MIRROR says it too — a reader runs when the server is unreachable, which is already the
-    // moment a user is least able to go and look the reason up. reasonMissing is not STORED on the
-    // entry as of format 4 (computed at read via hasNoReason, the one predicate every surface
-    // shares) — evaluateGateFromMirror is that read, so running the mirror through it is what proves
-    // the offline surface still discloses this, not merely that the raw JSON carries a reason.
-    const mirrored = dst.materializeGateMirror().sidecar;
-    const entry = mirrored.entries[0]!;
-    expect(entry).toMatchObject({ conceptId, reason: null });
-    const offlineFired = evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" });
-    expect(offlineFired.rules[0]).toMatchObject({ conceptId, reason: null, reasonMissing: true });
-    // Present in the FILE, not merely in the return value: the file is what a reader actually opens.
-    const onDisk = JSON.parse(readFileSync(path, "utf8")) as GateMirror;
-    expect(onDisk.format).toBe(4);
-    expect(onDisk.entries[0]).toMatchObject({ conceptId, reason: null });
 
     // ...and CURATION gets a REPAIR QUEUE, not an alarm: `stageName` and `title` are exactly the
     // `stage` and `content` the repairing declaration below takes, so nothing has to be gone and
@@ -4583,21 +3814,16 @@ describe("gate substrate sync", () => {
    * that only covered the agreeing case is what let the disagreement ship.
    */
   for (const [label, blank] of [["tab", "\t"], ["newline", "\n"], ["one space", " "], ["several spaces", "   "]] as const) {
-    it(`treats a relayed ${label} reason as no reason, on the gate, the mirror, the list AND the view`, async () => {
-      const dir = mkTmp();
-      const path = join(dir, "gate-sidecar.json");
+    it(`treats a relayed ${label} reason as no reason, on the gate, the list AND the view`, async () => {
       const dst = new MonetCore(":memory:", {
-        tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-b", gateSidecarPath: path,
+        tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-b",
       });
       const { src, conceptId } = await relayReasonlessDeny(dst, { reason: blank });
       // Stored verbatim: graft does not normalize a peer's value, which is exactly why every READER
       // has to ask the same question rather than trusting the column to be canonical.
       expect(dst.ruleBinding(conceptId)!.reason).toBe(blank);
 
-      expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
-      const mirrored = dst.materializeGateMirror().sidecar;
-      expect(evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules[0])
-        .toMatchObject({ reasonMissing: true });
+      expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: true });
       expect(dst.gateCoverage("default").unexplainedDenies).toMatchObject([{ conceptId, stageName: "rm -rf" }]);
       const rendered = renderOverview(dst.overview("default"), { color: false });
       expect(rendered).toContain("repair [");
@@ -4612,7 +3838,7 @@ describe("gate substrate sync", () => {
    * `UPDATE` away. SQLite stores whatever a writer hands the column, so a malformed peer could leave
    * a NUMBER in `reason`; `hasNoReason` then called `.trim()` on it and threw, taking out the
    * matching gate query, the sidecar rebuild and the gate-stats read together — live AND offline
-   * delivery for that rule, which is precisely the pair the mirror exists to keep independent.
+   * delivery for that rule, which was precisely the pair the mirror existed to keep independent.
    */
   const corruptReason = (c: MonetCore, conceptId: string, value: unknown) =>
     raw(c).prepare(`UPDATE rule_bindings SET reason = ? WHERE concept_id = ?`).run(value, conceptId);
@@ -4622,13 +3848,11 @@ describe("gate substrate sync", () => {
     ["an empty blob", Buffer.alloc(0)],
   ] as const) {
     it(`survives ${label} already stored in reason, on every read path, and discloses it`, async () => {
-      const dir = mkTmp();
-      const path = join(dir, "gate-sidecar.json");
       const c = new MonetCore(":memory:", {
-        tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
+        tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a",
       });
       const deny = await c.declare({
-        species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+        species: "rule", stage: "rm -rf",
         content: "Never delete a tree unattended.", severity: "blocking",
         reason: "there is no undo", ...AGENT_RULE,
       });
@@ -4640,24 +3864,14 @@ describe("gate substrate sync", () => {
 
       // THE DENY STILL FIRES. Not throwing is the whole point — a rule whose read path raises is a
       // rule that stops governing.
-      const fired = c.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+      const fired = c.stageLookup({ stage: "rm -rf" });
       expect(fired.rules).toHaveLength(1);
       expect(fired.rules[0]).toMatchObject({ severity: "blocking", reasonMissing: true });
 
-      // ...and it lands in the disclosure this branch already built for a deny that cannot explain
-      // itself. Nothing special-cases a number, because it is not a special case: it is not an
-      // explanation, so the rule has none. The offline evaluator reaches the same disclosure off the
-      // SAME mirror, through the SAME hasNoReason predicate — reasonMissing is computed, not stored.
-      const mirrored = c.materializeGateMirror().sidecar;
-      const offlineFired = evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" });
-      expect(offlineFired.rules[0]).toMatchObject({ reasonMissing: true });
       expect(c.gateCoverage("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
       expect(renderOverview(c.overview("default"), { color: false })).toContain("repair [");
       // Delivered as NULL, not as the raw value: `reason` is declared `string | null`, and handing a
-      // caller a Buffer moves the crash from this module into theirs. The mirror stays readable JSON
-      // for the same reason.
       expect(fired.rules[0]!.reason).toBeNull();
-      expect(mirrored.entries[0]!.reason).toBeNull();
       c.close();
     });
   }
@@ -4665,7 +3879,7 @@ describe("gate substrate sync", () => {
   it("treats a NUMBER in reason as the text SQLite actually stored, not as corruption", async () => {
     const c = core();
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4679,7 +3893,7 @@ describe("gate substrate sync", () => {
     // case above.
     corruptReason(c, deny.conceptId, 42);
     expect(c.ruleBinding(deny.conceptId)!.reason).toBe("42.0");
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({
       severity: "blocking", reason: "42.0", reasonMissing: false,
     });
     expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
@@ -4689,7 +3903,7 @@ describe("gate substrate sync", () => {
   it("lets an ordinary declaration REPAIR a corrupt reason, rather than locking the rule", async () => {
     const c = resolvingCore();
     const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4712,7 +3926,7 @@ describe("gate substrate sync", () => {
     });
     if (repaired.species !== "rule") throw new Error("unreachable");
     expect(repaired.conceptId).toBe(deny.conceptId);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({
       severity: "blocking", reason: "there is genuinely no undo", reasonMissing: false,
     });
     expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
@@ -4723,7 +3937,7 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4742,7 +3956,7 @@ describe("gate substrate sync", () => {
 
     // null still relays — absence is legal, and refusing it would drop a deny the peer has.
     dst.graftRows({ ...payload, ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, reason: null })) });
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: true });
     src.close();
     dst.close();
   });
@@ -4752,7 +3966,7 @@ describe("gate substrate sync", () => {
     const dst = core({ syncDeviceId: "machine-b" });
     const atMax = "s".repeat(STAGE_NAME_MAX_CHARS);
     await src.declare({
-      species: "rule", stage: atMax, patterns: ["Bash:frob"],
+      species: "rule", stage: atMax,
       content: "Guidance at the boundary length.", severity: "advisory", ...AGENT_RULE,
     });
     const payload = src.exportDelta(0);
@@ -4778,7 +3992,7 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     await src.declare({
-      species: "rule", stage: "Git Force Push", patterns: ["Bash:git push --force"],
+      species: "rule", stage: "Git Force Push",
       content: "Guidance for a canonical stage.", severity: "advisory", ...AGENT_RULE,
     });
     const payload = src.exportDelta(0);
@@ -4812,7 +4026,7 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4862,7 +4076,7 @@ describe("gate substrate sync", () => {
     const dst = core({ syncDeviceId: "machine-b" });
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -4880,8 +4094,7 @@ describe("gate substrate sync", () => {
     expect(dst.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", reason: null });
 
     // DELIVERY says it does not exist...
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
-    expect(dst.materializeGateMirror(join(mkTmp(), "s.json")).sidecar.entries).toEqual([]);
+    expect(dst.stageLookup({ stage: "rm -rf" })).toMatchObject({ matched: false, rules: [] });
     // ...so DISCLOSURE must not say it does. Naming it here told the user to redeclare a rule whose
     // redeclaration would CREATE the missing stage and change what the store does — a repair queue
     // giving advice that alters behaviour rather than restoring it.
@@ -4890,7 +4103,7 @@ describe("gate substrate sync", () => {
 
     // And once the stage lands, the SAME binding is a live reasonless deny on every surface at once.
     dst.graftRows(payload);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: true });
     expect(dst.gateCoverage("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
     src.close();
     dst.close();
@@ -4902,7 +4115,7 @@ describe("gate substrate sync", () => {
     // a reason: it renders, it explains the deny, and marking it would put a rule on the repair
     // queue that has nothing to repair.
     const { src, conceptId } = await relayReasonlessDeny(dst, { reason: "  there is no undo  " });
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({
       reason: "  there is no undo  ", reasonMissing: false,
     });
     expect(dst.gateCoverage("default").unexplainedDenies).toEqual([]);
@@ -4913,11 +4126,9 @@ describe("gate substrate sync", () => {
   });
 
   it("REPAIRS a relayed reasonless deny through an ordinary local declaration", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const dst = new MonetCore(":memory:", { syncDeviceId: "machine-b", gateSidecarPath: path });
+    const dst = new MonetCore(":memory:", { syncDeviceId: "machine-b" });
     const { src, conceptId } = await relayReasonlessDeny(dst);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: true });
 
     // No migration and no backfill: the repair is a human stating the sentence they owe, through
     // the same declaration surface as any other. `resolvingCore`-style resolution lands it on the
@@ -4931,14 +4142,10 @@ describe("gate substrate sync", () => {
 
     // Severity was never named and is preserved — the repair supplies the reason WITHOUT the human
     // having to re-assert deny power they never withdrew.
-    const fired = dst.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    const fired = dst.stageLookup({ stage: "rm -rf" });
     expect(fired.rules[0]).toMatchObject({
       severity: "blocking", reason: "there is no undo", reasonMissing: false,
     });
-    const mirrored = dst.materializeGateMirror().sidecar;
-    expect(mirrored.entries[0]).toMatchObject({ reason: "there is no undo" });
-    expect(evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules[0])
-      .toMatchObject({ reason: "there is no undo", reasonMissing: false });
     expect(dst.gateCoverage("default").unexplainedDenies).toEqual([]);
     src.close();
     dst.close();
@@ -4975,7 +4182,7 @@ describe("gate substrate sync", () => {
     // Seven entries remain compact in the overview's source-capped exception queue.
     for (let i = 0; i < 7; i++) {
       await src.declare({
-        species: "rule", stage: `gate-${i}`, patterns: [`Bash:tool${i} run`],
+        species: "rule", stage: `gate-${i}`,
         content: `Never run tool ${i} unattended.`, severity: "blocking",
         reason: "there is no undo", ...AGENT_RULE,
       });
@@ -5007,19 +4214,19 @@ describe("gate substrate sync", () => {
     const c = core();
     // An advisory rule with no reason is the ordinary case, not a broken promise — marking it would
     // bury the one population a caller has to say something about.
-    await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE } });
-    expect(c.gate({ actionContext: "Bash:git push" }).rules[0]).toMatchObject({
+    await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", ...AGENT_RULE } });
+    expect(c.stageLookup({ stage: "git push" }).rules[0]).toMatchObject({
       severity: "advisory", reason: null, reasonMissing: false,
     });
     expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
 
     // ...and an ordinary deny, declared properly, is never marked either.
     await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: false });
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ reasonMissing: false });
     expect(c.gateCoverage("default").unexplainedDenies).toEqual([]);
     c.close();
   });
@@ -5028,7 +4235,7 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const rule = await src.store("An ordinary advisory rule.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const payload = src.exportDelta(0);
     const forged = { ...payload.ruleBindings![0]!, severity: "blocking" };
@@ -5059,7 +4266,7 @@ describe("gate substrate sync", () => {
   it("keeps a graft atomic when two replicas independently created the same stage", async () => {
     const local = core({ syncDeviceId: "machine-a" });
     await local.store("A rule.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const payload = local.exportDelta(0);
     const mine = local.stages()[0]!.id;
@@ -5089,7 +4296,7 @@ describe("gate substrate sync", () => {
 describe("deny power cannot be removed by accident", () => {
   const declareDeny = async (c: MonetCore, content = "Never delete a directory tree unattended.") => {
     const r = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"], content,
+      species: "rule", stage: "rm -rf", content,
       severity: "blocking", reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
     });
     if (r.species !== "rule") throw new Error("unreachable");
@@ -5112,7 +4319,7 @@ describe("deny power cannot be removed by accident", () => {
     expect(again.binding.severity).toBe("blocking");
     expect(again.binding.reason).toBe("there is genuinely no undo");
     expect(again.downgraded).toBeUndefined();
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]!.severity).toBe("blocking");
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]!.severity).toBe("blocking");
     c.close();
   });
 
@@ -5126,7 +4333,7 @@ describe("deny power cannot be removed by accident", () => {
     if (downgraded.species !== "rule") throw new Error("unreachable");
     expect(downgraded.conceptId).toBe(deny.conceptId);
     expect(downgraded).toMatchObject({ downgraded: true, from: "blocking" });
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]!.severity).toBe("advisory");
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]!.severity).toBe("advisory");
 
     // Sovereignty runs both ways: the upgrade path is unchanged and reports no downgrade.
     const restored = await c.declare({
@@ -5150,13 +4357,11 @@ describe("deny power cannot be removed by accident", () => {
    * for the MCP-side half (tested separately, in "MCP surface", since it is a DIFFERENT bug from a
    * DIFFERENT layer).
    */
-  it("PATH 1 — breadth — re-declaring a global rule WITHOUT naming a circle preserves it, on the live gate, the mirror, and every circle", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { gateSidecarPath: path });
+  it("PATH 1 — breadth — re-declaring a global rule WITHOUT naming a circle preserves it, on delivery and in every circle", async () => {
+    const c = new MonetCore(":memory:", {});
     const CONTENT = "Never install without a lockfile present.";
     const first = await c.declare({
-      circle: "*", species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: "*", species: "rule", stage: "npm install",
       content: CONTENT, severity: "blocking", reason: "an unlocked install can drift", ...AGENT_RULE,
     });
     if (first.species !== "rule") throw new Error("unreachable");
@@ -5174,13 +4379,10 @@ describe("deny power cannot be removed by accident", () => {
     expect(again.narrowedFromBreadth).toBeUndefined();
     expect(again.previousCircle).toBeUndefined();
 
-    // LIVE GATE: fires from a circle the fixture never otherwise touches — the reach is the
+    // LIVE DELIVERY: reaches a circle the fixture never otherwise touches — the reach is the
     // marker's, not an accident of overlap with some other circle.
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
       .toEqual([first.conceptId]);
-    // THE MIRROR: materialized fresh, still carries '*' verbatim.
-    const mirror = c.materializeGateMirror(path).sidecar;
-    expect(mirror.entries.find((e) => e.conceptId === first.conceptId)?.circle).toBe(BREADTH_CIRCLE);
     c.close();
   });
 
@@ -5188,7 +4390,7 @@ describe("deny power cannot be removed by accident", () => {
     const c = new MonetCore(":memory:", {});
     const CONTENT = "Never install without a lockfile present.";
     const first = await c.declare({
-      circle: "*", species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: "*", species: "rule", stage: "npm install",
       content: CONTENT, severity: "blocking", reason: "an unlocked install can drift", ...AGENT_RULE,
     });
     if (first.species !== "rule") throw new Error("unreachable");
@@ -5202,8 +4404,8 @@ describe("deny power cannot be removed by accident", () => {
     expect(narrowed.binding.circle).toBe("default");
     // THE DISCLOSURE — legal (the owner's recorded act), never silent.
     expect(narrowed).toMatchObject({ narrowedFromBreadth: true, previousCircle: BREADTH_CIRCLE });
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "some-other-circle" }).rules).toEqual([]);
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "default" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "some-other-circle" }).rules).toEqual([]);
+    expect(c.stageLookup({ stage: "npm install", circle: "default" }).rules.map((r) => r.conceptId))
       .toEqual([first.conceptId]);
 
     // Sovereignty runs both ways here too: re-widening is unchanged and reports no narrowing.
@@ -5220,7 +4422,7 @@ describe("deny power cannot be removed by accident", () => {
   it("a NEW declaration without a circle still defaults to defaultCircle, unchanged (Codex round 2, item 1 regression check)", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, defaultCircle: "my-default" });
     const rule = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -5229,105 +4431,23 @@ describe("deny power cannot be removed by accident", () => {
     c.close();
   });
 
-  it("PATH 2 — re-authoring a stage that carries a deny is REFUSED until the denies are named", async () => {
-    const c = core();
-    const deny = await declareDeny(c);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
-
-    // D0-D2: one ordinary agent-callable declaration used to reroute the deny's firing surface —
-    // deny fires, pattern edit, silence, and the binding still reads `blocking`.
-    await expect(
-      c.declare({ species: "stage", stage: "rm -rf", patterns: ["Bash:something-else"] }),
-    ).rejects.toThrow(new RegExp(`would change what 1 blocking rule\\(s\\) deny.*${deny.conceptId}`, "s"));
-    // Refused means UNCHANGED: the deny still fires on the action it was declared for.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
-
-    // Acknowledged: the human has seen the deny and is re-aiming it deliberately.
-    const reaimed = await c.declare({
-      species: "stage", stage: "rm -rf", patterns: ["Bash:rm -rf", "Bash:rm -fr"],
-      acknowledgeBlockingRules: [deny.conceptId],
-    });
-    if (reaimed.species !== "stage") throw new Error("unreachable");
-    expect(reaimed.previousPatterns).toEqual(["bash: rm -rf"]);
-    expect(reaimed.patterns).toEqual(["bash: rm -rf", "bash: rm -fr"]);
-    expect(c.gate({ actionContext: "Bash:rm -fr /tmp/x" }).rules).toHaveLength(1);
-    c.close();
-  });
-
-  it("PATH 2 — the acknowledgement is enforced INSIDE the write transaction, not just at the edge", async () => {
-    const c = resolvingCore();
-    const declared = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (declared.species !== "rule") throw new Error("unreachable");
-
-    // THE TOCTOU. declare() validates BEFORE the embed and outside the write transaction, so a deny
-    // bound during the embed window would be re-aimed by a call that was validated when no deny
-    // existed. Asserting against the layer that performs the mutation is the direct test of where
-    // the guard lives: if it existed only in declare(), this would silently re-aim the deny.
-    const deps = { db: raw(c) as never, newId: () => "unused", nextSyncTimestamp: () => Date.now(), syncDeviceId: "d" };
-    expect(() => upsertStage(deps, { stage: "rm -rf", patterns: ["Bash:something-else"], origin: "declaration" }))
-      .toThrow(new RegExp(`would change what 1 blocking rule\\(s\\) deny.*${declared.conceptId}`, "s"));
-    // The deny still points where it was declared to point.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
-
-    // Acknowledged at the mutation layer succeeds, which proves both checks read one predicate.
-    expect(() => upsertStage(deps, {
-      stage: "rm -rf", patterns: ["Bash:something-else"],
-      acknowledgeBlockingRules: [declared.conceptId], origin: "declaration",
-    })).not.toThrow();
-    c.close();
-  });
-
-  it("PATH 2 — an empty patterns array disarms a stage, and is guarded like any other replacement", async () => {
-    const c = core();
-    const deny = await declareDeny(c);
-    // `patterns: []` used to coerce to null and be silently ignored — so the one input shape most
-    // obviously aimed at disarming a gate slipped past the guard entirely.
-    await expect(c.declare({ species: "stage", stage: "rm -rf", patterns: [] }))
-      .rejects.toThrow(/would change what 1 blocking rule/);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
-
-    const disarmed = await c.declare({
-      species: "stage", stage: "rm -rf", patterns: [], acknowledgeBlockingRules: [deny.conceptId],
-    });
-    if (disarmed.species !== "stage") throw new Error("unreachable");
-    expect(disarmed.patterns).toEqual([]);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).silence).toBe(true);
-    // An inert stage is visible in curation rather than quietly gone.
-    expect(c.gateCoverage().unverifiedPatterns.map((u) => u.stageName)).toContain("rm -rf");
-    c.close();
-  });
-
-  it("PATH 2 — replacing patterns resets verified, so the watchlist stops vouching for them", async () => {
-    const c = core();
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
-    c.gate({ actionContext: "Bash:terraform apply -auto-approve" });
-    expect(c.stages()[0]!.verified).toBe(true);
-
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform destroy"] });
-    // The proof belonged to the OLD patterns. Carrying it across would have the dead-pattern
-    // watchlist vouch for a replacement nothing has ever matched.
-    expect(c.stages()[0]!.verified).toBe(false);
-    expect(c.gateCoverage().unverifiedPatterns.map((u) => u.patterns)).toEqual([["*: terraform destroy"]]);
-    c.close();
-  });
-
-  it("PATH 2 — an advisory-only stage is re-authored freely", async () => {
-    const c = core();
-    await c.declare({ species: "rule", stage: "terraform apply", patterns: ["terraform apply"], content: "Plan first.", ...AGENT_RULE });
-    const r = await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform destroy"] });
-    if (r.species !== "stage") throw new Error("unreachable");
-    expect(r.patterns).toEqual(["*: terraform destroy"]);
-    c.close();
-  });
-
+  // PATH 2 — RE-AIMING A GATE'S PATTERNS — WAS CLOSED BY REMOVAL (2026-08-22), not by a guard.
+  //
+  // Four tests stood here: the refusal until every deny was named, the same refusal re-run inside
+  // the write transaction (the TOCTOU the acknowledgement guard existed to close), `patterns: []`
+  // as the disarm shape that had once slipped past it, and the advisory-only stage that could be
+  // re-authored freely. All four had the same subject — `acknowledgeBlockingRules` — and that
+  // parameter is gone with trigger patterns themselves, because the ACT it guarded cannot be
+  // performed any more: a stage is its name, and a rule is bound to the stage.
+  //
+  // The numbering is left alone. PATH 2 is a closed door, and a renumbered list would hide that
+  // this door was ever open. PATH 4 below is its RELAY-side twin and is still live — see the Door
+  // 10 comment in graftRows for why an old peer keeps that one reachable.
   it("PATH 4 — sync can neither mint a deny nor demote or repoint one", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const deny = await declareDeny(src);
-    await src.declare({ species: "stage", stage: "another gate", patterns: ["Bash:other"] });
+    await src.declare({ species: "stage", stage: "another gate" });
     dst.graftRows(src.exportDelta(0));
     expect(dst.ruleBinding(deny.conceptId)!.severity).toBe("blocking");
 
@@ -5368,18 +4488,18 @@ describe("deny power cannot be removed by accident", () => {
   it("PATH 5 — flagging a rule as contradicted is refused; it was a deny-removal path", async () => {
     const c = core();
     const deny = await declareDeny(c);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
 
-    // flagContradiction sets status='disputed', and the gate delivers only ACTIVE concepts — so the
+    // flagContradiction sets status='disputed', and delivery carries only ACTIVE concepts — so the
     // standard MCP tool removed a deny with no declaration anywhere in sight.
     expect(() => c.flagContradiction(deny.conceptId, { detail: "I disagree" }))
       .toThrow(/'dispute \(contradiction\)' would remove the blocking rule/);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf" }).rules).toHaveLength(1);
     expect((await c.getConcept(deny.conceptId))!.status).toBe("active");
 
     // UNIFORM across severities: the refusal is about what a rule IS, not about how hard it bites.
     const advisory = await c.store("An advisory rule.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     expect(() => c.flagContradiction(advisory.conceptId, { detail: "hmm" }))
       .toThrow(/is a rule and cannot be flagged as contradicted/);
@@ -5395,11 +4515,11 @@ describe("deny power cannot be removed by accident", () => {
     // scan is kind-blind, so this is what used to consume the rule and strand its binding.
     await c.store("Never delete a directory tree unattended.", { circle: "target", kind: "fact" });
     const deny = await c.declare({
-      circle: "origin", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "origin", species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "origin" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf", circle: "origin" }).rules).toHaveLength(1);
 
     const moved = c.reassignCircle(deny.conceptId, "target")!;
     // MOVED, not merged: the concept survives with its identity and its binding.
@@ -5407,7 +4527,7 @@ describe("deny power cannot be removed by accident", () => {
     expect(moved.conceptId).toBe(deny.conceptId);
     expect(c.ruleBinding(deny.conceptId)!.severity).toBe("blocking");
     // ...and the deny follows it into the new circle.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "target" }).rules).toHaveLength(1);
+    expect(c.stageLookup({ stage: "rm -rf", circle: "target" }).rules).toHaveLength(1);
     // The near-match is not discarded — it reaches curation as a pair, the forceNew-shaped answer.
     expect(c.overview("target").possibleDuplicates.length).toBeGreaterThan(0);
     c.close();
@@ -5434,269 +4554,11 @@ describe("deny power cannot be removed by accident", () => {
   });
 });
 
-describe("the robustness tail", () => {
-  const read = (path: string): GateMirror => JSON.parse(readFileSync(path, "utf8")) as GateMirror;
-
-  it("returns its verdict even when the instrumentation write cannot land", async () => {
-    const c = core();
-    await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
-    });
-    // Break the write half only. A gate lookup that THREW because its bookkeeping could not be
-    // written would be the worst possible trade: the bookkeeping is a rounding error, a missed
-    // delivery is the thing the subsystem exists to prevent. The row that used to be at risk here
-    // was a `gate_events` insert; what remains is the `verified` flip, and the property is the same.
-    const db = raw(c) as unknown as { prepare: (sql: string) => unknown };
-    const original = db.prepare.bind(db);
-    db.prepare = (sql: string) => {
-      if (sql.includes("UPDATE stages SET verified")) throw new Error("database is locked");
-      return original(sql) as never;
-    };
-    const fired = c.gate({ actionContext: "Bash:git push --force origin main" });
-    expect(fired.rules).toHaveLength(1);
-    db.prepare = original as never;
-    // The verdict survived; only the bookkeeping did not.
-    expect(c.stages()[0]!.verified).toBe(false);
-    c.close();
-  });
-
-  it("OVERWRITES a sidecar whose generation is ahead of what we are writing, same-store or foreign", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
-    await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    const current = read(path);
-
-    // rename() is atomic, but atomic is not ordered — that motivates COMPARING before replacing, not
-    // preserving whatever is already there. Multi-process is the shipped topology (WAL + busy_timeout,
-    // set in storage.ts's own constructor precisely so the MCP server and a `monet` CLI call can share
-    // one `.monet` DB), so a racing newer writer publishing between another call's snapshot and its
-    // rename is real, not theoretical — see materializeGateMirror's own comment and the dedicated
-    // race test in "the sidecar generation contract" below, which pins THAT half. HERE, nothing else
-    // is mutating: the fabricated file is ahead of the store's CURRENT generation too, with no
-    // legitimate writer behind it, so it is debris of an abandoned lineage (a restore or a rollback) —
-    // the same event class as the foreign case below — and it is overwritten.
-    const newer = { ...current, generation: current.generation + 5, entries: [] };
-    writeFileSync(path, JSON.stringify(newer), "utf8");
-    const result = c.materializeGateMirror(path);
-    expect(result.outcome).toBe("written");
-    expect(read(path).generation).toBe(current.generation); // the store's own count, not the fabricated one
-    expect(read(path).entries).toHaveLength(1);              // the store's real deny, not the fabricated empty set
-    expect(readdirSync(dir)).toEqual(["gate-sidecar.json"]);  // and no temp file left behind
-
-    // A file from ANOTHER store is not ours to defer to either, however high its number — identity
-    // already gated the preservation rule before generation did, and still does.
-    writeFileSync(path, JSON.stringify({ ...newer, storeIdentity: "machine-b" }), "utf8");
-    c.materializeGateMirror(path);
-    expect(read(path).storeIdentity).toBe("machine-a");
-    expect(read(path).entries).toHaveLength(1);
-    c.close();
-  });
-
-  /**
-   * FILE PERMISSIONS (Codex round 7, item 5, corrected by round 8, item 1) — reusing
-   * source-materializer's own precedent MECHANISM:
-   * mode supplied at creation time, never chmod-after. 0600 on the FILE defends against other local
-   * accounts and backup tooling reading the mirror's content — never against the agent itself (same
-   * uid) — the boundary doc's own framing, unchanged here. Three orthogonal cases, matching
-   * materializeGateMirror's own comment: a freshly-created directory (0700, since this call is the
-   * one minting it), a pre-existing directory (left exactly as it is — round 7 tightened it, which
-   * overreached on a caller-supplied, possibly-shared path; round 8 corrected that), and a
-   * pre-existing too-loose FILE (inherits the tight mode via rename regardless, no separate chmod
-   * call — this is the actual confidentiality boundary, not the directory).
-   */
-  it("writes the mirror file at 0600 and its directory at 0700, freshly created (Codex round 7, item 5)", async () => {
-    const dir = join(mkTmp(), "fresh-nested"); // does not exist yet: exercises mkdirSync's OWN mode
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    expect(read(path).entries).toHaveLength(1); // the hardening did not break the substantive write
-    if (process.platform !== "win32") {
-      expect(statSync(path).mode & 0o777).toBe(0o600);
-      expect(statSync(dir).mode & 0o777).toBe(0o700);
-    }
-    c.close();
-  });
-
-  it("leaves a pre-existing mirror directory's permissions untouched — the file's own 0600 is the confidentiality boundary, not the directory (Codex round 8, item 1)", async () => {
-    if (process.platform === "win32") return; // chmod bits are not meaningful on this platform
-    const dir = join(mkTmp(), "already-there");
-    mkdirSync(dir, { mode: 0o755 }); // simulates an ordinary, caller-owned directory predating this fix
-    expect(statSync(dir).mode & 0o777).toBe(0o755);
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    // UNTOUCHED, not tightened — round 7 chmod'd this to 0700, which overreached: `gateSidecarPath`
-    // is caller-supplied and `dir` may be `$HOME`, a project directory, or any other shared location
-    // the caller populated with unrelated content, none of it this module's to seize. See
-    // materializeGateMirror's own comment for why leaving it alone does not reopen the confidentiality
-    // gap the fix exists to close — the FILE's own 0600, asserted below, is the actual boundary.
-    expect(statSync(dir).mode & 0o777).toBe(0o755);
-    expect(statSync(path).mode & 0o777).toBe(0o600);
-    expect(read(path).entries).toHaveLength(1);
-    c.close();
-  });
-
-  it("a rename onto a pre-existing looser-permissioned mirror file tightens it to 0600 too, with no separate chmod (Codex round 7, item 5)", async () => {
-    if (process.platform === "win32") return;
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    writeFileSync(path, JSON.stringify({ format: GATE_MIRROR_FORMAT, generation: 0, entries: [] }), { mode: 0o644 });
-    expect(statSync(path).mode & 0o777).toBe(0o644);
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    // Inherited from the freshly-written 0600 tmp file via rename — see the "TARGET INHERITS 0600
-    // VIA RENAME" comment at materializeGateMirror's own renameSync call.
-    expect(statSync(path).mode & 0o777).toBe(0o600);
-    expect(read(path).entries).toHaveLength(1);
-    c.close();
-  });
-
-  /**
-   * EXCLUSIVE, UNPREDICTABLE TMP CREATION (Codex round 9, item 1, P1) — the composition hole round
-   * 7 + round 8 opened between them: round 7 rejected `O_EXCL` reasoning the (then-tightened) 0700
-   * directory already closed the preplant window; round 8 correctly removed that tightening on its
-   * own separate terms; neither round was wrong alone, but together the tmp write was left with no
-   * exclusivity of its own AND no directory protection. `Date.now()` and `crypto.randomUUID()` are
-   * both pinned so the exact tmp path materializeGateMirror will attempt is known in advance —
-   * otherwise a test cannot pre-plant at the right path at all, which is itself part of what makes a
-   * REAL random suffix safe (an attacker cannot do what this test setup does).
-   */
-  it("refuses to write the mirror through a pre-planted regular file at the tmp path — its content survives untouched, and materialize throws named (Codex round 9, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    // DECLARE FIRST, mock SECOND — `store()`/`declare()` mint their own concept/binding ids via this
-    // SAME `randomUUID` (engine.ts's `this.newId`), so this runs with the REAL implementation still
-    // in effect, before the module-level mock's `mockReturnValueOnce` is ever armed.
-    await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-
-    const fixedNow = 1732000000000;
-    const fixedUuid = "11111111-1111-1111-1111-111111111111";
-    // PERSISTENT for Date.now (materializeGateMirror calls it twice — once for `generatedAt`, once
-    // for the tmp suffix — both need the SAME value), explicitly restored below. ONCE ONLY for
-    // randomUUID — see the module-level `vi.mock` comment for why anything more persistent here
-    // would be file-wide unsafe.
-    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(fixedNow);
-    try {
-      vi.mocked(nodeCrypto.randomUUID).mockReturnValueOnce(fixedUuid as `${string}-${string}-${string}-${string}-${string}`);
-      const plantedTmp = join(dir, `.${basename(path)}.${process.pid}.${fixedNow}.${fixedUuid}.tmp`);
-      const plantedContent = "NOT A GATE MIRROR — planted ahead of the exclusive-create attempt";
-      writeFileSync(plantedTmp, plantedContent, "utf8");
-
-      // materializeGateMirror() DIRECTLY, not through declare()'s own refreshGateSidecar() — that
-      // path wraps materializeGateMirror in a try/catch that deliberately swallows failures (see
-      // refreshGateSidecar's own comment, engine.ts), which would hide the very throw this test
-      // exists to pin.
-      expect(() => c.materializeGateMirror(path)).toThrow(/freshly-randomized path/);
-      // THE PLANTED FILE'S CONTENT IS UNCHANGED — the write never went through it. `wx` failing
-      // means writeFileSync did not touch the existing inode at all, not merely "reverted" it.
-      expect(readFileSync(plantedTmp, "utf8")).toBe(plantedContent);
-      // THE REAL TARGET WAS NEVER CREATED EITHER — materialize failed before ever reaching rename.
-      expect(existsSync(path)).toBe(false);
-    } finally {
-      nowSpy.mockRestore();
-      c.close();
-    }
-  });
-
-  it("refuses to write the mirror through a pre-planted symlink at the tmp path — the symlink's victim target survives untouched, and materialize throws named (Codex round 9, item 1)", async () => {
-    if (process.platform === "win32") return; // symlink semantics are not this test's concern there
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-
-    const fixedNow = 1732000000001;
-    const fixedUuid = "22222222-2222-2222-2222-222222222222";
-    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(fixedNow);
-    try {
-      vi.mocked(nodeCrypto.randomUUID).mockReturnValueOnce(fixedUuid as `${string}-${string}-${string}-${string}-${string}`);
-      const victim = join(mkTmp(), "victim.txt"); // a DIFFERENT directory — the classic symlink-escape shape
-      const victimContent = "the attacker's real target, elsewhere on disk";
-      writeFileSync(victim, victimContent, "utf8");
-      const plantedTmp = join(dir, `.${basename(path)}.${process.pid}.${fixedNow}.${fixedUuid}.tmp`);
-      symlinkSync(victim, plantedTmp);
-
-      expect(() => c.materializeGateMirror(path)).toThrow(/freshly-randomized path/);
-      // THE VICTIM FILE — what the symlink actually points at — IS UNCHANGED: `wx` refuses a
-      // pre-existing symlink at the leaf path WITHOUT following it (POSIX, cited in the mechanism's
-      // own comment), so the write never reaches the far end at all.
-      expect(readFileSync(victim, "utf8")).toBe(victimContent);
-      expect(existsSync(path)).toBe(false);
-    } finally {
-      nowSpy.mockRestore();
-      c.close();
-    }
-  });
-
-  it("re-materializes the mirror after a circle move, like every other bump site", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, defaultCircle: "proj" });
-    const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    expect(read(path).entries[0]!.circle).toBe("proj");
-
-    c.reassignCircle(deny.conceptId, "elsewhere");
-    // Detection already covered this (isSidecarStale would have said so), but a mirror that goes
-    // stale on an ordinary move and waits to be asked is not the contract the other sites keep.
-    expect(c.isSidecarStale().stale).toBe(false);
-    expect(read(path).entries[0]!.circle).toBe("elsewhere");
-    c.close();
-  });
-
-  it("bounds how many patterns one stage can carry", async () => {
-    const c = core();
-    const many = Array.from({ length: 33 }, (_, i) => `Bash:tool${i} run`);
-    // Every gate lookup scans every pattern of every stage, so an unbounded array is an unbounded
-    // per-action cost any declaration could inflict.
-    await expect(c.declare({ species: "stage", stage: "too many", patterns: many }))
-      .rejects.toThrow(/at most 32 trigger patterns \(got 33\)/);
-    await c.declare({ species: "stage", stage: "just enough", patterns: many.slice(0, 32) });
-    expect(c.stages()[0]!.patterns).toHaveLength(32);
-
-    // A row that arrived some other way is CLAMPED rather than rejected, and the overflow is
-    // counted so it surfaces in curation instead of vanishing.
-    const stageId = c.stages()[0]!.id;
-    raw(c).prepare(`UPDATE stages SET trigger_patterns = ? WHERE id = ?`).run(
-      JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ tool: "bash", tokens: [`tool${i}`, "run"] }))),
-      stageId,
-    );
-    expect(parseTriggerPatterns(
-      (raw(c).prepare(`SELECT trigger_patterns AS p FROM stages WHERE id = ?`).get(stageId) as { p: string }).p,
-    )).toHaveLength(32);
-    expect(c.gateCoverage().malformedPatterns[0]).toMatchObject({ stageId, malformed: 8 });
-    c.close();
-  });
-});
-
 describe("receipt replay", () => {
   it("returns the SAME rule outcome on a retried operationId", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
       operationId: "op-capture-1",
     });
     expect(rule.ruleBindingChange).toEqual({
@@ -5730,7 +4592,7 @@ describe("receipt replay", () => {
   it("replays a DOWNGRADE faithfully — the one transition the substrate cannot re-derive", async () => {
     const c = resolvingCore();
     await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     const downgrade = await c.store("Never delete a tree unattended.", {
@@ -5756,7 +4618,7 @@ describe("receipt replay", () => {
   it("replays a NARROWING (from breadth) faithfully — the other transition the substrate cannot re-derive", async () => {
     const c = resolvingCore();
     await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     const narrowed = await c.store("Never delete a tree unattended.", {
@@ -5785,7 +4647,7 @@ describe("receipt replay", () => {
   it("replays A's narrowing faithfully even after a LATER operation B widens the SAME rule back to breadth (Codex round 12, item 3)", async () => {
     const c = resolvingCore();
     await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     // OPERATION A: narrows the global rule to 'default'.
@@ -5829,7 +4691,7 @@ describe("receipt replay", () => {
   it("replays A's downgrade faithfully even after a LATER operation B re-declares the SAME rule blocking (Codex round 12, item 4)", async () => {
     const c = resolvingCore();
     await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     // OPERATION A: downgrades the rule to advisory.
@@ -5890,10 +4752,10 @@ describe("receipt replay", () => {
     // The ambiguous band the 5-B flagging block uses: the flag rides a fork's near-match.
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
     const first = await c.store("Verify the built artifact after the source changes.", {
-      kind: "rule", rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain" },
+      kind: "rule", rule: { stage: "docker build", scope: "domain" },
     });
     const second = await c.store("After the source changes, verify the artifact itself.", {
-      kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      kind: "rule", rule: { stage: "npm install", scope: "domain" },
       operationId: "op-extraction-1",
     });
     expect(second.extractionCandidate).toEqual({ pairedRuleId: first.conceptId, score: second.nearMatchScore });
@@ -5920,7 +4782,7 @@ describe("receipt replay", () => {
     // the fresh call reported nothing. A replay reading `near_match_id` alone would invent one.
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
     await c.store("Verify the built artifact after the source changes.", {
-      kind: "rule", rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain" },
+      kind: "rule", rule: { stage: "docker build", scope: "domain" },
     });
     const second = await c.store("After the source changes, verify the artifact itself.", {
       kind: "rule", rule: { stage: "docker build", scope: "domain" }, operationId: "op-same-stage-1",
@@ -5939,7 +4801,7 @@ describe("receipt replay", () => {
     const declared = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation.", declaredBy: "john" });
     if (declared.species !== "principle") throw new Error("unreachable");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: declared.conceptId, dstConceptId: rule.conceptId, bornOf: "extraction" });
 
@@ -5971,7 +4833,7 @@ describe("receipt replay", () => {
   it("omits impeachedPrincipleIds on replay when the correction impeached nothing", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     const correction = await c.store("Force-push is fine on your own branch; never on a shared one.", {
       kind: "correction", attachTo: rule.conceptId, operationId: "op-no-impeach-1",
@@ -5996,15 +4858,16 @@ describe("the chokepoint: every door is a call site", () => {
    */
   async function liveDeny(c: MonetCore) {
     const r = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
     });
     if (r.species !== "rule") throw new Error("unreachable");
     return r;
   }
+  /** How many DENIES this store still delivers at the battery's one stage, in `circle`. */
   const fires = (c: MonetCore, circle?: string): number =>
-    c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle }).rules.filter((rule) => rule.severity === "blocking").length;
+    c.stageLookup({ stage: "rm -rf", circle }).rules.filter((rule) => rule.severity === "blocking").length;
 
   it("refuses every LOCAL operation that would remove a live deny, and the deny survives each", async () => {
     const c = resolvingCore();
@@ -6149,7 +5012,7 @@ describe("the chokepoint: every door is a call site", () => {
   it("MOVES a BREADTH-bound live deny into an archived circle — that move takes delivery from nowhere", async () => {
     const c = resolvingCore();
     const declared = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
     });
@@ -6293,15 +5156,17 @@ describe("the chokepoint: every door is a call site", () => {
     // The deny still fires under its ORIGINAL scope semantics — for the model it was declared for,
     // and (the attempted rewrite's target) not for the one the forged row tried to re-tag it to.
     const denies = (tag: string): string[] => dst
-      .gate({ actionContext: "Bash:rm -rf /tmp/x", runtimeModelTag: tag })
+      .stageLookup({ stage: "rm -rf", runtimeModelTag: tag })
       .rules.filter((r) => r.severity === "blocking").map((r) => r.conceptId);
     expect(denies(AGENT_RULE.modelTag)).toEqual([deny.conceptId]);
     expect(denies("some-other-model")).toEqual([]);
 
-    // RELAYED STAGE RE-AIM (door 10) — the last member of the class. The chokepoint stops a relayed
-    // act from REMOVING a deny; this stops one from silently changing what a deny denies, which is
-    // the same authority reached by a different mechanism. Locally this needs
-    // acknowledgeBlockingRules; a grafted row carries no acknowledgment.
+    // RELAYED STAGE RE-AIM (door 10) — the last member of the class, and now the ONLY member. The
+    // chokepoint stops a relayed act from REMOVING a deny; this stops one from silently changing
+    // what a deny denies, which is the same authority reached by a different mechanism. The LOCAL
+    // twin of this guard retired with trigger patterns (see the PATH 2 note above) because the act
+    // it refused cannot be performed here any more. THIS one stays reachable: an older peer still
+    // sends real pattern sets, which is exactly what the forged row below is.
     const stageId = dst.stages().find((st) => st.name === "rm -rf")!.id;
     const stageRow = dst.exportDelta(0).stages!.find((st) => st.id === stageId)!;
     const reaim = dst.graftRows({
@@ -6314,9 +5179,12 @@ describe("the chokepoint: every door is a call site", () => {
       }],
     });
     expect(reaim.skipped.stages).toBeGreaterThan(0);
-    // The deny still fires on the patterns it was DECLARED against.
+    // The deny still stands, and the forged value never reached the row. Read off the column
+    // itself: a StageView carries no patterns any more, and the column is the only place the
+    // challenger's bytes could have landed.
     expect(fires(dst)).toBe(1);
-    expect(dst.stages().find((st) => st.id === stageId)!.patterns).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
+    expect(raw(dst).prepare(`SELECT trigger_patterns FROM stages WHERE id = ?`).get(stageId))
+      .toEqual({ trigger_patterns: RETIRED_TRIGGER_PATTERNS });
 
     // The LOCAL declaration path still withdraws it — that is the point of refusing the relay
     // rather than refusing the withdrawal: this machine decides about this machine's deny.
@@ -6334,30 +5202,42 @@ describe("the chokepoint: every door is a call site", () => {
     const dst = core({ syncDeviceId: "machine-b" });
     // An ADVISORY-only stage converges normally — the guard is about deny power, not about stages.
     await src.store("Pull before you push.", {
-      kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git push", ...AGENT_RULE },
     });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     dst.graftRows(src.exportDelta(0));
 
-    await src.declare({ species: "stage", stage: "git push", patterns: ["Bash:git push --all"] });
-    dst.graftRows(src.exportDelta(0));
-    expect(dst.stages().find((st) => st.name === "git push")!.patterns)
-      .toEqual([{ tool: "bash", tokens: ["git", "push", "--all"] }]);
+    // THE SAME FORGED SHAPE, on an ADVISORY-only stage. Nothing local authors patterns any more,
+    // so this is an OLDER PEER's row — the only thing that can still produce a differing
+    // `trigger_patterns` — and it must converge, because the guard is about deny power and this
+    // stage carries none.
+    const pushId = src.stages().find((st) => st.name === "git push")!.id;
+    const pushRow = src.exportDelta(0).stages!.find((st) => st.id === pushId)!;
+    const relayed = JSON.stringify([{ tool: "bash", tokens: ["git", "push", "--all"] }]);
+    dst.graftRows({
+      ...src.exportDelta(0),
+      stages: [{
+        ...pushRow,
+        trigger_patterns: relayed,
+        sync_revision: (pushRow.sync_revision ?? 0) + 5,
+        sync_writer: "zzz-newer-writer",
+      }],
+    });
+    expect(raw(dst).prepare(`SELECT trigger_patterns FROM stages WHERE id = ?`).get(pushId))
+      .toEqual({ trigger_patterns: relayed });
 
-    // A pattern-IDENTICAL row on a blocking-bound stage still converges, including verified-OR:
-    // there is no re-aim in it, so there is nothing to refuse.
-    // The verified flag is the proof: the guard `continue`s BEFORE the monotonic-OR update, so the
-    // flag arriving at all means the row was not refused. (The row counts as skipped either way —
-    // an unchanged replay loses the revision contest — which is why the counter cannot be the
-    // assertion here.)
-    expect(dst.stages().find((st) => st.name === "rm -rf")!.verified).toBe(false);
-    src.gate({ actionContext: "Bash:rm -rf /tmp/x" }); // verifies the stage on the sender
-    dst.graftRows(src.exportDelta(0));
-    expect(dst.stages().find((st) => st.name === "rm -rf")!.verified).toBe(true);
+    // A pattern-IDENTICAL row on a blocking-bound stage still converges: there is no re-aim in it,
+    // so the guard has nothing to refuse. The guard `continue`s BEFORE the upsert, so a row that
+    // LANDS proves it was never refused — and landing is only observable on a row that can win the
+    // (revision, writer) contest, which is what `bumpStageRevision` manufactures. An unchanged
+    // replay loses that contest and counts as skipped whether the guard refused it or not, which is
+    // why the counter alone cannot carry this assertion.
+    bumpStageRevision(src, src.stages().find((st) => st.name === "rm -rf")!.id);
+    expect(dst.graftRows(src.exportDelta(0)).inserted.stages).toBe(1);
     src.close();
     dst.close();
   });
@@ -6397,7 +5277,7 @@ describe("the chokepoint: every door is a call site", () => {
   it("leaves ADVISORY rules and ordinary concepts completely alone", async () => {
     const c = resolvingCore();
     const advisory = await c.store("An advisory rule.", {
-      kind: "rule", rule: { stage: "rm -rf", instance: "Bash:rm -rf", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE },
     });
     const fact = await c.store("An ordinary fact.", { kind: "fact" });
     // The guard is about deny power, not about rules in general — an advisory rule retires freely.
@@ -6423,7 +5303,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.1 refuses '*' minted from every non-declaration origin, severity flipped to advisory to prove the circle check does not ride on the (separate) blocking-only guard", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -6449,7 +5329,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     const fact = await src.store("An ordinary fact.", { kind: "fact" });
     const insight = await src.store("An ordinary insight.", { kind: "insight" });
     const rule = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "advisory", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -6491,7 +5371,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     for (const startSeverity of ["blocking", "advisory"] as const) {
       const src = core({ syncDeviceId: "machine-a" });
       const rule = await src.declare({
-        species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+        species: "rule", stage: "rm -rf",
         content: "Never delete a tree unattended.", severity: startSeverity,
         ...(startSeverity === "blocking" ? { reason: "there is no undo" } : {}),
         ...AGENT_RULE,
@@ -6554,7 +5434,7 @@ describe("DOOR 13: the breadth graft surface", () => {
         const label = `${startSeverity}/${circleField}`;
         const src = core({ syncDeviceId: "machine-a" });
         const rule = await src.declare({
-          circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+          circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
           content: "Never delete a tree unattended.", severity: startSeverity,
           ...(startSeverity === "blocking" ? { reason: "there is no undo" } : {}),
           ...AGENT_RULE,
@@ -6612,7 +5492,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.5 an old-protocol dangling deny (circle absent, reason absent) fires and discloses the moment its concept lands — no reopen required", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -6641,7 +5521,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     dst.graftRows(oldProtocol as never);
     expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("default");
 
-    const fired = dst.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    const fired = dst.stageLookup({ stage: "rm -rf" });
     expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
     expect(fired.rules[0]).toMatchObject({ severity: "blocking", reasonMissing: true });
 
@@ -6652,10 +5532,16 @@ describe("DOOR 13: the breadth graft surface", () => {
     dst.close();
   });
 
-  it("13.6 a still-dangling NULL-circle binding is never a deliverable mirror entry", async () => {
+  /**
+   * A DANGLING BINDING GUARDS NOTHING AND MUST NOT BE OFFERED AS IF IT DID. The row is legal — it
+   * arrived ahead of its own concept — but until the concept lands there is no rule for it to name,
+   * so nothing may deliver it. The stage itself DOES land with the payload, so the empty answer
+   * below is a genuine stage-hit-no-rules rather than a lookup miss papering over the question.
+   */
+  it("13.6 a still-dangling NULL-circle binding is never delivered", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", ...AGENT_RULE,
     });
@@ -6680,16 +5566,16 @@ describe("DOOR 13: the breadth graft surface", () => {
       (raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null }).circle,
     ).toBeNull();
 
-    // Dangling right now: the row exists (it holds and guards nothing yet), but it must not be
-    // OFFERED as a deliverable entry — minor m1's exclusion, at the exact moment it matters.
-    const stale = dst.materializeGateMirror(join(mkTmp(), "m.json")).sidecar;
-    expect(stale.entries).toEqual([]);
+    // Dangling right now: the row exists (it holds and guards nothing yet), and delivery excludes
+    // it — at the exact moment it matters.
+    const stale = dst.stageLookup({ stage: "rm -rf" });
+    expect(stale.matched).toBe(true);
+    expect(stale.rules).toEqual([]);
 
     // ...and the moment the concept lands, in the SAME store, it is admitted (BLOCKER B3) — proving
     // the exclusion above was the dangling row being genuinely absent, not a bug hiding it forever.
     dst.graftRows(oldProtocol as never);
-    const settled = dst.materializeGateMirror(join(mkTmp(), "m.json")).sidecar;
-    expect(settled.entries.map((e) => e.conceptId)).toEqual([rule.conceptId]);
+    expect(dst.stageLookup({ stage: "rm -rf" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
     src.close();
     dst.close();
   });
@@ -6697,7 +5583,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.7 a legitimate '*' deny relays verbatim and fires in a circle the receiver never configured", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile present.", severity: "blocking",
       reason: "an unlocked install can pull an unreviewed transitive dependency", scope: "domain",
     });
@@ -6709,7 +5595,7 @@ describe("DOOR 13: the breadth graft surface", () => {
       circle: BREADTH_CIRCLE, severity: "blocking", origin: "declaration",
     });
 
-    const fired = dst.gate({ actionContext: "Bash:npm install", circle: "a-circle-the-receiver-never-configured" });
+    const fired = dst.stageLookup({ stage: "npm install", circle: "a-circle-the-receiver-never-configured" });
     expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
     src.close();
     dst.close();
@@ -6750,7 +5636,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     // the supersession edge together — the ordinary shape one incremental export produces.
     const src = core({ syncDeviceId: "machine-a" });
     const original = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
     });
     if (original.species !== "rule") throw new Error("unreachable");
@@ -6762,7 +5648,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     const result = dst.graftRows(payload);
     expect(result.skipped.rule_bindings).toBe(0);
     expect(dst.ruleBinding(corrected.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE, origin: "correction" });
-    expect(dst.gate({ actionContext: "Bash:npm install", circle: "a-circle-dst-never-configured" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "npm install", circle: "a-circle-dst-never-configured" }).rules.map((r) => r.conceptId))
       .toEqual([corrected.conceptId]);
 
     // FORGED: an ordinary unrelated local rule, relayed with a hand-forged circle:'*'/
@@ -6770,7 +5656,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     // dst — naming it as anyone's successor.
     const src2 = core({ syncDeviceId: "machine-c" });
     const ordinary = await src2.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "An ordinary local rule.", severity: "advisory", scope: "domain",
     });
     if (ordinary.species !== "rule") throw new Error("unreachable");
@@ -6814,7 +5700,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     // twice, so both sides genuinely share one src_concept_id to diverge over.
     const origin = core({ syncDeviceId: "machine-origin" });
     const shared = await origin.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
     });
     if (shared.species !== "rule") throw new Error("unreachable");
@@ -6858,7 +5744,7 @@ describe("DOOR 13: the breadth graft surface", () => {
 
     // NOTHING DELIVERS TWICE: src's own successor is the one live global rule, everywhere —
     // including a circle this fixture never otherwise configured.
-    expect(src.gate({ actionContext: "Bash:npm install", circle: "a-circle-src-never-configured" }).rules.map((r) => r.conceptId))
+    expect(src.stageLookup({ stage: "npm install", circle: "a-circle-src-never-configured" }).rules.map((r) => r.conceptId))
       .toEqual([successorA.conceptId]);
 
     // CONVERGENCE, VERIFIED: grafting src's delta back into challenger does NOT retroactively
@@ -6871,7 +5757,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     expect(reverseResult.skipped.lifecycle_edges).toBeGreaterThan(0);
     expect(reverseResult.skipped.rule_bindings).toBeGreaterThan(0);
     expect(challenger.ruleBinding(successorA.conceptId)).toBeNull();
-    expect(challenger.gate({ actionContext: "Bash:npm install", circle: "a-circle-challenger-never-configured" }).rules.map((r) => r.conceptId))
+    expect(challenger.stageLookup({ stage: "npm install", circle: "a-circle-challenger-never-configured" }).rules.map((r) => r.conceptId))
       .toEqual([successorB.conceptId]);
 
     origin.close(); src.close(); challenger.close();
@@ -6899,7 +5785,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.11 a legitimate owner narrowing relays and converges: B agrees; B's own stale ('*') delta replayed back at A does not resurrect it; a forged non-declaration transition is still held (Codex round 10, item 1)", async () => {
     const src = new MonetCore(":memory:", { syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
       ...AGENT_RULE,
     });
@@ -6970,7 +5856,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.12 an admitted declaration-origin narrowing lands at the CONCEPT's own actual circle on the receiver, not the row's claimed circle, when the two diverge (Codex round 11, item 6)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "advisory", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -7002,9 +5888,9 @@ describe("DOOR 13: the breadth graft surface", () => {
     expect(dst.ruleBinding(rule.conceptId)!.circle).toBe("y");
     // And it delivers from 'y', never from 'x' — the divergence would otherwise silently move the
     // rule's delivery to a circle its own concept never actually lived in on this store.
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "y" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "y" }).rules.map((r) => r.conceptId))
       .toContain(rule.conceptId);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "x" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "x" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
 
     src.close();
@@ -7025,7 +5911,7 @@ describe("DOOR 13: the breadth graft surface", () => {
   it("13.13 an admitted narrowing arrives while its own concept is STILL dangling — the binding lands NULL (never the row's claim, never a frozen '*'), and heals to wherever the concept actually lands, even when that differs from the narrowing's own claim (post-merge review round, P1, item d)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "advisory", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -7052,7 +5938,7 @@ describe("DOOR 13: the breadth graft surface", () => {
     // '*' (current?.circle, which would silently neutralize the very narrowing just admitted).
     const stillDangling = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
     expect(stillDangling.circle).toBeNull();
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
 
     // A CONCURRENT MOVE WINS ELSEWHERE, before the concept ever reaches B: it lands at
@@ -7064,9 +5950,9 @@ describe("DOOR 13: the breadth graft surface", () => {
     // HEALS TO 'actual-circle' — the concept's own real circle — never 'claimed-by-narrow'.
     const healed = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
     expect(healed.circle).toBe("actual-circle");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "actual-circle" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "actual-circle" }).rules.map((r) => r.conceptId))
       .toContain(rule.conceptId);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
 
     src.close();
@@ -7092,7 +5978,7 @@ describe("correcting a global rule inherits its breadth, not just its content", 
   it("correcting a global ADVISORY rule succeeds: the successor is '*', fires everywhere, and the supersession edge + disclosure are intact", async () => {
     const c = core();
     const original = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
     });
     if (original.species !== "rule") throw new Error("unreachable");
@@ -7112,13 +5998,13 @@ describe("correcting a global rule inherits its breadth, not just its content", 
     expect(edge).toMatchObject({ src_concept_id: original.conceptId, dst_concept_id: corrected.conceptId, family: "supersession" });
     // THE SUCCESSOR INHERITS BREADTH — the fix itself.
     expect(c.ruleBinding(corrected.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE, origin: "correction", severity: "advisory" });
-    // FIRES EVERYWHERE, including a circle this fixture never otherwise touches.
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+    // DELIVERS EVERYWHERE, including a circle this fixture never otherwise touches.
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
       .toEqual([corrected.conceptId]);
     // THE OLD RULE IS HISTORY — active, searchable, never injected again (existing doctrine,
     // unaffected by this fix — confirmed still true for a GLOBAL predecessor specifically).
     expect((await c.getConcept(original.conceptId))!.status).toBe("active");
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "default" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "default" }).rules.map((r) => r.conceptId))
       .toEqual([corrected.conceptId]); // the OLD concept id never appears
     c.close();
   });
@@ -7130,10 +6016,12 @@ describe("correcting a global rule inherits its breadth, not just its content", 
    * rather than assumed: there is no acknowledgment door that unlocks blocking-rule correction.
    * `ruleCorrectionVerdict` returns `"blocking"` — refused, UNCONDITIONALLY — for ANY blocking
    * incumbent, by explicit design ("Declaration is the only mutation path for a blocking rule, in
-   * both directions" — that function's own comment). `acknowledgeBlockingRules` is a REAL mechanism
-   * in this codebase, but for a different door entirely (re-authoring a STAGE's trigger patterns
-   * when blocking rules are bound to it — assertNoUnacknowledgedDenies), not for unlocking
-   * correction-based supersession of a blocking rule's CONTENT. succeedRule's own doc comment
+   * both directions" — that function's own comment). `acknowledgeBlockingRules` WAS a real mechanism
+   * in this codebase when this was written, but for a different door entirely (re-authoring a
+   * STAGE's trigger patterns when blocking rules were bound to it), never for unlocking
+   * correction-based supersession of a blocking rule's CONTENT. It has since retired with trigger
+   * patterns (2026-08-22), which makes the disagreement below stronger rather than weaker: the door
+   * the review imagined composing with does not exist at all now. succeedRule's own doc comment
    * already states the successor "cannot inherit blocking severity, because the incumbent could
    * never have been blocking" — this is a confirmed, pre-existing, deliberate invariant, not a gap
    * this round's fix should touch. What this test proves instead: that invariant survives this fix
@@ -7143,7 +6031,7 @@ describe("correcting a global rule inherits its breadth, not just its content", 
   it("correcting a global BLOCKING rule is still refused, unconditionally — declaration-only, unrelated to breadth (a correction to the review's own premise, not a gap this fix should close)", async () => {
     const c = core();
     const deny = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
       content: "Never install without a lockfile.", severity: "blocking", reason: "unlocked installs drift",
       scope: "domain",
     });
@@ -7151,9 +6039,9 @@ describe("correcting a global rule inherits its breadth, not just its content", 
     await expect(
       c.store("A challenger observation.", { kind: "correction", attachTo: deny.conceptId }),
     ).rejects.toThrow(/blocking rule.*cannot be corrected/s);
-    // UNCHANGED: still blocking, still global, still firing — the refusal left it exactly as it was.
+    // UNCHANGED: still blocking, still global, still delivered — the refusal left it exactly as it was.
     expect(c.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", circle: BREADTH_CIRCLE });
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId]);
     c.close();
   });
@@ -7179,7 +6067,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("a relayed row claiming a DIFFERENT local circle than its own concept converges to the concept — the deny STAYS in the concept's actual circle and still fires there (Codex round 1, item 3)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "circle-a", species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -7204,9 +6092,9 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
     expect((raw(dst).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle)
       .toBe("circle-a");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId]);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-b" }).rules).toEqual([]);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-b" }).rules).toEqual([]);
     src.close();
     dst.close();
   });
@@ -7214,7 +6102,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("a legitimate move — the concept row ALSO moves circles in the SAME payload — the binding follows it (Codex round 1, item 3)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "circle-a", species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -7229,9 +6117,157 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     const result = dst.graftRows(payload);
     expect(result.skipped.rule_bindings).toBe(0);
     expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-b");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-b" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-b" }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId]);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules).toEqual([]);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules).toEqual([]);
+    src.close();
+    dst.close();
+  });
+  /**
+   * THE MOVED CONCEPT THAT STRANDS ITS BINDING (Codex round 4, P1 — a safety regression this
+   * branch introduced). `trg_rule_bindings_follow_concept_circle` used to be the UNCONDITIONAL
+   * repair for exactly this: any write that moved `concepts.circle` dragged every non-breadth
+   * binding of that concept along with it, whatever else the same transaction did or refused to do.
+   * The removal audit that retired it enumerated a JS keep-in-step update on every writer of
+   * `concepts.circle` — but establishing that an update EXISTS on each path is not establishing
+   * that it always WINS, and on the graft path it does not.
+   *
+   * `concepts` and `rule_bindings` are versioned INDEPENDENTLY (separate `sync_revision`/
+   * `sync_writer` pairs, contested by separate INSERT ... WHERE clauses), so the concept row can
+   * win its own contest and MOVE while the binding row loses its own and stays put. The only other
+   * repair left in the concepts loop is `WHERE ... AND circle IS NULL` — it heals a DANGLING
+   * binding and deliberately never revisits one that already holds a value — so a binding with a
+   * non-null circle stays in the circle the concept LEFT, permanently: it delivers nowhere the
+   * concept now lives (RULE_LIVENESS_WHERE tests the BINDING's circle) and nothing ever re-selects
+   * it to try again. A blocking rule silently disappears from the circle it is supposed to guard.
+   */
+  it("a relayed concept move that WINS while its own binding row LOSES the convergence contest must not strand the binding in the circle the concept left (Codex round 4, P1)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: "circle-a", species: "rule", stage: "rm -rf",
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
+
+    // The concept moves on machine-a; both rows are stamped and relayed together, exactly as the
+    // "legitimate move" test above relays them.
+    src.reassignCircle(deny.conceptId, "circle-b");
+    const payload = src.exportDelta(0);
+    expect(payload.concepts.find((c) => c.id === deny.conceptId)?.circle).toBe("circle-b");
+
+    // BUT machine-b's own copy of the BINDING is already at this revision under its own writer id —
+    // the ordinary result of any local act on it (moveConcept and renameCircle both run
+    // `sync_revision = sync_revision + 1, sync_writer = <local device>`), or of a third device
+    // reaching this binding first. The relay's binding row therefore ties on revision and loses the
+    // writer tiebreak, while the CONCEPT row — carrying its own, unrelated counter — still wins.
+    const incumbent = raw(dst).prepare(
+      `SELECT sync_revision, sync_writer FROM rule_bindings WHERE concept_id = ?`,
+    ).get(deny.conceptId) as { sync_revision: number; sync_writer: string | null };
+    const bindingRow = payload.ruleBindings!.find((b) => b.concept_id === deny.conceptId)!;
+    const result = dst.graftRows({
+      ...payload,
+      ruleBindings: [{
+        ...bindingRow,
+        sync_revision: incumbent.sync_revision,
+        sync_writer: incumbent.sync_writer ?? "",
+      }],
+    });
+    // The binding row genuinely lost: the graft counted it as skipped, not landed.
+    expect(result.inserted.rule_bindings).toBe(0);
+    expect(result.skipped.rule_bindings).toBe(1);
+    // The concept genuinely moved.
+    expect((raw(dst).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle)
+      .toBe("circle-b");
+
+    // THE REGRESSION: without the repair the binding still reads "circle-a", and the deny fires in
+    // the circle the concept LEFT while the circle it now lives in is unguarded.
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-b");
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-b" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules).toEqual([]);
+    src.close();
+    dst.close();
+  });
+
+  /**
+   * THE SECOND DOOR ONTO THE SAME STRAND: the binding row does not lose a contest, it never reaches
+   * the contest at all. DOOR 12 (`current?.severity === 'blocking'`) `continue`s past the INSERT
+   * for any incoming row that reclassifies a live deny — correctly, since cross-device rescoping is
+   * not a merge decision. But the CONCEPT's move is a separate, already-accepted fact, and refusing
+   * the reclassification must not also freeze the incumbent deny in a circle its concept has left.
+   */
+  it("a relayed concept move whose binding row is refused by the deny guard must still carry the incumbent deny into the concept's new circle (Codex round 4, P1)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: "circle-a", species: "rule", stage: "rm -rf",
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
+
+    src.reassignCircle(deny.conceptId, "circle-b");
+    const payload = src.exportDelta(0);
+    const bindingRow = payload.ruleBindings!.find((b) => b.concept_id === deny.conceptId)!;
+    // Re-aimed at a different stage — a reclassification DOOR 12 refuses outright, however high its
+    // revision runs.
+    const result = dst.graftRows({
+      ...payload,
+      ruleBindings: [{
+        ...bindingRow, stage_id: "some-other-stage",
+        sync_revision: (bindingRow.sync_revision ?? 0) + 50, sync_writer: "machine-z",
+      }],
+    });
+    expect(result.skipped.rule_bindings).toBe(1);
+    // The refusal held: severity, stage and scope are the incumbent's, untouched.
+    expect(dst.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking" });
+    expect((raw(dst).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle)
+      .toBe("circle-b");
+    // ...and the deny followed its concept anyway.
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-b");
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-b" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules).toEqual([]);
+    src.close();
+    dst.close();
+  });
+
+  /**
+   * THE BREADTH BINDING IS THE ONE THAT MUST NOT FOLLOW, and the repair has to keep it that way —
+   * the retired trigger's own `circle != '*'` exclusion, and moveConcept's and renameCircle's
+   * identical `WHERE ... AND circle != '*'`, all encode the same doctrine: a global binding's reach
+   * is a property of the BINDING, independent of wherever its concept happens to be filed, so
+   * moving the concept must never narrow it back down to one circle.
+   */
+  it("a relayed concept move never narrows a GLOBAL binding down to the concept's new circle (Codex round 4, P1 — the exclusion the repair must keep)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
+      scope: "domain",
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+    const homeCircle = (raw(src).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle;
+
+    src.reassignCircle(deny.conceptId, "circle-b");
+    const payload = src.exportDelta(0);
+    expect(payload.concepts.find((c) => c.id === deny.conceptId)?.circle).toBe("circle-b");
+    expect(homeCircle).not.toBe("circle-b");
+    // The binding row is stripped so ONLY the concept's move lands — isolating the repair.
+    dst.graftRows({ ...payload, ruleBindings: [] } as never);
+
+    expect((raw(dst).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle)
+      .toBe("circle-b");
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
     src.close();
     dst.close();
   });
@@ -7239,7 +6275,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("the SAME divergence, for an ADVISORY binding — non-breadth means non-breadth regardless of severity too (Codex round 1, item 3)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "circle-a", species: "rule", stage: "rm -rf",
       content: "Confirm before deleting.", severity: "advisory", ...AGENT_RULE,
     });
     if (rule.species !== "rule") throw new Error("unreachable");
@@ -7257,7 +6293,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     });
     expect(result.skipped.rule_bindings).toBe(0);
     expect(dst.ruleBinding(rule.conceptId)!.circle).toBe("circle-a");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-a" }).rules.map((r) => r.conceptId))
       .toEqual([rule.conceptId]);
     src.close();
     dst.close();
@@ -7277,7 +6313,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("a binding-first graft: the row claims one circle while dangling, but its concept later lands in a DIFFERENT circle — the binding heals to the concept's ACTUAL circle, never freezing the row's stale claim (post-merge review round, P1)", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const rule = await src.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
       circle: "claimed",
     });
@@ -7293,7 +6329,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     // NULL, not 'claimed' — the fix itself (was `row.circle` before this round).
     const dangling = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
     expect(dangling.circle).toBeNull();
-    expect(dst.gate({ actionContext: "Bash:npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
 
     // A CONCURRENT MOVE WINS ELSEWHERE, before the receiver ever sees the concept at all.
@@ -7307,9 +6343,9 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     // HEALS TO 'actual' — the concept's own real circle — never 'claimed', the row's stale guess.
     const healed = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
     expect(healed.circle).toBe("actual");
-    expect(dst.gate({ actionContext: "Bash:npm install", circle: "actual" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "npm install", circle: "actual" }).rules.map((r) => r.conceptId))
       .toContain(rule.conceptId);
-    expect(dst.gate({ actionContext: "Bash:npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
       .not.toContain(rule.conceptId);
     src.close();
     dst.close();
@@ -7330,7 +6366,7 @@ describe("relayed circle divergence: the concept is authoritative", () => {
   it("renameCircle's rule_bindings update is stamped for sync too — a rename relayed to a peer moves the binding, not only the concept", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const deny = await src.declare({
-      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "circle-a", species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -7345,1378 +6381,53 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     expect(result.skipped.rule_bindings).toBe(0);
     expect(result.inserted.rule_bindings).toBe(1);
     expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-renamed");
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-renamed" }).rules.map((r) => r.conceptId))
+    expect(dst.stageLookup({ stage: "rm -rf", circle: "circle-renamed" }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId]);
     src.close();
     dst.close();
   });
 });
 
-describe("the sidecar generation contract", () => {
-  const read = (path: string): GateMirror => JSON.parse(readFileSync(path, "utf8")) as GateMirror;
-
-  it("bumps exactly once per mutation class, and not at all for unrelated writes", async () => {
-    const c = resolvingCore();
-    const at = (): number => c.sidecarGeneration();
-    const start = at();
-
-    // AN ADVISORY RULE IS MIRROR CONTENT TOO, as of format 4 (entries carries every live rule, both
-    // severities — no longer "an advisory rule is not deny power: nothing to mirror, nothing to
-    // bump", which was the correct read only while the mirror was blocking-only). This one call
-    // creates a NEW stage ("rm -rf" did not exist) AND a new binding — two mirror-relevant writes,
-    // two bumps. An ordinary FACT touches neither `stages` nor `rule_bindings`, so it still bumps
-    // nothing — that half of "not at all for unrelated writes" is unchanged.
-    await c.store("An advisory rule.", { kind: "rule", rule: { stage: "rm -rf", instance: "Bash:rm -rf", ...AGENT_RULE } });
-    const afterAdvisoryRule = at();
-    expect(afterAdvisoryRule).toBe(start + 2);
-    await c.store("An ordinary fact.", { kind: "fact" });
-    expect(at()).toBe(afterAdvisoryRule);
-
-    // 1. a blocking binding appears, on a NEW stage — new stage (+1) and new binding (+1), same as
-    //    the advisory case above: severity does not change what counts as mirror-relevant creation.
-    const deny = await c.declare({
-      species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
-      content: "Never apply without a plan review.", severity: "blocking",
-      reason: "an unreviewed apply changes infrastructure nobody agreed to change", ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    const afterDeclare = at();
-    expect(afterDeclare).toBe(afterAdvisoryRule + 2);
-
-    // 2. patterns change on a stage that carries a deny — unchanged from before: a stage carrying a
-    //    live blocking rule already bumped under the old, narrower gate, and still does under the
-    //    new, wider one (every stage's patterns are mirror content now, not only a denying stage's).
-    await c.declare({
-      species: "stage", stage: "terraform apply", patterns: ["terraform apply", "terraform destroy"],
-      acknowledgeBlockingRules: [deny.conceptId],
-    });
-    const afterPatterns = at();
-    expect(afterPatterns).toBe(afterDeclare + 1);
-    // ...but a no-op re-declaration of the SAME patterns changes nothing, so it bumps nothing —
-    // upsertStage's own no-op guard (`nextPatterns === existing.trigger_patterns`) short-circuits
-    // before any bump decision is even reached, unaffected by this slice's widening.
-    await c.declare({
-      species: "stage", stage: "terraform apply", patterns: ["terraform apply", "terraform destroy"],
-      acknowledgeBlockingRules: [deny.conceptId],
-    });
-    expect(at()).toBe(afterPatterns);
-
-    // 3. moving the rule between circles rewrites the entry's `circle` field — unchanged: this rule
-    //    is blocking, so both the old and new liveness predicate agree it is mirror-relevant.
-    c.reassignCircle(deny.conceptId, "elsewhere");
-    const afterMove = at();
-    expect(afterMove).toBe(afterPatterns + 1);
-
-    // 4. an explicit downgrade — the only way to take deny power off a live rule. +2, not +1, as of
-    //    Codex round 10, items 2+3: withdrawDeny's own store() call reaches bindRule's "replace"
-    //    branch, changing `severity` — one of the seven columns `trg_rule_bindings_bump_on_
-    //    reclassification` now also watches. That trigger composes with bindRule's OWN kept bump
-    //    (see that branch's own comment, gates.ts, for why — unlike every other case in this
-    //    family — the JS-side call could not be safely removed) rather than replacing it: a
-    //    genuine, single reclassification act now bumps twice, an accepted, documented cost, not a
-    //    regression. `afterDowngrade` still anchors every later delta below by its own actual value,
-    //    not by a hardcoded absolute, so nothing downstream needed to change.
-    await withdrawDeny(c, deny.conceptId, "terraform apply", "elsewhere");
-    const afterDowngrade = at();
-    expect(afterDowngrade).toBe(afterMove + 2);
-
-    // 5. RETIRE, now that the deny has been withdrawn and retirement is ordinary cleanup. THIS is
-    //    where format 4 changes the count: the rule is ADVISORY now (not blocking) since step 4, so
-    //    the OLD blocking-only gate (hasBlockingBinding) would have seen no bump owed here — "the
-    //    rule stopped being in the mirror at the downgrade" was true when the mirror was
-    //    blocking-only. It is NOT true any more: the advisory rule is very much in `entries` after
-    //    the downgrade, and retiring it is what removes it now — so THIS bumps, where it used not to.
-    c.retireConcept(deny.conceptId);
-    const afterRetire = at();
-    expect(afterRetire).toBe(afterDowngrade + 1);
-
-    // ...and an ordinary NEW advisory rule write ALSO bumps now — on the EXISTING "rm -rf" stage, so
-    // only the binding is new (+1, not +2). This is the other half of what "not at all for unrelated
-    // writes" used to mean: an all-advisory write was UNRELATED to a blocking-only mirror. It is not
-    // unrelated to this one. Text deliberately dissimilar from "An advisory rule." above — this is
-    // resolvingCore, and a near-paraphrase would resolve onto the SAME concept (bindRule's `keep`
-    // branch, a genuine no-op that bumps nothing), which would test attach-dedup instead of this.
-    await c.store("Confirm before force-deleting a mounted volume.", { kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE } });
-    const afterNewAdvisoryRule = at();
-    expect(afterNewAdvisoryRule).toBe(afterRetire + 1);
-    // A FACT remains genuinely unrelated: it never touches stages or rule_bindings, retired or not.
-    c.retireConcept((await c.store("A throwaway fact.", { kind: "fact" })).conceptId);
-    expect(at()).toBe(afterNewAdvisoryRule);
-    c.close();
-  });
-
-  /**
-   * THE MIRROR MUST STOP GOING STALE ON A RETITLE, EVERYWHERE ONE CAN HAPPEN (Codex round 6, item 1;
-   * closing the family round 2, item 4 opened). noteRuleTouched bumps the IN-MEMORY generation
-   * counter — that alone changes nothing ON DISK until something calls refreshGateSidecar(). Four
-   * call sites wrote noteRuleTouched but never that follow-up call: detach()'s partial-detach
-   * (source-survives) branch, resolveContradiction's explicit-body-override branch, applySynthesis
-   * (the agent-facing MCP twin), and synthesizeRow's own two callers (getConcept's lazy synthesis,
-   * checkpoint's batch). Each is proven directly below: a configured sidecar path, the retitling
-   * act, then reading the FILE ON DISK (not sidecarGeneration(), which only proves the IN-MEMORY
-   * counter moved) for the recomputed title, with no intervening unrelated mutation.
-   */
-  it("detach()'s partial-detach branch refreshes the on-disk mirror immediately — the recomputed source title lands without an unrelated write (Codex round 6, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
-    const rule = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
-      scope: "domain",
-    });
-    if (rule.species !== "rule") throw new Error("unreachable");
-    // A second observation on the SAME concept, so a PARTIAL detach (source survives) is reachable —
-    // detaching the first leaves the second as the source's sole remaining, recomputed-title evidence.
-    await c.store("Confirm the target path is not a mount point.", { attachTo: rule.conceptId });
-    const before = read(path);
-    expect(before.entries[0]!.text).not.toContain("Confirm the target path");
-
-    const firstObsId = (await c.getConcept(rule.conceptId))!.observations[0]!.id;
-    await c.detach(rule.conceptId, [firstObsId]);
-
-    // ON DISK, IMMEDIATELY — no unrelated mutation, no explicit materializeGateMirror() call.
-    const after = read(path);
-    expect(after.entries).toHaveLength(1); // still the same one live rule, just retitled
-    expect(after.entries[0]!.text).toContain("Confirm the target path");
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  it("closes the same family for applySynthesis, resolveContradiction's explicit-body-override, and both synthesizeRow callers (getConcept's lazy synthesis, checkpoint's batch) — each refreshes the on-disk mirror immediately (Codex round 6, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
-
-    // applySynthesis: the agent-facing MCP twin of synthesizeRow's own retitling.
-    const forSynthesis = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Prefer npm ci over npm install.", severity: "advisory", scope: "domain",
-    });
-    if (forSynthesis.species !== "rule") throw new Error("unreachable");
-    await c.applySynthesis(forSynthesis.conceptId, "Always run npm ci in CI, never npm install.");
-    expect(read(path).entries.find((e) => e.conceptId === forSynthesis.conceptId)?.text)
-      .toContain("Always run npm ci in CI");
-    expect(c.isSidecarStale().stale).toBe(false);
-
-    // resolveContradiction: an explicit body override on the accept-new/keep-current verdict.
-    // "A rule is corrected, never mediated" (door 7's own comment, this file) refuses an open
-    // contradiction against a rule concept at EVERY documented entrance — local flagContradiction
-    // outright, and a relayed one too, unconditionally, regardless of severity. resolveContradiction
-    // itself carries no such guard (it operates on whatever open contradiction it is handed), so this
-    // is reachable only the way the codebase's own other defensive checks already assume things can
-    // arrive: a row that bypassed every guard (a hand-edited store, an older build predating door 7).
-    // Inserted directly, matching that convention, to prove resolveContradiction's OWN behavior on
-    // the row it is handed rather than relitigating how a contradiction could end up on a rule.
-    const forContradiction = await c.declare({
-      species: "rule", stage: "git push --force", patterns: ["Bash:git push --force"],
-      content: "Never force-push to a shared branch.", severity: "advisory", scope: "domain",
-    });
-    if (forContradiction.species !== "rule") throw new Error("unreachable");
-    const contradictionId = "bypassed-guard-contradiction-1";
-    raw(c).prepare(
-      `INSERT INTO contradictions (id, concept_id, kind, status, detail, detected_at, updated_at, sync_revision, sync_writer)
-       VALUES (?, ?, 'value-conflict', 'open', 'a peer disagrees', ?, ?, 0, 'x')`,
-    ).run(contradictionId, forContradiction.conceptId, Date.now(), Date.now());
-    c.resolveContradiction(contradictionId, { decision: "accept-new", body: "Force-push only with --force-with-lease, and only to your own branch." });
-    expect(read(path).entries.find((e) => e.conceptId === forContradiction.conceptId)?.text)
-      .toContain("Force-push only with --force-with-lease");
-    expect(c.isSidecarStale().stale).toBe(false);
-
-    // getConcept's lazy synthesis: a fetch that happens to be the trigger for pending synthesis.
-    const forLazySynthesis = await c.declare({
-      species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
-      content: "Never apply without a plan review.", severity: "advisory", scope: "domain",
-    });
-    if (forLazySynthesis.species !== "rule") throw new Error("unreachable");
-    await c.store("Always run terraform plan and share the diff before applying.", { attachTo: forLazySynthesis.conceptId });
-    raw(c).prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(forLazySynthesis.conceptId); // force the lazy path
-    await c.getConcept(forLazySynthesis.conceptId, { synthesize: true });
-    expect(c.isSidecarStale().stale).toBe(false);
-
-    // checkpoint's batch: the same synthesizeRow, reached through the multi-concept path.
-    const forCheckpoint = await c.declare({
-      species: "rule", stage: "docker system prune", patterns: ["Bash:docker system prune"],
-      content: "Never prune without confirming with the team.", severity: "advisory", scope: "domain",
-    });
-    if (forCheckpoint.species !== "rule") throw new Error("unreachable");
-    await c.store("Post in #ops before pruning, every time.", { attachTo: forCheckpoint.conceptId });
-    raw(c).prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(forCheckpoint.conceptId);
-    await c.checkpoint();
-    expect(c.isSidecarStale().stale).toBe(false);
-
-    c.close();
-  });
-
-  it("bumps on a circle rename that moves a deny, and on a supersession that ends one", async () => {
-    const c = core({ circle: "proj" });
-    const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    const before = c.sidecarGeneration();
-    c.renameCircle("proj", "project-renamed");
-    // +2, not +1, as of Codex round 11, item 3: trg_rule_bindings_follow_concept_circle's own
-    // unconditional bump for the moved concept (unchanged — this rename carries a live deny) PLUS
-    // trg_circle_aliases_bump_on_insert firing for the from→to alias row this rename also publishes
-    // (gates.ts, migrateGateColumns) — circle_aliases writes were not mirror-bump-covered by any
-    // mechanism at all before this round (see that trigger family's own comment for why: circle
-    // aliases only became mirror content in format 4, and no build predates knowing to bump for it
-    // deliberately; renameCircle's own gated JS bump happened to be silent here too, because the
-    // rule_bindings trigger had already advanced the generation before the gate was checked — see
-    // renameCircle's own comment, engine.ts, for the removed call this replaces).
-    expect(c.sidecarGeneration()).toBe(before + 2);
-    // The mirror names each rule's circle, so the rename really did change the file's content.
-    expect(c.materializeGateMirror(join(mkTmp(), "s.json")).sidecar.entries[0]!.circle).toBe("project-renamed");
-
-    const successor = await c.store("A replacement rule.", {
-      circle: "project-renamed", kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE },
-    });
-    // Superseding a LIVE deny is refused (door 11); withdraw it first, which is itself a bump.
-    expect(() => c.addLifecycleEdge({
-      family: "supersession", srcConceptId: deny.conceptId, dstConceptId: successor.conceptId, bornOf: "declaration",
-    })).toThrow(/would remove the blocking rule/);
-    await withdrawDeny(c, deny.conceptId, "rm -rf", "project-renamed");
-    const beforeSupersede = c.sidecarGeneration();
-    c.addLifecycleEdge({
-      family: "supersession", srcConceptId: deny.conceptId, dstConceptId: successor.conceptId, bornOf: "declaration",
-    });
-    // A FURTHER bump, where format 4 disagrees with format 3: the withdrawn rule is ADVISORY, not
-    // gone — it stayed in `entries` (both severities are mirror content now) right up until THIS
-    // supersession edge excludes it (the `NOT EXISTS supersession` clause every liveness check
-    // shares). "The rule left the mirror at the withdrawal" was true only while the mirror was
-    // blocking-only; here it leaves at the supersession, and that is what must bump.
-    expect(c.sidecarGeneration()).toBe(beforeSupersede + 1);
-    c.close();
-  });
-
-  it("stamps the generation into the file and answers isSidecarStale truthfully", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-
-    // Opening the store with a path configured LEAVES A USABLE MIRROR, before any rule exists. An
-    // empty entries array is the correct mirror of a store with nothing blocking, and is what makes
-    // the hook's "no file at all" case mean what it says.
-    expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
-    expect(read(path).entries).toEqual([]);
-
-    // MISSING is stale — the hook's question is "can I trust this to decide a deny", and for a file
-    // that is not there the answer is no. Removed by hand now that construction no longer leaves the
-    // path empty; the contract it pins is unchanged.
-    rmSync(path);
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "missing", fileGeneration: null });
-
-    const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    expect(read(path).generation).toBe(c.sidecarGeneration());
-    expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
-
-    // BEHIND — the file's own header is what makes this detectable at all. `checksum` STRIPPED here
-    // (Codex round 12, item 1), not merely carried over: this test hand-mutates ONE field
-    // (`generation`) while keeping the rest, and a checksum copied verbatim from the pre-mutation
-    // read would now mismatch the mutated content — genuinely malformed, not merely behind, exactly
-    // the corruption detection the checksum exists to provide. Stripping it keeps this test isolated
-    // to the generation-comparison logic it actually targets (verify-if-present: an absent checksum
-    // skips verification entirely, the same dev-window path a pre-checksum v4 file takes).
-    const { checksum: _staleChecksum, ...stale } = read(path);
-    writeFileSync(path, JSON.stringify({ ...stale, generation: stale.generation - 1 }), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind", fileGeneration: stale.generation - 1 });
-
-    // UNREADABLE is stale, not an exception on the critical path of somebody's action.
-    // MALFORMED covers both "not JSON" and "JSON of the wrong shape" — parsing successfully says
-    // nothing about structure, and reading fields off `null` or `[]` would throw on the critical
-    // path of an action, which the never-throw contract forbids.
-    writeFileSync(path, "{ not json", "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed" });
-    writeFileSync(path, JSON.stringify({ entries: [] }), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed" });
-    for (const junk of ["null", "[]", '"a string"', "42", JSON.stringify({ generation: "seven", entries: [] }), JSON.stringify({ generation: 1 })]) {
-      writeFileSync(path, junk, "utf8");
-      expect(c.isSidecarStale(), junk).toMatchObject({ stale: true, reason: "malformed" });
-    }
-
-    // A file from ANOTHER store is not this store's mirror either, even if its count runs ahead.
-    writeFileSync(path, JSON.stringify({ ...stale, generation: stale.generation + 99 }), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
-    c.close();
-  });
-
-  /**
-   * THE FORMAT BUMP HAS TO REACH DISK, or it is worse than not bumping at all.
-   *
-   * A version number that a reader honours and a writer ignores is how "defensive" turns into an
-   * outage: the hook rejects a shape it cannot parse — correctly — while nothing on the writing side
-   * ever replaces the file, so offline blocking is simply gone until an unrelated mutation happens
-   * to move the generation counter. The generation compare was right about vintage and wrong to be
-   * the only comparison.
-   */
-  const withDeny = async (path: string) => {
-    const c = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
-    });
-    await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    return c;
-  };
-
-  it("calls a mirror of the WRONG SHAPE stale, however current its generation and identity look", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-
-    // The upgraded install, exactly: same store, same generation, previous entry shape. Every check
-    // that existed before this one passes — which is what made the failure quiet.
-    const current = read(path);
-    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({
-      stale: true, reason: "format", fileFormat: 3, format: 4, fileGeneration: current.generation,
-    });
-
-    // A v1 file predates the field entirely. Not ours either, and it says so with fileFormat null
-    // rather than by being lumped in with unparseable junk.
-    const { format: _dropped, ...noFormat } = current;
-    writeFileSync(path, JSON.stringify(noFormat), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "format", fileFormat: null });
-    c.close();
-  });
-
-  /**
-   * A FRACTIONAL FORMAT IS MALFORMED, NOT A FUTURE FORMAT TO DEFER TO. Format versions are discrete —
-   * there is no meaning between format 4 and format 5 — so `4.5` is not "a number ahead of ours",
-   * it is a corrupt header. Before this fix it classified exactly like a genuine future build's file:
-   * `format-ahead` here, and `skipped-format-ahead` forever from materializeGateMirror, preserved
-   * on the promise of an upgrade that would never arrive, since no build — past or future — will ever
-   * actually write format 4.5. Same permanent-strand shape as the round-9 generation finding, one
-   * field over.
-   */
-  it("treats a FRACTIONAL format as malformed, not as a future format to defer to", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path);
-
-    const fractional = { ...current, format: 4.5 };
-    writeFileSync(path, JSON.stringify(fractional), "utf8");
-    // NOT format-ahead: the whole header is rejected at the read seam, so this is indistinguishable
-    // from any other structurally-wrong file — same reason, same fileGeneration: null.
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("written"); // regenerated, not preserved as an unreadable "future" shape
-    expect(read(path).format).toBe(4);
-    expect(read(path).entries).toHaveLength(1);
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  /**
-   * FORMAT 4 REQUIRES stages/circleAliases TOO (Codex round 1, item 2). readSidecarHeader checked
-   * `entries` but not the two arrays format 4 also added, so `{format:4, generation:n, entries:[]}`
-   * — every earlier check passing (a valid generation, entries genuinely an array, format genuinely
-   * an integer) — read as an ordinary CURRENT v4 file with two empty sections. It is not: it is
-   * structurally wrong, and reading `mirror.stages` off it throws (proven directly below) the first
-   * time anything iterates it — the read-path-throw class this fix closes at the ONE chokepoint both
-   * consumers share.
-   */
-  it("treats a format-4 header missing stages/circleAliases as malformed, not as an empty-but-current v4 file (Codex round 1, item 2)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path) as unknown as Record<string, unknown>;
-
-    // The exact shape Codex named: format matches, generation matches, entries is genuinely `[]` —
-    // stages and circleAliases simply never made it into this file at all.
-    const { stages: _stages, circleAliases: _circleAliases, ...missingBoth } = current;
-    writeFileSync(path, JSON.stringify({ ...missingBoth, entries: [] }), "utf8");
-    // BOTH SURFACES MUST AGREE. inspectSidecar says malformed —
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-    // — and materializeGateMirror regenerates rather than skipping "an already-current file" (the
-    // generation in the malformed header equals the store's own).
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("written");
-    expect(read(path).entries).toHaveLength(1);
-    expect(read(path).stages.length).toBeGreaterThan(0);
-    expect(read(path).circleAliases).toEqual([]);
-    expect(c.isSidecarStale().stale).toBe(false);
-
-    // Proven directly, not merely inferred: the shape this fix rejects would have crashed
-    // evaluateGateFromMirror on the read path this whole header check exists to keep off of — here,
-    // at `mirror.circleAliases.find(...)` (the M3 alias-resolution fix runs before the stages loop
-    // even starts); with only `stages` missing it throws one step later, iterating `mirror.stages`
-    // ("not iterable"). Either way: a TypeError on a read, not a graceful answer.
-    const malformed = { ...missingBoth, entries: [] } as unknown as GateMirror;
-    expect(() => evaluateGateFromMirror(malformed, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }))
-      .toThrow(TypeError);
-    c.close();
-  });
-
-  it("treats stages: 'not-an-array' as malformed too, at format 4 (Codex round 1, item 2)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path);
-
-    writeFileSync(path, JSON.stringify({ ...current, stages: "not-an-array" }), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("written");
-    expect(Array.isArray(read(path).stages)).toBe(true);
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  /**
-   * ARRAY-NESS ALONE IS NOT ELEMENT SHAPE (Codex round 5, item 1, read-path-crash class).
-   * `Array.isArray(header.entries)` passed `entries: [null]` clean through — the array genuinely IS
-   * an array — and the crash lands one layer down, on the FIRST read of any element:
-   * `evaluateGateFromMirror`'s own filter dereferences `entry.stageId` unconditionally
-   * (`matchedStageIds.has(entry.stageId)`), so `entry === null` throws "Cannot read properties of
-   * null" before the filter's own logic ever runs — the same shape one layer over for
-   * `stage.triggerPatterns` and `row.from` (circleAliases). Proven directly against
-   * `evaluateGateFromMirror` itself below, not merely inferred from `isSidecarStale`'s own verdict —
-   * matching the precedent the format-4-missing-arrays test above already set.
-   */
-  it("treats [null] as a malformed element in entries, stages, AND circleAliases — not merely a malformed array (Codex round 5, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path) as unknown as Record<string, unknown>;
-
-    for (const field of ["entries", "stages", "circleAliases"] as const) {
-      const corrupted = { ...current, [field]: [null] };
-      writeFileSync(path, JSON.stringify(corrupted), "utf8");
-      expect(c.isSidecarStale(), field).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-      const result = c.materializeGateMirror();
-      expect(result.outcome, field).toBe("written"); // regenerated, not preserved as "already current"
-      // Regenerated to a genuine array with the corrupt [null] gone — NOT asserting a specific
-      // length here: circleAliases is legitimately EMPTY in this fixture (withDeny never renames a
-      // circle), while entries/stages each carry exactly the one real rule/stage. What every field
-      // shares is "no longer contains the corruption".
-      expect(Array.isArray(read(path)[field]), field).toBe(true);
-      expect(read(path)[field], field).not.toContain(null);
-      expect(c.isSidecarStale().stale, field).toBe(false);
-
-      // Proven directly: the shape this fix rejects would have crashed evaluateGateFromMirror on
-      // the read path this whole header check exists to keep off of.
-      expect(() => evaluateGateFromMirror(corrupted as unknown as GateMirror, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }))
-        .toThrow(TypeError);
-    }
-    c.close();
-  });
-
-  it("treats an entry missing stageId as malformed, at format 4 (Codex round 5, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path) as unknown as Record<string, unknown>;
-    const entries = current.entries as Array<Record<string, unknown>>;
-
-    const { stageId: _stageId, ...entryMissingStageId } = entries[0]!;
-    const corrupted = { ...current, entries: [entryMissingStageId] };
-    writeFileSync(path, JSON.stringify(corrupted), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("written");
-    expect(read(path).entries).toHaveLength(1);
-    expect((read(path).entries[0] as unknown as Record<string, unknown>).stageId).toBeDefined();
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  it("treats a stage with triggerPatterns of the wrong type (not a string) as malformed, at format 4 (Codex round 5, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path) as unknown as Record<string, unknown>;
-    const stages = current.stages as Array<Record<string, unknown>>;
-
-    // A NUMBER, not a string — `parseTriggerPatterns`'s own declared parameter type is `string`, and
-    // JSON.parse's implicit ToString coercion means this would not itself crash the parser (it
-    // silently yields zero patterns instead) — but that stage would go permanently, silently quiet,
-    // an offline/live parity gap the malformed classification exists to prevent, not only crashes.
-    const corrupted = { ...current, stages: [{ ...stages[0], triggerPatterns: 42 }] };
-    writeFileSync(path, JSON.stringify(corrupted), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("written");
-    expect(typeof (read(path).stages[0] as unknown as Record<string, unknown>).triggerPatterns).toBe("string");
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  /**
-   * VALUE, NOT JUST SHAPE (Codex round 9, item 4 — a PR finding: an unrecognized severity "can
-   * similarly make a cached deny appear non-blocking to consumers"). `entry.severity === "blocking"`
-   * does not crash on a garbage string — it silently answers false, exactly the failure mode a mere
-   * `typeof === "string"` shape check (round 5) cannot catch, since a typo'd severity is still a
-   * string.
-   */
-  it("treats an entry with an unrecognized severity value as malformed, at format 4 (Codex round 9, item 4)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path) as unknown as Record<string, unknown>;
-    const entries = current.entries as Array<Record<string, unknown>>;
-
-    // A STRING, so round 5's own `typeof === "string"` shape check alone would have passed this
-    // clean through — the exact gap this item closes: "critical" is well-typed, just not one of
-    // RULE_SEVERITIES, and the live evaluator's own `severity === "blocking"` branch would have
-    // silently treated it as non-blocking, not thrown.
-    const corrupted = { ...current, entries: [{ ...entries[0], severity: "critical" }] };
-    writeFileSync(path, JSON.stringify(corrupted), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("written");
-    expect(read(path).entries).toHaveLength(1);
-    expect(read(path).entries[0]!.severity).toBe("blocking"); // regenerated from the store, not the corrupt value
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  /**
-   * VALUE, NOT JUST SHAPE, THE SCOPE HALF (Codex round 9, item 4 — the PR finding's own worked
-   * example): "removing scope from an agent-scoped entry leaves the same-generation file classified
-   * as current, and `ruleTagIsLive(undefined, ...)` then treats that rule as domain-scoped and fires
-   * it for the wrong runtime model". `scope` was PREVIOUSLY not checked at all by
-   * `hasMirrorEntryShape` (round 5 deliberately excluded it, reasoning it could not crash) — this is
-   * the first shape/value check this field has ever had.
-   */
-  it("treats an entry with a missing or unrecognized scope value as malformed, at format 4 (Codex round 9, item 4)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path) as unknown as Record<string, unknown>;
-    const entries = current.entries as Array<Record<string, unknown>>;
-
-    for (const badScope of [undefined, "unrecognized-scope"] as const) {
-      const withOrWithoutScope: Record<string, unknown> = { ...entries[0] };
-      if (badScope === undefined) delete withOrWithoutScope.scope;
-      else withOrWithoutScope.scope = badScope;
-      const corrupted = { ...current, entries: [withOrWithoutScope] };
-      writeFileSync(path, JSON.stringify(corrupted), "utf8");
-      expect(c.isSidecarStale(), String(badScope)).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-      const result = c.materializeGateMirror();
-      expect(result.outcome, String(badScope)).toBe("written");
-      expect(read(path).entries, String(badScope)).toHaveLength(1);
-      expect(c.isSidecarStale().stale, String(badScope)).toBe(false);
-    }
-    c.close();
-  });
-
-  /**
-   * REFERENTIAL, NOT JUST PER-ELEMENT SHAPE (Codex round 11, item 5). Every check above validates
-   * ONE array's elements in isolation — entries individually well-shaped, stages individually
-   * well-shaped — but never asks whether the two arrays actually agree with each other.
-   * `GateMirrorEntry.stageId`'s own comment says plainly: "join against `GateMirror.stages` to match
-   * and to render" — an entry naming a stageId absent from this SAME file's own `stages[]` can never
-   * be reached through that join, live or offline.
-   */
-  it("treats an entry whose stageId names no stage in the same mirror as malformed, at format 4 (Codex round 11, item 5)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path) as unknown as Record<string, unknown>;
-    const entries = current.entries as Array<Record<string, unknown>>;
-
-    // A well-shaped entry — a real string stageId, so hasMirrorEntryShape alone passes it clean
-    // through — that simply names a stage absent from THIS file's own stages[]. HOLDS BY
-    // CONSTRUCTION for any file this build honestly writes (listGateMirrorEntries' own INNER JOIN to
-    // stages), so this can only arise from a hand-edited or corrupted file — exactly what this
-    // function exists to refuse.
-    const corrupted = { ...current, entries: [{ ...entries[0], stageId: "no-such-stage-in-this-file" }] };
-    writeFileSync(path, JSON.stringify(corrupted), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("written");
-    expect(read(path).entries).toHaveLength(1);
-    // Regenerated from the store, not the corrupt value — the real stageId names a real stage again.
-    expect(read(path).entries[0]!.stageId).not.toBe("no-such-stage-in-this-file");
-    expect(read(path).stages.some((s) => s.id === read(path).entries[0]!.stageId)).toBe(true);
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  /**
-   * THE CONTENT CHECKSUM (Codex round 12, item 1 — closes the validation-depth category, John's own
-   * ratification 2026-07-28). Four tests: a plain round-trip, the corruption case the checksum exists
-   * for that no shape check could ever catch, the dev-window backward-compatibility case, and
-   * confirmation that adding a NEW field to the header did not disturb the EXISTING compare-before-
-   * replace machinery that reads the header for a completely different reason.
-   */
-  it("round-trips: materializeGateMirror writes a checksum, and the same file reads back as current", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const written = read(path);
-    // ADDITIVE, present on every file this build writes — a string, not merely truthy, and 64 hex
-    // characters (sha256's own digest length in hex).
-    expect(written.checksum).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
-    expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
-    c.close();
-  });
-
-  it("a single-byte corruption inside an otherwise well-typed, well-shaped string is caught as malformed — the gap no shape check could ever close — and materializeGateMirror regenerates it (Codex round 12, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const before = read(path);
-    expect(before.entries[0]).toMatchObject({ reason: "there is no undo" });
-
-    // ONE CHARACTER, inside the `reason` string — still perfectly valid JSON (no structural
-    // character touched), still a STRING where a string is expected (every existing shape check
-    // passes this clean through, exactly as it would before this item existed), and still silently
-    // WRONG: the store's own reason is "there is no undo", the file now claims "Xhere is no undo".
-    // No `hasMirrorEntryShape`-style check can ever catch this — a corrupted string is still a
-    // string — which is precisely the depth the checksum exists to add.
-    const raw = readFileSync(path, "utf8");
-    expect(raw).toContain("there is no undo");
-    writeFileSync(path, raw.replace("there is no undo", "Xhere is no undo"), "utf8");
-
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("written");
-    // REGENERATED from the store, not the corrupted value — and the fresh file's own checksum now
-    // verifies against ITS content (not asserted equal to `before.checksum`: `generatedAt` is a live
-    // timestamp with no `now` override reachable through this public method, so two materializations
-    // legitimately produce two different canonical strings, and two different checksums, even over
-    // otherwise-identical content — exactly as the recipe's own inclusion of every field intends).
-    expect(read(path).entries[0]).toMatchObject({ reason: "there is no undo" });
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  it("a checksum-less v4 file (the dev-window case — a file predating this field) still reads as current (Codex round 12, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const withChecksum = read(path) as unknown as Record<string, unknown>;
-    expect(withChecksum.checksum).toBeDefined();
-
-    // SIMULATE a pre-checksum v4 file: every field this build already wrote, `checksum` simply never
-    // added at all — not `checksum: undefined` (which JSON.stringify would already drop on its own),
-    // genuinely absent, the same shape a file from before this item shipped has.
-    const { checksum: _omitted, ...withoutChecksum } = withChecksum;
-    expect(Object.keys(withoutChecksum)).not.toContain("checksum");
-    writeFileSync(path, JSON.stringify(withoutChecksum), "utf8");
-
-    // VERIFY-IF-PRESENT: absent here, so verification is skipped entirely — the file reads exactly
-    // as it always would have before this item existed, on the shape checks alone.
-    expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
-    c.close();
-  });
-
-  it("the checksum survives the compare-before-replace path — skipped-current still recognizes an up-to-date checksummed file, and a corrupted one is overwritten rather than skipped (Codex round 12, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const firstWrite = read(path);
-    expect(firstWrite.checksum).toBeDefined();
-
-    // NOTHING CHANGED about the store — materializing again must recognize the EXISTING, checksummed
-    // file as already current and decline to rewrite it. This is the exact path
-    // materializeGateMirror's own comment calls "COMPARE BEFORE REPLACE": readSidecarHeader is called
-    // on the file BEFORE any decision to write, and that function is where checksum verification
-    // lives — confirming the addition of a new field to the header did not disturb the skip logic,
-    // which reads generation/storeIdentity/format from that SAME return value and has no notion of
-    // `checksum` of its own.
-    const repeat = c.materializeGateMirror();
-    expect(repeat.outcome).toBe("skipped-current");
-    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(firstWrite); // untouched, byte for byte
-    expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
-
-    // A CORRUPTED existing file must NOT be recognized as "already current" and skipped — it reads
-    // as if it were not there at all (readSidecarHeader returns null), so the compare-before-replace
-    // logic falls through every skip branch and proceeds to overwrite it, exactly like any other
-    // malformed file.
-    const raw = readFileSync(path, "utf8");
-    writeFileSync(path, raw.replace("there is no undo", "Xhere is no undo"), "utf8");
-    const afterCorruption = c.materializeGateMirror();
-    expect(afterCorruption.outcome).toBe("written");
-    expect(read(path)).toMatchObject({ entries: [expect.objectContaining({ reason: "there is no undo" })] });
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  /**
-   * THE v4-ARRAY REQUIREMENT MUST NOT SWALLOW THE FUTURE (review fix — Codex round 2, item 5; round
-   * 1's own fix, above, is what this bounds). `format >= 4` with no upper bound applied the "must
-   * have stages/circleAliases as arrays" requirement to ANY format at or past 4 — including one this
-   * build has never heard of. A legitimate same-store v5 file that legitimately restructured those
-   * fields would fail that shape check exactly like a truly corrupt file: `malformed`, not
-   * `format-ahead` — and materializeGateMirror would then OVERWRITE it, which is precisely the
-   * thrash the format-ahead machinery exists to prevent (see its own "REFUSES to overwrite..." test
-   * above), broken by the very guard meant to strengthen it.
-   */
-  it("treats a format AHEAD of this build as format-ahead, not malformed — even with missing or restructured v4 arrays (Codex round 2, item 5)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path) as unknown as Record<string, unknown>;
-
-    // A legitimate future build's file: format ahead of what THIS build understands, and its own
-    // (here, deliberately incompatible) shape for whatever format 4 called stages/circleAliases —
-    // this build cannot know whether that is "restructured" or "missing", and must not guess.
-    const futureFormat = (current.format as number) + 1;
-    const fromTheFuture = {
-      ...current, format: futureFormat, stages: { restructured: true }, circleAliases: "not even an array",
-    };
-    writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
-    expect(c.isSidecarStale()).toMatchObject({
-      stale: true, reason: "format-ahead", fileFormat: futureFormat, format: GATE_MIRROR_FORMAT,
-    });
-
-    c.materializeGateMirror();
-    // UNTOUCHED, byte for byte — the format-ahead contract, unbroken by the array requirement.
-    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture);
-    c.close();
-  });
-
-  it("REWRITES a stale-shaped mirror even though the generation has not moved", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path);
-
-    // Downgrade the file in place and change nothing else. Before format joined the replace
-    // decision, the skip-if-not-newer guard fired here and the v3 artifact survived indefinitely.
-    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
-    expect(c.sidecarGeneration()).toBe(current.generation); // nothing about the store has changed
-
-    c.materializeGateMirror();
-    expect(read(path).format).toBe(4);
-    expect(read(path).entries[0]).toMatchObject({ reason: "there is no undo" });
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  it("REFUSES to overwrite a mirror written by a build AHEAD of this one, and names the skew", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path);
-
-    // A format we do not speak, from a writer we cannot second-guess. Declining is not about losing
-    // data — the mirror is derived and either build can regenerate it — it is about THRASH: if an
-    // older build clobbered forward-format files, two installs sharing a path would each overwrite
-    // the other on every invocation and both hooks would fail unreproducibly. Declining makes the
-    // failure deterministic and attributable to the install that needs upgrading.
-    const fromTheFuture = { ...current, format: 99, entries: [{ somethingWeCannotRead: true }] };
-    writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
-
-    c.materializeGateMirror();
-    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture); // untouched, byte for byte
-
-    // ...and NOT a silent no-op: the operator asking gets the direction of the skew, not just "bad".
-    expect(c.isSidecarStale()).toMatchObject({
-      stale: true, reason: "format-ahead", fileFormat: 99, format: 4,
-    });
-    c.close();
-  });
-
-  it("OVERWRITES a forward-format mirror that belongs to a different store", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path);
-
-    // Same unreadable future format as above — but somebody else's. The thrash argument needs two
-    // installs sharing a path for the SAME store; a foreign file is not the other half of a thrash
-    // pair, it is debris a restore left in our directory. Deferring to it would defer to a file we
-    // have already decided we cannot read, and the skip repeats forever — so this store would never
-    // get an offline deny at all, which is the failure the mirror exists to prevent.
-    const somebodyElses = {
-      ...current, format: 99, storeIdentity: "a-different-store-entirely",
-      entries: [{ somethingWeCannotRead: true }],
-    };
-    writeFileSync(path, JSON.stringify(somebodyElses), "utf8");
-
-    c.materializeGateMirror();
-
-    const after = JSON.parse(readFileSync(path, "utf8"));
-    expect(after.format).toBe(4);
-    expect(after.storeIdentity).toBe(current.storeIdentity);
-    expect(after.entries).toHaveLength(1); // our deny, back on disk
-    expect(c.isSidecarStale()).toMatchObject({ stale: false });
-    c.close();
-  });
-
-  /**
-   * OPENING THE STORE IS THE REPAIR TRIGGER, because an upgrade is the one event that invalidates
-   * the mirror without touching the store. Every other refresh site is a MUTATION site, so
-   * detection alone left the hook rejecting a file that nothing regenerated: offline blocking
-   * unavailable until some unrelated gate-affecting write happened to occur.
-   */
-  it("REGENERATES a wrong-shaped mirror when the store is merely OPENED, with no write at all", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const first = await withDeny(path);
-    const current = read(path);
-    first.close();
-
-    // The upgrade, exactly: the file on disk is the previous shape, and nothing about the store has
-    // changed or is about to. Before this, the next reader was a v4 build rejecting a v3 file.
-    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
-
-    const reopened = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
-    });
-    // NOT a declaration, NOT a gate, NOT a graft — the constructor returning is the whole event.
-    expect(read(path).format).toBe(4);
-    expect(reopened.isSidecarStale().stale).toBe(false);
-    reopened.close();
-  });
-
-  /**
-   * A WRITER THAT SAYS IT WROTE WHEN IT DID NOT is the same lie this module spends its length
-   * preventing everywhere else. materializeGateMirror returned the freshly generated,
-   * current-format sidecar whatever happened — so a DECLINED write was indistinguishable from a
-   * successful one, and install or recovery tooling reported "mirror regenerated" over a file its
-   * own hook rejects. The artifact it hands back is what it GENERATED; the outcome is what reached
-   * disk, and only the caller can be trusted to know the difference matters.
-   */
-  it("reports skipped-format-ahead rather than claiming it wrote the mirror it declined", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path);
-    const fromTheFuture = { ...current, format: 99, entries: [{ somethingWeCannotRead: true }] };
-    writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
-
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("skipped-format-ahead");
-    // The generated mirror is still handed back — it is what WOULD have been written, and reading
-    // it is legitimate. What is no longer possible is mistaking it for the file on disk.
-    expect(result.sidecar.format).toBe(4);
-    expect(result.sidecar.entries).toHaveLength(1);
-    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture);
-    // The two agree, which is the property that makes either one safe to act on.
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "format-ahead" });
-    c.close();
-  });
-
-  it("distinguishes a genuine no-op from a declined write, because they are not the same news", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-
-    // Nothing has changed since the declaration auto-refreshed the file, so it already says what we
-    // would say. The mirror is FINE — this is the one skip a caller may treat as success, and the
-    // reason the two skips needed separate names rather than a single boolean.
-    const noop = c.materializeGateMirror();
-    expect(noop.outcome).toBe("skipped-current");
-    expect(c.isSidecarStale().stale).toBe(false);
-
-    // Recovery after the file is lost — the other documented reason this method is public. Here the
-    // write really happens, and "written" is what entitles the caller to report a repaired mirror.
-    rmSync(path);
-    const written = c.materializeGateMirror();
-    expect(written.outcome).toBe("written");
-    expect(written.sidecar.entries).toHaveLength(1);
-    expect(read(path).entries).toHaveLength(1);
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  /**
-   * AHEAD OF OUR SNAPSHOT IS AMBIGUOUS ON ITS OWN — rollback debris and a legitimate racing writer
-   * produce the identical shape (same store, same format, `existing.generation > sidecar.generation`)
-   * and only a fresh read of the store's CURRENT generation tells them apart. See
-   * materializeGateMirror's own comment for the full split. This pins the ROLLBACK half: no
-   * concurrent writer exists in this test, so the fabricated file is ahead of the store's CURRENT
-   * generation too, not merely ahead of what this call snapshotted — the only shape that is genuinely
-   * debris of an abandoned lineage. Before this fix, `existing.generation >= sidecar.generation`
-   * treated EVERY ahead file this way, race included: refresh became a permanent no-op, and explicit
-   * recovery reported `skipped-current` for a mirror that was, in truth, still serving an abandoned
-   * deny set. The RACE half is pinned by the sibling test below.
-   */
-  it("OVERWRITES a same-store, same-format mirror whose generation is ahead of the store's CURRENT generation (rollback, not a race)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = await withDeny(path);
-    const current = read(path);
-
-    // Same store, same format — only the generation is wrong, and wrong in the direction that used
-    // to earn deference. Entries are wiped too, so a wrongly-preserved file would be caught either
-    // way: by the generation number staying too high, or by the deny silently disappearing.
-    const fromABackward = { ...current, generation: current.generation + 7, entries: [] };
-    writeFileSync(path, JSON.stringify(fromABackward), "utf8");
-    // PINS "ahead of CURRENT", not just "ahead of the old snapshot": nothing mutates the store between
-    // this line and the call below, so the store's live generation is still exactly `current.generation`
-    // — the fabricated file is ahead of THAT, which is what makes it rollback debris rather than a race.
-    expect(c.sidecarGeneration()).toBe(current.generation);
-
-    const result = c.materializeGateMirror();
-    expect(result.outcome).toBe("written");
-    expect(read(path).generation).toBe(current.generation); // the store's own count, not the stale-ahead one
-    expect(read(path).entries).toHaveLength(1); // the store's real deny is back, not the fabricated empty set
-    // Not just overwritten — CURRENT afterward, which is the property recovery tooling relies on.
-    expect(c.isSidecarStale()).toMatchObject({ stale: false, generation: current.generation });
-    c.close();
-  });
-
-  /**
-   * THE RACE HALF of the same ambiguity, pinned separately because it is a DIFFERENT event with a
-   * DIFFERENT correct outcome, even though the snapshot alone cannot distinguish it from the rollback
-   * test above. Nothing here is fabricated except the ordering: a second declaration really does bump
-   * the store and really does refresh the file to the true, current generation — that IS what "a
-   * legitimate newer writer of this lineage published" looks like on disk. What cannot be reproduced
-   * honestly on one thread is a call whose OWN internal snapshot started before that write landed, so
-   * that one piece — and only that piece — is forced back to the stale value, via the same
-   * db.prepare interception the "instrumentation write cannot land" test above already uses.
-   */
-  it("does NOT overwrite a mirror a legitimate newer writer already published — skips as SUPERSEDED", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
-    });
-    await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    const staleSnapshot = c.sidecarGeneration();
-
-    // The winning writer. Real bump, real refresh — no doctored generation number anywhere here.
-    await c.declare({
-      species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
-      content: "Never apply without a plan review.", severity: "blocking",
-      reason: "an unreviewed apply changes infrastructure nobody agreed to change", ...AGENT_RULE,
-    });
-    const wonTheRace = read(path);
-    expect(wonTheRace.generation).toBeGreaterThan(staleSnapshot);
-    expect(c.sidecarGeneration()).toBe(wonTheRace.generation);
-
-    // The losing call. Force ONLY its own opening snapshot back to the stale value; everything
-    // downstream is real, including the fresh generation read the fix under test performs at decision
-    // time — which is what has to see the TRUE, advanced generation for this test to mean anything.
-    const db = raw(c) as unknown as { prepare: (sql: string) => unknown };
-    const original = db.prepare.bind(db);
-    let genReads = 0;
-    db.prepare = (sql: string) => {
-      if (sql.includes("FROM gate_meta")) {
-        genReads += 1;
-        if (genReads === 1) return { get: () => ({ generation: staleSnapshot }) };
-      }
-      return original(sql);
-    };
-    let result: SidecarMaterialization;
-    try {
-      result = c.materializeGateMirror();
-    } finally {
-      db.prepare = original;
-    }
-
-    expect(result.outcome).toBe("skipped-superseded");
-    expect(read(path)).toEqual(wonTheRace); // untouched, byte for byte — the winner's file survives
-    expect(readdirSync(dir)).toEqual(["gate-sidecar.json"]); // no temp file left behind either
-    expect(c.isSidecarStale().stale).toBe(false); // still current: the winner was right all along
-    c.close();
-  });
-
-  it("leaves a mirror from a NEWER build alone on open, rather than thrashing it every time", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const first = await withDeny(path);
-    const current = read(path);
-    first.close();
-
-    // The one skew we decline. If opening rewrote it, two installs sharing a path would clobber each
-    // other on every open — which is the failure the forward-format rule exists to avoid, and an
-    // open-time trigger is exactly what would make it constant rather than occasional.
-    //
-    // This is a REGRESSION GUARD on the new trigger, not a pin on the rule itself: the rule is
-    // pinned below by "REFUSES to overwrite a mirror written by a build AHEAD of this one", which is
-    // the test that fails if materializeGateMirror's guard is removed. This one fails if the
-    // open-time path ever starts bypassing it.
-    const fromTheFuture = { ...current, format: 99, entries: [{ somethingWeCannotRead: true }] };
-    writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
-
-    const reopened = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
-    });
-    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture); // untouched, byte for byte
-    expect(reopened.isSidecarStale()).toMatchObject({ stale: true, reason: "format-ahead" });
-    // No tmp debris either: declining happens before the write, not by writing and unlinking.
-    expect(readdirSync(dir)).toEqual(["gate-sidecar.json"]);
-    reopened.close();
-  });
-
-  it("never lets a broken sidecar path fail the CONSTRUCTOR", () => {
-    const dir = mkTmp();
-    // The path's parent is a FILE, so every write against it fails. Opening a store must still
-    // succeed: a mirror that cannot be written is a condition isSidecarStale reports, never a reason
-    // somebody's store will not open.
-    writeFileSync(join(dir, "notadir"), "i am a file", "utf8");
-    const path = join(dir, "notadir", "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "missing" });
-    c.close();
-  });
-
-  it("does NOT write the mirror on open in report-only mode, however stale the file is", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const first = await withDeny(path);
-    const current = read(path);
-    first.close();
-    // A file the served runtime would rewrite on sight — so if report-only mode writes at all, it
-    // writes here.
-    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
-
-    // `deferCreatedPin` is the EXISTING declaration that this caller is inspection or dry-run
-    // tooling which must never write anything — the same flag that already stops a pin being minted.
-    // Opening a store to LOOK at it must not mutate the installation being looked at.
-    const inspector = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
-      deferCreatedPin: true,
-    });
-    expect(read(path).format).toBe(3);
-    // It can still SAY the mirror is stale — reporting is what this mode is for.
-    expect(inspector.isSidecarStale()).toMatchObject({ stale: true, reason: "format" });
-    // And an EXPLICIT call is the caller asking, which the suppression does not countermand.
-    expect(inspector.materializeGateMirror().outcome).toBe("written");
-    expect(read(path).format).toBe(4);
-    inspector.close();
-
-    // The served runtime, for contrast: same file, same staleness, repaired by opening.
-    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
-    const served = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
-    });
-    expect(read(path).format).toBe(4);
-    served.close();
-  });
-
-  it("creates no mirror at all on a first open in report-only mode", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    // The sharper case: nothing exists yet, so the automatic refresh would CREATE the artifact.
-    // Inspection tooling pointed at a path must not bring the file into being.
-    const inspector = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, deferCreatedPin: true,
-    });
-    expect(existsSync(path)).toBe(false);
-    expect(inspector.isSidecarStale()).toMatchObject({ stale: true, reason: "missing" });
-    inspector.close();
-  });
-
-  it("costs nothing on a store with no sidecar path — construction touches no filesystem", () => {
-    const dir = mkTmp();
-    // The opt-in is the whole cost control: a store nobody wired a hook to must not write into
-    // anyone's directory just because it was constructed.
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    expect(readdirSync(dir)).toEqual([]);
-    expect(() => c.isSidecarStale()).toThrow(/needs a path/);
-    c.close();
-  });
-
-  it("auto-re-materializes from every mutation point when a path is configured", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    expect(read(path).entries).toHaveLength(1);
-
-    // B1's over-block case: withdrawing the deny must take the DENY out of the file, without anyone
-    // remembering to re-materialize — but not the rule itself: format 4 mirrors every live rule, so
-    // the now-advisory rule stays visible until it is actually retired. Retirement alone is refused
-    // while blocking, so the withdrawal is the declaration and the retire is cleanup afterwards.
-    await withdrawDeny(c, deny.conceptId, "rm -rf");
-    expect(read(path).entries).toHaveLength(1);
-    expect(read(path).entries[0]).toMatchObject({ conceptId: deny.conceptId, severity: "advisory" });
-    c.retireConcept(deny.conceptId);
-    expect(read(path).entries).toEqual([]);
-    expect(c.isSidecarStale().stale).toBe(false);
-    c.close();
-  });
-
-  it("treats a foreign mirror as stale, however current its generation number looks", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const mine = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
-    await mine.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    expect(mine.isSidecarStale().stale).toBe(false);
-
-    // A restored backup, a copied database, or a path a second store was pointed at. A generation
-    // counts ONE store's mutations, so comparing it across stores compares nothing — and two stores
-    // land on the same small integer constantly. This is the strongest form of the stale-mirror
-    // failure: not a missing deny, somebody else's deny.
-    const theirs = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-b" });
-    await theirs.declare({
-      species: "rule", stage: "other gate", patterns: ["Bash:other"],
-      content: "A rule from another store entirely.", severity: "blocking",
-      reason: "it cannot be undone", ...AGENT_RULE,
-    });
-    // Same generation number on both sides, different stores.
-    expect(theirs.sidecarGeneration()).toBe(mine.sidecarGeneration());
-    const verdict = mine.isSidecarStale();
-    expect(verdict).toMatchObject({ stale: true, reason: "foreign", fileStoreIdentity: "machine-b", storeIdentity: "machine-a" });
-    mine.close();
-    theirs.close();
-  });
-
-  it("closes the dangling-then-live gap: a binding arriving before its concept", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const src = core({ syncDeviceId: "machine-a" });
-    const dst = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-b", gateSidecarPath: path,
-    });
-    const deny = await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    const payload = src.exportDelta(0);
-
-    // Normative rows relay independently of endpoint liveness, so this ORDER is legitimate, not a
-    // corrupted payload: the binding lands first and cannot resolve its rule yet.
-    dst.graftRows({ ...payload, concepts: [], observations: [], conceptRevisions: [], contradictions: [] });
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
-    expect(JSON.parse(readFileSync(path, "utf8")).entries).toEqual([]);
-
-    // Now the concept arrives. Without the concept-arrival bump the deny goes live in gateQuery
-    // while the file still reads as CURRENT — a deny the store enforces and the hook cannot see.
-    dst.graftRows(payload);
-    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toHaveLength(1);
-    expect(dst.isSidecarStale().stale).toBe(false);
-    expect(JSON.parse(readFileSync(path, "utf8")).entries.map((e: { conceptId: string }) => e.conceptId))
-      .toEqual([deny.conceptId]);
-    src.close();
-    dst.close();
-  });
-
-  it("regenerates on a graft that lands a deny, and stays pollable when no path is configured", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const src = core({ syncDeviceId: "machine-a" });
-    const dst = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-b", gateSidecarPath: path,
-    });
-    await src.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    const before = dst.sidecarGeneration();
-    dst.graftRows(src.exportDelta(0));
-    expect(dst.sidecarGeneration()).toBeGreaterThan(before);
-    expect(read(path).entries).toHaveLength(1);
-    expect(dst.isSidecarStale().stale).toBe(false);
-
-    // No path configured: the generation still advances, so a 4b consumer can poll it.
-    const unwired = core({ syncDeviceId: "machine-c" });
-    const unwiredBefore = unwired.sidecarGeneration();
-    unwired.graftRows(src.exportDelta(0));
-    expect(unwired.sidecarGeneration()).toBeGreaterThan(unwiredBefore);
-    src.close();
-    dst.close();
-    unwired.close();
-  });
-
-  /**
-   * mergeCircle COMMITS THE ALIAS AND RETURNS WITHOUT REFRESHING (Codex round 1, item 1). The
-   * per-concept reassignCircle() calls inside the merge loop each refresh on their own, but every
-   * one of those runs BEFORE the alias write lands — the alias is the LAST thing the transaction
-   * does — so a mirror rebuilt only from those calls never carries the fresh from→into row, and an
-   * EMPTY merge (nothing in `from` to reassign) calls reassignCircle zero times and refreshes
-   * NOTHING at all. 4b-C's failure policy deliberately keeps answering BLOCKING from a mirror that
-   * has gone stale; a mirror still missing this alias has no entry to answer FROM under the old name
-   * at all, so an offline query made under it reads as an ordinary miss instead of the deny the live
-   * gate delivers — fail toward allow, the one direction this whole subsystem exists to prevent.
-   * Same class, same fix, for archiveCircle/unarchiveCircle below (m5, closed for all three writers
-   * that lacked it — renameCircle and reassignCircle already had it).
-   */
-  it("mergeCircle refreshes the configured sidecar immediately — the alias itself, not just a rule move (Codex round 1, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", {
-      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
-    });
-    const deny = await c.declare({
-      circle: "proj", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    await c.mergeCircle("proj", "project");
-
-    // ON DISK, IMMEDIATELY — no separate materialize call, no unrelated write to piggyback a
-    // refresh onto.
-    const onDisk = read(path);
-    expect(onDisk.circleAliases).toEqual([{ from: "proj", to: "project" }]);
-    expect(onDisk.entries[0]).toMatchObject({ conceptId: deny.conceptId, circle: "project" });
-
-    // Offline, under the OLD name, delivers exactly what the live gate delivers — the concrete
-    // 4b-C consequence Codex named: a mirror missing this alias would silently MISS this query.
-    const liveOld = c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "proj" });
-    const offlineOld = evaluateGateFromMirror(onDisk, { actionContext: "Bash:rm -rf /tmp/x", circle: "proj" });
-    expect(offlineOld.rules.map((r) => r.conceptId)).toEqual(liveOld.rules.map((r) => r.conceptId));
-    expect(offlineOld.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
-    c.close();
-  });
-
-  it("mergeCircle refreshes even an EMPTY merge — zero concepts in `from`, so zero reassignCircle calls to piggyback a refresh on", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    await c.store("Anchor concept so 'keep' is a real circle.", { circle: "keep", kind: "fact" });
-    const before = read(path).generation;
-    // "empty-source" holds nothing at all — no concept, no prior alias — which mergeCircle allows
-    // (no existence check on `from`, unlike renameCircle's).
-    await c.mergeCircle("empty-source", "keep");
-    const after = read(path);
-    expect(after.generation).toBeGreaterThan(before);
-    expect(after.circleAliases).toEqual([{ from: "empty-source", to: "keep" }]);
-    c.close();
-  });
-
-  it("archiveCircle and unarchiveCircle refresh the configured sidecar too (Codex round 1, item 1 — same class, third writer)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    await c.store("Anchor concept.", { circle: "shelved", kind: "fact" });
-    const before = read(path).generation;
-
-    c.archiveCircle("shelved");
-    const afterArchive = read(path);
-    expect(afterArchive.generation).toBeGreaterThan(before);
-    expect(afterArchive.circles).toContain("shelved"); // an archived circle is still "known"
-
-    c.unarchiveCircle("shelved");
-    expect(read(path).generation).toBeGreaterThan(afterArchive.generation);
-    c.close();
-  });
-
-  /**
-   * synthesizeRow CAN RETITLE A BOUND RULE WITHOUT BUMPING (Codex round 2, item 4). A rule's TITLE
-   * is the text a gate delivers (GateRule.text / GateMirrorEntry.text both read `concepts.title`) —
-   * the sieve tier folding new evidence into a dirty rule's body can change `firstLine(body)`, and
-   * the live gate serves the new text immediately (a plain SQL read, always current) while a
-   * materialized mirror — nothing having told it anything changed — stayed CURRENT-AND-STALE
-   * indefinitely: the worst shape of staleness, since isSidecarStale reports it trustworthy.
-   */
-  it("synthesizing a bound advisory rule's title bumps the generation, refreshes the mirror, and the offline evaluator serves the new text (Codex round 2, item 4)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const rule = await c.store("Confirm the target path before deleting.", {
-      kind: "rule", rule: { stage: "rm -rf", instance: "Bash:rm -rf", ...AGENT_RULE },
-    });
-    const titleBefore = (await c.getConcept(rule.conceptId, { synthesize: false }))!.title;
-    expect(titleBefore).toBe("Confirm the target path before deleting");
-
-    // Force the sieve tier to have real, ORDER-CHANGING work: DeterministicSynthesizer joins
-    // observations oldest-first and the title is firstLine() of the join, so a new observation
-    // dated BEFORE the existing one is what actually changes `title` — appending one after would
-    // leave firstLine(body) reading the same original first line.
-    const originalObs = raw(c).prepare(`SELECT id, created_at, embedding FROM observations WHERE concept_id = ?`).get(rule.conceptId) as { id: string; created_at: number; embedding: string };
-    raw(c).prepare(
-      `INSERT INTO observations (id, content, embedding, concept_id, author_agent_id, circle, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run("obs-earlier-evidence", "Always dry-run large deletes first.", originalObs.embedding, rule.conceptId, "local-agent", "default", originalObs.created_at - 1000);
-    raw(c).prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(rule.conceptId);
-
-    const genBefore = c.sidecarGeneration();
-    const synthesizedCount = await c.checkpoint("default");
-    expect(synthesizedCount).toBeGreaterThan(0);
-
-    const titleAfter = (await c.getConcept(rule.conceptId, { synthesize: false }))!.title;
-    expect(titleAfter).toBe("Always dry-run large deletes first");
-    expect(titleAfter).not.toBe(titleBefore);
-
-    // THE BUMP — this is the fix itself, not an incidental check.
-    expect(c.sidecarGeneration()).toBeGreaterThan(genBefore);
-
-    // THE MIRROR — materialized fresh, carries the NEW text.
-    const mirror = c.materializeGateMirror(path).sidecar;
-    const entry = mirror.entries.find((e) => e.conceptId === rule.conceptId);
-    expect(entry?.text).toBe(titleAfter);
-
-    // THE OFFLINE EVALUATOR — reading only the mirror, agrees with the live gate.
-    const live = c.gate({ actionContext: "Bash:rm -rf /tmp/x" });
-    const offline = evaluateGateFromMirror(mirror, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" });
-    expect(live.rules[0]?.text).toBe(titleAfter);
-    expect(offline.rules[0]?.text).toBe(titleAfter);
-    c.close();
-  });
-});
-
-describe("silence never means I gave up", () => {
-  it("matches a governed command hidden behind 64KiB of padding, where two prefix caps reported silence", () => {
-    const c = core();
-    void c.declare({ species: "stage", stage: "git force push", patterns: ["Bash:git push --force"] });
-    const padded = `Bash:${"x".repeat(64 * 1024)} && git push --force origin main`;
-    const fired = c.gate({ actionContext: padded });
-    expect(fired.silence).toBe(false);
-    expect(fired.overflow).toBe(false);
-    expect(fired.stages.map((st) => st.name)).toEqual(["git force push"]);
-    c.close();
-  });
-
-  it("reports OVERFLOW, not silence, past the refusal threshold", () => {
-    const c = core();
-    void c.declare({ species: "stage", stage: "git force push", patterns: ["Bash:git push --force"] });
-    const absurd = `Bash:${"x".repeat(4 * 1024 * 1024 + 16)} && git push --force`;
-    const result = c.gate({ actionContext: absurd });
-    // The two are opposite claims: silence means "nothing governs this", overflow means "I could
-    // not tell". A host maps the second to asking the human, never to allowing.
-    expect(result.overflow).toBe(true);
-    expect(result.silence).toBe(false);
-    expect(result.rules).toEqual([]);
-    c.close();
-  });
+describe("shell fidelity in the tokenizer", () => {
+  // THESE TESTS USED TO ASSERT THROUGH THE MATCHER (`fires(...)` over a seeded pattern). The
+  // matcher retired with trigger patterns on 2026-08-22; every decision they pin belongs to the
+  // TOKENIZER, which is still live behind `parseActionContext`, so they now assert against its
+  // token stream directly — the same properties, one layer down, with no pattern in sight.
 
   it("does not let a token run cross a command boundary — a newline ends a command", () => {
-    const pattern = seedTriggerPattern("Bash:git push --force origin main");
-    // `echo git` on one line and `push --force` on the next is two commands; matching across them
-    // fires a gate on a command nobody ran. A false positive is the expensive kind of wrong.
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:echo git\npush --force"))).toBe(false);
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:echo git\r\npush --force"))).toBe(false);
-    // ...and the real thing on one line still fires.
-    expect(matchesTriggerPattern(pattern, parseActionContext("Bash:echo hi\ngit push --force origin main"))).toBe(true);
-    // Seeding uses the same vocabulary, so both sides segment identically.
-    expect(seedTriggerPattern("Bash:cd /x\ngit push --force origin dev").tokens).toEqual(["git", "push", "--force"]);
+    // `echo git` on one line and `push --force` on the next is TWO commands. A consumer that
+    // stitched them into one contiguous run would be reading a command nobody ran, which is why
+    // the boundary is emitted as its own token rather than treated as ordinary whitespace.
+    expect(parseActionContext("Bash:echo git\npush --force").tokens)
+      .toEqual(["echo", "git", COMMAND_BOUNDARY, "push", "--force"]);
+    expect(parseActionContext("Bash:echo git\r\npush --force").tokens)
+      .toEqual(["echo", "git", COMMAND_BOUNDARY, "push", "--force"]);
+    // One boundary per RUN of newlines — a blank line means "the command ended", not "twice".
+    expect(parseActionContext("Bash:a\n\n\nb").tokens).toEqual(["a", COMMAND_BOUNDARY, "b"]);
   });
-});
-
-describe("shell fidelity in the shared tokenization", () => {
-  const pattern = seedTriggerPattern("Bash:git push --force origin main");
-  const fires = (context: string): boolean => matchesTriggerPattern(pattern, parseActionContext(context));
 
   it("joins a line continuation, because the shell does", () => {
-    // Round one made newline a command boundary — correctly — which turned `git \<nl>push` into the
-    // token `\npush` and made a continued command MISS its deny. Backslash-newline is a JOIN.
-    expect(fires("Bash:git \\\npush --force origin main")).toBe(true);
-    expect(fires("Bash:git \\\r\npush --force origin main")).toBe(true);
+    // Making newline a command boundary — correctly — once turned `git \<nl>push` into the token
+    // `\npush`, splitting a command the shell reads as one. Backslash-newline is a JOIN, consumed
+    // before the boundary rule can see the newline.
+    expect(parseActionContext("Bash:git \\\npush --force origin main").tokens)
+      .toEqual(["git", "push", "--force", "origin", "main"]);
+    expect(parseActionContext("Bash:git \\\r\npush --force origin main").tokens)
+      .toEqual(["git", "push", "--force", "origin", "main"]);
     expect(parseActionContext("Bash:a\\\nb").tokens).toEqual(["ab"]);
     // ...and an ESCAPED backslash before a newline is not a continuation: the first backslash
     // consumes the second, so the newline reaches the boundary rule on its own.
     expect(parseActionContext("Bash:a\\\\\nb").tokens).toEqual(["a\\", COMMAND_BOUNDARY, "b"]);
-    // A bare newline is still a boundary, so the round-one false positive stays fixed.
-    expect(fires("Bash:echo git\npush --force")).toBe(false);
   });
 
   it("strips a shell comment, and only where the shell would", () => {
-    // `echo safe # git push --force` runs `echo safe`. Firing inside the comment is a false
-    // positive on a command nobody ran.
-    expect(fires("Bash:echo safe # git push --force origin main")).toBe(false);
+    // `echo safe # git push --force` runs `echo safe`. Everything after the `#` is not a command.
+    expect(parseActionContext("Bash:echo safe # git push --force origin main").tokens)
+      .toEqual(["echo", "safe"]);
     expect(parseActionContext("Bash:echo safe # secret").tokens).toEqual(["echo", "safe"]);
     // The comment ends at the newline, so the next line is live again.
-    expect(fires("Bash:echo safe # nothing here\ngit push --force origin main")).toBe(true);
+    expect(parseActionContext("Bash:echo safe # nothing here\ngit push --force").tokens)
+      .toEqual(["echo", "safe", COMMAND_BOUNDARY, "git", "push", "--force"]);
     // A `#` INSIDE a word is an ordinary character — URLs and fragments survive.
     expect(parseActionContext("Bash:curl http://x/y#frag").tokens).toEqual(["curl", "http://x/y#frag"]);
     expect(parseActionContext("Bash:a#b c").tokens).toEqual(["a#b", "c"]);
@@ -8725,29 +6436,17 @@ describe("shell fidelity in the shared tokenization", () => {
   });
 });
 
-describe("corruption narrows a pattern, never widens it", () => {
-  it("makes a malformed pattern INERT instead of coercing it into a wildcard", () => {
-    // `tool: 42` used to become `tool: null`, which is the ANY-TOOL wildcard: a corrupt row widened
-    // the gate's firing surface. A dropped token is the same disease — a shorter run matches more.
-    const widened = JSON.stringify([{ tool: 42, tokens: ["git", "push"] }]);
-    expect(readTriggerPatterns(widened)).toEqual({ patterns: [], malformed: 1 });
-    const shortened = JSON.stringify([{ tool: "Bash", tokens: ["git", null, "--force"] }]);
-    expect(readTriggerPatterns(shortened)).toEqual({ patterns: [], malformed: 1 });
-    // An absent or explicitly null tool is NOT corruption — that is the legitimate any-tool pattern.
-    expect(readTriggerPatterns(JSON.stringify([{ tokens: ["terraform", "apply"] }])).patterns)
-      .toEqual([{ tool: null, tokens: ["terraform", "apply"] }]);
-    // A good pattern beside a bad one survives; only the bad one is dropped.
-    const mixed = JSON.stringify([{ tool: 42, tokens: ["a"] }, { tool: "Bash", tokens: ["git", "push"] }]);
-    expect(readTriggerPatterns(mixed)).toEqual({ patterns: [{ tool: "bash", tokens: ["git", "push"] }], malformed: 1 });
-  });
-
-});
+// THE CORRUPTION SUITE WENT WITH `readTriggerPatterns` (2026-08-22). It pinned one rule — a
+// malformed stored pattern must go INERT rather than be coerced into something BROADER (a non-string
+// `tool` becoming the any-tool wildcard, a dropped token shortening a run so it matches more). The
+// rule mattered because a widened pattern produces confident wrong denies. Nothing stores or reads a
+// pattern any more, so there is no row left to narrow or widen.
 
 describe("model-tag retirement", () => {
   it("delivers a compensation only to the model it compensates for", async () => {
     const c = core();
     const forOld = await c.store("Old model forgets to quote paths.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-1" },
+      kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "model-1" },
     });
     const domain = await c.store("Force-push destroys shared history.", {
       kind: "rule", rule: { stage: "git force push", scope: "domain" },
@@ -8755,13 +6454,13 @@ describe("model-tag retirement", () => {
 
     // No tag supplied: nothing is filtered. A caller that does not know which model it is must not
     // have its rules silently vanish.
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId).sort())
+    expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId).sort())
       .toEqual([forOld.conceptId, domain.conceptId].sort());
     // The model it was captured for still gets it.
-    expect(c.gate({ actionContext: "Bash:git push --force", runtimeModelTag: "model-1" }).rules.map((r) => r.conceptId).sort())
+    expect(c.stageLookup({ stage: "git force push", runtimeModelTag: "model-1" }).rules.map((r) => r.conceptId).sort())
       .toEqual([forOld.conceptId, domain.conceptId].sort());
     // A DIFFERENT model does not inherit the last model's defects as instructions...
-    const next = c.gate({ actionContext: "Bash:git push --force", runtimeModelTag: "model-2" });
+    const next = c.stageLookup({ stage: "git force push", runtimeModelTag: "model-2" });
     expect(next.rules.map((r) => r.conceptId)).toEqual([domain.conceptId]);
 
     // ...and the filtered rule surfaces for curation rather than being retired by machinery.
@@ -8778,9 +6477,9 @@ describe("model-tag retirement", () => {
   it("takes the runtime tag from the store when the call does not name one", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, runtimeModelTag: "model-2" });
     const forOld = await c.store("A compensation for the old model.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-1" },
+      kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "model-1" },
     });
-    expect(c.gate({ actionContext: "Bash:git push --force" }).rules).toEqual([]);
+    expect(c.stageLookup({ stage: "git force push" }).rules).toEqual([]);
     expect(c.gateCoverage().retirementCandidates.map((r) => r.conceptId)).toEqual([forOld.conceptId]);
     c.close();
   });
@@ -8811,7 +6510,7 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const ok = await src.declare({
-      species: "rule", stage: "ws3", patterns: ["Bash:frob"],
+      species: "rule", stage: "ws3",
       content: "A compensation.", severity: "advisory", ...AGENT_RULE,
     });
     if (ok.species !== "rule") throw new Error("unreachable");
@@ -8831,16 +6530,14 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
 
     const c = core();
     const stored = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: padded },
+      kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: padded },
     });
     // STORED CANONICAL, not padded — bindRule trims before writing, the same canonical-form
     // discipline normalizeStageName already enforces for stage names.
     expect(c.ruleBinding(stored.conceptId)!.model_tag).toBe(trimmed);
-    // DELIVERS under the TRIMMED runtime tag, on BOTH matchers — setRuntimeModelTag already trims
-    // the RUNTIME side (round 4), so this only round-trips if storage now agrees on the same
-    // canonical form; the SQL comparison (RULE_LIVENESS_WHERE) is exact, never trimmed at read time.
-    expect(c.gate({ actionContext: "Bash:git push --force", runtimeModelTag: trimmed }).rules.map((r) => r.conceptId))
-      .toEqual([stored.conceptId]);
+    // DELIVERS under the TRIMMED runtime tag — setRuntimeModelTag already trims the RUNTIME side
+    // (round 4), so this only round-trips if storage now agrees on the same canonical form; the SQL
+    // comparison (RULE_LIVENESS_WHERE) is exact, never trimmed at read time.
     expect(c.stageLookup({ stage: "git force push", runtimeModelTag: trimmed }).rules.map((r) => r.conceptId))
       .toEqual([stored.conceptId]);
     c.close();
@@ -8935,17 +6632,15 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
     dst.close();
   });
 
-  it("an EXACTLY-at-max modelTag passes end to end: store(), delivered via gate() AND stageLookup(), and grafts cleanly", async () => {
+  it("an EXACTLY-at-max modelTag passes end to end: store(), delivered via stageLookup(), and grafts cleanly", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const atMax = "m".repeat(MODEL_TAG_MAX_CHARS);
     const stored = await src.store("Never force-push to a shared branch.", {
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: atMax },
+      rule: { stage: "git force push", scope: "agent", modelTag: atMax },
     });
     expect(src.ruleBinding(stored.conceptId)!.model_tag).toBe(atMax);
-    expect(src.gate({ actionContext: "Bash:git push --force", runtimeModelTag: atMax }).rules.map((r) => r.conceptId))
-      .toEqual([stored.conceptId]);
     expect(src.stageLookup({ stage: "git force push", runtimeModelTag: atMax }).rules.map((r) => r.conceptId))
       .toEqual([stored.conceptId]);
 
@@ -8961,39 +6656,39 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
 // the recognized matcher
 // ---------------------------------------------------------------------------
 describe("stageLookup — the recognized matcher", () => {
-  it("delivers the same rules gateQuery delivers for that stage — parity through the chokepoint", async () => {
+  it("delivers identically through all three entrances — evaluateStageLookup, the standalone form, and MonetCore.stageLookup()", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "it destroys teammates' commits", ...AGENT_RULE },
+      rule: { stage: "git force push", reason: "it destroys teammates' commits", ...AGENT_RULE },
     });
-    const viaGate = c.gate({ actionContext: "Bash:cd /repo && git push --force origin dev" });
-    const viaLookup = c.stageLookup({ stage: "git force push" });
+    const db = (c as unknown as { db: StoragePort }).db;
+    // The unwrapped read, the transaction-wrapped standalone form, and the MonetCore wrapper are
+    // three doors onto ONE chokepoint. Nothing may differ between them: a caller with its own
+    // transaction and a caller without one must be told the same thing.
+    const viaEvaluate = evaluateStageLookup(db, { stage: "git force push", circle: "default" });
+    const viaStandalone = standaloneStageLookup(db, { stage: "git force push", circle: "default" });
+    const viaCore = c.stageLookup({ stage: "git force push" });
 
-    expect(viaGate.rules).toHaveLength(1);
-    expect(viaLookup.matched).toBe(true);
-    expect(viaLookup.rules).toHaveLength(1);
-    // Same delivery in every field gateQuery also carries — the one field stageLookup adds on top
-    // (`body`) is stripped before the comparison, so this pins the shared chokepoint fields exactly.
-    const { body: _body, ...deliveredWithoutBody } = viaLookup.rules[0]!;
-    expect(deliveredWithoutBody).toEqual(viaGate.rules[0]);
-    expect(viaLookup.rules[0]!.conceptId).toBe(rule.conceptId);
+    expect(viaCore.matched).toBe(true);
+    expect(viaCore.rules).toHaveLength(1);
+    expect(viaCore.rules[0]!.conceptId).toBe(rule.conceptId);
+    expect(viaStandalone).toEqual(viaEvaluate);
+    expect(viaCore).toEqual(viaEvaluate);
     c.close();
   });
 
-  it("excludes a foreign-model agent-scoped rule on BOTH surfaces alike", async () => {
+  it("excludes a foreign-model agent-scoped rule", async () => {
     const c = core();
     const forOld = await c.store("Old model forgets to quote paths.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-1" },
+      kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "model-1" },
     });
     const domain = await c.store("Force-push destroys shared history.", {
       kind: "rule", rule: { stage: "git force push", scope: "domain" },
     });
 
-    const gateResult = c.gate({ actionContext: "Bash:git push --force", runtimeModelTag: "model-2" });
     const lookupResult = c.stageLookup({ stage: "git force push", runtimeModelTag: "model-2" });
 
-    expect(gateResult.rules.map((r) => r.conceptId)).toEqual([domain.conceptId]);
     expect(lookupResult.rules.map((r) => r.conceptId)).toEqual([domain.conceptId]);
     expect(forOld.conceptId).not.toBe(domain.conceptId); // sanity: the excluded rule really exists
     c.close();
@@ -9014,7 +6709,7 @@ describe("stageLookup — the recognized matcher", () => {
 
   it("is a HIT with rules:[] for a stage that exists but has none bound — never a miss", async () => {
     const c = core();
-    await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
+    await c.declare({ species: "stage", stage: "terraform apply" });
     const r = c.stageLookup({ stage: "terraform apply" });
     expect(r).toMatchObject({ matched: true, rules: [] });
     expect(r.stage).toMatchObject({ name: "terraform apply" });
@@ -9037,7 +6732,7 @@ describe("stageLookup — the recognized matcher", () => {
     c.close();
   });
 
-  it("delivers body when non-blank; gateQuery's GateRule never carries the field at all", async () => {
+  it("delivers body when non-blank", async () => {
     const c = core();
     const rule = await c.store("Run the review watcher.", {
       kind: "rule", rule: { stage: "starting a review pass", ...AGENT_RULE },
@@ -9049,14 +6744,6 @@ describe("stageLookup — the recognized matcher", () => {
     );
     const r = c.stageLookup({ stage: "starting a review pass" });
     expect(r.rules[0]!.body).toBe("watch-reviews team-monet/monet-core --interval 5m");
-
-    // gateQuery's own delivery type carries no `body` field at all — pin the SHAPE, not just a value.
-    await c.declare({ species: "stage", stage: "trigger it mechanically", patterns: ["Bash:review-pass"] });
-    await c.store("Run the review watcher, mechanically triggered.", {
-      kind: "rule", rule: { stage: "trigger it mechanically", ...AGENT_RULE },
-    });
-    const viaGate = c.gate({ actionContext: "Bash:review-pass" });
-    expect(viaGate.rules[0]).not.toHaveProperty("body");
     c.close();
   });
 
@@ -9071,61 +6758,30 @@ describe("stageLookup — the recognized matcher", () => {
     c.close();
   });
 
-  it("re-aiming a stage's patterns reroutes the MECHANICAL matcher only — recognized delivery is unaffected (doctrine, item 7)", async () => {
-    const c = core();
-    const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
-      ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
-    expect(c.stageLookup({ stage: "rm -rf" }).rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
-
-    // Re-aim the stage's MECHANICAL firing surface to a shape that no longer matches the old
-    // action — acknowledging the deny, exactly as the guard requires.
-    await c.declare({
-      species: "stage", stage: "rm -rf", patterns: ["Bash:something-else-entirely"],
-      acknowledgeBlockingRules: [deny.conceptId],
-    });
-
-    // MECHANICAL reachability changed: the deny no longer fires on the old action shape.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
-    // RECOGNIZED reachability did NOT change: the SAME deny is still delivered by name, severity
-    // and all — pattern re-aiming is not a rule-withdrawal lever on either matcher (doctrine).
-    const stillReachable = c.stageLookup({ stage: "rm -rf" });
-    expect(stillReachable.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
-    expect(stillReachable.rules[0]!.severity).toBe("blocking");
-    c.close();
-  });
+  // THE RE-AIM DOCTRINE TEST WAS REMOVED HERE (2026-08-22), because its premise was.
+  //
+  // It pinned doctrine item 7: re-aiming a stage's patterns moved the MECHANICAL firing surface and
+  // took nothing away — the same deny stayed bound, stayed blocking, and stayed delivered by name.
+  // The half that mattered was always the second one, and it is unchanged and asserted elsewhere
+  // (stage_lookup resolves by NAME, and a deny is withdrawn only by rule-level acts — see PATH 1).
+  // The first half no longer names anything: there is no mechanical firing surface to move.
 });
 
 // ---------------------------------------------------------------------------
 // createGateSchema — concurrent-migrator race (Codex round 3, item 5)
 // ---------------------------------------------------------------------------
 
-/**
- * Simulates the documented race's STALE READ: a second migrator's PRAGMA probe, taken before a
- * first migrator's ALTER committed, reports the `matcher` column absent — regardless of what the
- * REAL table underneath already has. Only `.all()` is ever called on the intercepted statement by
- * createGateSchema, so only it needs the faked answer; every other statement (including the ALTER
- * this stale answer provokes) passes straight through to the real connection, so the resulting
- * error is REAL SQLite output, not a fabricated one.
- */
-class StaleMatcherProbeStorage extends BetterSqlitePort {
-  private probeConsumed = false;
-
-  override prepare(sql: string): Statement {
-    const statement = super.prepare(sql);
-    if (this.probeConsumed || !/^\s*PRAGMA table_info\(gate_events\)/.test(sql)) return statement;
-    this.probeConsumed = true;
-    return {
-      run: (...params: unknown[]) => statement.run(...params),
-      get: (...params: unknown[]) => statement.get(...params),
-      all: () => [],
-    };
-  }
-}
+// THE STALE `matcher`-COLUMN PROBE FIXTURE WAS REMOVED HERE (2026-08-22), with its subject.
+//
+// `StaleMatcherProbeStorage` faked a stale `PRAGMA table_info(gate_events)` answer so that
+// createGateSchema's guarded ALTER for that table's `matcher` column would hit a REAL
+// duplicate-column error. `gate_events` is gone, the PRAGMA it intercepted is a statement nothing
+// in the tree issues, and the class had no instantiation left — a fixture that could no longer
+// exhibit the effect it was written to certify. THE PROPERTY ITSELF IS STILL PINNED, TWICE: the
+// stale-probe race by `StaleIngestOperationsColumnProbeStorage` just below, against the guarded
+// ALTERs that survive; and the uncoordinated two-migrator race by the "TWO MIGRATORS RACING"
+// section of the circle-column block further down, which uses two real connections and no fake
+// probe at all.
 
 class StaleIngestOperationsColumnProbeStorage extends BetterSqlitePort {
   private probeConsumed = false;
@@ -9158,15 +6814,16 @@ describe("MonetCore construction — ingest_operations receipt-column concurrent
     const path = join(dir, "monet.db");
 
     // FIRST MIGRATOR: an ordinary construction against a brand-new file. `ingest_operations`' own
-    // CREATE TABLE does NOT declare any of the four receipt columns inline (unlike gate_events'
-    // `matcher`) — so even this FIRST, uncontested construction reaches all four guarded ALTERs, and
-    // is the WINNER of the race regardless of file freshness.
+    // CREATE TABLE does NOT declare any of the four receipt columns inline (unlike
+    // `rule_bindings.circle`, which a fresh install gets from its own CREATE TABLE) — so even this
+    // FIRST, uncontested construction reaches all four guarded ALTERs, and is the WINNER of the
+    // race regardless of file freshness.
     const winner = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1 });
     winner.close();
 
     // SECOND MIGRATOR: a fresh connection to the SAME (already-migrated) file, but its own PRAGMA
-    // probe is stale — the SAME supported MCP+CLI-sharing-one-`.monet`-DB topology
-    // `StaleMatcherProbeStorage`'s own comment names — and reports all four columns absent. Every one
+    // probe is stale — the SAME supported MCP+CLI-sharing-one-`.monet`-DB topology `storage.ts`'s
+    // own WAL + busy_timeout setup exists for — and reports all four columns absent. Every one
     // of the four guarded ALTERs proceeds exactly as the real guard would, and each hits SQLite's
     // real "duplicate column name" error against the real, already-migrated table. BEFORE this
     // round's fix, the FIRST of the four to throw aborted this process's entire construction —
@@ -9226,17 +6883,9 @@ const LEGACY_RULE_BINDINGS_DDL = `
 function downgradeToPreBreadthSchema(path: string): void {
   const db = new Database(path);
   db.exec(`DROP INDEX IF EXISTS idx_rule_bindings_circle`);
-  // trg_rule_bindings_backfill_circle (round 5, ON rule_bindings) needs no explicit drop: SQLite
-  // rewrites a trigger's body to follow ALTER TABLE ... RENAME TO, so it survives the rename below as
-  // "ON rule_bindings_new" and is then dropped for real, automatically, by the final DROP TABLE
-  // rule_bindings_new — a genuinely pre-breadth store has no such trigger, and this reaches that
-  // state without help. trg_rule_bindings_follow_concept_circle (round 7, item 2, ON concepts) gets
-  // NO such help — it is scoped to a table this function never renames or drops, so it would
-  // otherwise survive this whole dance unchanged, still referencing rule_bindings.circle, and throw
-  // "no such column: circle" the moment anything updates a concept's circle against the
-  // no-circle-column LEGACY_RULE_BINDINGS_DDL shape this function is about to install. Dropped
-  // explicitly, for the identical reason: a genuinely pre-breadth store has none of this either.
-  db.exec(`DROP TRIGGER IF EXISTS trg_rule_bindings_follow_concept_circle`);
+  // The compatibility triggers this function used to have to drop by hand are gone from the schema
+  // entirely (see migrateGateColumns' own removal record); a genuinely pre-breadth store has none
+  // of them either, so the rename/copy dance below reaches that state unassisted.
   db.exec(`ALTER TABLE rule_bindings RENAME TO rule_bindings_new`);
   db.exec(LEGACY_RULE_BINDINGS_DDL);
   db.exec(`INSERT INTO rule_bindings
@@ -9256,7 +6905,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     // shape a pre-breadth store has on disk.
     const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
     await built.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking",
       reason: "there is no undo", circle: "alpha", ...AGENT_RULE,
     });
@@ -9264,7 +6913,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       circle: "alpha", kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE },
     });
     await built.store("Prefer npm ci.", {
-      circle: "beta", kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", ...AGENT_RULE },
+      circle: "beta", kind: "rule", rule: { stage: "npm install", ...AGENT_RULE },
     });
     // This concept moves circles BEFORE the downgrade — the backfill must follow the CONCEPT's
     // CURRENT circle ("gamma"), not whatever the binding might have remembered.
@@ -9319,10 +6968,10 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     }
     expect(postUpgrade.find((r) => r.concept_id === "ghost-concept")?.circle).toBeNull();
 
-    // Gate delivery actually works post-upgrade, in every circle involved, including the moved one.
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "alpha" }).rules).toHaveLength(1);
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "gamma" }).rules).toHaveLength(1);
-    expect(upgraded.gate({ actionContext: "Bash:npm install", circle: "beta" }).rules).toHaveLength(1);
+    // Delivery actually works post-upgrade, in every circle involved, including the moved one.
+    expect(upgraded.stageLookup({ stage: "rm -rf", circle: "alpha" }).rules).toHaveLength(1);
+    expect(upgraded.stageLookup({ stage: "rm -rf", circle: "gamma" }).rules).toHaveLength(1);
+    expect(upgraded.stageLookup({ stage: "npm install", circle: "beta" }).rules).toHaveLength(1);
 
     // The CHECK constraint the guarded ALTER carried is actually enforced on the upgraded table —
     // not merely present in the DDL text. 'projection' rather than 'correction' (review fix — Codex
@@ -9348,7 +6997,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     const racePath = join(raceDir, "race.db");
     const seedForRace = new MonetCore(racePath, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
     await seedForRace.store("Prefer npm ci.", {
-      circle: "beta", kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", ...AGENT_RULE },
+      circle: "beta", kind: "rule", rule: { stage: "npm install", ...AGENT_RULE },
     });
     seedForRace.close();
     downgradeToPreBreadthSchema(racePath);
@@ -9362,29 +7011,6 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     expect(raceRows[0]!.circle).toBe("beta");
     portA.close();
     portB.close();
-  });
-
-  it("bumps the generation exactly once for a backfill that actually changes delivery, and not at all once there is nothing left to backfill (minor m3)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "store2.db");
-    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    await built.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking",
-      reason: "there is no undo", ...AGENT_RULE,
-    });
-    built.close();
-    downgradeToPreBreadthSchema(path);
-
-    const port = new BetterSqlitePort(path);
-    const genBefore = gateGeneration(port);
-    createGateSchema(port); // the guarded ALTER, plus a real backfill (one row: NULL -> 'default')
-    const genAfterBackfill = gateGeneration(port);
-    expect(genAfterBackfill).toBeGreaterThan(genBefore);
-
-    createGateSchema(port); // idempotent: the ALTER no-ops, and there is nothing left to backfill
-    expect(gateGeneration(port)).toBe(genAfterBackfill);
-    port.close();
   });
 
   /**
@@ -9428,7 +7054,8 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     // The backfill ran clean afterward: opening at all (a fresh MonetCore always runs
     // createGateSchema's full sequence — rename, guarded ALTER, backfill, index) completed without
     // throwing, and an ordinary gate query in the new circle is a plain, correct miss.
-    expect(upgraded.gate({ actionContext: "Bash:anything", circle: LEGACY_STAR_CIRCLE }).silence).toBe(true);
+    expect(upgraded.stageLookup({ stage: "anything", circle: LEGACY_STAR_CIRCLE }))
+      .toMatchObject({ matched: false, stage: null, rules: [] });
     upgraded.close();
   });
 
@@ -9440,7 +7067,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     // (circle != '*' OR origin = 'declaration') would NOT reject this combination, so an unfixed
     // backfill copying '*' straight onto it would succeed and mint an ACCIDENTAL global deny.
     const deny = await built.declare({
-      circle: "an-ordinary-circle", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: "an-ordinary-circle", species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
@@ -9467,10 +7094,10 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       expect(bindingRow.circle, id).toBe(LEGACY_STAR_CIRCLE); // NEVER '*' — never silently breadth
       expect(bindingRow.origin, id).toBe(expectedOrigin); // unchanged — this was never a breadth mint
     }
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: LEGACY_STAR_CIRCLE }).rules.map((r) => r.conceptId))
+    expect(upgraded.stageLookup({ stage: "rm -rf", circle: LEGACY_STAR_CIRCLE }).rules.map((r) => r.conceptId))
       .toEqual([deny.conceptId, advisory.conceptId]);
-    // ...and it never fires as though either were global.
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "some-other-circle-entirely" }).rules).toEqual([]);
+    // ...and it never delivers as though either were global.
+    expect(upgraded.stageLookup({ stage: "rm -rf", circle: "some-other-circle-entirely" }).rules).toEqual([]);
     upgraded.close();
   });
 
@@ -9518,13 +7145,14 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
   /**
    * ROUND 2's OWN SEAM REPRODUCED B1's CLASS ONE LAYER UP (Codex round 3, item 1). A genuine
    * pre-gate 1.3.1 store has NO gate tables at all — not just no `circle` column, no `stages`,
-   * `rule_bindings`, `gate_events`, or `gate_meta` whatsoever. Round 2 ran the legacy-star migration
-   * BEFORE `createGateSchema` (which creates `gate_meta`), so its own `bumpGateGeneration` call
+   * `rule_bindings`, `gate_events`, or `gate_meta` whatsoever (the last two have since been dropped
+   * from the schema outright; only the first two are still created). Round 2 ran the legacy-star
+   * migration BEFORE `createGateSchema`, which then created `gate_meta`, so its `bumpGateGeneration`
    * threw "no such table: gate_meta" — AFTER the concept had already moved (no explicit transaction
    * wraps `moveCircleScopedTables`) — aborting construction on the FIRST open and succeeding only on
    * a retry, because the second attempt found nothing left to migrate. This is the exact scenario:
    * no DROP-and-rebuild-the-legacy-DDL fixture (nothing to preserve — this store never had gate
-   * tables to begin with), just the four gate tables genuinely absent.
+   * tables to begin with), just the gate tables genuinely absent.
    */
   it("legacy-star migration preserves colliding workstreams and leaves no same-slug duplicates (#101)", async () => {
     const dir = mkTmp();
@@ -9567,21 +7195,17 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     // Simulate a GENUINE pre-gate 1.3.1 store: every gate table absent, not merely missing a column.
     const legacy = new Database(path);
     legacy.exec(`DROP INDEX IF EXISTS idx_rule_bindings_circle`);
-    // trg_rule_bindings_backfill_circle (round 5, ON rule_bindings) is auto-dropped by the DROP
-    // TABLE rule_bindings below (a trigger dies with the table it is registered on). trg_rule_
-    // bindings_follow_concept_circle (round 7, item 2, ON concepts) is NOT — concepts is never
-    // touched here — so it survives, unchanged, still referencing rule_bindings, and throws "no such
-    // table: rule_bindings" the moment the UPDATE below fires it. A genuine pre-gate store has
-    // neither trigger; dropped explicitly to actually reach that state.
-    legacy.exec(`DROP TRIGGER IF EXISTS trg_rule_bindings_follow_concept_circle`);
+    // The compatibility triggers this fixture used to have to drop by hand are gone from the
+    // schema entirely (see migrateGateColumns' own removal record), so there is nothing left here
+    // but the tables themselves. `DROP TABLE IF EXISTS gate_events` went the same way (2026-08-22):
+    // the builder above no longer creates that table, so the line could only ever be a no-op here —
+    // it read as coverage of a shape this fixture cannot produce.
     legacy.exec(`DROP TABLE IF EXISTS rule_bindings`);
     legacy.exec(`DROP TABLE IF EXISTS stages`);
-    legacy.exec(`DROP TABLE IF EXISTS gate_events`);
-    legacy.exec(`DROP TABLE IF EXISTS gate_meta`);
     legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
     legacy.close();
 
-    // THE FIRST ATTEMPT. Pre-fix, this line itself threw "no such table: gate_meta".
+    // THE FIRST ATTEMPT — pre-fix, construction threw here on a genuine pre-gate store.
     const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
 
     // Migration completed: the concept moved.
@@ -9589,20 +7213,12 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     expect(migratedRow.circle).toBe(LEGACY_STAR_CIRCLE);
     // Every gate table now exists, backfill included — a fresh rule declared now works end to end.
     const rule = await upgraded.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
       scope: "domain",
     });
     if (rule.species !== "rule") throw new Error("unreachable");
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
-    // Generation is sane: positive, and advances on a further real mutation.
-    const genAfterOpen = upgraded.sidecarGeneration();
-    expect(genAfterOpen).toBeGreaterThan(0);
-    await upgraded.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Prefer npm ci.", severity: "advisory", scope: "domain",
-    });
-    expect(upgraded.sidecarGeneration()).toBeGreaterThan(genAfterOpen);
+    expect(upgraded.stageLookup({ stage: "rm -rf" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
     upgraded.close();
   });
 
@@ -9632,14 +7248,13 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     const migratedRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
     expect(migratedRow.circle).toBe(LEGACY_STAR_CIRCLE);
     expect(raw(upgraded).prepare(`SELECT 1 FROM sync_meta WHERE singleton = 1`).get()).toBeDefined();
-    expect(upgraded.sidecarGeneration()).toBeGreaterThan(0);
     const rule = await upgraded.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
       scope: "domain",
     });
     if (rule.species !== "rule") throw new Error("unreachable");
-    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
+    expect(upgraded.stageLookup({ stage: "rm -rf" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
     upgraded.close();
   });
 
@@ -9727,14 +7342,14 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       // proving the resolution lands on the migrated destination rather than degenerating to
       // global-only.
       const localRule = await built.declare({
-        circle: "project", species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+        circle: "project", species: "rule", stage: "npm install",
         content: "Confirm the registry before installing.", severity: "advisory", scope: "domain",
       });
       if (localRule.species !== "rule") throw new Error("unreachable");
       // A GENUINELY GLOBAL rule sharing the same stage — the control that makes "delivers the local
       // rule too" distinguishable from "delivers only global rules regardless".
       const globalRule = await built.declare({
-        circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+        circle: BREADTH_CIRCLE, species: "rule", stage: "npm install",
         content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
       });
       if (globalRule.species !== "rule") throw new Error("unreachable");
@@ -9782,9 +7397,9 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
       // THE PAYOFF: querying through "project" delivers BOTH the migrated local rule and the global
       // one — union, not global-only. A second, untouched circle proves the global rule alone is not
       // what is doing the work here (it would fire there too, with or without this fix).
-      expect(upgraded.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId).sort())
+      expect(upgraded.stageLookup({ stage: "npm install", circle: "project" }).rules.map((r) => r.conceptId).sort())
         .toEqual([globalRule.conceptId, localRule.conceptId].sort());
-      expect(upgraded.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+      expect(upgraded.stageLookup({ stage: "npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
         .toEqual([globalRule.conceptId]);
 
       // DISCLOSURE counts both cleaned rows (1 deleted + 1 repointed = 2).
@@ -9800,63 +7415,19 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
   });
 
   /**
-   * A LIVE COMPATIBILITY TRIGGER, NOT ONLY A RESTART-TIME BACKFILL (Codex round 5, item 4, P1). "This
-   * machine runs mixed builds against one store today": an OLDER build's own `bindRule`-equivalent
-   * INSERT was compiled before the `circle` column existed, so it omits the column entirely — a raw
-   * INSERT landing `circle = NULL`, invisible to RULE_LIVENESS_WHERE's `b.circle = ?` filter (NULL
-   * matches nothing, ever), including a FRESH DENY, until SOME process eventually restarts and reruns
-   * the backfill. A schema-level TRIGGER fires on ANY connection's INSERT regardless of which build
-   * issued it — closing the live gap between "an old build wrote this" and "the next restart notices".
+   * THE DANGLING COMPOSITION (Codex round 5, item 4, kept past the compatibility-trigger removal):
+   * a binding whose concept has not landed on this device AT ALL yet — the sync-specific
+   * dangling-then-live gap — must stay genuinely NULL, not be resolved to a wrong guess, until the
+   * concept actually arrives. BLOCKER B3 (engine.ts) is what heals it, in the graft's own concepts
+   * loop, and it is the ONLY healer left on the write path now that the trigger family is gone.
    */
-  it("a raw pre-breadth-shaped INSERT (old-build shape, no circle reference at all) on an upgraded store carries the concept's circle immediately, at insert time — no restart required (Codex round 5, item 4)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const oldBuildsRule = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
-      circle: "project",
-    });
-    if (oldBuildsRule.species !== "rule") throw new Error("unreachable");
-    const stageId = c.ruleBinding(oldBuildsRule.conceptId)!.stage_id;
-
-    // SIMULATE: this binding arrived via an OLD BUILD's own bindRule-equivalent instead — the
-    // CONCEPT (kind='rule', active, RULE_LIVENESS_WHERE's own other requirements) was declared
-    // normally above and stays untouched; only the BINDING is replaced with the exact pre-breadth
-    // column shape LEGACY_RULE_BINDINGS_DDL declares (no `circle` anywhere in the INSERT) — the one
-    // column this fix is about.
-    raw(c).prepare(`DELETE FROM rule_bindings WHERE concept_id = ?`).run(oldBuildsRule.conceptId);
-    raw(c).prepare(
-      `INSERT INTO rule_bindings
-         (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
-          created_at, sync_updated_at, sync_revision, sync_writer)
-       VALUES (?, ?, 'advisory', 'domain', NULL, 'declaration', NULL, 'an old-build reason', ?, ?, 0, 'old-build')`,
-    ).run(oldBuildsRule.conceptId, stageId, Date.now(), Date.now());
-
-    // IMMEDIATELY — no reopen, no restart, no call to migrateGateColumns again. The trigger fired
-    // synchronously inside the INSERT statement above, before it even returned.
-    const landed = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(oldBuildsRule.conceptId) as { circle: string | null };
-    expect(landed.circle).toBe("project");
-    // And it actually delivers, live, in the SAME process that never restarted.
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
-      .toContain(oldBuildsRule.conceptId);
-    c.close();
-  });
-
-  /**
-   * THE DANGLING COMPOSITION (Codex round 5, item 4): this trigger and BLOCKER B3 (engine.ts) heal
-   * the SAME symptom at two DIFFERENT moments and must not fight over the row in between. A binding
-   * whose concept has not landed on this device AT ALL yet — the sync-specific dangling-then-live
-   * gap — must stay genuinely NULL, not be resolved to a wrong guess, until the concept actually
-   * arrives; this trigger's own UPDATE subquery evaluates to NULL when no matching concept exists
-   * (a scalar subquery over zero rows), which is a real no-op, not a false resolution — verified
-   * directly, not merely asserted from reading the SQL.
-   */
-  it("the dangling composition: a binding whose concept has not arrived stays NULL (this trigger's own no-op), and BLOCKER B3 heals it when the concept lands via graft — composing rather than fighting (Codex round 5, item 4)", async () => {
+  it("the dangling composition: a binding whose concept has not arrived stays NULL, and BLOCKER B3 heals it when the concept lands via graft (Codex round 5, item 4)", async () => {
     const peer = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "peer" });
     // kind='rule' on the CONCEPT — RULE_LIVENESS_WHERE requires it (this module's own doc comment:
     // "active concept, kind='rule', not superseded"), so the concept side must satisfy it even
     // though its OWN binding (created here too) never crosses to the receiver — stripped below.
     const futureRule = await peer.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "A rule concept that has not arrived on the receiver yet.", severity: "advisory", scope: "domain",
       circle: "project",
     });
@@ -9868,7 +7439,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
 
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "Seed rule so a real stage exists on the receiver too.", severity: "advisory", scope: "domain",
     });
     if (seed.species !== "rule") throw new Error("unreachable");
@@ -9884,8 +7455,8 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     expect(
       (raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(futureRule.conceptId) as { circle: string | null }).circle,
     ).toBeNull();
-    // Correctly invisible — a NULL circle matches no query's filter, live or offline.
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
+    // Correctly invisible — a NULL circle matches no query's filter.
+    expect(c.stageLookup({ stage: "npm install", circle: "project" }).rules.map((r) => r.conceptId))
       .not.toContain(futureRule.conceptId);
 
     // THE CONCEPT ARRIVES — via graft, BLOCKER B3's own trigger condition ("this concept landing IS
@@ -9893,694 +7464,16 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     c.graftRows(conceptOnlyPayload as never);
     const healed = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(futureRule.conceptId) as { circle: string | null };
     expect(healed.circle).toBe("project");
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "project" }).rules.map((r) => r.conceptId))
       .toContain(futureRule.conceptId);
 
     peer.close(); c.close();
   });
 
-  /**
-   * THE UPDATE SIDE OF THE COMPATIBILITY TRIGGER FAMILY (Codex round 7, item 2, P1). Round 5's own
-   * trigger closes the gap for an old build MINTING a binding (INSERT); this one closes the
-   * SYMMETRIC gap for an old build MOVING a concept that already has one — moveConcept/renameCircle's
-   * pre-breadth code UPDATEs `concepts.circle` directly with no idea `rule_bindings.circle` needs to
-   * follow, reopening the exact round-1, item-3 silent-divergence shape for any writer old enough to
-   * predate the keep-in-step convention.
-   */
-  it("a raw old-build-shaped UPDATE of a concept's circle (no rule_bindings touch at all) — the binding follows immediately, at update time; a '*' binding stays '*', untouched (Codex round 7, item 2)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const localRule = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
-      circle: "project",
-    });
-    if (localRule.species !== "rule") throw new Error("unreachable");
-    const globalRule = await c.declare({
-      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
-    });
-    if (globalRule.species !== "rule") throw new Error("unreachable");
-
-    // THE OLD BUILD'S OWN UPDATE — concepts.circle alone, exactly what moveConcept/renameCircle's
-    // pre-keep-in-step code issues; no rule_bindings statement anywhere near it.
-    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run("project-moved", localRule.conceptId);
-
-    // IMMEDIATELY — no second statement, no reopen. The trigger fired synchronously inside the very
-    // UPDATE above, before it even returned.
-    const followed = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(localRule.conceptId) as { circle: string };
-    expect(followed.circle).toBe("project-moved");
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "project-moved" }).rules.map((r) => r.conceptId))
-      .toContain(localRule.conceptId);
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
-      .not.toContain(localRule.conceptId);
-
-    // A '*' BINDING STAYS '*' — the same old-build UPDATE, against the GLOBAL rule's own concept.
-    // A global rule's reach is a property of the BINDING, independent of wherever its concept is
-    // filed — re-aligning it here would silently narrow a global rule to local.
-    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run("wherever-this-concept-ends-up", globalRule.conceptId);
-    const stayedGlobal = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(globalRule.conceptId) as { circle: string };
-    expect(stayedGlobal.circle).toBe(BREADTH_CIRCLE);
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
-      .toContain(globalRule.conceptId);
-    c.close();
-  });
-
-  /**
-   * THE BACKFILL TRIGGER BUMPS THE GENERATION TOO (Codex round 7, item 3, P2). Round 5's own trigger
-   * fixed the CIRCLE value; it never touched gate_meta, so an old build's own INSERT landed a live
-   * rule the on-disk mirror's own stamped generation had no way to know was now behind. isSidecarStale
-   * compares the file's own generation against gate_meta's current value — the bump is what makes
-   * that comparison catch this case at all.
-   */
-  it("an old-build-shaped INSERT bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 7, item 3)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Seed rule so a real stage exists to bind against.", severity: "advisory", scope: "domain",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    const stageId = c.ruleBinding(seed.conceptId)!.stage_id;
-    // A fresh materialize so the ON-DISK file's own stamped generation is CURRENT before the probe —
-    // isolates this test to what the trigger itself does, not to whatever staleness already existed.
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    const generationBefore = c.sidecarGeneration();
-
-    const oldBuildsRule = await c.store("Confirm the target path first.", { circle: "project", kind: "fact" });
-    // THE OLD BUILD'S OWN INSERT — the exact pre-circle-column column list, no circle anywhere in it.
-    raw(c).prepare(
-      `INSERT INTO rule_bindings
-         (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
-          created_at, sync_updated_at, sync_revision, sync_writer)
-       VALUES (?, ?, 'advisory', 'domain', NULL, 'declaration', NULL, 'an old-build reason', ?, ?, 0, 'old-build')`,
-    ).run(oldBuildsRule.conceptId, stageId, Date.now(), Date.now());
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    // THE FILE ITSELF NEVER MOVED — an old build's own process has no JS hook to refresh it — so the
-    // comparison now disagrees: exactly the honest-stale contract, not a silent-fresh lie.
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
-    c.close();
-  });
-
-  /**
-   * THE UPDATE-SIDE TRIGGER BUMPS THE GENERATION TOO (Codex round 8, item 2, P2). The symmetric gap
-   * to round 7, item 3's own fix on the INSERT trigger: round 7, item 2 fixed the CIRCLE value for an
-   * old build's own concept move, but never touched gate_meta, so the move landed undetectably — the
-   * on-disk mirror's own stamped generation had no way to know it was now behind.
-   */
-  it("an old-build-shaped UPDATE of a concept's circle (with a live binding) bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 8, item 2)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
-      circle: "project",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    // A fresh materialize so the ON-DISK file's own stamped generation is CURRENT before the probe —
-    // isolates this test to what the trigger itself does, not to whatever staleness already existed.
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    const generationBefore = c.sidecarGeneration();
-
-    // THE OLD BUILD'S OWN UPDATE — concepts.circle alone, exactly what moveConcept/renameCircle's
-    // pre-keep-in-step code issues; no rule_bindings statement anywhere near it (same shape as round
-    // 7, item 2's own test above, here probing the generation side rather than the circle value).
-    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run("project-moved", seed.conceptId);
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    // THE FILE ITSELF NEVER MOVED — an old build's own process has no JS hook to refresh it — so the
-    // comparison now disagrees: the same honest-stale contract item 3 established for the INSERT side.
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
-    c.close();
-  });
-
-  /**
-   * THE THIRD COMPATIBILITY TRIGGER, THE STATUS SIDE (Codex round 9, item 2, P2). Round 5's INSERT
-   * trigger and round 8's UPDATE-of-circle trigger say nothing about an old build RETIRING or
-   * RESTORING a concept — retireConcept/restoreConcept's own pre-mirror-widening code UPDATEs
-   * `concepts.status` directly, so an old build retiring an ADVISORY rule (its own era only tracked
-   * blocking, if it bumped status at all) leaves the new build's on-disk mirror serving the retired
-   * rule as current, indefinitely — nothing else ever re-triggers a refresh for a concept nobody
-   * touches again.
-   */
-  it("an old-build-shaped status UPDATE retiring a bound ADVISORY rule bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 9, item 2)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    expect((JSON.parse(readFileSync(path, "utf8")) as GateMirror).entries).toHaveLength(1); // live pre-retire
-    const generationBefore = c.sidecarGeneration();
-
-    // THE OLD BUILD'S OWN UPDATE — concepts.status alone, exactly what retireConcept's pre-mirror-
-    // widening code issues; no gate_meta statement anywhere near it, and (its own era) no bump at
-    // all for an ADVISORY rule specifically, only ever for blocking.
-    raw(c).prepare(`UPDATE concepts SET status = 'retired' WHERE id = ?`).run(seed.conceptId);
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    // THE FILE ITSELF NEVER MOVED — still reports the retired rule as live — so the comparison now
-    // disagrees: the same honest-stale contract items 3 and round-8-item-2 established.
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
-    c.close();
-  });
-
-  it("does NOT bump for an ordinary fact's status churn — the EXISTS-on-rule_bindings scope holds, not a blanket status trigger (Codex round 9, item 2)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const fact = await c.store("A fact with no rule binding at all.", { kind: "fact" });
-    const before = c.sidecarGeneration();
-    c.retireConcept(fact.conceptId);
-    expect(c.sidecarGeneration()).toBe(before); // no rule_bindings row for this concept — no-op
-    c.restoreConcept(fact.conceptId);
-    expect(c.sidecarGeneration()).toBe(before);
-    c.close();
-  });
-
-  /**
-   * NEW-BUILD retireConcept/restoreConcept STILL BUMP EXACTLY ONCE (Codex round 9, item 2's own
-   * double-bump check — the round-8 lesson applied before shipping: an increment is not idempotent).
-   * `noteRuleTouched(id)` was REMOVED from both call sites (engine.ts) because
-   * trg_rule_bindings_follow_concept_status's own WHEN clause is `hasLiveBinding`'s EXACT predicate,
-   * not merely a superset — the broader "bumps exactly once per mutation class" test already covers
-   * retireConcept incidentally (step 5); this pins BOTH directions explicitly and by name.
-   */
-  it("retireConcept and restoreConcept each bump gate_meta exactly once for a bound rule, not twice (Codex round 9, item 2, exact-count)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const deny = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
-    });
-    if (deny.species !== "rule") throw new Error("unreachable");
-    await withdrawDeny(c, deny.conceptId, "rm -rf");
-    const beforeRetire = c.sidecarGeneration();
-    c.retireConcept(deny.conceptId);
-    expect(c.sidecarGeneration()).toBe(beforeRetire + 1);
-
-    const beforeRestore = c.sidecarGeneration();
-    c.restoreConcept(deny.conceptId);
-    expect(c.sidecarGeneration()).toBe(beforeRestore + 1);
-    c.close();
-  });
-
-  /**
-   * CLOSING THE FAMILY, THE STAGE SIDE (Codex round 10, items 2+3, P2 — one of the two findings
-   * named by the coordinator). An old build's own upsertStage gated its bump on
-   * `liveBlockingRulesForStage(...).length > 0` — correct while the mirror was blocking-only,
-   * silently wrong once GateMirror.stages started carrying every stage, rule-bound or not. See
-   * `trg_stages_bump_on_trigger_patterns`'s own comment (gates.ts) for the full argument.
-   */
-  it("an old-build-shaped UPDATE of a stage's trigger_patterns bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 10, items 2+3)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    await c.declare({ species: "stage", stage: "npm install", patterns: ["Bash:npm install"] });
-    const stageId = c.stages()[0]!.id;
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    const generationBefore = c.sidecarGeneration();
-
-    // THE OLD BUILD'S OWN UPDATE — trigger_patterns alone, exactly what an old, blocking-only-era
-    // upsertStage issues for a stage with no live blocking rule bound (its own gate: `if
-    // (liveBlockingRulesForStage(db, existing.id).length > 0) bumpGateGeneration(db)`, absent here).
-    raw(c).prepare(`UPDATE stages SET trigger_patterns = ? WHERE id = ?`).run(
-      JSON.stringify([{ tool: "bash", tokens: ["npm", "ci"] }]), stageId,
-    );
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
-    c.close();
-  });
-
-  it("does NOT bump for a same-value UPDATE of trigger_patterns — the OLD-IS-NOT-NEW guard holds, matching the sibling triggers (Codex round 10, items 2+3)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    await c.declare({ species: "stage", stage: "npm install", patterns: ["Bash:npm install"] });
-    const stageId = c.stages()[0]!.id;
-    const currentPatterns = raw(c).prepare(`SELECT trigger_patterns FROM stages WHERE id = ?`).get(stageId) as { trigger_patterns: string };
-    const before = c.sidecarGeneration();
-    raw(c).prepare(`UPDATE stages SET trigger_patterns = ? WHERE id = ?`).run(currentPatterns.trigger_patterns, stageId);
-    expect(c.sidecarGeneration()).toBe(before);
-    c.close();
-  });
-
-  /**
-   * NEW-BUILD stage re-authoring bumps EXACTLY ONCE, not twice (Codex round 10, items 2+3,
-   * exact-count) — upsertStage's own explicit bump was REMOVED (unlike bindRule's, kept — see
-   * that trigger's own comment for why the two cases differ), because upsertStage's own
-   * pre-existing no-op guard (`nextPatterns === existing.trigger_patterns → return existing`)
-   * already made its removed bump an EXACT match for `trg_stages_bump_on_trigger_patterns`'s own
-   * condition, not merely a superset.
-   */
-  it("declare({species:'stage'}) re-authoring patterns bumps gate_meta exactly once, not twice (Codex round 10, items 2+3, exact-count)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    await c.declare({ species: "stage", stage: "npm install", patterns: ["Bash:npm install"] });
-    const before = c.sidecarGeneration();
-    await c.declare({ species: "stage", stage: "npm install", patterns: ["Bash:npm install", "Bash:npm ci"] });
-    expect(c.sidecarGeneration()).toBe(before + 1);
-    c.close();
-  });
-
-  /**
-   * CLOSING THE FAMILY, THE TITLE SIDE (Codex round 10, items 2+3, P2 — the other finding named by
-   * the coordinator). An old build's own retitling code (synthesizeRow and its three swept twins,
-   * engine.ts) predates knowing an ADVISORY rule's retitle is mirror-relevant at all — the mirror
-   * was blocking-only when those paths were first written. See
-   * `trg_rule_bindings_follow_concept_title`'s own comment (gates.ts) for the full argument.
-   */
-  it("an old-build-shaped UPDATE of a bound ADVISORY rule's title (a retitle) bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 10, items 2+3)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    expect((JSON.parse(readFileSync(path, "utf8")) as GateMirror).entries[0]!.text).toBe("Confirm the lockfile before installing");
-    const generationBefore = c.sidecarGeneration();
-
-    // THE OLD BUILD'S OWN UPDATE — title alone, exactly what old, blocking-only-era synthesis code
-    // (synthesizeRow, applySynthesis, resolveContradiction, detach()'s partial-detach — all
-    // predating the mirror widening) issues for an advisory rule's concept.
-    raw(c).prepare(`UPDATE concepts SET title = ? WHERE id = ?`).run("Confirm the lockfile is present before installing", seed.conceptId);
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
-    c.close();
-  });
-
-  it("does NOT bump for a same-value UPDATE of a concept's title — the OLD-IS-NOT-NEW guard holds (Codex round 10, items 2+3)", async () => {
+  it("the bulk backfill leaves UNRESOLVABLE NULL-circle bindings alone — dangling (no concept at all) or parked in the reserved '*' circle — rather than resolving either to a wrong value (Codex round 12, P2)", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    const before = c.sidecarGeneration();
-    raw(c).prepare(`UPDATE concepts SET title = ? WHERE id = ?`).run("Confirm the lockfile before installing", seed.conceptId);
-    expect(c.sidecarGeneration()).toBe(before);
-    c.close();
-  });
-
-  it("does NOT bump for an ordinary fact's retitle — the EXISTS-on-rule_bindings scope holds, not a blanket title trigger (Codex round 10, items 2+3)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const fact = await c.store("A fact with no rule binding at all.", { kind: "fact" });
-    const before = c.sidecarGeneration();
-    raw(c).prepare(`UPDATE concepts SET title = ? WHERE id = ?`).run("A retitled fact.", fact.conceptId);
-    expect(c.sidecarGeneration()).toBe(before);
-    c.close();
-  });
-
-  /**
-   * NEW-BUILD retitling bumps EXACTLY ONCE, not twice (Codex round 10, items 2+3, exact-count) —
-   * all four `noteRuleTouched` calls tied to a title-only write were REMOVED (resolveContradiction,
-   * applySynthesis, detach()'s partial-detach, synthesizeRow — engine.ts, each site's own comment),
-   * because `hasLiveBinding` (what each called) is the EXACT condition
-   * `trg_rule_bindings_follow_concept_title`'s own WHEN clause tests, not merely a superset.
-   */
-  it("applySynthesis retitling a bound rule bumps gate_meta exactly once, not twice (Codex round 10, items 2+3, exact-count)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    raw(c).prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(seed.conceptId); // force synthesis to actually run
-    const before = c.sidecarGeneration();
-    await c.applySynthesis(seed.conceptId, "Always confirm the lockfile is present and committed before installing.");
-    expect(c.sidecarGeneration()).toBe(before + 1);
-    c.close();
-  });
-
-  /**
-   * CLOSING THE FAMILY, THE THIRD GAP THE AUDIT ITSELF FOUND (Codex round 10, items 2+3 — beyond
-   * the two the coordinator named by name): stage_id/severity/scope/model_tag/origin/declared_by/
-   * reason all move together through bindRule's own "replace" branch (gates.ts), whose bump was
-   * ALSO historically gated on touching deny power. See
-   * `trg_rule_bindings_bump_on_reclassification`'s own comment (gates.ts) for the full argument,
-   * including why — unlike every other trigger in this family — bindRule's own JS-side bump is
-   * KEPT rather than removed, and the accepted double-bump that follows for a genuine new-build
-   * reclassification.
-   */
-  it("an old-build-shaped UPDATE of a bound ADVISORY rule's scope/model_tag/reason (staying advisory throughout) bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 10, items 2+3)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "agent", modelTag: "old-model",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    const generationBefore = c.sidecarGeneration();
-
-    // THE OLD BUILD'S OWN UPDATE — scope/model_tag/reason, severity UNCHANGED (advisory throughout,
-    // so deny power is never in play) — exactly what an old, blocking-only-era bindRule's own
-    // "replace" branch issues, with its own bump gated on `touchesDenyPower` and so absent here.
-    raw(c).prepare(`UPDATE rule_bindings SET scope = 'domain', model_tag = NULL, reason = 'updated reason' WHERE concept_id = ?`)
-      .run(seed.conceptId);
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
-    c.close();
-  });
-
-  it("does NOT bump for a same-value UPDATE of rule_bindings' scope/model_tag/origin/declared_by/reason/stage_id — the OLD-IS-NOT-NEW guard holds across all seven (Codex round 10, items 2+3)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "agent", modelTag: "some-model",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    const current = raw(c).prepare(`SELECT stage_id, scope, model_tag, origin, declared_by, reason FROM rule_bindings WHERE concept_id = ?`)
-      .get(seed.conceptId) as { stage_id: string; scope: string; model_tag: string; origin: string; declared_by: string | null; reason: string };
-    const before = c.sidecarGeneration();
-    raw(c).prepare(
-      `UPDATE rule_bindings SET stage_id = ?, scope = ?, model_tag = ?, origin = ?, declared_by = ?, reason = ? WHERE concept_id = ?`,
-    ).run(current.stage_id, current.scope, current.model_tag, current.origin, current.declared_by, current.reason, seed.conceptId);
-    expect(c.sidecarGeneration()).toBe(before);
-    c.close();
-  });
-
-  /**
-   * THE ACCEPTED DOUBLE-BUMP, NAMED AND VERIFIED, NOT LEFT UNDOCUMENTED (Codex round 10, items 2+3):
-   * a genuine new-build reclassification (declare() re-aiming an already-advisory rule's scope,
-   * staying advisory throughout) bumps TWICE — once from bindRule's own kept, unconditional bump,
-   * once from `trg_rule_bindings_bump_on_reclassification`. Deliberately not "exactly once", unlike
-   * every sibling exact-count test above — see that trigger's own comment (gates.ts) for why
-   * bindRule's own call could not be safely removed the way every other one in this family was.
-   */
-  it("declare() re-aiming an already-advisory rule's scope bumps gate_meta TWICE — an accepted, documented double-bump, not an exact-count regression (Codex round 10, items 2+3)", async () => {
-    // DEFAULT (ENABLED) DEDUP, not this describe block's own disabled-dedup convention — deliberately:
-    // the second declare() call below must resolve to the SAME concept as the first (identical
-    // content), which enabled dedup guarantees and disabled dedup does not — the exact same
-    // consideration DOOR 13.11's own comment already verified against the working "PATH 1 — breadth"
-    // precedent test.
-    const c = new MonetCore(":memory:", {});
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "agent", modelTag: "some-model",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    const before = c.sidecarGeneration();
-    const reclassified = await c.declare({
-      species: "rule", stage: "npm install", content: "Confirm the lockfile before installing.",
-      severity: "advisory", scope: "domain",
-    });
-    if (reclassified.species !== "rule") throw new Error("unreachable");
-    expect(reclassified.conceptId).toBe(seed.conceptId);
-    expect(c.sidecarGeneration()).toBe(before + 2);
-    c.close();
-  });
-
-  /**
-   * CLOSING THE VERB DIMENSION (Codex round 11): round 10's own family table enumerated COLUMNS an
-   * old build's UPDATE could touch, but never asked what an old build's INSERT or DELETE against the
-   * SAME tables could miss. The next several tests close stages' own INSERT (item 1), concepts' own
-   * hard DELETE (item 2), and circle_aliases' full INSERT/UPDATE/DELETE (item 3) — the same
-   * old-build-shaped-raw-statement technique every trigger above already uses.
-   */
-  it("an old-build-shaped stage INSERT bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 1)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    // A fresh materialize so the ON-DISK file's own stamped generation is CURRENT before the probe —
-    // isolates this test to what the trigger itself does, matching this family's own established
-    // pattern (round 7, item 3's INSERT-bump test, above).
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    const generationBefore = c.sidecarGeneration();
-
-    // THE OLD BUILD'S OWN INSERT — a brand-new, RULE-LESS stage, exactly the shape upsertStage's own
-    // NEW-STAGE branch writes; no rule ever binds to it in this test, because the finding is about
-    // the STAGE'S OWN ARRIVAL being mirror content (GateMirror.stages carries the full registry,
-    // rule-less stages included — see listGateMirrorStages' own comment), not about anything
-    // rule-shaped.
-    raw(c).prepare(
-      `INSERT INTO stages (id, name, trigger_patterns, origin, verified, created_at, sync_updated_at, sync_revision, sync_writer)
-       VALUES ('old-build-stage', 'a rule-less stage', '[]', 'declaration', 0, ?, ?, 0, 'old-build')`,
-    ).run(Date.now(), Date.now());
-
-    // IMMEDIATELY — no reopen, no restart. The trigger fired synchronously inside the INSERT above.
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    expect(c.isSidecarStale().stale).toBe(true);
-    c.close();
-  });
-
-  it("declare({species:'stage'}) creating a BRAND NEW stage bumps gate_meta's generation exactly once — the trigger alone, now that upsertStage's own JS-side bump has been removed (Codex round 11, item 1, exact-count)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const before = c.sidecarGeneration();
-    const registered = await c.declare({
-      species: "stage", stage: "a brand new rule-less stage", patterns: ["Bash:some new command"],
-    });
-    expect(registered.species).toBe("stage");
-    // Exactly once, not twice: upsertStage's own explicit bumpGateGeneration(db) call on this branch
-    // is GONE (removed — Codex round 11, item 1), an exact-match resolution against
-    // trg_stages_bump_on_insert, which now does this alone — a regression back to a JS-side call
-    // sitting alongside the trigger would show as +2 here, not +1.
-    expect(c.sidecarGeneration()).toBe(before + 1);
-    c.close();
-  });
-
-  /**
-   * THE DELETE SIDE, CONCEPTS (Codex round 11, item 2, P2). A hard-deleted concept's own rule
-   * binding disappears from listGateMirrorEntries' own result set (the INNER JOIN to concepts simply
-   * stops matching it) exactly like a retire, but via DELETE rather than UPDATE. An old build's own
-   * hard-delete code — its era: blocking-only bump gates — bumped nothing for an ADVISORY-bound
-   * concept's own hard delete.
-   */
-  it("an old-build-shaped hard DELETE of a concept carrying a live ADVISORY binding bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 2)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const advisoryRule = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
-    });
-    if (advisoryRule.species !== "rule") throw new Error("unreachable");
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    const generationBefore = c.sidecarGeneration();
-
-    // THE OLD BUILD'S OWN HARD DELETE — its era's equivalent of hardDeleteNativeConcept, minus the
-    // noteRuleTouched call this fix removes and minus every OTHER bookkeeping statement this item
-    // does not concern (concept_deletions, first_block, etc.): isolates this test to the ONE
-    // statement whose trigger this item is about — the concepts row itself disappearing. The
-    // binding row is deliberately left behind, ORPHANED — verified by absence elsewhere in this
-    // codebase that rule_bindings is never explicitly deleted anywhere, so this is the REAL shape a
-    // hard delete leaves, old build or new.
-    raw(c).prepare(`DELETE FROM concepts WHERE id = ?`).run(advisoryRule.conceptId);
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    expect(c.isSidecarStale().stale).toBe(true);
-    c.close();
-  });
-
-  it("does NOT bump for hard-deleting an ordinary FACT concept with no rule binding at all — the EXISTS-on-rule_bindings scope holds, not a blanket delete trigger (Codex round 11, item 2)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const fact = await c.store("An ordinary fact, never a rule.", { kind: "fact" });
-    const before = c.sidecarGeneration();
-    raw(c).prepare(`DELETE FROM concepts WHERE id = ?`).run(fact.conceptId);
-    expect(c.sidecarGeneration()).toBe(before);
-    c.close();
-  });
-
-  it("a NEW-build hard delete of an advisory-bound concept (consolidating detach) bumps gate_meta's generation exactly once — the trigger alone, now that hardDeleteNativeConcept's own noteRuleTouched call has been removed (Codex round 11, item 2, exact-count)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const advisoryRule = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
-    });
-    if (advisoryRule.species !== "rule") throw new Error("unreachable");
-    const other = await c.store("An unrelated concept to consolidate onto.", { kind: "fact" });
-    const full = await c.getConcept(advisoryRule.conceptId);
-
-    const before = c.sidecarGeneration();
-    // Consolidating detach: ALL of the rule's observations move to `other`, so the emptied rule
-    // concept is hard-deleted — advisory, so assertBlockingRuleMutationAllowed lets it through.
-    await c.detach(advisoryRule.conceptId, full!.observations.map((o) => o.id), { destConceptId: other.conceptId });
-    // Exactly once, not twice: a regression re-adding hardDeleteNativeConcept's own JS-side bump
-    // alongside trg_concepts_bump_on_delete would show as +2 here, not +1.
-    expect(c.sidecarGeneration()).toBe(before + 1);
-    c.close();
-  });
-
-  /**
-   * THE CIRCLE_ALIASES VERBS (Codex round 11, item 3, P2). Unlike every trigger above, this gap is
-   * not "blocking-only vs widened" — circle_aliases/circles were ADDED to the mirror in format 4
-   * ITSELF, so ANY build predating that slice has no bump of any kind for an alias write, regardless
-   * of severity. All three verbs, tested directly against the raw table, matching this family's own
-   * established old-build-shaped-statement technique.
-   */
-  it("an old-build-shaped raw INSERT into circle_aliases bumps gate_meta's generation, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 3)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    const generationBefore = c.sidecarGeneration();
-
-    raw(c).prepare(`INSERT INTO circle_aliases (from_name, to_name, status) VALUES ('old-from', 'old-to', 'active')`).run();
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    expect(c.isSidecarStale().stale).toBe(true);
-    c.close();
-  });
-
-  it("an old-build-shaped raw UPDATE of circle_aliases bumps gate_meta's generation, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 3)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    raw(c).prepare(`INSERT INTO circle_aliases (from_name, to_name, status) VALUES ('old-from', 'old-to', 'active')`).run();
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    const generationBefore = c.sidecarGeneration();
-
-    raw(c).prepare(`UPDATE circle_aliases SET status = 'archived' WHERE from_name = 'old-from'`).run();
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    expect(c.isSidecarStale().stale).toBe(true);
-    c.close();
-  });
-
-  it("an old-build-shaped raw DELETE from circle_aliases bumps gate_meta's generation, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 3)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    raw(c).prepare(`INSERT INTO circle_aliases (from_name, to_name, status) VALUES ('old-from', 'old-to', 'active')`).run();
-    c.materializeGateMirror(path);
-    expect(c.isSidecarStale().stale).toBe(false);
-    const generationBefore = c.sidecarGeneration();
-
-    // No application code path ever issues this DELETE today (renameCircle/mergeCircle/
-    // archiveCircle/unarchiveCircle all upsert, never delete) — tested anyway, both because the
-    // trigger exists unconditionally and because a raw DELETE is exactly the class of statement this
-    // whole mixed-build family defends against, reachable or not through today's own app code.
-    raw(c).prepare(`DELETE FROM circle_aliases WHERE from_name = 'old-from'`).run();
-
-    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
-    expect(c.isSidecarStale().stale).toBe(true);
-    c.close();
-  });
-
-  it("mergeCircle of an EMPTY circle (zero concepts in `from`) bumps gate_meta's generation exactly once — the circle_aliases trigger alone, now that mergeCircle's own JS-side bump has been removed (Codex round 11, item 3, exact-count)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const before = c.sidecarGeneration();
-    // "empty-source" holds nothing at all — no concept, no prior alias — which mergeCircle allows
-    // (no existence check on `from`, unlike renameCircle's own). The for-loop over conceptRows is a
-    // clean no-op, isolating this test to the alias write alone.
-    await c.mergeCircle("empty-source", "keep");
-    expect(c.sidecarGeneration()).toBe(before + 1);
-    c.close();
-  });
-
-  it("archiveCircle of a brand-new (never-before-seen) circle name bumps gate_meta's generation exactly once — the circle_aliases trigger alone, now that archiveCircle's own JS-side bump has been removed (Codex round 11, item 3, exact-count)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const before = c.sidecarGeneration();
-    // archiveCircle has no existence requirement at all (unlike renameCircle's own) — archiving a
-    // name with no prior alias row just upserts one, fresh.
-    c.archiveCircle("never-seen-before");
-    expect(c.sidecarGeneration()).toBe(before + 1);
-    c.close();
-  });
-
-  it("unarchiveCircle bumps gate_meta's generation exactly once when it actually flips a row back to active, and NOT AT ALL for its documented no-op (no alias row exists) — the trigger's own per-row firing is an exact match for the removed `changes > 0` gate (Codex round 11, item 3, exact-count)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    c.archiveCircle("shelved");
-    const before = c.sidecarGeneration();
-    c.unarchiveCircle("shelved");
-    expect(c.sidecarGeneration()).toBe(before + 1);
-
-    // THE DOCUMENTED NO-OP: no alias row exists for this name at all — the UPDATE's WHERE clause
-    // matches zero rows, so trg_circle_aliases_bump_on_update fires zero times too, exactly as the
-    // removed `if (r.changes > 0)` JS gate used to test.
-    const beforeNoop = c.sidecarGeneration();
-    c.unarchiveCircle("a-name-that-was-never-archived");
-    expect(c.sidecarGeneration()).toBe(beforeNoop);
-    c.close();
-  });
-
-  /**
-   * NEVER MINT BREADTH FROM A COMPATIBILITY MOVE (Codex round 12, P1 — found by review). Two
-   * triggers in this family copy a circle value verbatim from somewhere else; both had the same
-   * hole, both are fixed the same way, both get their own test here.
-   */
-  it("an old-build-shaped UPDATE of a concept's circle INTO the reserved '*' marker does NOT mint breadth on its binding — refused rather than treated as an ordinary move (Codex round 12, P1)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const localRule = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Confirm the lockfile before installing.", severity: "blocking", scope: "domain",
-      reason: "an unlocked install can drift", circle: "project",
-    });
-    if (localRule.species !== "rule") throw new Error("unreachable");
-    const before = c.sidecarGeneration();
-
-    // THE OLD BUILD'S OWN UPDATE — moving the concept into a circle literally spelled "*", legal
-    // under its own pre-breadth freedom (arbitrary circle names), with zero awareness the marker is
-    // now reserved. Before this fix: the sibling trigger copied it straight into rule_bindings.circle
-    // — a BLOCKING rule silently made global, on the strength of an old process's ordinary move.
-    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run(BREADTH_CIRCLE, localRule.conceptId);
-
-    // THE BINDING STAYS PUT — no mint, no crash.
-    const afterMove = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(localRule.conceptId) as { circle: string };
-    expect(afterMove.circle).toBe("project");
-    // The CONCEPT itself did move (this trigger never touches `concepts`) — legacy-star cleanup is
-    // a separate, later concern (the next new-build open), unaffected by this fix either way.
-    expect(raw(c).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(localRule.conceptId)).toEqual({ circle: BREADTH_CIRCLE });
-    // NO BUMP either — nothing mirror-relevant changed (the binding, which is what the mirror reads
-    // for this rule, never moved).
-    expect(c.sidecarGeneration()).toBe(before);
-    // And the deny still fires from exactly where it always did.
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
-      .toContain(localRule.conceptId);
-    c.close();
-  });
-
-  it("an old-build-shaped raw INSERT into rule_bindings, whose concept already lives in the reserved '*' circle, resolves to NULL rather than minting breadth (Codex round 12, P1 — same audit, the backfill trigger)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
-      content: "Seed rule so a real stage exists to bind against.", severity: "advisory", scope: "domain",
-    });
-    if (seed.species !== "rule") throw new Error("unreachable");
-    const stageId = c.ruleBinding(seed.conceptId)!.stage_id;
-
-    // A concept ALREADY sitting in the reserved circle (the legacy pre-breadth shape) — no binding
-    // yet.
-    const pathological = await c.store("A concept an old build already parked in '*'.", { kind: "fact" });
-    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run(BREADTH_CIRCLE, pathological.conceptId);
-
-    // THE OLD BUILD'S OWN INSERT — the pre-breadth column shape, binding this pathological concept.
-    raw(c).prepare(
-      `INSERT INTO rule_bindings
-         (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
-          created_at, sync_updated_at, sync_revision, sync_writer)
-       VALUES (?, ?, 'advisory', 'domain', NULL, 'declaration', NULL, 'an old-build reason', ?, ?, 0, 'old-build')`,
-    ).run(pathological.conceptId, stageId, Date.now(), Date.now());
-
-    // NULL, not '*' — resolves the SAME way a genuinely dangling binding (no concept at all) already
-    // does, not minted.
-    const landed = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(pathological.conceptId) as { circle: string | null };
-    expect(landed.circle).toBeNull();
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
-      .not.toContain(pathological.conceptId);
-    c.close();
-  });
-
-  it("the bulk backfill does NOT bump when the only NULL-circle bindings are unresolvable — dangling (no concept at all) or parked in the reserved '*' circle — miscounting either as resolved was the exact review finding (Codex round 12, P2)", async () => {
-    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const seed = await c.declare({
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      species: "rule", stage: "npm install",
       content: "Seed rule so a real stage exists to bind against.", severity: "advisory", scope: "domain",
     });
     if (seed.species !== "rule") throw new Error("unreachable");
@@ -10608,59 +7501,17 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
        VALUES (?, ?, 'advisory', 'domain', NULL, 'declaration', NULL, NULL, ?, ?, 0, 'old-build')`,
     ).run(parked.conceptId, stageId, Date.now(), Date.now());
 
-    const generationBefore = (db.prepare(`SELECT generation FROM gate_meta WHERE singleton = 1`).get() as { generation: number }).generation;
-
     // Calling migrateGateColumns AGAIN, directly — the SAME idempotent re-entry this module's own
     // "concurrent-migrator race"/"survives a second migration pass" tests already rely on, isolating
     // this test to the bulk backfill's OWN behavior rather than construction's own two-call sequence
     // (round 11, item 3).
     migrateGateColumns(db);
 
-    // NO BUMP — neither row was actually resolvable (EXISTS fails for both, for different reasons),
-    // so neither is touched by the UPDATE's own WHERE clause, so neither is miscounted as resolved.
-    expect((db.prepare(`SELECT generation FROM gate_meta WHERE singleton = 1`).get() as { generation: number }).generation)
-      .toBe(generationBefore);
     expect((db.prepare(`SELECT circle FROM rule_bindings WHERE concept_id = 'dangling-nowhere'`).get() as { circle: string | null }).circle)
       .toBeNull();
     expect((db.prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(parked.conceptId) as { circle: string | null }).circle)
       .toBeNull();
     c.close();
-  });
-
-  it("the trigger survives a second migration pass — idempotent CREATE TRIGGER IF NOT EXISTS, not merely accidentally harmless (Codex round 5, item 4)", () => {
-    const dir = mkTmp();
-    const path = join(dir, "trigger-idempotent.db");
-    const port = new BetterSqlitePort(path);
-    // A MINIMAL concepts table — just enough for the backfill's own "GUARDED ON concepts EXISTING"
-    // check to see it (the pure schema-race fixture above deliberately has none at all; this test is
-    // about a DIFFERENT concern, the trigger's own idempotent creation, which needs the guard to pass
-    // so the trigger actually gets created in the first place).
-    port.exec(`CREATE TABLE concepts (id TEXT PRIMARY KEY, circle TEXT NOT NULL DEFAULT 'default')`);
-    createGateSchema(port); // first pass: creates rule_bindings, adds circle, creates the trigger
-    createGateSchema(port); // second pass: must not throw, must not duplicate the trigger
-
-    const triggers = port.prepare(
-      `SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_rule_bindings_backfill_circle'`,
-    ).all() as Array<{ name: string }>;
-    expect(triggers).toHaveLength(1);
-
-    // AND IT STILL WORKS after the second pass — not merely present, but functioning. No `stages`
-    // FK is enforced at the SQL layer (this table has none), so a dummy stage_id is enough to prove
-    // the INSERT itself does not throw — that the trigger body is valid SQL against this schema —
-    // without needing a real stage row. `concept_id` names nothing in the minimal `concepts` table
-    // above, exercising the SAME no-op path the dangling case does: circle stays NULL, silently.
-    expect(() =>
-      port.prepare(
-        `INSERT INTO rule_bindings
-           (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
-            created_at, sync_updated_at, sync_revision, sync_writer)
-         VALUES ('trigger-survives-check', 'dummy-stage', 'advisory', 'domain', NULL, 'declaration', NULL, NULL, 1, 1, 0, 'x')`,
-      ).run(),
-    ).not.toThrow();
-    const stillDangling = port.prepare(`SELECT circle FROM rule_bindings WHERE concept_id = 'trigger-survives-check'`)
-      .get() as { circle: string | null };
-    expect(stillDangling.circle).toBeNull();
-    port.close();
   });
 
   /**
@@ -10669,7 +7520,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
    * edges, then normative rows, then the source registry, then aliases, then the generation bump —
    * so a crash between any two of them left a HALF-MOVED store: exactly the "concepts moved,
    * sources/aliases not, or worse" shape this item names. Injected via a probe StoragePort (matching
-   * this describe block's own StaleMatcherProbeStorage precedent), throwing partway through
+   * this file's own StaleIngestOperationsColumnProbeStorage precedent), throwing partway through
    * moveCircleScopedTables itself — after concepts/observations/edges/normative rows have already
    * been touched, before knowledge_sources, entities, first_block, alias cleanup, or the generation
    * bump ever run — the worst-shaped partial failure available, not merely a clean early one.
@@ -10724,7 +7575,6 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
     const migratedRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
     expect(migratedRow.circle).toBe(LEGACY_STAR_CIRCLE);
-    expect(upgraded.sidecarGeneration()).toBeGreaterThan(0);
     upgraded.close();
   });
 });
@@ -10739,8 +7589,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
  * order, so a test can assert the SHAPE of the transaction boundaries around a call: not just that
  * "some transaction" existed somewhere (a per-statement `inTransaction()` snapshot cannot tell one
  * merged transaction apart from two sequential ones — every statement in EITHER scenario runs with
- * SOME transaction open), but that the read phase shares exactly one, the write phase shares a
- * SEPARATE one, and the write's begins only after the read's has fully closed.
+ * SOME transaction open), but exactly how many of each kind opened, and in what order.
  */
 class TransactionLoggingStorage extends BetterSqlitePort {
   readonly events: string[] = [];
@@ -10769,7 +7618,26 @@ class TransactionLoggingStorage extends BetterSqlitePort {
 }
 
 describe("stageLookup (standalone) — transaction boundaries", () => {
-  it("wraps the read phase in ONE db.transaction(...), and commitGateWrites in its OWN separate db.immediateTransaction(...) afterward — mirrors MonetCore.stageLookup()'s own split exactly (Codex round 4, item 3). STRUCTURAL ASSERTION chosen over true concurrency: a genuine concurrent-writer race would need a second real connection racing mid-read, which is disproportionate to set up deterministically; this instead proves the CODE SHAPE the race protection depends on.", async () => {
+  /**
+   * WHAT THIS ASSERTED UNTIL 2026-08-22, and what changed: the original (Codex round 4, item 3)
+   * required ONE `db.transaction(...)` for the read phase and ONE SEPARATE
+   * `db.immediateTransaction(...)` for `commitGateWrites` afterward, beginning only after the read
+   * had closed. The first half was the TOCTOU fix and is unchanged below. The second half was
+   * protection for a write that no longer exists: `commitGateWrites` had been emptied when
+   * `gate_events` and the `verified` flag were removed, so the assertion was pinning the SHAPE of a
+   * write phase that committed nothing.
+   *
+   * IT IS NOW THE OPPOSITE ASSERTION, and that is a strengthening rather than a loss. `BEGIN
+   * IMMEDIATE` takes SQLite's write lock whether or not the transaction body does anything —
+   * measured on this build: a concurrent writer on a second connection takes SQLITE_BUSY for the
+   * duration of an EMPTY immediate transaction. So a lookup that opened one was serialising real
+   * writers behind a no-op. ZERO immediate transactions is the property worth holding: a pure read
+   * must never take the write lock. If a gate write is reintroduced, this test should go back to
+   * requiring the SEPARATE-transaction split, for the reason it was written with — a DEFERRED read
+   * transaction upgrading to a write one can be refused with SQLITE_BUSY, and a lookup must not
+   * throw because a bookkeeping row could not be written.
+   */
+  it("wraps every read in ONE db.transaction(...) and opens NO write transaction at all — a pure read must not take the store's write lock. STRUCTURAL ASSERTION chosen over true concurrency: a genuine concurrent-writer race would need a second real connection racing mid-read, which is disproportionate to set up deterministically; this instead proves the CODE SHAPE the race protection depends on.", async () => {
     const dir = mkTmp();
     const path = join(dir, "monet.db");
     const setup = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1 });
@@ -10785,28 +7653,26 @@ describe("stageLookup (standalone) — transaction boundaries", () => {
     setup.close();
 
     const port = new TransactionLoggingStorage(path);
-    const result = standaloneStageLookup(port, { stage: "bulk stage", circle: "default", nextSyncTimestamp: () => Date.now() });
+    const result = standaloneStageLookup(port, { stage: "bulk stage", circle: "default" });
     port.close();
 
     expect(result.matched).toBe(true);
     expect(result.rulesTotal).toBe(RULE_COUNT); // sanity: this really is the capped, multi-read path
 
-    // EXACTLY ONE read transaction, EXACTLY ONE write transaction — the same shape
-    // MonetCore.stageLookup() itself uses (engine.ts), not zero (unwrapped — the bug) and not one
-    // shared transaction spanning both (which would defeat the write's own allowed-to-fail split).
+    // EXACTLY ONE read transaction — not zero (unwrapped: the bug round 4 closed), not several
+    // (which would put the capped-path reads in a different instant from the prefix already
+    // returned). The same shape MonetCore.stageLookup() itself uses (engine.ts).
     expect(port.events.filter((e) => e === "transaction:call")).toHaveLength(1);
-    expect(port.events.filter((e) => e === "immediateTransaction:call")).toHaveLength(1);
+    // AND NO WRITE TRANSACTION, at all.
+    expect(port.events.filter((e) => e === "immediateTransaction:call")).toHaveLength(0);
+    expect(port.events).not.toContain("immediateTransaction:run:start");
 
     const readStart = port.events.indexOf("transaction:run:start");
     const readEnd = port.events.indexOf("transaction:run:end");
-    const writeStart = port.events.indexOf("immediateTransaction:run:start");
-    const writeEnd = port.events.indexOf("immediateTransaction:run:end");
     expect(readStart).toBeGreaterThanOrEqual(0);
     expect(readEnd).toBeGreaterThan(readStart);
-    // THE WRITE BEGINS ONLY AFTER THE READ TRANSACTION FULLY CLOSED: proof these are two SEQUENTIAL
-    // transactions, not one merged one.
-    expect(writeStart).toBeGreaterThan(readEnd);
-    expect(writeEnd).toBeGreaterThan(writeStart);
+    // Nothing runs after the read transaction closes.
+    expect(port.events[port.events.length - 1]).toBe("transaction:run:end");
   }, 30_000);
 });
 
@@ -10923,7 +7789,7 @@ describe("evaluateStageLookup — SQL-level retrieval bounds", () => {
     // shorter than the cap returns the whole string) — reasonMissing computes false exactly as it
     // did before retrieval was ever bounded.
     const ordinary = await c.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking",
       reason: "there is no undo", scope: "domain",
     });
@@ -10939,7 +7805,7 @@ describe("evaluateStageLookup — SQL-level retrieval bounds", () => {
     // elsewhere in this file — constructed directly so the analysis is verified empirically rather
     // than by inspection alone.
     const pathological = await c.declare({
-      species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
+      species: "rule", stage: "terraform apply",
       content: "Confirm the plan before applying.", severity: "blocking",
       reason: "a placeholder reason", scope: "domain",
     });
@@ -10999,7 +7865,7 @@ describe("liveStageIndex", () => {
   it("excludes a stage whose only rule was SUPERSEDED (corrected away), not just retired", async () => {
     const c = core();
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     expect(c.prewarm().stageIndex).toEqual(["git force push"]);
     // A correction supersedes the rule AND births a successor bound to the same stage, so the
@@ -11219,7 +8085,7 @@ describe("MCP surface", () => {
     const stored = await call("memory_store", {
       content: "Never force-push to a shared branch.",
       kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "it destroys teammates' commits" },
+      rule: { stage: "git force push", reason: "it destroys teammates' commits" },
     });
     expect(stored.isError).toBe(false);
     // The model tag came from the HOST, not from the agent — the agent never named one.
@@ -11228,13 +8094,13 @@ describe("MCP surface", () => {
     });
 
     const declared = await call("memory_declare", {
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
       declaredBy: "john",
     });
     expect(declared.isError).toBe(false);
     expect(declared.json).toMatchObject({ species: "rule" });
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ severity: "blocking" });
+    expect(c.stageLookup({ stage: "rm -rf" }).rules[0]).toMatchObject({ severity: "blocking" });
 
     await client.close();
     c.close();
@@ -11440,7 +8306,7 @@ describe("MCP surface", () => {
     const declared = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation.", declaredBy: "john" });
     if (declared.species !== "principle") throw new Error("unreachable");
     const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+      kind: "rule", rule: { stage: "git force push", ...AGENT_RULE },
     });
     c.addLifecycleEdge({ family: "derivation", srcConceptId: declared.conceptId, dstConceptId: rule.conceptId, bornOf: "extraction" });
     // A correction kills the rule, which impeaches the parent — the reachable route to an open
@@ -11466,10 +8332,10 @@ describe("MCP surface", () => {
     const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
     const { call, client } = await harness(c);
     const first = await c.store("Verify the built artifact after the source changes.", {
-      kind: "rule", rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain" },
+      kind: "rule", rule: { stage: "docker build", scope: "domain" },
     });
     const second = await c.store("After the source changes, verify the artifact itself.", {
-      kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      kind: "rule", rule: { stage: "npm install", scope: "domain" },
     });
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
     const declared = await c.declare({
@@ -11503,7 +8369,7 @@ describe("MCP surface", () => {
   /** A live deny, declared the only way a deny can be born: by declaration. `circle: "*"` = global. */
   async function mcpDeny(c: MonetCore, content: string, stage: string, circle?: string) {
     const r = await c.declare({
-      species: "rule", stage, patterns: [`Bash:${stage}`], content,
+      species: "rule", stage, content,
       severity: "blocking", reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
       ...(circle ? { circle } : {}),
     });
@@ -11629,10 +8495,10 @@ describe("MCP surface", () => {
     expect(moved.isError).toBe(false);
     expect(moved.json.action).toBe("moved");
     expect(moved.json.message as string).not.toContain("DENY RELOCATED");
-    // Because nothing about its delivery changed: the binding stayed global, and the deny still
-    // fires in the circle its concept just left.
+    // Because nothing about its delivery changed: the binding stayed global, and the deny is still
+    // delivered in the circle its concept just left.
     expect(c.ruleBinding(deny.conceptId)!.circle).toBe(BREADTH_CIRCLE);
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules
+    expect(c.stageLookup({ stage: "rm -rf", circle: "default" }).rules
       .filter((r) => r.severity === "blocking")).toHaveLength(1);
 
     // BATCH MODE, same question — the field is absent entirely rather than present and empty.
@@ -11716,10 +8582,10 @@ describe("MCP surface", () => {
     // THE LIE THAT MUST NOT BE TOLD: "it now denies only in live-dest" about a rule that denies
     // nowhere. A mandatory disclosure stating the opposite of the truth is worse than an absent one.
     expect(moved.json.message as string).not.toContain("DENY RELOCATED");
-    // ...and the silence is accurate: advisory now, and no deny fires in either circle.
+    // ...and the silence is accurate: advisory now, and no deny is delivered in either circle.
     expect(a.ruleBinding(deny.conceptId)!.severity).toBe("advisory");
     for (const circle of ["default", "live-dest"]) {
-      expect(a.gate({ actionContext: "Bash:rm -rf /tmp/x", circle }).rules
+      expect(a.stageLookup({ stage: "rm -rf", circle }).rules
         .filter((r) => r.severity === "blocking")).toHaveLength(0);
     }
     // The ordinary guidance is untouched — silence is about the disclosure, not the response.
@@ -11738,7 +8604,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(a);
     // Advisory at the moment the caller asked, so the old pre-call read said "nothing to disclose".
     const rule = await a.declare({
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", reason: "there is no undo",
       declaredBy: "john", ...AGENT_RULE,
     });
@@ -11764,9 +8630,9 @@ describe("MCP surface", () => {
     expect(message).toContain("it now denies only in live-dest");
     // ...and the disclosure is accurate: a real deny stopped covering `default` and covers live-dest.
     expect(a.ruleBinding(rule.conceptId)).toMatchObject({ severity: "blocking", circle: "live-dest" });
-    expect(a.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules
+    expect(a.stageLookup({ stage: "rm -rf", circle: "default" }).rules
       .filter((r) => r.severity === "blocking")).toHaveLength(0);
-    expect(a.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "live-dest" }).rules
+    expect(a.stageLookup({ stage: "rm -rf", circle: "live-dest" }).rules
       .filter((r) => r.severity === "blocking")).toHaveLength(1);
 
     spy.mockRestore();
@@ -11809,7 +8675,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c);
 
     const first = await call("memory_declare", {
-      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
       scope: "domain", // domain, not the "agent" default — sidesteps the modelTag requirement entirely, irrelevant to what this test targets
     });
@@ -11861,7 +8727,7 @@ describe("MCP surface", () => {
     const CONTENT = "Never install without a lockfile present.";
 
     const first = await call("memory_declare", {
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"], scope: "domain",
+      species: "rule", stage: "npm install", scope: "domain",
       content: CONTENT, severity: "blocking", reason: "an unlocked install can drift", circle: "*",
     });
     expect(first.isError).toBe(false);
@@ -11882,7 +8748,7 @@ describe("MCP surface", () => {
     // session default the moment `circle` was omitted from the wire call.
     expect(c.ruleBinding(firstConceptId)!.circle).toBe(BREADTH_CIRCLE);
     expect(againJson.narrowedFromBreadth).toBeUndefined();
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-this-test-never-otherwise-touches" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-this-test-never-otherwise-touches" }).rules.map((r) => r.conceptId))
       .toEqual([firstConceptId]);
 
     await client.close();
@@ -11910,7 +8776,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c, { autoPrewarm: true });
 
     const declared = await call("memory_declare", {
-      species: "rule", stage: "npm install", patterns: ["Bash:npm install"], scope: "domain",
+      species: "rule", stage: "npm install", scope: "domain",
       content: "Never install without a lockfile present.", severity: "blocking",
       reason: "an unlocked install can drift", circle: "*",
     });
@@ -11919,7 +8785,7 @@ describe("MCP surface", () => {
 
     // THE RULING still reaches declare() as '*' — round 2's own fix, unweakened by this one.
     expect(c.ruleBinding(conceptId)!.circle).toBe(BREADTH_CIRCLE);
-    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-this-test-never-configured" }).rules.map((r) => r.conceptId))
+    expect(c.stageLookup({ stage: "npm install", circle: "a-circle-this-test-never-configured" }).rules.map((r) => r.conceptId))
       .toEqual([conceptId]);
 
     // THE RESPONSE'S OWN `circle` FIELD names the HOME circle, honestly — where the CONCEPT
@@ -11942,7 +8808,7 @@ describe("MCP surface", () => {
     // would then retire the wrong ones — a boundary that must not rest on self-knowledge.
     const stored = await call("memory_store", {
       content: "A compensation.", kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force", modelTag: "agent-claimed-model" },
+      rule: { stage: "git force push", modelTag: "agent-claimed-model" },
     });
     expect(c.ruleBinding(stored.json.conceptId as string)!.model_tag).toBe("host-model");
 
@@ -11963,7 +8829,7 @@ describe("MCP surface", () => {
       const { call, client } = await harness(c); // no host tag at all
       const stored = await call("memory_store", {
         content: "A compensation.", kind: "rule",
-        rule: { stage: "git force push", instance: "Bash:git push --force", modelTag: "agent-claimed-model" },
+        rule: { stage: "git force push", modelTag: "agent-claimed-model" },
       });
       expect(stored.isError).toBe(false);
       expect(c.ruleBinding(stored.json.conceptId as string)!.model_tag).toBe("agent-claimed-model");
@@ -11979,28 +8845,26 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c, { modelTag: "model-a" });
     // A host that changes which model it is running mid-session calls setRuntimeModelTag directly
     // — registration ran ONCE, at server start, and its closure-captured copy of "model-a" must not
-    // be what capture stamps from here on. gate()/stageLookup() already read this live; capture did
+    // be what capture stamps from here on. stageLookup() already reads this live; capture did
     // not, before this fix.
     c.setRuntimeModelTag("model-b");
 
     const stored = await call("memory_store", {
       content: "Never force-push to a shared branch.", kind: "rule",
-      rule: { stage: "git force push", instance: "Bash:git push --force origin main" },
+      rule: { stage: "git force push" },
     });
     expect(stored.isError).toBe(false);
     expect(c.ruleBinding(stored.json.conceptId as string)!.model_tag).toBe("model-b");
-    // IMMEDIATELY deliverable via BOTH read paths, with no explicit runtimeModelTag override — both
+    // IMMEDIATELY deliverable on the read path, with no explicit runtimeModelTag override — the read
     // already resolved `this.runtimeModelTag` live before this fix; what was missing is CAPTURE
-    // catching up to them. Before the fix this rule was stamped "model-a" and would be silently
-    // filtered out of both calls below (captured, then instantly invisible).
-    expect(c.gate({ actionContext: "Bash:git push --force origin main" }).rules.map((r) => r.conceptId))
-      .toContain(stored.json.conceptId);
+    // catching up to it. Before the fix this rule was stamped "model-a" and would be silently
+    // filtered out of the call below (captured, then instantly invisible).
     expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId))
       .toContain(stored.json.conceptId);
 
     // memory_declare's capture handler carries the identical fix.
     const declared = await call("memory_declare", {
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
     });
     expect(declared.isError).toBe(false);
@@ -12021,8 +8885,10 @@ describe("MCP surface", () => {
     // rather than slipping in under a negative assertion. `projectedFromPrincipleId` (slice 5-B) is
     // the one addition since, and it is refused outright in combination with blocking severity —
     // "no agent, and NO PROJECTION, can self-assign deny power" (see the refusal test below).
+    // `instance` came OFF this list on 2026-08-22: it existed only to seed a new stage's trigger
+    // patterns and retired with them. The exact-list discipline is the point and is unchanged.
     expect(Object.keys(ruleSchema.properties ?? {}).sort())
-      .toEqual(["instance", "modelTag", "projectedFromPrincipleId", "reason", "scope", "stage"]);
+      .toEqual(["modelTag", "projectedFromPrincipleId", "reason", "scope", "stage"]);
     // ...while memory_declare does carry it, and says so.
     const declare = tools.find((t) => t.name === "memory_declare")!;
     expect(Object.keys(declare.inputSchema.properties as object)).toContain("severity");
@@ -12044,7 +8910,7 @@ describe("MCP surface", () => {
     const projected = await call("memory_store", {
       content: "Rebuild the image before deploying after a lockfile change.",
       kind: "rule",
-      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain", projectedFromPrincipleId: principle.conceptId },
+      rule: { stage: "docker build", scope: "domain", projectedFromPrincipleId: principle.conceptId },
     });
     expect(projected.isError).toBe(false);
     expect(c.ruleBinding(projected.json.conceptId as string)!.origin).toBe("projection");
@@ -12060,11 +8926,11 @@ describe("MCP surface", () => {
     // EXTRACTION CANDIDATE on the store response, omitted-when-absent like every optional field.
     const first = await call("memory_store", {
       content: "Verify the built artifact after the source changes.",
-      kind: "rule", rule: { stage: "terraform apply", instance: "Bash:terraform apply", scope: "domain" },
+      kind: "rule", rule: { stage: "terraform apply", scope: "domain" },
     });
     const second = await call("memory_store", {
       content: "After the source changes, verify the artifact itself.",
-      kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      kind: "rule", rule: { stage: "npm install", scope: "domain" },
     });
     expect(second.json.extractionCandidate).toMatchObject({ pairedRuleId: first.json.conceptId });
     expect(first.json.extractionCandidate).toBeUndefined();
@@ -12100,11 +8966,11 @@ describe("MCP surface", () => {
 
     const first = await call("memory_store", {
       content: "Verify the built artifact after the source changes.",
-      kind: "rule", rule: { stage: "terraform apply", instance: "Bash:terraform apply", scope: "domain" },
+      kind: "rule", rule: { stage: "terraform apply", scope: "domain" },
     });
     const second = await call("memory_store", {
       content: "After the source changes, verify the artifact itself.",
-      kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+      kind: "rule", rule: { stage: "npm install", scope: "domain" },
     });
     expect(second.json.extractionCandidate).toBeDefined();
     expect(c.overview("default").counts.extractionCandidates).toBe(1);
@@ -12183,7 +9049,7 @@ describe("MCP surface", () => {
     if (principle.species !== "principle") throw new Error("unreachable");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
       kind: "rule",
-      rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: principle.conceptId },
+      rule: { stage: "helm delete", scope: "domain", projectedFromPrincipleId: principle.conceptId },
     });
 
     const before = await call("stage_lookup", { stage: "helm delete" });
@@ -12193,7 +9059,7 @@ describe("MCP surface", () => {
 
     // Impeach the parent through a SIBLING rule, so the rule being looked up is itself untouched.
     const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
-      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: principle.conceptId },
+      kind: "rule", rule: { stage: "kubectl delete", scope: "domain", projectedFromPrincipleId: principle.conceptId },
     });
     const corrected = await call("memory_store", {
       content: "Snapshot the volume AND drain the node before deleting a stateful set.",
@@ -12266,7 +9132,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c, { modelTag: "m1" });
     const stored = await call("memory_store", {
       content: "Never force-push to a shared branch.",
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main" },
+      kind: "rule", rule: { stage: "git force push" },
     });
     const corrected = await call("memory_store", {
       content: "Force-push is fine on your own branch; never on a shared one.",
@@ -12288,13 +9154,13 @@ describe("MCP surface", () => {
     // raw throw surfaces as a protocol failure, which reads as "the tool is broken" rather than
     // "you left out the one field this rule is required to carry".
     const r = await call("memory_declare", {
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking",
     });
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/blocking rule requires `reason`/);
-    // And the refusal was total: no stage was addressed, so nothing fires.
-    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
+    // And the refusal was total: no stage was addressed, so there is nothing to look up.
+    expect(c.stageLookup({ stage: "rm -rf" })).toMatchObject({ matched: false, rules: [] });
     await client.close();
     c.close();
   });
@@ -12332,19 +9198,18 @@ describe("MCP surface", () => {
       // DELIVERY still filters by the constructor's tag, not by "" (which would match nothing —
       // every compensation invisible, the exact failure this fix closes).
       const forA = await c.store("A compensation for model-a.", {
-        kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-a" },
+        kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "model-a" },
       });
       const forOther = await c.store("A compensation for a different model.", {
         kind: "rule", resolution: "forceNew", rule: { stage: "git force push", scope: "agent", modelTag: "other-model" },
       });
       expect(forA.conceptId).not.toBe(forOther.conceptId); // sanity: the excluded rule really exists
-      expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId)).toEqual([forA.conceptId]);
       expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId)).toEqual([forA.conceptId]);
 
       // CAPTURE is not poisoned either: an agent-scoped write with no explicit modelTag stamps the
       // constructor's live tag, not "" — the second half of the bug this fix closes.
       const captured = await call("memory_store", {
-        content: "Another compensation.", kind: "rule", rule: { stage: "rm -rf", instance: "Bash:rm -rf" },
+        content: "Another compensation.", kind: "rule", rule: { stage: "rm -rf" },
       });
       expect(captured.isError).toBe(false);
       expect(c.ruleBinding(captured.json.conceptId as string)!.model_tag).toBe("model-a");
@@ -12367,16 +9232,15 @@ describe("MCP surface", () => {
       // DELIVERY: every agent-scoped rule still fires, unfiltered — the documented meaning of an
       // absent runtime tag, not "matches nothing" (which a poisoned "" would have produced).
       const stored = await c.store("A compensation.", {
-        kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "some-model" },
+        kind: "rule", rule: { stage: "git force push", scope: "agent", modelTag: "some-model" },
       });
-      expect(c.gate({ actionContext: "Bash:git push --force" }).rules.map((r) => r.conceptId)).toEqual([stored.conceptId]);
       expect(c.stageLookup({ stage: "git force push" }).rules.map((r) => r.conceptId)).toEqual([stored.conceptId]);
 
       // CAPTURE: unconfigured behavior — identical to no MONET_MODEL_TAG at all (see "falls back to
       // the agent's tag only when the host supplies none" above): falls back to the agent's own tag.
       const captured = await call("memory_store", {
         content: "Another compensation.", kind: "rule",
-        rule: { stage: "rm -rf", instance: "Bash:rm -rf", modelTag: "agent-claimed-model" },
+        rule: { stage: "rm -rf", modelTag: "agent-claimed-model" },
       });
       expect(captured.isError).toBe(false);
       expect(c.ruleBinding(captured.json.conceptId as string)!.model_tag).toBe("agent-claimed-model");
@@ -12456,6 +9320,28 @@ describe("MCP surface", () => {
     c.close();
   });
 
+  it("the empty-stage acknowledgement describes the lookup that exists, not a report that does not", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const declared = await call("memory_declare", { species: "stage", stage: "an empty stage" });
+    expect(declared.isError).toBe(false);
+    const guidance = declared.json.guidance as string;
+    // WHAT IT USED TO PROMISE: that a matching ACTION would REPORT the stage as having no rules.
+    // Both halves of that sentence were trigger patterns and the gate hook, and both are retired —
+    // nothing watches actions and nothing reports. A user who waits for that report waits forever,
+    // and reads the silence as the stage working.
+    expect(guidance).not.toContain("matching action");
+    expect(guidance).not.toContain("reports");
+    // WHAT ACTUALLY HAPPENS, asserted against the real surface and not just the sentence: someone
+    // looks the stage up by name, and it comes back matched with no rules.
+    expect(guidance).toContain("stage_lookup");
+    const looked = await call("stage_lookup", { stage: "an empty stage" });
+    expect(looked.isError).toBe(false);
+    expect(looked.json).toMatchObject({ matched: true, rules: [] });
+    await client.close();
+    c.close();
+  });
+
   it("stage_lookup wire response stays parseable JSON at adversarial rule/body/reason sizes (blocker fix)", async () => {
     const c = core();
     const { call, client } = await harness(c, { modelTag: "host-model" });
@@ -12493,7 +9379,7 @@ describe("MCP surface", () => {
     const c = core();
     const { call, client } = await harness(c, { modelTag: "host-model" });
     const declared = await call("memory_declare", {
-      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      species: "rule", stage: "rm -rf",
       content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
     });
     expect(declared.isError).toBe(false);
@@ -12517,7 +9403,7 @@ describe("MCP surface", () => {
 
     const forHost = await call("memory_store", {
       content: "A compensation for THIS model.",
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", modelTag: "host-model" },
+      kind: "rule", rule: { stage: "git force push", modelTag: "host-model" },
     });
     expect(forHost.isError).toBe(false);
     const forOther = await call("memory_store", {
@@ -12830,7 +9716,7 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c, { modelTag: "host-model" });
     const stored = await call("memory_store", {
       content: "A compensation for THIS model.",
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", modelTag: "host-model" },
+      kind: "rule", rule: { stage: "git force push", modelTag: "host-model" },
     });
     expect(stored.isError).toBe(false);
     const lookup = await call("stage_lookup", { stage: "git force push" });
@@ -13112,7 +9998,7 @@ describe("MCP surface", () => {
     const c = core();
     const { call, client } = await harness(c);
     const declaredStage = await call("memory_declare", {
-      species: "stage", stage: "opening a pr", patterns: ["Bash:gh pr create"], declaredBy: "john",
+      species: "stage", stage: "opening a pr", declaredBy: "john",
     });
     expect(declaredStage.isError).toBe(false);
     expect(c.stages().find((stage) => stage.name === "opening a pr")!.origin).toBe("declaration");
@@ -13311,111 +10197,6 @@ describe("MCP surface", () => {
 
     spy.mockRestore();
     await client.close();
-    a.close();
-    b.close();
-  });
-
-  // -------------------------------------------------------------------------
-  // THE MIRROR IS PUBLISHED AFTER THE RESERVATION COMMITS (review fix — round 3)
-  //
-  // The two races above prove the ROWS are decided under the reservation. These two prove the one
-  // write in this pair that is not a row is decided OUTSIDE it — for the opposite reason, and with
-  // the same technique: a REAL second connection, run at the exact instant this store publishes.
-  //
-  // WHAT ROUND 1 ACCEPTED, AND WHY IT WAS WRONG: `retireConcept`/`restoreConcept` end with their own
-  // `refreshGateSidecar()`, which under the reserved wrappers ran INSIDE the transaction, on the
-  // reasoning that nothing after it could roll back and the write is idempotent against the gate
-  // generation. The hazard is not rollback. A file published from inside an uncommitted transaction
-  // is visible to every other process while the store they can read still sits at the OLD
-  // generation, so a second reader materializing the mirror in that interval sees a file ahead of
-  // the generation its own fresh read reports, cannot tell it from debris of a lineage the store no
-  // longer has, and overwrites it. The commit then lands with no further write to re-derive the
-  // file — the very write that would have is the one that just happened.
-  //
-  // THE INTERLEAVING IS FORCED, NOT WAITED FOR: better-sqlite3 is synchronous, so the second reader
-  // is placed by spying on THIS store's own publish point and calling through first. That is the
-  // one hook that sits at the same code location in both worlds — only its position relative to the
-  // commit differs, which is exactly the property under test.
-  // -------------------------------------------------------------------------
-  const readMirror = (path: string): GateMirror => JSON.parse(readFileSync(path, "utf8")) as GateMirror;
-
-  /** Interpose `after` immediately after this store's own sidecar publish, once. */
-  function onPublish(c: MonetCore, after: () => string): { spy: { mockRestore(): void }; raced: () => string } {
-    type Sidecarred = { refreshGateSidecar(): void };
-    const original = (Object.getPrototypeOf(c) as Sidecarred).refreshGateSidecar;
-    let raced = "not attempted";
-    const spy = vi.spyOn(c as unknown as Sidecarred, "refreshGateSidecar").mockImplementation(() => {
-      original.call(c as unknown as Sidecarred);
-      if (raced === "not attempted") raced = after();
-    });
-    return { spy, raced: () => raced };
-  }
-
-  it("publishes the gate sidecar only AFTER the retirement's reservation commits, against a second reader materializing it in the interval", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const dbPath = join(mkTmp(), "retire-sidecar-order.db");
-    const a = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    // The second reader: its own connection to the same file, and NO sidecar of its own — it writes
-    // this one only when asked, which is what an offline hook's `monet` CLI invocation does.
-    const b = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    // AN ADVISORY RULE, and that is the whole reachable range here: retiring a LIVE DENY is refused
-    // outright by the blocking-rule chokepoint, so a locally-retirable rule is one whose deny has
-    // already been withdrawn. The mirror carries both severities (format 4), so the generation moves
-    // and the file changes exactly as it would for a deny — the restore test below is the direction
-    // where that difference would matter, and it is stated there.
-    const rule = await a.store("Pull before you push.", {
-      kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE },
-    });
-    expect(readMirror(path).entries.map((e) => e.conceptId)).toEqual([rule.conceptId]); // the premise
-
-    const { spy, raced } = onPublish(a, () => b.materializeGateMirror(path).outcome);
-    expect(a.retireIfUnblocked(rule.conceptId, "default").outcome).toBe("retired");
-
-    // THE SECOND READER FOUND THE FILE ALREADY CURRENT — it could only have, because the commit had
-    // landed before the publish, so its own snapshot carried the same generation and the same
-    // (empty) rule set. In the in-transaction world it reads the OLD generation, calls the fresh
-    // file debris, and answers "written" for a mirror it has just reverted.
-    expect(raced()).toBe("skipped-current");
-    expect(readMirror(path).entries).toEqual([]);
-    expect(a.isSidecarStale().stale).toBe(false); // the store and the file agree
-
-    spy.mockRestore();
-    a.close();
-    b.close();
-  });
-
-  /**
-   * The same ordering on the RESTORE side, where the mismatch runs the dangerous way: restoring a
-   * rule ADDS it to the mirror, so a reverted publish leaves the store DELIVERING a rule the offline
-   * file omits — the under-block direction `restoreConcept`'s own comment names as the one that must
-   * not be forgotten. Advisory here for the reason the retire test states (a live deny cannot be
-   * retired locally, so no locally-retired concept carries one), and the mechanism is severity-blind:
-   * both live in `entries`, and one generation bump governs both.
-   */
-  it("publishes the gate sidecar only AFTER the restoration's reservation commits", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "gate-sidecar.json");
-    const dbPath = join(mkTmp(), "restore-sidecar-order.db");
-    const a = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
-    const b = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const rule = await a.store("Pull before you push.", {
-      kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE },
-    });
-    expect(a.retireConcept(rule.conceptId)!.status).toBe("retired");
-    expect(readMirror(path).entries).toEqual([]); // the premise: the file is caught up on the retire
-
-    const { spy, raced } = onPublish(a, () => b.materializeGateMirror(path).outcome);
-    expect(a.restoreIfInCircle(rule.conceptId, "default").outcome).toBe("restored");
-
-    expect(raced()).toBe("skipped-current");
-    // THE RULE THE STORE NOW DELIVERS IS IN THE FILE. Without the deferral this array is empty while
-    // `stageLookup` below answers with the rule — the store enforcing what the mirror denies knowing.
-    expect(readMirror(path).entries.map((e) => e.conceptId)).toEqual([rule.conceptId]);
-    expect(a.stageLookup({ stage: "git push" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
-    expect(a.isSidecarStale().stale).toBe(false);
-
-    spy.mockRestore();
     a.close();
     b.close();
   });
@@ -13631,171 +10412,15 @@ describe("MCP surface", () => {
 });
 
 // ---------------------------------------------------------------------------
-// the performance contract
+// THE TRIGGER-MATCHER PERFORMANCE CONTRACT WAS REMOVED HERE (2026-08-22), with the matcher.
 // ---------------------------------------------------------------------------
-describe("gate performance", () => {
-  /**
-   * WHY THIS TEST IS CALIBRATED AND RATIO-BASED RATHER THAN ABSOLUTE.
-   *
-   * An earlier version asserted a bare `p95 < 1ms` and failed CI at p50=1.069/p95=1.159 — on a
-   * runner that is simply slower hardware, uniformly, for every operation. Best-of-batches removes
-   * scheduler NOISE but cannot remove a slower CPU, so an absolute millisecond bound in a portable
-   * test measures the machine and calls it a regression.
-   *
-   * The product contract is still sub-millisecond on reference hardware, and it is stated where it
-   * belongs — in the module docs, against named numbers. What a PORTABLE test can prove is what
-   * actually rots when this code regresses:
-   *
-   *   1. SCALING, asserted unconditionally and hardware-independently. A slower machine scales both
-   *      sides of a ratio, so the ratios hold everywhere. These are the assertions that catch the
-   *      real failure mode — an O(stages x context) matcher — with orders of magnitude of margin.
-   *   2. AN ABSOLUTE BOUND CALIBRATED IN-PROCESS: a baseline primitive measured on the same machine
-   *      in the same run, with the gate held to a generous multiple of it, plus a hard ceiling that
-   *      only fires on catastrophe.
-   */
-
-  /**
-   * The calibration primitive: prepared-statement round trips and short string scans, which is
-   * what a gate lookup is made of. Deliberately NOT a gate call — it has to move with the hardware
-   * without moving with the code under test.
-   */
-  function baselineOnce(db: RawDb): void {
-    const q = db.prepare("SELECT 1 AS one");
-    let acc = 0;
-    for (let i = 0; i < 200; i++) {
-      q.get();
-      const text = `Bash:tool${i} run --flag${i} operand`;
-      for (let ch = 0; ch < text.length; ch++) acc += text.charCodeAt(ch);
-    }
-    if (acc < 0) throw new Error("unreachable");
-  }
-
-  /** Best-of-batches p95 — batches absorb the runner's scheduler, the minimum picks a clean one. */
-  function bestP95(fn: () => void, iters: number, batches = 8): number {
-    for (let i = 0; i < Math.min(100, iters); i++) fn();
-    const out: number[] = [];
-    for (let b = 0; b < batches; b++) {
-      const samples: number[] = [];
-      for (let i = 0; i < iters; i++) {
-        const started = process.hrtime.bigint();
-        fn();
-        samples.push(Number(process.hrtime.bigint() - started) / 1e6);
-      }
-      samples.sort((a, b2) => a - b2);
-      out.push(samples[Math.floor(samples.length * 0.95)]!);
-    }
-    return Math.min(...out);
-  }
-
-  it("does not scale with stage count times context length — the matcher stays indexed", () => {
-    // THE ALGORITHMIC GUARD, and the one that needs no hardware assumptions at all. It exercises the
-    // pure matcher, so there is no DB, no clock and no I/O in the measurement.
-    //
-    // Before the context index, matching N patterns against a long context rescanned the whole token
-    // stream once per pattern: 200 stages x 4,000 tokens = 800k comparisons, measured at 2.4ms and
-    // the reason a context cap looked necessary. Indexed, a pattern whose first token is absent
-    // costs one Map lookup, so a 400x longer context costs essentially the same. The bound below is
-    // 20x — two orders of magnitude of headroom against the linear behaviour, which no hardware
-    // difference can manufacture.
-    const patterns = Array.from({ length: 200 }, (_, i) => seedTriggerPattern(`Bash:tool${i} run --flag${i}`));
-    const short = parseActionContext("Bash:tool7 run --flag7 operand");
-    const long = parseActionContext(
-      `Bash:${Array.from({ length: 4000 }, (_, i) => `arg${i}`).join(" ")} && tool42 run --flag42`,
-    );
-    const matchAll = (ctx: ReturnType<typeof parseActionContext>) => (): void => {
-      for (const pattern of patterns) matchesTriggerPattern(pattern, ctx);
-    };
-    const shortCost = bestP95(matchAll(short), 150, 5);
-    const longCost = bestP95(matchAll(long), 150, 5);
-    expect(longCost, `match 200 patterns: short=${shortCost.toFixed(5)}ms long=${longCost.toFixed(5)}ms`)
-      .toBeLessThan(Math.max(shortCost * 20, 0.05));
-  });
-
-  /**
-   * ONE fixture for the whole block, built ONCE.
-   *
-   * This is a CI-COURTESY measure as much as a speed one, and the lesson cost a red build: vitest
-   * runs test FILES in parallel workers, so a benchmark that pins a core for twelve seconds does
-   * not merely measure a two-core runner — it STARVES the other workers, and an unrelated file
-   * (gather.test.ts, on vitest's default 5s timeout) failed with a worker RPC timeout while this
-   * one was busy. A perf test that makes its neighbours fail is a worse test than no perf test.
-   *
-   * Three changes bought back ~85% of it, in order of size:
-   *
-   *   - `resolution: "forceNew"` and `graphEnabled: false` when BUILDING. Both the nomination scan
-   *     and edge derivation compare an incoming concept against every other concept in the circle,
-   *     so building the fixture through the ordinary path is quadratic and dwarfed everything being
-   *     measured. The gate reads stages, rule_bindings, concepts and lifecycle_edges — never
-   *     memory_edge, never an observation vector — so the shape it measures is identical.
-   *   - ONE fixture for the block instead of one per test.
-   *   - A fixture SCALE the test can afford. See below.
-   *
-   * WHY THE TEST'S SCALE IS SMALLER THAN THE CONTRACT'S. The stated contract is 200 stages / 1,000
-   * rules, and gate latency really does move with the rules DELIVERED per fire (measured: 1 rule
-   * 0.24ms, 2 rules 0.27ms, 5 rules 0.48ms), so a smaller fixture measures a smaller number — this
-   * is not a scale-free quantity and pretending otherwise would be the dishonest version of this
-   * fix. What the test is FOR, though, is regression detection, and every assertion here is a ratio
-   * or a calibrated multiple that holds at any scale. The contract NUMBER is verified out of band
-   * against the full 1,000-rule shape (scripts-free harness, re-run and reported every review
-   * round) and stated in the gates.ts module docs against named reference hardware. A CI job is the
-   * wrong place to defend a millisecond; it is the right place to defend a slope.
-   */
-  const PERF_STAGES = 200;
-  const PERF_RULES = 400;
-  let fixture: MonetCore;
-  beforeAll(async () => {
-    fixture = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, graphEnabled: false });
-    for (let s = 0; s < PERF_STAGES; s++) {
-      await fixture.declare({ species: "stage", stage: `stage-${s}`, patterns: [`Bash:tool${s} run --flag${s}`] });
-    }
-    for (let r = 0; r < PERF_RULES; r++) {
-      await fixture.store(`Rule number ${r} for stage ${r % PERF_STAGES}.`, {
-        kind: "rule", resolution: "forceNew", rule: { stage: `stage-${r % PERF_STAGES}`, ...AGENT_RULE },
-      });
-    }
-  }, 180_000);
-  afterAll(() => fixture?.close());
-
-  it("answers within a calibrated budget at scale, and silence costs less than a fire", () => {
-    const c = fixture;
-    expect(c.stages()).toHaveLength(PERF_STAGES);
-    expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM rule_bindings`).get()).toEqual({ n: PERF_RULES });
-    const db = raw(c);
-
-    const baseline = bestP95(() => baselineOnce(db), 100, 5);
-    const fire = bestP95(() => { c.gate({ actionContext: "Bash:tool7 run --flag7 with some operands", record: false }); }, 100, 5);
-    const silence = bestP95(() => { c.gate({ actionContext: "Bash:git status", record: false }); }, 100, 5);
-    const midChain = bestP95(() => { c.gate({ actionContext: "Bash:cd /x && tool199 run --flag199 now", record: false }); }, 100, 5);
-    const report =
-      `baseline=${baseline.toFixed(4)}ms fire=${fire.toFixed(4)}ms (${(fire / baseline).toFixed(1)}x) ` +
-      `silence=${silence.toFixed(4)}ms midChain=${midChain.toFixed(4)}ms`;
-
-    // RATIO: a silence does strictly less work than a fire — no binding join, no rule marshalling.
-    // If that inverts, something is doing per-stage work that should be per-match.
-    expect(silence, report).toBeLessThan(fire);
-    // CALIBRATED ABSOLUTE. Locally the gate is ~13x the baseline primitive; 60x is generous enough
-    // that no plausible hardware trips it and tight enough that an algorithmic regression (which
-    // moves this by orders of magnitude, not tens of percent) still does.
-    expect(fire, report).toBeLessThan(baseline * 60);
-    expect(midChain, report).toBeLessThan(baseline * 60);
-    // CATASTROPHE CEILING: an absolute number that says nothing about hardware and everything about
-    // whether the gate is still usable on the critical path of an action.
-    expect(fire, report).toBeLessThan(10);
-  }, 60_000);
-
-  it("matches a 64KiB context in full, and stays linear rather than multiplying by stage count", () => {
-    const c = fixture;
-    // THE POINT OF THE WHOLE ITEM: a governed command hidden behind 64KiB of padding still FIRES.
-    // Under either of the two prefix-matching caps this reported silence.
-    const big = `Bash:${"x".repeat(64 * 1024)} && tool42 run --flag42`;
-    expect(c.gate({ actionContext: big, record: false }).rules.length).toBeGreaterThan(0);
-
-    const fire = bestP95(() => { c.gate({ actionContext: "Bash:tool7 run --flag7 operand", record: false }); }, 80, 5);
-    const bigCost = bestP95(() => { c.gate({ actionContext: big, record: false }); }, 20, 5);
-    const report = `fire=${fire.toFixed(4)}ms 64KiB=${bigCost.toFixed(4)}ms (${(bigCost / fire).toFixed(1)}x)`;
-    // Linear in the string's length, NOT in stages x length: locally 64KiB is ~1.5x a normal fire.
-    // 40x leaves room for a slow runner's memory bandwidth while still failing loudly if the
-    // per-stage rescan ever comes back (which would put this in the hundreds).
-    expect(bigCost, report).toBeLessThan(Math.max(fire * 40, 0.5));
-  }, 60_000);
-});
+//
+// It measured 200 patterns against a 4,000-token context and held the indexed cost to within 20x of
+// a short one — a RATIO rather than an absolute bound, so a slower CI runner scaled both sides and
+// the assertion stayed portable. What it caught was an O(patterns x context) matcher, the shape
+// that once made a long command line look like a reason to cap the context.
+//
+// `ActionContext.index` went with it: the occurrence map existed only to make the matcher's
+// candidate-start scan cheap and had no other reader. `parseActionContext` survives for
+// `declareAdvisories`, which reads `context.tool` and never scans the token stream at all, so there
+// is no scan left here to hold to a bound.

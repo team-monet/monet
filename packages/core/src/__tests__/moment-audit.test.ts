@@ -120,9 +120,6 @@ describe("F3 — debris is not a governed moment", () => {
     // The schema's own comment says a debris row "is not a governed moment and must never be
     // counted as one". Nothing read `opened` until now.
     expect(counts.total).toBe(1);
-    // And it is certainly not `ungoverned`, which means an overflow, an unreadable surface, or a
-    // call into the store — none of which happened here.
-    expect(counts.ungoverned).toBe(0);
   });
 
   it("does not report debris to a human as an agent defect", () => {

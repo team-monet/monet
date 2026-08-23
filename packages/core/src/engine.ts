@@ -113,38 +113,24 @@ import type {
 } from "./lifecycle-edges";
 import {
   assertBlockingRuleMutationAllowed,
-  assertNoUnacknowledgedDenies,
   bindRule,
   blockingRuleMutationGuard,
   BREADTH_CIRCLE,
-  bumpGateGeneration,
   createGateTables,
   migrateGateColumns,
   evaluateStageLookup,
   findStage,
-  formatTriggerPattern,
-  gateGeneration,
-  commitGateWrites,
-  evaluateGate,
   gateCoverage,
   getRuleBinding,
-  hasLiveBinding,
   hasLineBreak,
   hasNoReason,
-  inspectSidecar,
   isCircleLocalLiveBlockingRule,
   LEGACY_STAR_CIRCLE,
-  listMatchableStages,
   listStages,
   liveBlockingRulesForStage,
   liveStageIndex,
-  materializeGateMirror,
-  assertPatternCountWithinCap,
-  matchesTriggerPattern,
   normalizeStageName,
   parseActionContext,
-  seedTriggerPattern,
-  parseTriggerPatterns,
   upsertStage,
   MODEL_TAG_MAX_CHARS,
   RULE_BINDING_ORIGINS,
@@ -155,18 +141,14 @@ import {
 } from "./gates";
 import type {
   GateDeps,
-  GateResult,
   GateCoverage,
-  SidecarMaterialization,
   RuleBindingOrigin,
   RuleBindingRow,
   RuleScope,
   RuleSeverity,
-  SidecarStaleness,
   StageLookupResult,
   StageOrigin,
   StageRow,
-  TriggerPattern,
 } from "./gates";
 import { readFileSync } from "node:fs";
 import { RATIFICATION_ENTRANCES, classifyRatificationPair } from "./lifecycle-edges";
@@ -1104,8 +1086,8 @@ interface SkeletonDeliveryChange {
 /**
  * Rule capture — "a rule is born at a correction", stored live when the agent notices it.
  *
- * Every field here answers a question the gate will be asked later: WHERE does this fire (`stage`
- * + `instance`), WHAT does it cost to ignore (`reason` — "the reason is what earns compliance"),
+ * Every field here answers a question the gate will be asked later: WHERE does this fire (`stage`),
+ * WHAT does it cost to ignore (`reason` — "the reason is what earns compliance"),
  * and WHO does it bind (`scope` + `modelTag`, so a new model can retire the old model's
  * compensations automatically).
  */
@@ -1113,15 +1095,8 @@ export interface RuleCaptureOpts {
   /** Stage name or id. Created if unknown — "a correction landing on an action with no stage IS
    *  the stage's creation." */
   stage: string;
-  /** The concrete action observed at the capture moment, e.g. "Bash:git push --force origin main".
-   *  Seeds the trigger pattern when the stage is being born; ignored when it already exists. */
-  instance?: string;
   /** Advisory only on this surface. Blocking is declaration-only — use declare(). */
   severity?: RuleSeverity;
-  /** Declaration only: replaces the stage's trigger patterns. Ignored on the capture path. */
-  patterns?: string[];
-  /** Declaration only: the live blocking rules a pattern replacement is knowingly re-aiming. */
-  acknowledgeBlockingRules?: string[];
   /**
    * INTERNAL — declaration-scoped for the two non-`undefined` values, restated for a second field
    * for the same reason blocking severity gets its own check independent of the schema CHECK: an
@@ -1212,16 +1187,16 @@ const MAX_CONTEXT_HEADING_CHARS = 120;
 const MAX_CONTEXT_PREFIX_CHARS = 300;
 
 /**
- * A stage as read back: the registry entry, with its patterns already parsed. A stage is store-
- * global and carries no circle — `git push --force` is the same action in every project.
+ * A stage as read back. A stage is store-global and carries no circle — `git push --force` is the
+ * same action in every project.
+ *
+ * `patterns` WAS REMOVED 2026-08-22 with trigger patterns themselves. A stage is now its NAME plus
+ * its origin; there is nothing else about it to read back.
  */
 export interface StageView {
   id: string;
   name: string;
-  patterns: TriggerPattern[];
   origin: StageOrigin;
-  /** False until these patterns have matched a real action at least once, anywhere. */
-  verified: boolean;
   createdAt: number;
 }
 
@@ -1246,10 +1221,6 @@ export interface DeclareInput {
    * battery's Exits test exists to catch.
    */
   exitsEvidence?: string;
-  /** Replaces the stage's trigger patterns outright. Each entry is seeded like a capture instance. */
-  patterns?: string[];
-  /** A concrete instance to seed from when the stage is new and no explicit patterns were given. */
-  instance?: string;
   /**
    * THE ONLY SURFACE THAT ACCEPTS "blocking".
    *
@@ -1270,22 +1241,16 @@ export interface DeclareInput {
    * carries its reason. The write path still refuses a blocking declaration without one. Optional
    * for advisory rules, where its absence is weaker guidance rather than a broken contract.
    *
-   * WHERE IT IS SHOWN DID MOVE (#49). This used to read "what the gate shows when it fires", and
-   * the hook path no longer shows it: that payload carries stage identity and an instruction to
-   * read, never rule content. The reason reaches a reader through `stage_lookup`, which delivers
-   * the rule whole. So the promise is intact and its delivery is now a pull rather than a push —
-   * which is the point, because a pull leaves a record that the words were actually fetched.
+   * WHERE IT IS SHOWN DID MOVE (#49). This used to read "what the gate shows when it fires". An
+   * interception payload carries stage identity and an instruction to read, never rule content; the
+   * reason reaches a reader through `stage_lookup`, which delivers the rule whole. So the promise is
+   * intact and its delivery is a pull rather than a push — which is the point, because a pull leaves
+   * a record that the words were actually fetched.
    */
   reason?: string;
   declaredBy?: string;
   circle?: string;
   sourceRefs?: string[];
-  /**
-   * Required when `patterns` would re-author a stage that carries live blocking rules: name every
-   * one of them. Re-aiming a gate re-aims its denies, and this is what stops that from happening
-   * without the decision being made — see assertPatternReauthoringAcknowledged.
-   */
-  acknowledgeBlockingRules?: string[];
 }
 
 /**
@@ -1415,12 +1380,6 @@ export type DeclareResult =
   | {
       species: "stage";
       stage: StageView;
-      /** Rendered patterns before this call, so a re-authoring is auditable in-band. */
-      previousPatterns: string[];
-      /** Rendered patterns after. Equal to `previousPatterns` when nothing changed. */
-      patterns: string[];
-      /** Warning-light only; the write above has already happened. Omitted when nothing fired. */
-      advisories?: DeclareAdvisory[];
     }
   | {
       species: "rule";
@@ -1447,8 +1406,6 @@ export type DeclareResult =
        * flagged nothing, which is the ordinary case.
        */
       extractionCandidate?: { pairedRuleId: string; score: number };
-      /** Warning-light only; the write above has already happened. Omitted when nothing fired. */
-      advisories?: DeclareAdvisory[];
     }
   | {
       /**
@@ -2055,19 +2012,23 @@ export interface MemoryOverview {
     skeleton: number;
   };
   /**
-   * WHAT THE GATE HAS DONE, and what its registry can say about itself.
+   * WHAT IS KNOWN ABOUT THE GOVERNED MOMENTS, and what the rule registry can say about itself.
    *
    * REBUILT ON THE GOVERNED MOMENT. The counts used to come from a `gate_events` row per intercepted
    * action; they now come from the moment record, which unlike a verdict row can name the rules that
-   * fired and be joined back to the act. Two shapes changed with it, both deliberately:
+   * fired and be joined back to the act. One shape changed with it, deliberately:
    *
-   *   - `ungoverned` replaces the old `overflows`, and is wider: it counts every moment NOTHING
-   *     evaluated — an overflow, a surface the hook could not read, or a call into the store. The
-   *     split is on whether a gate looked, because `silences` is a claim that one did.
    *   - `unreadStages` is derived by joining the live stage registry against the stages agents have
    *     actually NAMED through `stage_lookup`, rather than against a per-stage event count. A stage
    *     absent from that set has never been asked for, which is the state indistinguishable from a
    *     healthy quiet one until something says so.
+   *
+   * WHAT IS DELIBERATELY ABSENT: `fires`, `silences`, `delivered`, and `ungoverned` (which had
+   * itself replaced an older `overflows`). Nothing in this tree writes the columns behind the first
+   * three, so each would report a structurally-fixed zero, which is worse than reporting nothing.
+   * `ungoverned` read the same columns from the other side and failed the mirrored test: with
+   * `openStoreMoment` the only writer left, every moment is ungoverned, so it restated `total`
+   * instead of adding a fact. See `MomentCounts`' own comment for both removals.
    *
    * `conformance` is the fourth fact and the only one no machine produced. `unanswered` and
    * `notAsked` are reported separately and never summed: one is a queue owed to the user, the other
@@ -2322,19 +2283,9 @@ export interface MonetCoreOptions {
   /** Min cosine for a `related` edge. Default: embedder-bound (0.45 MiniLM / 0.40 lexical). */
   edgeSimMin?: number;
   /**
-   * Where to materialize the blocking-rule mirror (the local JSON sidecar a host hook reads when
-   * the server is unreachable). NO DEFAULT, deliberately: with one, every MonetCore ever
-   * constructed — tests, evals, one-off scripts — would write into the user's real store directory
-   * on the first declaration. The mirror belongs to whoever wired the hook that reads it, so that
-   * caller names the path. Unset means declarations write no file; the engine method still works
-   * when given an explicit path.
-   */
-  gateSidecarPath?: string;
-  /**
-   * The governed-moment spool. Null (the default) makes every moment call a no-op, the same
-   * discipline `gateJournalPath` and `gateSidecarPath` hold and for the same reason: with a default
-   * path, every core ever constructed — tests, evals, one-off scripts — would append into the
-   * user's real store.
+   * The governed-moment spool. Null (the default) makes every moment call a no-op, deliberately:
+   * with a default path, every core ever constructed — tests, evals, one-off scripts — would append
+   * into the user's real store.
    */
   momentSpoolPath?: string;
   /**
@@ -2528,8 +2479,6 @@ export class MonetCore {
   private graphEnabled: boolean;
   private edgeSimMin!: number; // see the tauAttach/tauAmbiguous comment above — same reason
   private newId: () => string;
-  /** Where declarations re-materialize the blocking mirror. Null = nobody wired a hook to read it. */
-  private gateSidecarPath: string | null;
   /** Governed-moment spool sink; null (the default) makes every moment call a no-op. */
   private momentSpoolPath: string | null;
   /**
@@ -2541,7 +2490,7 @@ export class MonetCore {
    */
   private momentRun: MomentRun | null = null;
   /**
-   * Which model this runtime is serving — the default `gate()`/`stageLookup()`/`gateCoverage()` all
+   * Which model this runtime is serving — the default `stageLookup()`/`gateCoverage()` both
    * fall back to when a call omits an explicit `runtimeModelTag`. Set at construction (the
    * `runtimeModelTag` option) or later via `setRuntimeModelTag` — see that method's own comment for
    * why a setter exists at all: it is what lets a host wire this ONCE, after the fact, so every
@@ -2578,7 +2527,6 @@ export class MonetCore {
     this.explicitThresholdOpts = { tauAttach: opts.tauAttach, tauAmbiguous: opts.tauAmbiguous, edgeSimMin: opts.edgeSimMin };
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
-    this.gateSidecarPath = opts.gateSidecarPath ?? null;
     this.momentSpoolPath = opts.momentSpoolPath ?? null;
     this.runtimeModelTag = opts.runtimeModelTag ?? null;
     this.scopeContext = opts.scopeContext ?? null;
@@ -2604,26 +2552,23 @@ export class MonetCore {
     this.init();
     this.initSyncIdentity(opts.syncDeviceId);
     this.migrate();
-    // A SECOND migrateGateColumns() PASS, HERE (Codex round 11, item 3 — found by this item's own
-    // failing tests, not anticipated up front: every one of the new circle_aliases exact-count tests
-    // read `sidecarGeneration()` unchanged, which traced back to the triggers never having been
-    // created at all). `init()`, above, already runs createGateTables -> migrateLegacyStarCircle ->
-    // migrateGateColumns as its own "GATE SUBSTRATE, IN THREE EXPLICIT PHASES" sequence (init()'s own
-    // comment) — but `circle_aliases` itself is not created until `this.migrate()`, one line above,
-    // which runs AFTER init() on EVERY construction, not only the first. So `migrateGateColumns`'s
-    // own `hasCircleAliasesTable` guard (gates.ts) read false on EVERY open, including a store's very
-    // first ever construction, and the circle_aliases trigger family this same round adds was
-    // therefore dead code — never created, not merely delayed to "one open later" as that guard's own
-    // comment assumed (true across a process RESTART against an on-disk store, false within the SAME
-    // construction, which is the only kind of construction a `:memory:` store ever gets).
+    // A SECOND migrateGateColumns() PASS, HERE (Codex round 11, item 3). `init()`, above, already
+    // runs createGateTables -> migrateLegacyStarCircle -> migrateGateColumns as its own "GATE
+    // SUBSTRATE, IN THREE EXPLICIT PHASES" sequence (init()'s own comment). This call was added
+    // because `circle_aliases` is not created until `this.migrate()`, one line above, which runs
+    // AFTER init() on EVERY construction — so whatever inside migrateGateColumns needed that table
+    // to exist never got it on the first pass.
+    //
+    // WHAT NEEDED IT IS GONE. The circle_aliases trigger family was removed 2026-08-22 (see
+    // migrateGateColumns' own removal record, gates.ts), and what remains in that function — the
+    // guarded `rule_bindings.circle` ALTER, the backfill, the index — reads no circle_aliases table
+    // at all. On a normal construction this second call now repeats work the first pass already did
+    // and creates nothing new.
     //
     // SAFE TO CALL AGAIN, by design, not by luck: migrateGateColumns is exactly the function this
-    // module's own "concurrent-migrator race" tests and "the trigger survives a second migration
-    // pass" test already prove idempotent — every ALTER is a guarded no-op the second time, every
-    // CREATE TRIGGER is `IF NOT EXISTS`, the backfill's own `WHERE circle IS NULL` scan finds nothing
-    // left to do, and its gated bump does not fire on an empty backfill. The ONLY thing this second
-    // call newly does, on a normal construction, is create the three circle_aliases triggers for the
-    // first time, now that the table they watch actually exists.
+    // module's own "concurrent-migrator race" tests already prove idempotent — every ALTER is a
+    // guarded no-op the second time, and the backfill's own `WHERE circle IS NULL` scan finds
+    // nothing left to do.
     migrateGateColumns(this.db);
     this.repairEmptyConceptSlugs();
     const versionAfterLedger = this.db.pragma("user_version", { simple: true }) as number;
@@ -2653,34 +2598,6 @@ export class MonetCore {
     // vectors are rewritten, so equality alone is not evidence that this store is safe to serve.
     this.pinUnsatisfied = this.readEmbedderMigration() !== undefined
       || (pinRow.embedder_model_id !== null && pinRow.embedder_model_id !== this.embedderModelId);
-    // OPENING THE STORE IS THE REPAIR TRIGGER for a mirror this build cannot serve from.
-    //
-    // Every other refresh site is a MUTATION site, which is exactly the wrong set for the case that
-    // needs this: an upgrade changes the format the reader demands without changing the store at
-    // all. Detection alone left the hook rejecting a file nothing regenerated, so offline blocking
-    // was unavailable for an unbounded window — until some unrelated gate-affecting write happened
-    // to occur — on every install that upgrades.
-    //
-    // CONSTRUCTION, NOT A LAZY FIRST-USE HOOK, and the reason is that the mirror's reader is in
-    // ANOTHER PROCESS. There is no in-process call that "needs the mirror" and could serve as the
-    // trigger: the hook reads the file precisely when this server is unreachable, so a lazy trigger
-    // would be betting that some unrelated call happens first — the same unbounded-window bet the
-    // bug is made of. A read-only session that never gates would never fire it at all.
-    //
-    // The cost is one header read plus a generation query, and ONLY for a store that was wired with
-    // a sidecar path — an opt-in that by definition means a hook is reading the file. Stores without
-    // one (every test, every eval run, every one-off script) return on the first line and touch no
-    // filesystem. Runs last so the schema, the migrations and the sync identity are all in place.
-    //
-    // EXCEPT IN REPORT-ONLY MODE. `deferCreatedPin` is the existing declaration that this caller is
-    // inspection or dry-run tooling which must never write anything — the same flag that already
-    // stops a pin being minted — so it governs here rather than a second, parallel notion of
-    // read-only. Without this, opening a store to LOOK at it created or replaced the active
-    // installation's mirror, which is a report-only invocation mutating the thing it is reporting
-    // on. The suppression is deliberately only on this automatic path: an explicit
-    // materializeGateMirror() call is the caller asking, and the mutation sites are already
-    // writes by definition.
-    if (!this.deferCreatedPin) this.refreshGateSidecar();
   }
 
   private initSyncIdentity(requested?: string): void {
@@ -3257,16 +3174,23 @@ export class MonetCore {
     // src/gates.ts for the same reason lifecycle_edges is: the firing path is deliberately separate
     // machinery from the similarity graph, and keeping its DDL out of the shared block above is the
     // first line of that separation). Round 2 called `createGateSchema` — table creation and column
-    // migration together — AFTER `migrateLegacyStarCircle()`'s own bump, which reproduced BLOCKER
-    // B1's class one layer up: on a genuine pre-gate 1.3.1 store (no gate tables at all yet) with a
-    // '*' circle, `bumpGateGeneration` threw "no such table: gate_meta" — AFTER
-    // `moveCircleScopedTables` had already auto-committed its move (no explicit transaction wraps
-    // it), aborting construction on the FIRST attempt and silently succeeding on a retry, because
-    // the second attempt found nothing left to migrate. Fixed by splitting the phases explicitly:
-    //   (a) every gate table, gate_meta included — createGateTables, just `db.exec(GATE_SCHEMA_SQL)`;
-    //   (b) THEN the legacy-star migration, which can now bump the generation successfully;
+    // migration together — AFTER `migrateLegacyStarCircle()` had already run, which reproduced
+    // BLOCKER B1's class one layer up: on a genuine pre-gate 1.3.1 store (no gate tables at all yet) with a
+    // '*' circle, the generation bump the legacy-star migration then issued (`bumpGateGeneration`,
+    // since removed) threw "no such table: gate_meta" — AFTER `moveCircleScopedTables` had already
+    // auto-committed its move (no explicit transaction wraps it), aborting construction on the FIRST
+    // attempt and silently succeeding on a retry, because the second attempt found nothing left to
+    // migrate. Fixed by splitting the phases explicitly:
+    //   (a) every gate table — createGateTables, just `db.exec(GATE_SCHEMA_SQL)`;
+    //   (b) THEN the legacy-star migration;
     //   (c) THEN the circle-column ALTER + backfill + index — migrateGateColumns, everything
     //       createGateSchema used to do after its own `db.exec(GATE_SCHEMA_SQL)`.
+    // (b) BEFORE (c) IS STILL LOAD-BEARING, and both ends say so (migrateLegacyStarCircle's own doc
+    // comment here, migrateGateColumns' in gates.ts): that backfill copies `concepts.circle`
+    // verbatim onto dangling bindings, so a concept still named '*' when it runs either trips the
+    // ALTER's own CHECK or mints an unintended global-breadth binding. (a) BEFORE (b) was required by
+    // the generation bump alone; with the bump gone nothing in phase (b) reads a gate table, so that
+    // half of the order is retained rather than re-derived.
     // createGateSchema itself (gates.ts) still exists, unchanged in EXTERNAL behavior, as a thin
     // wrapper calling (a) then (c) in one call — for standalone callers (this file's own
     // concurrent-migrator race tests, the pre-breadth migration battery) that have no legacy-star
@@ -3358,7 +3282,8 @@ export class MonetCore {
     // Idempotency keys are writer-domain scoped. A native retry must never claim a connector
     // receipt (and vice versa), even if a caller accidentally reuses the same operation id.
     const operationCols = this.db.prepare(`PRAGMA table_info(ingest_operations)`).all() as Array<{ name: string }>;
-    // Same duplicate-column catch as the receipt columns below (and the matcher-column precedent):
+    // Same duplicate-column catch as the receipt columns below (and `migrateGateColumns`' own
+    // circle-column precedent, gates.ts):
     // two processes first-opening a pre-column store concurrently can both cache `operationCols`
     // before either ALTER lands — the loser must treat "duplicate column name" as someone else's
     // success, not its own failure to construct.
@@ -3381,7 +3306,7 @@ export class MonetCore {
     // THE SEVERITY/CIRCLE RECEIPT COLUMNS (four, added across three earlier rounds) NOW USE THE
     // IDEMPOTENT-BY-CATCH PATTERN (post-merge review round, P2 — found by review, not
     // self-discovered): each ALTER below used to be a bare `if (!has-column) exec(ALTER)`, with no
-    // catch — exactly the shape `migrateGateColumns`'s own matcher-column guard (gates.ts) already
+    // catch — exactly the shape `migrateGateColumns`'s own circle-column guard (gates.ts) already
     // documents the danger of: the MCP server and a `monet` CLI call are a SUPPORTED topology
     // sharing one `.monet` DB (storage.ts's own WAL + busy_timeout setup exists for this), so two
     // processes can both open a pre-column store at once, both see a column absent via the SAME
@@ -4827,10 +4752,6 @@ export class MonetCore {
     // forceNew score is informational nearest-neighbor; attachTo score is cosine(new obs, target concept).
     const returnScore = txResult.score;
 
-    // A rule write can put deny power in play (a declaration) or end it (a supersession). Gated on
-    // the rule paths so an ordinary store() does not pay a read on the hot path.
-    if (ruleBindingChange !== undefined || ruleSuccession !== undefined) this.refreshGateSidecar();
-
     return {
       action,
       conceptId: row.id,
@@ -4971,12 +4892,6 @@ export class MonetCore {
     const synthesizedNow = row.dirty === 1 && (opts.synthesize ?? true);
     if (synthesizedNow) {
       row = await this.synthesizeRow(row);
-      // RE-MATERIALIZE (Codex round 6, item 1 sweep) — synthesizeRow's own noteRuleTouched (round 2,
-      // item 4: the sieve tier's retitling is mirror content) bumped the generation, but this lazy,
-      // read-triggered synthesis path never refreshed the sidecar. Gated on synthesizedNow rather
-      // than called unconditionally at the end of this otherwise-read-only method: getConcept is a
-      // hot path, and only the synthesis branch can possibly have touched a rule's title.
-      this.refreshGateSidecar();
     }
 
     const totalObservations = (this.db
@@ -5019,13 +4934,6 @@ export class MonetCore {
     // dirty, so a retired concept's stale pending-synthesis state must be filtered here explicitly.
     const rows = this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ? AND status != 'retired'`).all(circle) as ConceptRow[];
     for (const r of rows) await this.synthesizeRow(r);
-    // RE-MATERIALIZE (Codex round 6, item 1 sweep) — ONE call after the whole batch, not once per
-    // row: refreshGateSidecar()'s own no-op check (inspectSidecar's generation compare) makes calling
-    // it inside the loop merely wasteful, not wrong, but every other batch-shaped caller in this file
-    // (graftRows, its many per-row noteRuleTouched calls answered by ONE refresh at the very end)
-    // already establishes "once per outer operation" as the house pattern — matched here rather than
-    // reopened.
-    this.refreshGateSidecar();
     return rows.length;
   }
 
@@ -6035,14 +5943,6 @@ export class MonetCore {
             .prepare(`UPDATE concepts SET body = ?, title = ?, version = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
             .run(opts.body, nextTitle, version, conceptId);
           this.writeRevision(conceptId, version, opts.body);
-          // MIRROR CONTENT (review fix — Codex round 2, item 4): a rule's TITLE is the text a gate
-          // delivers (GateRule.text, GateMirrorEntry.text both read `concepts.title`) — resolving a
-          // contradiction with an explicit body override can retitle a bound rule exactly as
-          // synthesizeRow's own sieve-tier retitling can, and the live gate would start serving the
-          // new text immediately while a materialized mirror stayed current-and-stale indefinitely.
-          // NOT sourced from `noteRuleTouched(conceptId)` any more (removed here — Codex round 10,
-          // items 2+3): trg_rule_bindings_follow_concept_title (gates.ts) now bumps unassisted, on
-          // the title UPDATE above, for the identical `hasLiveBinding` condition.
         }
         this.db
           .prepare(
@@ -6073,12 +5973,6 @@ export class MonetCore {
       this.recomputeNativeConceptProjection(conceptId, this.nextSyncTimestamp());
       return toConcept(this.getRow(conceptId)!);
     })();
-    // RE-MATERIALIZE (Codex round 6, item 1 sweep) — the explicit-body-override branch's own
-    // noteRuleTouched (round 2, item 4: an override can retitle a bound rule) bumped the generation
-    // but nothing here ever refreshed the sidecar; `dismiss` and a body-less decision never reach
-    // noteRuleTouched at all, so this is a genuine no-op for them, matching the "no-op unless X"
-    // shape every other generation-changing path already uses.
-    this.refreshGateSidecar();
     return result;
   }
 
@@ -6755,29 +6649,8 @@ export class MonetCore {
       if (row.status === "retired") return { outcome: "retired", blockers: [] };
       const blockers = this.retirementBlockers(id);
       if (blockers.length > 0) return { outcome: "blocked", blockers };
-      // THE ROWS ONLY — THE MIRROR IS PUBLISHED AFTER THIS COMMITS (review fix — round 3), which is
-      // what `deferSidecarRefresh` suppresses. `retireConcept`'s own closing `refreshGateSidecar()`
-      // used to run HERE, inside the reservation, accepted in round 1 on the reasoning that nothing
-      // after it could roll back and the write is idempotent against the gate generation. The
-      // hazard is not rollback: a file published from inside an UNCOMMITTED transaction is visible
-      // to every other process while the store they can read still sits at the OLD generation. A
-      // second WAL reader materializing the mirror in that interval sees a file ahead of the
-      // generation its own fresh read reports, cannot distinguish it from debris of a lineage the
-      // store no longer has (materializeGateMirror's own AHEAD OF OUR SNAPSHOT compare — its
-      // tiebreaking re-read of `gateGeneration` cannot see our uncommitted bump either), and
-      // overwrites it with the pre-retirement rule set. After the commit the database and the
-      // offline mirror then disagree with nothing left to correct them, since the write that would
-      // have re-derived the file is the one that just happened. A process exit or a failed commit
-      // inside the same interval leaves the identical mismatch.
-      return { outcome: this.retireConcept(id, true) !== null ? "retired" : "not-in-circle", blockers: [] };
+      return { outcome: this.retireConcept(id) !== null ? "retired" : "not-in-circle", blockers: [] };
     })();
-    // PUBLISHED HERE, FROM COMMITTED STATE, and unconditionally — the same posture every other
-    // generation-moving path keeps. It reproduces exactly what the suppressed in-transaction call
-    // would have written (`refreshGateSidecar` derives the whole file from the database, and
-    // nothing runs between the commit and this line), and it is the same cheap no-op on every
-    // outcome that changed nothing: its own staleness compare returns before writing, and it
-    // returns before even that when no `gateSidecarPath` is configured, which is the default.
-    this.refreshGateSidecar();
     return outcome;
   }
 
@@ -6799,36 +6672,24 @@ export class MonetCore {
    *
    * ITS PIN ASSERTION AND ITS ROW READ NOW RUN INSIDE THE RESERVATION TOO, which is strictly the
    * stronger reading: they used to sit ahead of its deferred `db.transaction`, whose write lock is
-   * not taken until the first write. That transaction nests as a savepoint here, and its closing
-   * `refreshGateSidecar()` is suppressed and re-issued after the commit for exactly the reason
-   * `retireIfUnblocked` states above — MORE sharply on this side, because restoring a rule ADDS to
-   * the mirror: the interval publishes a newly live deny that a second WAL reader then reverts, and
-   * the store is left enforcing a deny the offline mirror omits. That is the under-block direction,
-   * the one `restoreConcept`'s own comment names as the one that must not be forgotten.
+   * not taken until the first write. That transaction nests as a savepoint here, so the whole
+   * restore — the circle check, the pin assertion, the row read and every write — decides and
+   * commits under one reservation. Restoring a rule ADDS a live deny, so a window where a second
+   * WAL reader can see the restore and then have it reverted is the under-block direction, the one
+   * `restoreConcept`'s own comment names as the one that must not be forgotten.
    */
   restoreIfInCircle(id: string, expectedCircle: string): RestorationOutcome {
     const outcome = this.db.immediateTransaction((): RestorationOutcome => {
       if (this.circleOf(id) !== expectedCircle) return { outcome: "not-in-circle" };
-      return { outcome: this.restoreConcept(id, true) !== null ? "restored" : "not-in-circle" };
+      return { outcome: this.restoreConcept(id) !== null ? "restored" : "not-in-circle" };
     })();
-    this.refreshGateSidecar();
     return outcome;
   }
 
   /**
    * Retire a concept without deleting immutable evidence. Restoring re-derives its graph.
-   *
-   * `deferSidecarRefresh` IS INTERNAL, AND HAS EXACTLY ONE CALLER (review fix — round 3):
-   * `retireIfUnblocked`, which wraps this in a write reservation and therefore has to publish the
-   * mirror AFTER that reservation commits rather than from inside it — see its own comment for the
-   * second-reader interval this closes. It is a suppression flag, never a skip: the reserved wrapper
-   * owes the identical `refreshGateSidecar()` call, one commit later. Every ORDINARY caller
-   * (source-sync's two apply loops, tests, any direct engine use) leaves it defaulted and keeps
-   * today's behavior exactly — this method still publishes the mirror itself, and the flag's shape
-   * is `hardDeleteNativeConcept`'s own `replicate`: an internal-only positional whose non-default
-   * value appears at one call site, directly under the comment that justifies it.
    */
-  retireConcept(id: string, deferSidecarRefresh = false): Concept | null {
+  retireConcept(id: string): Concept | null {
     this.assertNoEmbedderMigrationReentry("retire a concept");
     const row = this.getRow(id);
     if (!row) return null;
@@ -6839,13 +6700,6 @@ export class MonetCore {
       // CHOKEPOINT. Retiring a live deny removes it from the gate, and that is declaration's
       // decision to make, not retirement's.
       assertBlockingRuleMutationAllowed(this.db, id, "retire");
-      // A retired rule governs nothing, so retiring one whose deny was already withdrawn CHANGES
-      // THE MIRROR — the over-block case: the file keeps denying an action nothing denies any more.
-      // A bump is owed here, but NOT sourced from `noteRuleTouched(id)` any more (removed here —
-      // Codex round 9, item 2, applying round 8's own lesson before shipping): trg_rule_bindings_
-      // follow_concept_status (gates.ts) now bumps gate_meta on every concepts.status UPDATE for a
-      // concept with a live binding, including the one immediately below — the identical condition
-      // `noteRuleTouched` already tested, so keeping both double-counts.
       // Retiring removes a concept from every public curation surface; an open contradiction can
       // no longer be mediated there, so close it explicitly rather than leaving an orphaned alert.
       this.db
@@ -6868,17 +6722,14 @@ export class MonetCore {
       return toConcept(this.getRow(id)!);
     })();
     for (const [circle, conceptId] of this.lastConceptByCircle) if (conceptId === id) this.lastConceptByCircle.delete(circle);
-    if (!deferSidecarRefresh) this.refreshGateSidecar(); // no-op unless retiring this concept moved the generation
     return result;
   }
 
   /**
    * Restore a retired concept's active read status and graph footprint.
    *
-   * `deferSidecarRefresh`: see `retireConcept`'s own note — same flag, same one internal caller
-   * (`restoreIfInCircle`), same obligation to publish one commit later.
    */
-  restoreConcept(id: string, deferSidecarRefresh = false): Concept | null {
+  restoreConcept(id: string): Concept | null {
     this.assertNoEmbedderMigrationReentry("restore a concept");
     this.assertPinSatisfied(); // embedder-pin ADR — rederiveConceptGraph below scores this concept's stored vector against every OTHER concept's under this.tauAttach/this.edgeSimMin
     const row = this.getRow(id);
@@ -6887,12 +6738,6 @@ export class MonetCore {
     if (row.status !== "retired") return toConcept(row);
     const restored = this.db.transaction((): Concept => {
       const restoredAt = this.nextConceptLifecycleTimestamp(id);
-      // Restoring a retired deny puts it back into the mirror. Missing this bump is the UNDER-block
-      // direction — the file would omit a deny the store is enforcing, and isSidecarStale would
-      // call the file current — so it is the one that must not be forgotten. NOT sourced from
-      // `noteRuleTouched(id)` any more (removed here — Codex round 9, item 2): trg_rule_bindings_
-      // follow_concept_status (gates.ts) now bumps unassisted for the identical condition, on the
-      // status UPDATE immediately below — see retireConcept's own comment for the full argument.
       this.db
         .prepare(
           `INSERT INTO concept_restorations (concept_id, restored_at, updated_at) VALUES (?, ?, ?)
@@ -6905,7 +6750,6 @@ export class MonetCore {
       this.rederiveConceptGraph(id, row.circle);
       return toConcept(this.getRow(id)!);
     })();
-    if (!deferSidecarRefresh) this.refreshGateSidecar();
     return restored;
   }
 
@@ -6960,19 +6804,8 @@ export class MonetCore {
         .prepare(`UPDATE concepts SET body = ?, title = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
         .run(body, nextTitle, id);
       this.writeRevision(id, row.version, body);
-      // MIRROR CONTENT (review fix — Codex round 2, item 4) — mirror synthesizeRow's own fix here
-      // too: this is the AGENT-FACING (MCP) twin of the sieve tier's own retitling, no less able to
-      // retitle a bound rule and leave a materialized mirror stale. NOT sourced from
-      // `noteRuleTouched(id)` any more (removed here — Codex round 10, items 2+3):
-      // trg_rule_bindings_follow_concept_title (gates.ts) now bumps unassisted, on the title UPDATE
-      // above, for the identical condition.
       return toConcept(this.getRow(id)!);
     })();
-    // RE-MATERIALIZE (Codex round 6, item 1 sweep) — a title change bumps the generation above (the
-    // trigger now, JS before it); nothing here ever asked the sidecar to catch up. Unconditional,
-    // matching every other generation-changing path — a cheap no-op via hasLiveBinding for every
-    // non-rule concept.
-    this.refreshGateSidecar();
     return result;
   }
 
@@ -7261,10 +7094,6 @@ export class MonetCore {
     // deleted row). Drop any lastConcept pointer to it.
     for (const [c, v] of this.lastConceptByCircle) if (v === src.id) this.lastConceptByCircle.delete(c);
     this.installEmbeddingWidthProof(committed.proofToken);
-    // Every other generation-bump site re-materializes; this one bumped and did not. Detection
-    // already covered it (isSidecarStale would have said so), but a mirror that goes stale on an
-    // ordinary circle move and waits for someone to ask is not the contract the other sites keep.
-    this.refreshGateSidecar();
     return result;
   }
 
@@ -7690,14 +7519,6 @@ export class MonetCore {
                     dirty = 1, version = version + 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
           )
           .run(srcBody, embToJson(srcEmb), srcSupportCount, srcConfidence, newSrcTitle, newSrcSlug, sourceConceptId);
-        // MIRROR CONTENT (review fix — Codex round 2, item 4): the surviving source's title is
-        // recomputed from its remaining observations above — exactly the retitling class this fix
-        // covers everywhere else, reachable here too since door 8's own chokepoint (just above, in
-        // the sibling ALL-detached branch) already establishes that `sourceConceptId` can be a live
-        // rule's concept. NOT sourced from `noteRuleTouched(sourceConceptId)` any more (removed here
-        // — Codex round 10, items 2+3): trg_rule_bindings_follow_concept_title (gates.ts) now bumps
-        // unassisted, on the title UPDATE above, for the identical condition.
-
         // SOURCE temporal recompute (partial detach — source survives):
         // last_confirmed_at = min(pre-split value, max(created_at of REMAINING observations))
         // This conservatively lowers the stamp when the observations that earned freshness moved
@@ -7856,16 +7677,6 @@ export class MonetCore {
       for (const [c, v] of this.lastConceptByCircle) if (v === sourceConceptId) this.lastConceptByCircle.delete(c);
     }
 
-    // RE-MATERIALIZE (Codex round 6, item 1) — the partial-detach branch's own noteRuleTouched
-    // (round 2, item 4: the surviving source's recomputed title is mirror content) bumped the
-    // generation but nothing here ever asked the sidecar to catch up, exactly the gap
-    // reassignCircle's own comment warns against: "a mirror that goes stale on an ordinary [write]
-    // and waits for someone to ask is not the contract the other sites keep." Unconditional, matching
-    // every other generation-changing path (renameCircle/mergeCircle/archive/unarchive/reassignCircle/
-    // retireConcept/restoreConcept/addLifecycleEdge) — refreshGateSidecar() is its own cheap no-op
-    // when the generation did not move (the all-detached branch, which deletes the source outright
-    // rather than retitling it).
-    this.refreshGateSidecar();
     return result;
   }
 
@@ -10292,21 +10103,8 @@ export class MonetCore {
         );
       }
 
-      // Superseding a rule ends its delivery, so doing it to a rule whose deny was already
-      // withdrawn still changes the mirror.
-      if (written.family === "supersession") this.noteRuleTouched(written.src_concept_id);
-      // A DERIVATION EDGE IS MIRROR CONTENT TOO (slice 5-B, D4) — `GateMirrorEntry` carries the
-      // parent principle now, so an edge landing on a bound rule changes what the mirror would
-      // write. The DESTINATION is the rule (derivation runs principle → rule), so this reads
-      // dst_concept_id where supersession above reads src. Same trigger the two in-engine entrances
-      // (`recordProjectionEdge`, `ratifySkeletonMembership`) call, restated here because this
-      // exported method is a third door: a caller writing the edge directly gets the same refresh.
-      if (written.family === "derivation" && written.dst_concept_id !== null) {
-        this.noteRuleTouched(written.dst_concept_id);
-      }
       return written;
     })();
-    this.refreshGateSidecar();
     return row;
   }
 
@@ -10351,13 +10149,12 @@ export class MonetCore {
    * "re-ratify") when memberRuleIds is given — reject/retire are ratification history, never
    * membership grants, so they never mint an edge no matter what memberRuleIds holds.
    *
-   * SKELETON MATERIALIZATION SEAM (named, not built) — mirrors addLifecycleEdge's own
-   * refreshGateSidecar() precedent for the gate mirror: every call here is a ratification event,
-   * and per the design's materialized-mirror pattern the standing skeleton file must regenerate at
+   * SKELETON MATERIALIZATION SEAM (named, not built): every call here is a ratification event, and
+   * per the design's materialized-mirror pattern the standing skeleton file must regenerate at
    * every one of them (approve, reject, retire and re-ratify alike — a retire changes membership
    * exactly as an approve does). That regeneration is the later materialization slice's (5-C) to
-   * build; this comment is its hook. Until then, skeleton() (below) stays a live derived read —
-   * correct, just not yet mirrored to a resident file.
+   * build; this comment is where it attaches. Until then, skeleton() (below) stays a live derived
+   * read — correct, just not yet mirrored to a resident file.
    *
    * RECORDED AND DEFERRED, 2026-07-29 (review round 1, item 9) — CONTENT DRIFT ON A RATIFIED
    * PRINCIPLE. Nothing here re-opens ratification when a ratified principle's BODY later changes.
@@ -10370,10 +10167,9 @@ export class MonetCore {
    * explicit attachTo alike — so the fact→principle path and the same-species path both remain
    * open. The same-species case is legitimate evidence accretion and must not simply be refused;
    * the fact→principle case rides the same drift signal.
-   * The right shape is a drift SIGNAL — flag the concept and ask for re-ratification, the analog of
-   * the mirror's own `--verify`/summaryDirty machinery — and it belongs to the materialization
-   * slice that builds that machinery, not to this one. Named here so it has an owner rather than
-   * being rediscovered as a surprise.
+   * The right shape is a drift SIGNAL — flag the concept and ask for re-ratification — and it
+   * belongs to the materialization slice that builds that machinery, not to this one. Named here so
+   * it has an owner rather than being rediscovered as a surprise.
    *
    * SHARPENED (Codex PR #102, P1): accretion is the mild case — memory_synthesize can REWRITE the
    * body wholesale under the old approval, including the projected first line, with no ratification
@@ -10471,13 +10267,6 @@ export class MonetCore {
                 eventRef: ratification.id,
               }),
             );
-            // THE SHARED MIRROR TRIGGER (slice 5-B, D4) — the same call `recordProjectionEdge` makes
-            // for the projection entrance. `GateMirrorEntry` now carries the parent principle, so
-            // BOTH ways a derivation edge reaches a bound rule change mirror content, and both must
-            // bump the generation or the offline evaluator answers from a file that predates the
-            // parent. Inside the transaction, like every other noteRuleTouched call; the
-            // re-materialization itself runs in ratify(), after the commit.
-            this.noteRuleTouched(memberRuleId);
           } catch (e) {
             const message = e instanceof Error ? e.message : String(e);
             // NAME THE DATED DEFERRAL rather than let addLifecycleEdge's own cross-circle message
@@ -10640,8 +10429,9 @@ export class MonetCore {
     // telling them the call failed. Same reasoning, same shape as `StoreOpts.skeletonEntry` riding
     // store()'s own transaction: the dependent write goes INSIDE the primary act's envelope.
     // Both callees keep their own `db.transaction` (better-sqlite3 flattens those to savepoints), so
-    // each remains correct if ever called alone. `refreshGateSidecar()` stays OUTSIDE, below — it is
-    // a file materialization, not a row, and must never run for a verdict that did not commit.
+    // each remains correct if ever called alone. `materializeRequired` is computed inside and acted
+    // on OUTSIDE, by the caller — a file materialization is not a row, and must never run for a
+    // verdict that did not commit.
     let materializeRequired = false;
     const { ratification, edges, impeachmentsClosed, extractionFlagsResolved } = this.db.immediateTransaction((): {
       ratification: RatificationRow; edges: LifecycleEdgeRow[]; impeachmentsClosed: number; extractionFlagsResolved: number;
@@ -10674,13 +10464,6 @@ export class MonetCore {
         impeachmentsClosed: this.closeImpeachments(input.candidateId, recorded.ratification.ratified_by, input.verdict),
       };
     })();
-    // A DERIVATION EDGE CHANGES WHAT THE MIRROR WOULD WRITE (slice 5-B, D4): GateMirrorEntry now
-    // carries the parent principle, so a ratification that names member rules moves mirror content
-    // without touching any binding. `ratifySkeletonMembership` bumps the generation per member
-    // (noteRuleTouched); this is the re-materialization that bump exists for — the same
-    // pairing every other generation-changing path in this file keeps, and a no-op when nothing
-    // moved (refreshGateSidecar's own staleness compare).
-    if (edges.length > 0) this.refreshGateSidecar();
     return {
       ratificationId: ratification.id,
       verdict: ratification.verdict,
@@ -10980,7 +10763,7 @@ export class MonetCore {
   /**
    * May this concept receive rule evidence? Two refusals, both closing a SILENT loss.
    *
-   * NOT A RULE. `gateQuery` delivers only `kind = 'rule'` concepts, so a binding attached to a fact
+   * NOT A RULE. The gate delivers only `kind = 'rule'` concepts, so a binding attached to a fact
    * (which is reachable: the nomination scan ranks observations across every kind, and a rule often
    * paraphrases a fact that is already stored) would be accepted, stored, and never fire. The store
    * would have taken the write and lost the governance — the worst failure a memory substrate has.
@@ -11272,9 +11055,9 @@ export class MonetCore {
    * `lifecycle_edges` is append-only and carries no uniqueness constraint outside supersession's
    * own (see its schema), and both consumers of the relationship collapse the multiplicity anyway,
    * which was checked rather than assumed: `parent_concept_id` is a CORRELATED SCALAR SUBQUERY with
-   * `ORDER BY p.created_at ASC, p.id ASC LIMIT 1` (gates.ts, in both the live pick and the mirror's
-   * verbatim copy of it), so the parent a rule reports is still exactly one id — the earlier act's,
-   * which here is the human's ratification; and `walkDerivation` selects DISTINCT, so a principle's
+   * `ORDER BY p.created_at ASC, p.id ASC LIMIT 1` (gates.ts), so the parent a rule reports is still
+   * exactly one id — the earlier act's, which here is the human's ratification; and
+   * `walkDerivation` selects DISTINCT, so a principle's
    * member list cannot repeat a rule either. The human's ruling is not downgraded by recording the
    * projection beside it; it stays the FIRST act on the log and the one delivery names.
    *
@@ -11296,11 +11079,6 @@ export class MonetCore {
       bornOf: "projection",
       eventRef: observationId,
     });
-    // MIRROR CONTENT NOW (slice 5-B, D4): GateMirrorEntry carries the parent principle, so a
-    // derivation edge landing on a bound rule changes what materializeGateMirror would write even
-    // though nothing about the binding moved. Shared with the ratification edge write
-    // (ratifySkeletonMembership) so both entrances into the derivation family trigger identically.
-    this.noteRuleTouched(ruleConceptId);
     return edge.id;
   }
 
@@ -11357,15 +11135,6 @@ export class MonetCore {
     }
     const stage = upsertStage(this.gateDeps(), {
       stage: rule.stage,
-      instance: rule.instance,
-      // Patterns ride in here rather than being applied by a separate declare()-side call. That is
-      // what collapses declaration into ONE transaction: there is no window in which a re-authored
-      // stage can survive a failed rule write.
-      patterns: declaration ? rule.patterns : undefined,
-      // Carried all the way to the mutation: upsertStage re-checks it inside this transaction, so a
-      // deny bound during declare()'s embed window cannot be re-aimed by a call validated before it
-      // existed.
-      acknowledgeBlockingRules: rule.acknowledgeBlockingRules,
       origin: declaration ? "declaration" : "correction",
     });
     const bound = bindRule(
@@ -11741,19 +11510,6 @@ export class MonetCore {
             `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
         );
       }
-      if (input.patterns !== undefined) {
-        throw new Error(
-          `species '${input.species}' carries no trigger patterns: patterns address a gate, and a ` +
-            `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
-        );
-      }
-      if (input.instance !== undefined) {
-        throw new Error(
-          `species '${input.species}' carries no instance: an instance is the concrete gate action ` +
-            `that seeds a trigger pattern, and a ${input.species} bound to a moment is just a rule — ` +
-            `use species:"rule" instead.`,
-        );
-      }
       if (input.scope !== undefined) {
         throw new Error(
           `species '${input.species}' carries no scope: scope is a rule-binding property, and a ` +
@@ -11772,13 +11528,6 @@ export class MonetCore {
           `species '${input.species}' carries no reason: reason explains a rule at the moment its ` +
             `gate fires, and a ${input.species} bound to a moment is just a rule — use ` +
             `species:"rule" instead.`,
-        );
-      }
-      if (input.acknowledgeBlockingRules !== undefined) {
-        throw new Error(
-          `species '${input.species}' carries no blocking-rule acknowledgement: ` +
-            `acknowledgeBlockingRules authorizes re-aiming a gate that carries live denies, and a ` +
-            `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
         );
       }
       if (!input.content || input.content.trim().length === 0) {
@@ -11848,37 +11597,15 @@ export class MonetCore {
         );
       }
     }
-    this.assertPatternReauthoringAcknowledged(input);
-    const firingAdvisories = this.patternFiringAdvisories(input);
-
-    const before = this.sidecarGeneration();
     let result: DeclareResult;
     if (input.species === "stage") {
-      const existing = findStage(this.db, input.stage!);
-      const priorPatterns = existing ? this.toStageView(existing).patterns : [];
+      // DECLARING A STAGE IS NOW CREATE-OR-FETCH, and the response carries no old → new pair
+      // because there is nothing about an existing stage a declaration can change. Trigger
+      // patterns were the only editable thing a stage had; see gates.ts's retreat record.
       const stage = this.db.immediateTransaction(() =>
-        upsertStage(this.gateDeps(), {
-          stage: input.stage!,
-          patterns: input.patterns,
-          instance: input.instance,
-          acknowledgeBlockingRules: input.acknowledgeBlockingRules,
-          origin: "declaration",
-        }),
+        upsertStage(this.gateDeps(), { stage: input.stage!, origin: "declaration" }),
       )();
-      const view = this.toStageView(stage);
-      result = {
-        species: "stage",
-        stage: view,
-        // Old → new, in the response, so a pattern change is auditable IN BAND. A full pattern
-        // history table is DEFERRED (see assertPatternReauthoringAcknowledged): this response is
-        // the v1 record, which means an edit is visible to whoever made it but not reconstructible
-        // afterwards. Worth building when there is a second consumer of the history.
-        previousPatterns: priorPatterns.map(formatTriggerPattern),
-        patterns: view.patterns.map(formatTriggerPattern),
-        // Omitted when nothing fired, per the residency law that governs advisories: an always-
-        // present empty array is a field every reader pays for and no reader learns from.
-        ...(firingAdvisories.length > 0 ? { advisories: firingAdvisories } : {}),
-      };
+      result = { species: "stage", stage: this.toStageView(stage) };
     } else if (input.species === "principle" || input.species === "preference") {
       // THE DECLARATION ENTRANCE — sovereignty replaces the battery. Net-new code: unlike the rule
       // branch below, this never touches stages or rule_bindings (principles/preferences have no
@@ -11955,9 +11682,6 @@ export class MonetCore {
         sourceRefs: input.sourceRefs,
         rule: {
           stage: input.stage!,
-          instance: input.instance,
-          patterns: input.patterns,
-          acknowledgeBlockingRules: input.acknowledgeBlockingRules,
           // Passed through UNDEFAULTED. `undefined` means "the caller did not rule on severity",
           // which on an existing binding preserves what is there — see BindRuleInput.severity.
           severity: input.severity,
@@ -12007,153 +11731,10 @@ export class MonetCore {
         // Straight through from the shared write path (slice 5-B) — flagged by the same near-match
         // hook regardless of entrance, and disclosed here for the same reason it is on memory_store.
         ...(stored.extractionCandidate ? { extractionCandidate: stored.extractionCandidate } : {}),
-        // THE DECLARE-TIME FIRING TEST's finding, on the entrance that can actually carry patterns.
-        // Same disclosure discipline as the two above: legal, sovereign, and never something the
-        // caller should discover later rather than see reported here.
-        ...(firingAdvisories.length > 0 ? { advisories: firingAdvisories } : {}),
       };
     }
 
-    // Re-materialize when (and only when) the substrate actually moved. The generation counter is
-    // what makes this precise: an unconditional rebuild on every declaration was the cheap version
-    // of this check, and it could not tell a caller — or the 4b hook — whether anything changed.
-    if (this.sidecarGeneration() !== before) this.refreshGateSidecar();
-    // Recorded only now: the declaration is committed, so `admitted: true` is a fact rather than a
-    // prediction. See journalFiringAdvisories.
     return result;
-  }
-
-  /**
-   * A stage's patterns are its MECHANICAL firing surface, so re-authoring them REROUTES every rule
-   * bound to it FOR THE MECHANICAL MATCHER — including the denies. That made "silence this
-   * mechanical deny" a single ordinary agent-callable declaration: edit the patterns, the deny
-   * stops matching an intercepted action, and the binding still reads `blocking` so nothing in the
-   * store looks wrong.
-   *
-   * DOCTRINE, RULED: pattern re-aiming is NOT a rule-withdrawal lever, on either matcher, and this
-   * guard's whole justification is scoped to the mechanical one. Patterns say WHICH TOOL SHAPES are
-   * this moment; rules say WHAT GOVERNS the moment — conflating "re-aim the patterns" with
-   * "withdraw the rule" made sense only while mechanical matching was the sole way anything reached
-   * a rule at all. Now that `stageLookup` resolves by stage NAME/id rather than by pattern, a rule
-   * bound here — including a blocking one — stays fully reachable by a correctly-recognizing agent
-   * after this re-authoring: only the MECHANICAL interception stops, not the rule's existence or
-   * its advisory delivery via recognition. Silently reducing a correctly-recognizing agent's
-   * protection through an act that never said "the rule stops applying" would be exactly the wrong
-   * kind of quiet. The universal ways to actually withdraw a rule are rule-level acts (declare it
-   * advisory, or let a correction supersede it) and the stage itself going inert (every rule bound
-   * to it dies — see the design's own "a stage whose rules have all died is inert ... removable by
-   * declaration"). This method's guard is about the FIRST of those two surfaces only.
-   *
-   * The guard is acknowledgement, not prohibition: the human may absolutely re-aim a gate that
-   * carries a deny, but they must NAME the denies they are re-aiming. An agent that has not been
-   * told those rules exist cannot produce their ids, and a human who has been shown them is making
-   * the decision the parameter is asking about.
-   *
-   * DEFERRED, explicitly: there is no pattern-change audit trail. The declare response carries
-   * old → new (see above) and that is all — a change is visible to whoever made it, not
-   * reconstructible by whoever finds it later. The acknowledgement parameter is the v1 guard.
-   */
-  /**
-   * FAST FEEDBACK ONLY — the binding guard lives in upsertStage, inside the write transaction.
-   *
-   * This runs before the embed so a caller learns immediately which denies it has to name, but it
-   * is not the thing that makes the guard sound: between this check and the commit there is an
-   * embed, and a blocking rule bound in that window would be re-aimed by a call validated when it
-   * did not exist. upsertStage re-runs `assertNoUnacknowledgedDenies` against the same predicate
-   * inside the transaction that performs the replacement, which is where the window closes.
-   */
-  private assertPatternReauthoringAcknowledged(input: DeclareInput): void {
-    if (input.patterns === undefined) return;
-    const stage = findStage(this.db, input.stage!);
-    if (!stage) return; // a stage being born carries no rules yet, so nothing can be rerouted
-    assertNoUnacknowledgedDenies(this.db, stage, input.acknowledgeBlockingRules);
-  }
-
-  /**
-   * THE DECLARE-TIME FIRING TEST — monet-client#59:
-   * "a pattern is admitted with at least one example action context it matches, verified at declare
-   * time by the same evaluator the gate runs."
-   *
-   * SAME EVALUATOR, NOT A SECOND ONE. `seedTriggerPattern` (exactly what upsertStage will store),
-   * `parseActionContext` and `matchesTriggerPattern` (exactly what gateInternal fires with). A
-   * declare-time check that used its own matching machinery could pass while the gate fails, which
-   * would be a worse lie than no check — it would say "verified" about a pattern that never fires.
-   * The stage-shaped advisory below already set this precedent; this reuses the same three.
-   *
-   * THE EXAMPLE IS `instance`, and no new field is added for it. `instance` already means "the
-   * concrete action this is about": when no patterns are given it SEEDS one, and when patterns are
-   * given it now VERIFIES them. One field, one meaning, two uses.
-   *
-   * WARNED, NEVER REFUSED — and that is the entrance, not timidity. §2 rules that a non-matching
-   * pattern is "refused on extraction-quality writes and warned-and-recorded on sovereign ones",
-   * and `patterns` is reachable from `memory_declare` ALONE (the capture path derives a pattern
-   * from the instance itself, so it is self-matching by construction and has nothing to verify).
-   * Every pattern this check can see therefore arrived through the sovereign entrance, where
-   * sovereignty replaces the battery. There is no extraction-quality pattern write to refuse, so no
-   * refusal path is built for one; if such an entrance is ever added, this is where its refusal goes.
-   *
-   * WHAT THIS DELIBERATELY DOES NOT DO: flip the stage's `verified` flag. That flag means "these
-   * patterns matched a REAL action at least once, anywhere", and a real fire proves a HOST actually
-   * produced that context. An author-supplied example proves only that the author wrote a string
-   * that matches their own pattern — the `Agent:` trap is exactly a pair of matching fictions.
-   * Letting an example counterfeit a fire would weaken an existing safety property to decorate a
-   * new one.
-   *
-   * RATIONED, per the residency law that governs advisories. "Patterns given, no example" is NOT
-   * advised: it would fire on nearly every pattern declaration there has ever been, and that signal
-   * already has two homes — `gateCoverage().unverifiedPatterns`, and the governed-moment record.
-   */
-  private patternFiringAdvisories(input: DeclareInput): DeclareAdvisory[] {
-    // Everything echoed below is CALLER TEXT, and the MCP schema bounds neither `instance` nor a
-    // pattern (Codex P2 on PR #144, and it was right). A ~40k-character mismatching declaration
-    // would produce a message so large that the acknowledgement envelope replaced the whole
-    // response with its truncation notice — deleting the very warning the caller needed. Clipped
-    // here, at the source, so both the response and the journal stay bounded.
-    if (input.patterns === undefined || input.patterns.length === 0) return [];
-    // COUNT FIRST (Codex P2 on PR #144, and it was right). upsertStage refuses past
-    // MAX_STAGE_PATTERNS in constant time, but this analysis ran BEFORE it and tokenized every entry
-    // — so an arbitrarily large array was fully seeded just to be thrown away, on a path any MCP
-    // caller can reach with no `.max()` on the schema. Work proportional to a payload already known
-    // to be refused.
-    assertPatternCountWithinCap(input.patterns);
-    const seeded = input.patterns.map((pattern) => seedTriggerPattern(pattern));
-    const advisories: DeclareAdvisory[] = [];
-
-    // (a) INERT BY CONSTRUCTION — no example needed to know it. Seeding yields an empty token run
-    // for a segment that is nothing but flags ("a stage that means 'some command, somewhere, with
-    // this flag' is noise wearing a gate's clothes"), and matchesTriggerPattern returns false for
-    // an empty run unconditionally. The stage is born addressing nothing. This is a FORM defect —
-    // knowable without judging content, which is the only kind this layer is allowed to raise.
-    const inert = input.patterns.filter((_, index) => seeded[index]!.tokens.length === 0);
-    if (inert.length > 0) {
-      advisories.push({
-        kind: "pattern_never_matches",
-        message:
-          `These patterns can never match any action, so the gate they address is inert: ` +
-          `${joinAdvisoryEchoes(inert)}. A pattern seeds to its ` +
-          `command word through its last flag, and a run of nothing but flags addresses nothing. ` +
-          `Name the command the flag belongs to.`,
-      });
-    }
-
-    // (b) THE FIRING TEST ITSELF. An example was supplied and nothing declared here matches it.
-    if (typeof input.instance === "string" && input.instance.trim().length > 0) {
-      const context = parseActionContext(input.instance);
-      if (!seeded.some((pattern) => matchesTriggerPattern(pattern, context))) {
-        advisories.push({
-          kind: "pattern_matches_no_example",
-          message:
-            `None of these patterns match the example action given as \`instance\` ` +
-            `(${JSON.stringify(clipAdvisoryEcho(input.instance))}), evaluated with the gate's own matcher — so this ` +
-            `gate would not have fired on the very action it was authored from. The usual cause is ` +
-            `a tool prefix: a "Bash:" pattern can never match a "Task:" context, and a host's name ` +
-            `for a tool is a variable, not a constant (monet-client#58). Declared: ` +
-            `${joinAdvisoryEchoes(seeded.map(formatTriggerPattern))}.`,
-        });
-      }
-    }
-
-    return advisories;
   }
 
   /**
@@ -12269,8 +11850,8 @@ export class MonetCore {
    * unbounded spool growth when nobody is asking, never the mechanism.
    *
    * These are the ONLY paths that put a moment row into a store database. The interceptors write
-   * the spool and nothing else, which is what keeps invariant 05 intact: the hook is store-less and
-   * stays that way.
+   * the spool and nothing else, which is what keeps invariant 05 intact: an interceptor is
+   * store-less and stays that way.
    */
   /**
    * The run a conformance write must have, or an error the caller sees.
@@ -12329,10 +11910,10 @@ export class MonetCore {
     attachMomentAnswer(this.db, run, { momentId, answer });
   }
 
-  /** What the gate did, across every moment on record. Folds first. */
+  /** What is known about every moment on record. Folds first. */
   momentCounts(circle?: string): MomentCounts {
     if (this.momentSpoolPath === null) {
-      return { fires: 0, silences: 0, ungoverned: 0, delivered: 0, total: 0, unopened: 0, unattributed: 0 };
+      return { total: 0, unopened: 0, unattributed: 0 };
     }
     return momentCounts(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }
@@ -12424,25 +12005,17 @@ export class MonetCore {
   ): DeclareAdvisory[] {
     const advisories: DeclareAdvisory[] = [];
 
-    // (a) STAGE-SHAPED CONTENT — reuses the SAME matcher the gate itself fires with (parseActionContext
-    // + matchesTriggerPattern, both from gates.ts): no new matching machinery, per the design's own
-    // residency law — a second classifier here would be exactly the kind of unrationed surface the
-    // design's own audit measured at zero behavioral yield. "Command-shaped" reuses the identical
-    // parse the live gate path uses to recognize a `Tool:command` context (context.tool !== null);
-    // a registered stage match is the stronger, more specific signal and is preferred in the message
-    // when both are true.
+    // (a) COMMAND-SHAPED CONTENT — no new classifier, per the design's own residency law: a second
+    // one here would be exactly the kind of unrationed surface the design's audit measured at zero
+    // behavioral yield. `parseActionContext` answers this from the CONTENT'S OWN FORM alone.
+    //
+    // THE STRONGER HALF OF THIS CHECK WENT WITH TRIGGER PATTERNS (2026-08-22). It swept the registry
+    // for a stage whose patterns matched this content and named that stage in the message — a more
+    // specific signal, and preferred over the bare command shape when both were true. Nothing
+    // matches a stage any more, so the general half is now the whole of it: a declaration that reads
+    // like a command still gets told so, just without a stage name attached.
     const context = parseActionContext(content);
-    const matchedStage = listMatchableStages(this.db).find((stage) =>
-      parseTriggerPatterns(stage.trigger_patterns).some((pattern) => matchesTriggerPattern(pattern, context)),
-    );
-    if (matchedStage) {
-      advisories.push({
-        kind: "stage_shaped",
-        stage: matchedStage.name,
-        message: `This looks like a rule — it matches stage "${matchedStage.name}"'s own trigger patterns. ` +
-          `Consider species:"rule" bound to that gate instead of an always-on ${species}.`,
-      });
-    } else if (context.tool !== null) {
+    if (context.tool !== null) {
       // CLAMPED (Codex PR #102, round 2): `context.tool` is a verbatim prefix of caller content and
       // advisories are a fixed field of the acknowledgement, so an unbounded tool name could push the
       // complete envelope past the result ceiling. 120 chars is ample for any real command head.
@@ -12501,17 +12074,14 @@ export class MonetCore {
     return {
       id: row.id,
       name: row.name,
-      patterns: parseTriggerPatterns(row.trigger_patterns),
       origin: row.origin,
-      verified: row.verified === 1,
       createdAt: row.created_at,
     };
   }
 
   /**
-   * Set which model this runtime is serving, AFTER construction. THE single place `gate()`,
-   * `stageLookup()` and `gateCoverage()` all resolve `this.runtimeModelTag` from when a call omits an
-   * explicit tag (see `gate()`'s own comment for that fallback chain).
+   * Set which model this runtime is serving, AFTER construction. THE single place `stageLookup()`
+   * and `gateCoverage()` both resolve `this.runtimeModelTag` from when a call omits an explicit tag.
    *
    * WHY A SETTER, not just the constructor option: `MonetCore` is typically constructed by one
    * piece of code (e.g. scripts/mcp-cli.ts) and handed to another that knows the runtime's model
@@ -12575,144 +12145,49 @@ export class MonetCore {
    * path). Capture handlers (`memory_store`'s rule capture, `memory_declare`) used to stamp a NEW
    * agent-scoped rule's `modelTag` from a CLOSURE-CAPTURED copy of the tag taken once at MCP
    * registration time — so a live tag switch (`setRuntimeModelTag` called later, e.g. a host that
-   * changes which model it is running mid-session) was honored for DELIVERY (`gate()`/
-   * `stageLookup()` already read `this.runtimeModelTag` live) but NOT for CAPTURE: a rule written
+   * changes which model it is running mid-session) was honored for DELIVERY (`stageLookup()`
+   * already read `this.runtimeModelTag` live) but NOT for CAPTURE: a rule written
    * after the switch was stamped for the OLD model and immediately filtered out by the NEW one —
    * captured, then instantly invisible, with no error and no obvious cause. This getter gives
    * capture handlers the SAME live read delivery already had, so both directions of "which model is
    * this" resolve from the one place `setRuntimeModelTag` writes.
    *
    * Returns `undefined` (not `null`) to match every other external presentation of this field
-   * (`gate()`'s own `opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined` chain) — `null` is
-   * this class's internal "unset" representation, `undefined` is what every consumer already
-   * expects an omitted/absent tag to look like.
+   * (`stageLookup()`'s own `opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined` chain) —
+   * `null` is this class's internal "unset" representation, `undefined` is what every consumer
+   * already expects an omitted/absent tag to look like.
    */
   getRuntimeModelTag(): string | undefined {
     return this.runtimeModelTag ?? undefined;
   }
 
   /**
-   * THE GATE. Ask what governs this action, deterministically: pure SQL and string matching, no
-   * model, no network, no embedding — "silence when nothing matches".
-   *
-   * Writes, despite reading like a query: one instrumentation row per call (the fire-precision and
-   * silence-rate measures the design asks for), and the first match verifies a stage's pattern.
-   */
-
-  gate(opts: {
-    actionContext: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
-  }): GateResult {
-    // At the mouth: before the circle is resolved, because resolveCircle can throw and a call that
-    // died on an unqueryable circle is an arrival that must not vanish.
-    const result = this.gateUnjournaled(opts);
-    // AND THE MOMENT, because THIS is the public gate. `monet gate` writes its own interception from
-    // the CLI — it is the only party that holds the host's tool-call identity — and wiring the
-    // moment there alone left every embedder that configures a spool and calls this method
-    // recording no fires and no silences at all, while `record: false` still advertised itself as
-    // the way to opt out of counting. Recording silently off for a supported configuration is the
-    // failure this whole subsystem exists to end, and here it also breaks a documented contract.
-    if (opts.record !== false) this.spoolApiGateMoment(opts.actionContext, opts.circle, result);
-    return result;
-  }
-
-  /**
-   * The interception for a gate call made through the library rather than through the hook.
-   *
-   * NO OUTCOME, EVER, and that is honest rather than incomplete: nothing here observes whether the
-   * caller went on to act. The hook path closes its moments because the host fires a second event;
-   * a library caller returns into code this store cannot see. So these moments count toward fires,
-   * silences and delivery, and never toward conformance — which needs an outcome.
-   *
-   * NO MOMENT ID IS RETURNED, deliberately: adding one would change this method's public return
-   * type, and a library caller has no channel to carry it back on a read anyway. Fact 3 is
-   * therefore unreachable here for the same structural reason it is for an advisory, not because
-   * anything failed.
-   */
-  private spoolApiGateMoment(actionContext: string, circle: string | undefined, result: GateResult): void {
-    if (this.momentSpoolPath === null) return;
-    try {
-      if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
-      const ruleIds = result.rules.map((rule) => rule.conceptId);
-      spoolInterception(this.momentRun, {
-        momentId: mintMomentId(),
-        at: new Date().toISOString(),
-        toolUseId: null,
-        circle: this.resolveCircle(circle ?? this.defaultCircle),
-        sessionId: null,
-        // The surface is the action context's own `Tool:` prefix — derived, never passed, so it
-        // cannot disagree with what was matched. A context with no prefix yields null rather than
-        // an invented surface name.
-        surface: actionContext.indexOf(":") > 0 ? actionContext.slice(0, actionContext.indexOf(":")) : null,
-        action: actionContext,
-        stageId: result.stage?.id ?? null,
-        // NULL ON OVERFLOW, never [] — the gate short-circuits before matching, so an empty array
-        // here would claim it looked and found nothing bound. Same rule the CLI writer follows.
-        ruleIds: result.overflow ? null : ruleIds,
-        disposition: result.overflow
-          ? "ungoverned"
-          : result.silence || ruleIds.length === 0
-            ? "silent"
-            : result.rules.some((rule) => rule.severity === "blocking")
-              ? "blocked"
-              : "advised",
-        // EVERY identity, unlike the CLI's blocking-only set, and the difference is real rather
-        // than an inconsistency: the deny payload names only blocking rules, whereas this method
-        // hands the caller the entire GateResult. Delivery is what actually reached the receiver.
-        deliveredRuleIds: result.overflow ? null : ruleIds,
-      });
-    } catch {
-      // Instrumentation is owed to the record, never to the caller's operation.
-    }
-  }
-
-  private gateUnjournaled(opts: {
-    actionContext: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
-  }): GateResult {
-    const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
-    // THE READ, in its own deferred transaction, which ends before anything is written.
-    const { result, pending } = this.db.transaction(() =>
-      evaluateGate(this.db, {
-        actionContext: opts.actionContext,
-        circle,
-        now: opts.now,
-        record: opts.record,
-        runtimeModelTag: opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined,
-      }),
-    )();
-    // THE WRITES, separately, and ALLOWED TO FAIL. A deferred read transaction upgrading to a write
-    // one can be refused with SQLITE_BUSY when another connection commits in between — which, if
-    // the two were one transaction, would make a gate lookup THROW because an event row could not
-    // be inserted. That trade is unacceptable in the direction it fails: losing one instrumentation
-    // row costs a rounding error on a rate, and failing to deliver a deny costs the thing this
-    // subsystem exists for. The verdict is already computed and is returned either way.
-    if (pending) {
-      try {
-        this.db.immediateTransaction(() =>
-          commitGateWrites(this.db, pending, () => this.nextSyncTimestamp()),
-        )();
-      } catch {
-        // Instrumentation only. Deliberately swallowed — see above.
-      }
-    }
-    return result;
-  }
-
-  /**
    * THE RECOGNIZED MATCHER. The agent NAMES a stage it recognizes itself to be at (from the stage
    * index `agent_context`/`prewarm` carries) — no trigger-pattern matching, no fuzzy or embedding
-   * search. Delivers through the SAME chokepoint semantics as gate() (liveness, circle, model-tag
-   * filter, parent principle), plus each rule's `body` — the capability invocation payload gate()
-   * never carries. Advisory-only by design: severity is delivered as information and never
-   * enforced here. See gates.ts's own `stageLookup` doc comment for the full contract (stage-hit-
-   * no-rules vs miss, the live-index-on-miss self-repair, and why every call records an event).
+   * search. Delivers through the shared chokepoint (liveness, circle, model-tag filter, parent
+   * principle), plus each rule's `body` — the capability invocation payload. Advisory-only by
+   * design: severity is delivered as information and never enforced here. See gates.ts's own
+   * `stageLookup` doc comment for the full contract (stage-hit-no-rules vs miss, and the
+   * live-index-on-miss self-repair).
    *
-   * Same read/write transaction split as gate(), for the same reason: the verdict is computed and
-   * returned first, and the bookkeeping write is separate and allowed to fail silently.
+   * ONE READ TRANSACTION AND NOTHING ELSE. The lookup writes nothing to the gate substrate — see
+   * `evaluateStageLookup` for the write that used to follow it and why an empty second transaction
+   * was worse than none. The only write this method can still make is the governed-moment READ
+   * record below, which goes through the spool rather than the database.
    */
   stageLookup(opts: {
     stage: string;
     circle?: string;
-    now?: number;
+    /**
+     * `false` makes this call a PURE READ: asking without it counting.
+     *
+     * WHAT IT STILL SUPPRESSES, now that the gate substrate is written on no path: the
+     * governed-moment READ record below, and nothing else. It used to ALSO suppress a stage-event
+     * row, which is why it is distinct from `recordMomentRead` — the two were separable then. They
+     * are not any more, and the pair is kept apart rather than merged because they are asked by
+     * different callers for different reasons: `record: false` is "this lookup is not a real
+     * consultation", `recordMomentRead: false` is "it is, and I will record it more accurately".
+     */
     record?: boolean;
     runtimeModelTag?: string;
     /**
@@ -12722,8 +12197,7 @@ export class MonetCore {
      * EXACTLY ONE CALLER SETS IT, and it must: the MCP adapter fits the returned rules to a
      * response budget, so only IT knows which identities actually reached the agent. Recording
      * here as well would both double-count and re-credit rules the fitter dropped — the defect a
-     * Codex round already closed once. Distinct from `record`, which governs the separate
-     * stage-event instrumentation and whose meaning must not be overloaded.
+     * Codex round already closed once.
      */
     recordMomentRead?: boolean;
   }): StageLookupResult {
@@ -12750,28 +12224,18 @@ export class MonetCore {
   }
 
   private stageLookupUnjournaled(opts: {
-    stage: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
+    stage: string; circle?: string; runtimeModelTag?: string;
   }): StageLookupResult {
     const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
-    const { result, pending } = this.db.transaction(() =>
+    // ONE transaction, deferred, spanning every read the lookup makes — see gates.ts's own
+    // `stageLookup` for the TOCTOU window this closes and why nothing follows it.
+    return this.db.transaction(() =>
       evaluateStageLookup(this.db, {
         stage: opts.stage,
         circle,
-        now: opts.now,
-        record: opts.record,
         runtimeModelTag: opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined,
       }),
     )();
-    if (pending) {
-      try {
-        this.db.immediateTransaction(() =>
-          commitGateWrites(this.db, pending, () => this.nextSyncTimestamp()),
-        )();
-      } catch {
-        // Instrumentation only. Deliberately swallowed — see gate()'s own comment for why.
-      }
-    }
-    return result;
   }
 
   /** What the gate's own registry can say about itself — the curation lists, never act counts. */
@@ -12793,99 +12257,6 @@ export class MonetCore {
     return getRuleBinding(this.db, conceptId);
   }
 
-  /**
-   * The gate-substrate generation: a monotonic counter bumped in the same transaction as every
-   * mutation that can change what the gate mirror should contain. A consumer that cannot
-   * re-materialize (the 4b CLI) polls this to know whether its copy is current.
-   */
-  sidecarGeneration(): number {
-    return gateGeneration(this.db);
-  }
-
-  /** Is the mirror at `path` current? A missing or unreadable file reports stale, never throws. */
-  isSidecarStale(path?: string): SidecarStaleness {
-    const target = path ?? this.gateSidecarPath;
-    if (!target) throw new Error("isSidecarStale needs a path: pass one, or construct MonetCore with gateSidecarPath");
-    return inspectSidecar(this.db, target, this.syncDeviceId);
-  }
-
-  /**
-   * Re-materialize the mirror IF this store has one wired and it is not already current.
-   *
-   * Called from every mutation site that can change the deny set — the same set of sites that bump
-   * the generation — so a configured sidecar tracks the store without anyone remembering to ask.
-   * Where no path is configured (the default), the generation still advances and this is a no-op:
-   * the substrate stays pollable even when nothing is mirroring it.
-   *
-   * Never throws into its caller. A store whose sidecar directory has gone read-only must still be
-   * able to retire a rule; the mirror being stale is a condition `isSidecarStale` reports, and
-   * turning it into a failed memory write would be the "a memory tool bricks your work on its own
-   * failure" mode the design explicitly refuses.
-   */
-  private refreshGateSidecar(): void {
-    if (!this.gateSidecarPath) return;
-    try {
-      const verdict = inspectSidecar(this.db, this.gateSidecarPath, this.syncDeviceId);
-      if (!verdict.stale) return;
-      // THE ONE SKEW WE DELIBERATELY DECLINE. A file written by a build ahead of this one is stale
-      // — we cannot read its entries — but overwriting it is the thrash the forward-format rule
-      // exists to avoid.
-      //
-      // REDUNDANT WITH materializeGateMirror's own guard, deliberately and not load-bearing on
-      // its own: that function would decline the rename anyway, after writing and unlinking a temp
-      // file. This returns before doing work whose outcome is already known, which matters now that
-      // the constructor calls this on EVERY open — otherwise a store with forward-format skew pays a
-      // write+unlink per open, forever, to reach a decision available from the header. Neither copy
-      // is the safety property by itself; each covers the other's removal.
-      if (verdict.reason === "format-ahead") return;
-      materializeGateMirror(this.db, this.gateSidecarPath, { storeIdentity: this.syncDeviceId });
-    } catch {
-      // Reported by isSidecarStale, never raised here. See above.
-    }
-  }
-
-  /**
-   * Bump the generation when `conceptId` holds a live rule binding, of either severity. The shared
-   * hook for every path that changes whether a rule is DELIVERED without touching its binding —
-   * retire, hard delete, supersession — so those paths do not each re-derive what "matters to the
-   * mirror" means. Must be called inside the caller's transaction.
-   *
-   * WAS gated on `hasBlockingBinding` (blocking only) — see that function's own comment (now
-   * `hasLiveBinding`) for why an advisory rule leaving the mirror is exactly as mirror-relevant as a
-   * blocking one leaving it, once `GateMirror.entries` carries both severities.
-   */
-  private noteRuleTouched(conceptId: string): void {
-    if (hasLiveBinding(this.db, conceptId)) bumpGateGeneration(this.db);
-  }
-
-  /**
-   * Regenerate the gate mirror — every live rule, both severities, plus the stage registry and the
-   * circle map (see GateMirror). Called automatically on every declaration when the store was
-   * constructed with `gateSidecarPath`; exposed for the CLI that installs the host hooks and for
-   * recovery after the file is lost.
-   *
-   * NO DEFAULT PATH ON PURPOSE. An engine that materialized to a well-known location whether or not
-   * anyone asked would have every construction of MonetCore — every test, every eval run, every
-   * one-off script — writing into the user's real `~/.monet`. The mirror belongs to whoever wired
-   * the hook that reads it, so that caller names the path.
-   *
-   * Returns the OUTCOME alongside the generated mirror. This is the surface the host-hook installer
-   * and the recovery path call, which makes it exactly the caller that must not be told a declined
-   * write succeeded: `outcome: "skipped-format-ahead"` is an operator problem to report, not a
-   * regenerated mirror. `"skipped-superseded"` is not an operator problem — a concurrent writer's
-   * generation already outran this call's, so the mirror on disk is fine — but it is worth telling
-   * apart from `"skipped-current"` in anything that logs outcomes, since one means "nothing changed"
-   * and the other means "something changed while we were computing."
-   */
-  materializeGateMirror(path?: string): SidecarMaterialization {
-    const target = path ?? this.gateSidecarPath;
-    if (!target) {
-      throw new Error(
-        "materializeGateMirror needs a path: pass one, or construct MonetCore with gateSidecarPath",
-      );
-    }
-    return materializeGateMirror(this.db, target, { storeIdentity: this.syncDeviceId });
-  }
 
   /**
    * Export all rows modified since `since` (epoch ms; pass 0 for a full export).
@@ -13641,10 +13012,6 @@ export class MonetCore {
           if (row.status === "active" && row.from_name !== row.to_name) {
             this.moveMomentCircle(row.from_name, row.to_name);
           }
-          // GateMirror.circleAliases/circles are derived from this table (see gateMirrorCircles,
-          // gates.ts) — a landed rename, archive or unarchive is mirror content whether or not any
-          // rule lives in the circle it names.
-          bumpGateGeneration(this.db);
         } else skipped.circle_aliases++;
       }
 
@@ -13762,11 +13129,6 @@ export class MonetCore {
             skipped.tombstones++;
             continue;
           }
-          // A relayed retire changes what the offline hook must block on without any binding row
-          // moving. Bump owed, NOT from `noteRuleTouched(local.id)` any more (removed here — Codex
-          // round 9, item 2): trg_rule_bindings_follow_concept_status (gates.ts) now bumps unassisted
-          // on the status UPDATE below — see retireConcept's own comment (this function's local
-          // twin) for the full argument.
           this.db
             .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = ?, resolved_by = 'sync-tombstone' WHERE concept_id = ? AND status = 'open'`)
             .run(retiredAt, local.id);
@@ -13869,35 +13231,53 @@ export class MonetCore {
           );
         if (r.changes > 0) {
           inserted.concepts++;
-          // THE DANGLING-THEN-LIVE GAP. Normative rows relay independently of endpoint liveness, so
-          // a blocking BINDING can legitimately arrive in one payload and its rule CONCEPT in the
-          // next. The binding's arrival bumps the generation, but the mirror materialized at that
-          // moment omits the rule (listGateMirrorEntries joins concepts, which cannot resolve it yet)
-          // — and then the concept lands here, making the deny live in gateQuery while the file still
-          // reads as current. A deny the store enforces and the offline reader does not know about.
-          //
-          // An arriving concept that already has a blocking binding is therefore a mirror-changing
-          // event in its own right, regardless of payload order.
-          this.noteRuleTouched(row.id);
           // BLOCKER B3: the SAME gap, one field over. A binding can be sitting in this table right
           // now with circle left NULL — the ruleBindings loop's own EFFECTIVE CIRCLE fallback (see
           // above) found no concept to resolve against when THAT row landed, because this concept
           // did not exist yet on this device. A NULL circle is not a benign placeholder: it matches
           // no query's circle filter (RULE_LIVENESS_WHERE tests `b.circle = ?`, and NULL equals
-          // nothing, ever, in SQL) and no mirror entry (minor m1) — a deny that neither fires nor
-          // discloses, live or offline, until this store's next open runs createGateSchema's own
-          // backfill. This concept landing IS that binding's concept arriving: close the gap here,
+          // nothing, ever, in SQL) — a deny that neither fires nor discloses until this store's
+          // next open runs createGateSchema's own backfill. This concept landing IS that binding's concept arriving: close the gap here,
           // now, in the SAME transaction, with the SAME semantics as that backfill — stamp the
           // concept's CURRENT circle. Never BREADTH_CIRCLE: the guard at the top of this loop already
           // refuses any relayed concept row claiming '*', so `row.circle` is guaranteed ordinary here.
-          const resolvedDangling = this.db
-            .prepare(`UPDATE rule_bindings SET circle = ? WHERE concept_id = ? AND circle IS NULL`)
-            .run(row.circle, row.id);
-          // Explicit, not left to `noteRuleTouched` above to cover by coincidence: that hook exists
-          // for paths that change delivery WITHOUT touching the binding row, and this one touches it
-          // directly. Gated on `changes > 0` for the same reason the schema backfill's own bump is
-          // (m3): a concept with nothing dangling to resolve must not bump on every ordinary graft.
-          if (resolvedDangling.changes > 0) bumpGateGeneration(this.db);
+          //
+          // WIDENED FROM `circle IS NULL` TO EVERY NON-BREADTH BINDING (Codex round 4, P1 — a safety
+          // regression this branch introduced). `trg_rule_bindings_follow_concept_circle` was the
+          // UNCONDITIONAL repair for a MOVED concept: whatever else a transaction did, a write that
+          // changed `concepts.circle` dragged every non-breadth binding of that concept with it. The
+          // audit that retired the trigger family enumerated a JS keep-in-step update on every
+          // writer of `concepts.circle` — but "an update EXISTS on this path" is not "the update
+          // always WINS", and on THIS path it does not. `concepts` and `rule_bindings` carry
+          // INDEPENDENT (sync_revision, sync_writer) pairs contested by separate INSERT ... WHERE
+          // clauses, so the concept row can win its own contest and MOVE while its binding row loses
+          // its own and stays put — and the binding row can also never reach that contest at all,
+          // `continue`d past by DOOR 12 (a refused reclassification of a live deny), by the breadth
+          // boundary check, or by the divergent-successor recheck, every one of which is right to
+          // refuse the ROW while saying nothing about the concept's move. Left at `circle IS NULL`,
+          // this heal skipped all of it: a binding already holding a value stayed in the circle the
+          // concept LEFT, permanently — delivering nowhere the concept now lives, and never
+          // re-selected by anything that could try again. A blocking rule disappeared, silently,
+          // from the circle it exists to guard.
+          //
+          // `circle != BREADTH_CIRCLE` IN THE WHERE, NOT THE SET — the retired trigger's own
+          // exclusion, verbatim, and the same one moveConcept and renameCircle already carry: a
+          // global binding's reach is a property of the BINDING, independent of wherever its concept
+          // happens to be filed, so a move must never narrow it back down to one circle. Spelled
+          // `circle IS NULL OR circle != ?` because plain `circle != '*'` is NULL — not true — for a
+          // dangling row, which would silently drop the original B3 case this heal exists for.
+          //
+          // NOT SYNC-STAMPED, exactly as this statement already was not: this is a receiver
+          // CONVERGING to a fact the relayed concept row already carries, not a local act. Every
+          // peer that grafts the same concept move performs the identical repair from the identical
+          // input, so stamping would mint a revision on each receiver and let a mere receiver
+          // out-race the originator's own binding row on a third device.
+          this.db
+            .prepare(
+              `UPDATE rule_bindings SET circle = ?
+                WHERE concept_id = ? AND circle IS NOT ? AND (circle IS NULL OR circle != ?)`,
+            )
+            .run(row.circle, row.id, row.circle, BREADTH_CIRCLE);
         } else skipped.concepts++;
         const unionJson = (left: string | null | undefined, right: string | null | undefined): string | null => {
           const values = [...new Set([
@@ -14378,22 +13758,6 @@ export class MonetCore {
           );
         if (r.changes > 0) {
           inserted.lifecycle_edges++;
-          // A supersession edge stops its source being delivered. Landing one on a rule this store
-          // blocks on removes that deny from the mirror without any binding changing.
-          if (row.family === "supersession") this.noteRuleTouched(row.src_concept_id);
-          // THE FOURTH DOOR INTO THE DERIVATION FAMILY (review fix — Codex 5-B round 2, R2-1), and
-          // the same trigger the three local ones use (`addLifecycleEdge`, `recordProjectionEdge`,
-          // `ratifySkeletonMembership`). `GateMirrorEntry` carries the parent principle as of slice
-          // 5-B (D4), so a relayed projection or ratification edge landing on an ALREADY-BOUND rule
-          // changes what the mirror would write while nothing about the binding moves — and this
-          // loop's own `supersession` line above could not see that, because it was written when a
-          // derivation edge was mirror-irrelevant. Without it, graftRows' closing
-          // `refreshGateSidecar()` compares an unmoved generation, keeps the PARENTLESS file, and
-          // the offline reader disagrees with the live gate about who a rule descends from.
-          // DESTINATION, not source: derivation runs principle → rule, so the bound rule is `dst`.
-          if (row.family === "derivation" && row.dst_concept_id !== null) {
-            this.noteRuleTouched(row.dst_concept_id);
-          }
         } else skipped.lifecycle_edges++;
       }
       // 8b. GATE SUBSTRATE. Stages first, then the bindings that name them: the reference direction
@@ -14418,9 +13782,22 @@ export class MonetCore {
         const current = this.db.prepare(`SELECT sync_revision, trigger_patterns FROM stages WHERE id = ?`)
           .get(row.id) as { sync_revision: number; trigger_patterns: string } | undefined;
         // DOOR 10. AN ACT REFUSED BY HAND MUST NOT LAND AS FACT BY RELAY. Locally, re-aiming a
-        // stage that carries live blocking rules requires acknowledgeBlockingRules — the human has
-        // to name every deny they are re-pointing. A grafted row carries no acknowledgment, so it
-        // does not converge here.
+        // stage that carries live blocking rules used to require acknowledgeBlockingRules — the
+        // human had to name every deny they were re-pointing. A grafted row carries no
+        // acknowledgment, so it does not converge here.
+        //
+        // STILL REACHABLE, AND THAT IS WHY IT STAYS (2026-08-22). Trigger patterns were retired and
+        // the local acknowledgement guard went with them, so THIS build never writes a pattern —
+        // every stage it creates carries RETIRED_TRIGGER_PATTERNS. But an OLD PEER still sends real
+        // pattern sets, and `current` may still hold one an older build wrote, so the byte
+        // comparison below is genuinely reachable during the mixed period. Retiring the local guard
+        // and leaving this one standing is deliberate: the local act cannot be performed at all any
+        // more, while the relayed one can still arrive.
+        //
+        // WHEN THIS BECOMES RETIRABLE: when no peer that can still write a non-`[]`
+        // `trigger_patterns` remains — at which point both sides of the comparison are always
+        // RETIRED_TRIGGER_PATTERNS, the branch can never be taken, and it should be removed rather
+        // than left looking like a live check. That is the same test that retired the local guard.
         //
         // This is the last member of the removal/re-aim class: the chokepoint stops a relayed act
         // from REMOVING a deny, and this stops one from silently changing what a deny denies, which
@@ -14436,10 +13813,11 @@ export class MonetCore {
         // stage. Each device declares it locally until act-relay exists. Divergence you can see
         // beats a deny quietly re-aimed by a machine that never asked.
         //
-        // Scoped as narrowly as the risk: only when the patterns ACTUALLY DIFFER (byte comparison
-        // is exact here — both sides serialize through serializeTriggerPatterns, so an identical
-        // pattern set is an identical string) and only when live denies are bound. Identical-pattern
-        // rows, verified-OR convergence and advisory-only stages all flow untouched.
+        // Scoped as narrowly as the risk: only when the stored bytes ACTUALLY DIFFER, and only when
+        // live denies are bound. Identical rows and advisory-only stages flow untouched. The
+        // comparison is a plain byte comparison because there is nothing left to parse — this build
+        // writes RETIRED_TRIGGER_PATTERNS and an older peer writes whatever its own serializer
+        // produced, and "different bytes" is the whole question either way.
         if (
           current !== undefined &&
           row.trigger_patterns !== current.trigger_patterns &&
@@ -14452,9 +13830,9 @@ export class MonetCore {
         const r = this.db
           .prepare(
             `INSERT INTO stages
-               (id, name, trigger_patterns, origin, verified, created_at, sync_updated_at,
+               (id, name, trigger_patterns, origin, created_at, sync_updated_at,
                 sync_revision, sync_writer)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name,
                trigger_patterns = excluded.trigger_patterns,
@@ -14466,23 +13844,16 @@ export class MonetCore {
                     AND excluded.sync_writer > COALESCE(stages.sync_writer, ''))`,
           )
           .run(
-            row.id, row.name, row.trigger_patterns, row.origin, row.verified ? 1 : 0,
+            row.id, row.name, row.trigger_patterns, row.origin,
             row.created_at, relayAt, revision, writer,
           );
-        // `verified` CONVERGES OUTSIDE THE REVISION CONTEST, as a monotonic OR. It is not an
-        // opinion two replicas can disagree about — it records that this pattern matched a real
-        // action SOMEWHERE, which is a fact that can only accumulate. Folding it into the guarded
-        // upsert would let a peer who has never fired the stage un-verify it by winning an
-        // unrelated pattern edit, and would make the dead-pattern watchlist lie in the dangerous
-        // direction (a live pattern reported dead).
-        if (row.verified) this.db.prepare(`UPDATE stages SET verified = 1 WHERE id = ?`).run(row.id);
+        // A `verified` FLAG USED TO CONVERGE HERE, outside the revision contest, as a monotonic OR.
+        // It recorded that a stage's patterns had matched a real intercepted action somewhere. The
+        // mechanical matcher that could produce such a match is gone, so the flag was unmeasurable
+        // and went with it. A pre-2026-08-22 peer still sends the column; the INSERT above names
+        // its columns explicitly, so the extra property is simply not read.
         if (r.changes > 0) {
           inserted.stages++;
-          // UNCONDITIONAL — every stage is mirror content now (GateMirror.stages carries the full
-          // registry; see upsertStage's own comment for the same widening on the local-write side).
-          // A landed stage insert or update changes the mirror whether or not any rule, of either
-          // severity, is bound to it yet.
-          bumpGateGeneration(this.db);
         } else skipped.stages++;
       }
       for (const row of payload.ruleBindings ?? []) {
@@ -14772,9 +14143,9 @@ export class MonetCore {
         // we find badly formed.
         //
         // So the reasonless deny lands, guards the action it was declared to guard, and is
-        // DISCLOSED instead: `reasonMissing` on the delivered rule and on the sidecar entry,
-        // counted in the gate's own coverage. The promise is unmet for that rule and visibly so, which is
-        // survivable; hiding it would make the promise false, which is not. The repair is an
+        // DISCLOSED instead: `reasonMissing` on the delivered rule, counted in the gate's own
+        // coverage. The promise is unmet for that rule and visibly so, which is survivable; hiding
+        // it would make the promise false, which is not. The repair is an
         // ordinary local declaration supplying the reason — no migration, and deliberately no
         // backfill, because a backfill would be us inventing the sentence a human owes.
         // `revision`/`writer` COMPUTED ABOVE (Codex round 10, item 1), not here a second time: the
@@ -14808,11 +14179,6 @@ export class MonetCore {
           );
         if (r.changes > 0) {
           inserted.rule_bindings++;
-          // UNCONDITIONAL — mirrors bindRule's own local-write widening (gates.ts): every live rule
-          // binding is mirror content now, so a landed row changes the mirror whether it puts deny
-          // power in play, takes it out, or only touches advisory-level content (scope, modelTag,
-          // reason, origin).
-          bumpGateGeneration(this.db);
         } else skipped.rule_bindings++;
       }
 
@@ -14964,9 +14330,6 @@ export class MonetCore {
     const proofToken = txn();
     this.installEmbeddingWidthProof(proofToken);
 
-    // A graft can land, remove, or reroute deny power (a blocking binding, a stage's patterns, a
-    // tombstone or a supersession on a blocking rule). No-op unless the generation actually moved.
-    this.refreshGateSidecar();
     return { inserted, converted, skipped, conceptsMarkedDirty: [...conceptsMarkedDirty] };
   }
 
@@ -15177,10 +14540,6 @@ export class MonetCore {
       // (review fix, found while implementing Codex round 1 item 3's own requested test, NOT one of
       // that review's 4 named findings).
       const renameStamp = this.nextSyncTimestamp();
-      // NOT CAPTURED HERE ANY MORE (Codex round 8, item 2 fallout added `generationBeforeMove`;
-      // Codex round 11, item 3 removed it) — see the "OWED REGARDLESS" comment below, past
-      // moveCircleScopedTables and the alias write, for why comparing a before/after generation is
-      // no longer needed at all.
       // THE MECHANICAL CORE (review fix — Codex round 2, item 2): concepts, observations, memory_edge
       // (via moveEdgeScope), lifecycle_edges/ratifications, entities/concept_entities, workstream
       // slugs — every circle-scoped table EXCEPT circle_aliases (this method's own
@@ -15208,28 +14567,21 @@ export class MonetCore {
       // already does (gates.ts).
       //
       // MATCHED BY concept_id IN (...), NOT `WHERE circle = ?` (Codex round 7, item 2 fallout — found
-      // and fixed while testing that item, not a named finding on its own): the OLD form matched
-      // rows whose circle CURRENTLY equals `from`, which was safe only because nothing else could
-      // have already changed it first. That stopped being true the moment
-      // trg_rule_bindings_follow_concept_circle (gates.ts) started reacting to moveCircleScopedTables'
-      // own `UPDATE concepts SET circle = ?` a few lines up — the trigger fires per-row, synchronously,
-      // BEFORE this statement ever runs, and already rewrites each moved concept's binding circle to
-      // `to`. A `WHERE circle = ?` bound to `from` then matches NOTHING (every row it was meant to
-      // find already reads `to`), so this statement silently became a no-op: the circle value stayed
-      // correct (the trigger got it right), but sync_revision/sync_writer/sync_updated_at never
-      // advanced, making the row invisible to a peer's next incremental export — caught by an
-      // existing test ("renameCircle's rule_bindings update is stamped for sync too"), not by
-      // inspection. `movedConceptIds` (moveCircleScopedTables' own return value, captured via a plain
-      // SELECT before its own `concepts` UPDATE runs, so it names exactly the right set regardless of
-      // what any trigger does afterward) is a STABLE key the trigger's own write can never invalidate
-      // — matching moveConcept's own already-safe `WHERE concept_id = ? AND circle != ?` shape
-      // (engine.ts) rather than reinventing a second pattern. Redundant with the trigger for a
-      // NEW-build caller (both write the identical `to` value; this one ALSO advances the sync
-      // stamp, which the trigger deliberately does not — seeding sync_revision from a trigger would
-      // race the very read-modify-write convergence contest every other relayed write already uses)
-      // and is what actually does the job, unassisted, for an OLD build that predates this trigger's
-      // own guarantee — nothing here changes for that caller, which is the failure mode item 2 exists
-      // to close in the first place.
+      // and fixed while testing that item, not a named finding on its own): a `WHERE circle = ?`
+      // bound to `from` matches only rows whose circle STILL reads `from` when this statement runs,
+      // which makes the statement's own correctness depend on nothing else having rewritten those
+      // rows first. When something did, it silently became a no-op — the circle value was right, but
+      // sync_revision/sync_writer/sync_updated_at never advanced, making the row invisible to a
+      // peer's next incremental export. That was caught by an existing test ("renameCircle's
+      // rule_bindings update is stamped for sync too"), not by inspection, which is the point:
+      // a WHERE clause that reads the very column the statement is there to set cannot be audited
+      // by looking at it. `movedConceptIds` (moveCircleScopedTables' own return value, captured via a
+      // plain SELECT BEFORE its own `concepts` UPDATE runs, so it names exactly the right set
+      // regardless of what happens to `circle` afterward) is a STABLE key no later write can
+      // invalidate — matching moveConcept's own already-safe `WHERE concept_id = ? AND circle != ?`
+      // shape rather than reinventing a second pattern. The sync stamp is the half that is never
+      // redundant: `rule_bindings` carries no automatic sync trigger, so this statement is the only
+      // thing that makes the rename travel.
       if (movedConceptIds.length > 0) {
         const placeholders = movedConceptIds.map(() => "?").join(",");
         this.db.prepare(
@@ -15237,28 +14589,6 @@ export class MonetCore {
             WHERE concept_id IN (${placeholders}) AND circle != ?`,
         ).run(to, renameStamp, this.syncDeviceId, ...movedConceptIds, BREADTH_CIRCLE);
       }
-      // OWED REGARDLESS — a rename that holds ANY live rule (either severity) rewrites the mirror's
-      // content even though no binding was touched, and past that, this rename ALSO writes the
-      // from→to row `GateMirror.circleAliases`/`circles` are derived from (below), which changes the
-      // mirror even for a circle with no rules in it at all. Past the `from === to` no-op check
-      // above, this function has committed to a real rename, so a bump is owed unconditionally.
-      //
-      // NO BUMP CALL NEEDED HERE AT ALL ANY MORE (Codex round 11, item 3 — removing the
-      // `generationBeforeMove`-gated call round 8, item 2 fallout had added). That call existed to
-      // cover exactly the case trg_rule_bindings_follow_concept_circle's own per-concept bump could
-      // miss: an alias-only rename, or a rename of an otherwise rule-free circle, where nothing
-      // rule-bound moved and so the trigger never fired. What closes that residual case now is
-      // trg_circle_aliases_bump_on_insert / trg_circle_aliases_bump_on_update (gates.ts,
-      // migrateGateColumns), reacting to the alias UPSERT immediately below — VERIFIED, not assumed,
-      // by direct probe (better-sqlite3 11.10.0 / SQLite 3.49.2): an `INSERT ... ON CONFLICT DO
-      // UPDATE` fires EXACTLY ONE of a table's own AFTER INSERT / AFTER UPDATE triggers per row, never
-      // both and never neither — the INSERT trigger when no prior row existed for `from`, the UPDATE
-      // trigger when one did and the DO UPDATE clause ran instead. Either way, the alias write below
-      // is unconditionally reached the moment this function commits to a real rename (past the
-      // `from === to` check above), so one of those two triggers unconditionally bumps regardless of
-      // whether any concept moved, let alone one with a live binding — making a from/before generation
-      // comparison here redundant rather than merely double-counting: the alias write alone is now
-      // sufficient, on every path through this function, old build or new.
       // Upsert alias from→to (active). RENAME-SPECIFIC — never part of the shared helper: a
       // migration must NOT write one (see LEGACY_STAR_CIRCLE's own comment for why an alias here
       // would poison `resolveCircle('*')`).
@@ -15286,8 +14616,6 @@ export class MonetCore {
       this.moveMomentCircle(from, to);
       return { from, to, action: "renamed", conceptsUpdated, observationsUpdated, edgesUpdated, entitiesUpdated };
     })();
-    // The mirror names each rule's circle, so a rename that moved a deny changed the file's content.
-    this.refreshGateSidecar();
     return result;
   }
 
@@ -15596,11 +14924,11 @@ export class MonetCore {
    *     the opposite either, and moveCircleScopedTables already moves them unconditionally alongside
    *     whatever concepts move — they never determine the destination independently.
    *   - EXCLUDED, instrumentation-only (stated reason, per this round's own suggestion):
-   *     `gate_events` and `resolution_events`. Both carry a `circle` column, but both are explicitly
-   *     documented local, append-only logs of what happened, not identity anything else depends on —
-   *     resolution_events' own doc comment: "An instrumentation row must not perturb the thing it
-   *     instruments." A collision here would misattribute some historical metrics to the wrong
-   *     circle in a report, never conflate real content or identity.
+   *     `resolution_events` (and `gate_events`, until that table was dropped). It carries a `circle`
+   *     column, but it is explicitly documented a local, append-only log of what happened, not
+   *     identity anything else depends on — resolution_events' own doc comment: "An instrumentation
+   *     row must not perturb the thing it instruments." A collision here would misattribute some
+   *     historical metrics to the wrong circle in a report, never conflate real content or identity.
    *
    * GUARDED ON TABLE EXISTENCE ONLY WHERE IT CAN ACTUALLY BE MISSING AT THIS POINT IN CONSTRUCTION:
    * `circle_aliases` (Codex round 4, item 4 fallout) and `knowledge_sources` (round 5, item 2) both
@@ -15633,15 +14961,15 @@ export class MonetCore {
    * its own call site moved again in round 3, item 1 — see LEGACY_STAR_CIRCLE's own comment,
    * gates.ts, for the full history and why this is engine.ts's job rather than gates.ts's).
    *
-   * CALLED FROM `init()`, BETWEEN `createGateTables(this.db)` and `migrateGateColumns(this.db)` —
-   * that ordering is the whole point, now in two halves instead of one:
-   *   - AFTER createGateTables: this method's own `bumpGateGeneration` call needs `gate_meta` to
-   *     exist, which — on a genuine pre-gate 1.3.1 store — it does not until that call runs. Round
-   *     2's seam ran this method before ANY gate table existed, so the bump threw "no such table:
-   *     gate_meta" AFTER `moveCircleScopedTables` had already auto-committed (no explicit
-   *     transaction wraps it — see that method's own comment), aborting construction on the FIRST
-   *     attempt and silently succeeding on a retry, because nothing was left to migrate the second
-   *     time. Codex round 3, item 1 is that finding; this is the fix.
+   * CALLED FROM `init()`, BETWEEN `createGateTables(this.db)` and `migrateGateColumns(this.db)`:
+   *   - AFTER createGateTables: HISTORICAL. This method used to bump the gate generation counter,
+   *     which needs a table `createGateTables` creates; round 2's seam ran the method before ANY
+   *     gate table existed, so the bump threw AFTER `moveCircleScopedTables` had already
+   *     auto-committed (no explicit transaction wraps it — see that method's own comment), aborting
+   *     construction on the FIRST attempt and silently succeeding on a retry, because nothing was
+   *     left to migrate the second time. Codex round 3, item 1 is that finding; splitting the phases
+   *     is the fix. The counter was removed 2026-08-22 and nothing here reads a gate table any more,
+   *     so this half of the ordering no longer constrains anything.
    *   - BEFORE migrateGateColumns: its own backfill copies `concepts.circle` verbatim onto every
    *     dangling `rule_bindings` row, and a concept still named `*` at that moment either throws the
    *     guarded ALTER's own CHECK outright (a dev-main-shaped store: rule_bindings already exists,
@@ -15718,14 +15046,12 @@ export class MonetCore {
    *     grafting into any peer already throws today, on this exact shape, before this fix.)
    *
    * ONE TRANSACTION FOR THE WHOLE MIGRATION (Codex round 7, item 1, P1): every write below —
-   * destination choice through the generation bump — commits or rolls back as a single unit, in an
-   * `immediateTransaction`, exactly as `bumpGateGeneration`'s own doc comment requires ("MUST be
-   * called inside the SAME transaction as the mutation it describes"). Before this fix, each write
-   * auto-committed piecemeal (concepts, then observations, then edges, then normative rows, then the
-   * source registry, then aliases, then the bump — one statement, one commit) — a crash between any
-   * two of them left a HALF-MOVED store: concepts renamed but their source registry row still
-   * pointing at `*`, or an alias repointed but the generation never bumped, so the mirror stayed
-   * confidently wrong instead of detectably stale. The pre-transaction existence checks above stay
+   * destination choice through the alias cleanup — commits or rolls back as a single unit, in an
+   * `immediateTransaction`. Before this fix, each write auto-committed piecemeal (concepts, then
+   * observations, then edges, then normative rows, then the source registry, then aliases — one
+   * statement, one commit) — a crash between any two of them left a HALF-MOVED store: concepts
+   * renamed but their source registry row still pointing at `*`, or the concepts moved and the
+   * aliases naming `*` left behind. The pre-transaction existence checks above stay
    * OUTSIDE (a cheap fast path — no reason to open a write-locked transaction when there is provably
    * nothing to do), but everything that can actually WRITE, plus the counting that decides WHETHER
    * anything wrote, moves inside.
@@ -15790,9 +15116,8 @@ export class MonetCore {
     if (!hasLegacyStar && !hasLegacyStarNormative && !staleStarSource && !staleStarTarget) return;
     // ONE TRANSACTION, START TO FINISH (Codex round 7, item 1) — see this method's own doc comment
     // for the nesting verification and why disclosure moves outside. `changedAnything` is computed
-    // and acted on (the generation bump) INSIDE, since "did anything actually happen" and "should the
-    // mirror generation move" must agree with what actually committed, not with a pre-transaction
-    // guess a concurrent migrator could have already falsified.
+    // INSIDE, since "did anything actually happen" must agree with what actually committed, not with
+    // a pre-transaction guess a concurrent migrator could have already falsified.
     const committed = this.db.immediateTransaction((): {
       destination: string;
       moved: {
@@ -15822,31 +15147,25 @@ export class MonetCore {
         ? (this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(destination, BREADTH_CIRCLE)).changes : 0;
       // A CONCURRENT MIGRATOR ALREADY WON EVERYTHING this instance found evidence of above: every
       // read at the top of this method was a stale snapshot by the time each write above actually
-      // ran — every one of them matched nothing, this migrator has nothing left to disclose or bump
-      // for, and the OTHER migrator's own run (its own transaction, fully committed before this one's
-      // immediateTransaction could even acquire its write reservation) already did both.
+      // ran — every one of them matched nothing, this migrator has nothing left to disclose, and the
+      // OTHER migrator's own run (its own transaction, fully committed before this one's
+      // immediateTransaction could even acquire its write reservation) already did it.
       // `moved.normativeUpdated > 0` ADDED (Codex round 9, item 3) — without it, a normative-only
       // migration would move real rows (moveCircleScopedTables already did, above) and then have
-      // this flag stay false, which SKIPS both the generation bump below AND the disclosure calls
-      // after commit (`if (!committed.changedAnything) return;`) — silently discarding a migration
-      // that genuinely ran, the same "fired but never told anyone" shape item 3's own bug report
-      // named for the trigger-condition gate, one level deeper.
+      // this flag stay false, which SKIPS the disclosure calls after commit
+      // (`if (!committed.changedAnything) return;`) — silently discarding a migration that genuinely
+      // ran, the same "fired but never told anyone" shape item 3's own bug report named for the
+      // trigger-condition gate, one level deeper.
       const changedAnything =
         moved.conceptsUpdated > 0 || moved.normativeUpdated > 0 ||
         deletedStarSource > 0 || repointedStarTargets > 0;
-      // UNCONDITIONAL past this gate: circle_aliases IS mirror content when touched here (GateMirror.
-      // circleAliases/circles are derived from this table — gateMirrorCircles, gates.ts, same as every
-      // other alias writer's own bump) — so a bump is owed whether concepts moved, a source moved,
-      // aliases changed, or any combination, and changedAnything is already the precise "at least one
-      // of the four counts is nonzero" fact.
-      if (changedAnything) bumpGateGeneration(this.db);
       return { destination, moved, deletedStarSource, repointedStarTargets, changedAnything };
     })();
     if (!committed.changedAnything) return;
     const { destination, moved, deletedStarSource, repointedStarTargets } = committed;
     // DISCLOSURE, AFTER COMMIT (Codex round 7, item 1: moved out of the transaction — see this
     // method's own doc comment for why). No prior migration in this codebase leaves a trace of its
-    // own (the `matcher` column, the original `circle` column itself: both silent, self-healing) —
+    // own (`rule_bindings.circle`'s own guarded ALTER and backfill, gates.ts: silent, self-healing) —
     // this one earns a line because it silently RENAMES pre-existing user content, not merely a
     // schema shape. `console.error`, matching the ONE disclosure convention this codebase already has
     // for a notable-but-recovered condition (embedding-onnx.ts's model-load fallback, store-
@@ -16062,20 +15381,9 @@ export class MonetCore {
         // coverage of the circle it consumed.
         //
         // The fold's own `resolveCircleAlias` handles the other half — records that keep ARRIVING
-        // under the old name, which they will, since a hook pins its circle in settings.json and
-        // no circle operation rewrites that file. Neither half covers the other's case.
+        // under the old name, which they will, since a writer outside this process pins its circle
+        // where no circle operation can reach it. Neither half covers the other's case.
         this.moveMomentCircle(from, into);
-        // NO EXPLICIT bumpGateGeneration(this.db) CALL HERE ANY MORE (removed — Codex round 11, item
-        // 3; was added unconditionally at review fix MATERIAL M2). Same reasoning as renameCircle's
-        // own removed call, immediately above it in this file: circle_aliases is mirror content
-        // regardless of whether any concept in `from` held a rule, so an empty circle merged into
-        // another still changes what the mirror's circle map says — but that is now
-        // trg_circle_aliases_bump_on_insert / trg_circle_aliases_bump_on_update's job
-        // (gates.ts, migrateGateColumns), reacting to the IDENTICAL upsert-then-flatten pair just
-        // above (the same two-statement shape renameCircle's own alias write uses), verified by the
-        // same direct probe to fire exactly one of the two per row, unconditionally, on every path
-        // through this method. The per-concept reassignCircle() calls above still bump on their own
-        // for any rule that actually moved; this removed call was never covering that half.
 
         return { from, into, conceptResults, counts: { moved, merged, noop, error: 0 } };
       })();
@@ -16085,17 +15393,6 @@ export class MonetCore {
       this.lastConceptByCircle = lastConceptSnapshot;
       throw error;
     }
-    // AFTER the transaction commits — same placement renameCircle uses (review fix, Codex round 1
-    // item 1). The per-concept reassignCircle() calls above already each refresh on their own, but
-    // every one of those runs BEFORE the alias write above lands, so a mirror rebuilt only from
-    // those calls never carries the fresh from→into row — and an EMPTY merge (no concepts in `from`
-    // at all, alias-only) calls reassignCircle zero times and refreshes NOTHING. 4b-C's own failure
-    // policy deliberately keeps answering BLOCKING from a mirror that has gone stale (a human's
-    // declaration does not expire because the mirror is behind); a mirror still missing this alias
-    // has no entry to answer FROM under the old name at all, so a query made under it reads as an
-    // ordinary miss instead of the deny the live gate delivers — fail toward allow, the one
-    // direction this whole subsystem exists to prevent.
-    this.refreshGateSidecar();
     return result;
   }
 
@@ -16122,29 +15419,14 @@ export class MonetCore {
     if (existing && existing.to_name !== name && existing.status === "active") {
       throw new Error(`cannot archive '${name}': it is an alias pointing to '${existing.to_name}' — archive the canonical circle instead`);
     }
-    // No JS-side bumpGateGeneration call needed here any more (removed — Codex round 11, item 3; was
-    // added inside this same transaction at review fix, Codex round 1 item 1). GateMirror.circles/
-    // circleAliases are derived from circle_aliases (gateMirrorCircles, gates.ts), so an archive is
-    // mirror content even for a circle holding no rules at all — but that is now
-    // trg_circle_aliases_bump_on_insert / trg_circle_aliases_bump_on_update's job (gates.ts,
-    // migrateGateColumns): the upsert below unconditionally reaches exactly one of the two, per the
-    // same direct-probe verification cited at renameCircle's own removed call. No transaction
-    // wrapper needed either, for the same reason: the trigger fires in lockstep with the upsert it
-    // reacts to, inside SQLite's own statement boundary, so there is no separate bump statement left
-    // whose commit could ever come apart from the write it describes.
+    // NO TRANSACTION WRAPPER: the upsert below is one statement, so there is nothing left whose
+    // commit could come apart from the write it describes.
     this.db
       .prepare(
         `INSERT INTO circle_aliases (from_name, to_name, status) VALUES (?, ?, 'archived')
          ON CONFLICT(from_name) DO UPDATE SET to_name = ?, status = 'archived'`,
       )
       .run(name, name, name);
-    // AFTER the write commits (review fix, Codex round 1 item 1 — closes m5 for the third and
-    // last writer missing it; renameCircle/reassignCircle/mergeCircle above already have it). An
-    // archived circle changes `GateMirror.circles` (gateMirrorCircles keeps BOTH statuses there — an
-    // archived circle is still "known", just hidden from default scans), so the trigger's own bump
-    // above is real mirror content and a configured sidecar must not sit stale until an unrelated
-    // write happens to touch it next.
-    this.refreshGateSidecar();
   }
 
   /**
@@ -16165,21 +15447,11 @@ export class MonetCore {
     if (existing && existing.to_name !== name && existing.status === "active") {
       throw new Error(`cannot unarchive '${name}': it is an alias pointing to '${existing.to_name}' — unarchive the canonical circle instead`);
     }
-    // No JS-side bumpGateGeneration call needed here any more, and no transaction wrapper either —
-    // same reasoning as archiveCircle above (Codex round 11, item 3). The removed call was GATED on
-    // `changes > 0` because this method is a documented no-op when no alias row exists at all; that
-    // gate is now an EXACT match for trg_circle_aliases_bump_on_update's own per-row firing (gates.ts,
-    // migrateGateColumns) — a plain UPDATE whose WHERE clause matches zero rows fires an AFTER UPDATE
-    // trigger zero times (there is no row for it to run against), the identical condition `changes >
-    // 0` was testing in JS.
+    // NO TRANSACTION WRAPPER, same reasoning as archiveCircle above: one statement, and a documented
+    // no-op when no alias row exists at all.
     this.db
       .prepare(`UPDATE circle_aliases SET status = 'active' WHERE from_name = ?`)
       .run(name);
-    // AFTER the transaction commits (review fix, Codex round 1 item 1 — same as archiveCircle's own
-    // addition just above). Unconditional, matching every other refresh call site in this file: safe
-    // and cheap even on the documented no-op path, since refreshGateSidecar's own isSidecarStale
-    // check is what decides whether there is anything to do.
-    this.refreshGateSidecar();
   }
 
   /**
@@ -16831,23 +16103,6 @@ export class MonetCore {
     this.assertActiveMutableConcept(src, "move");
     const id = src.id;
     const fromCircle = src.circle;
-    // Every sidecar entry names the circle its rule lives in, so moving a deny between circles
-    // rewrites the mirror even though the binding is untouched — a bump is owed here. NOT sourced
-    // from `noteRuleTouched(id)` any more (removed here — Codex round 8, item 2 fallout, found and
-    // fixed while validating that item): trg_rule_bindings_follow_concept_circle (gates.ts) now
-    // bumps gate_meta itself on every `concepts.circle` UPDATE, including the one immediately below,
-    // making a JS-side bump here REDUNDANT whenever `id` carries a live binding — and
-    // `noteRuleTouched`'s own `hasLiveBinding` gate is exactly the condition under which the trigger
-    // fires too, so the two always agreed on WHETHER to bump, only ever differing on whether BOTH
-    // fired for the same event. Caught by "the sidecar generation contract"'s own exact-count tests
-    // (`toBe(afterPatterns + 1)`, observed `+ 2`) the moment the trigger's own bump started landing
-    // alongside this one — an INCREMENT double-fired is not harmless the way the identical-value
-    // `rule_bindings` UPDATE below is (see that statement's own comment): unlike a same-value SET,
-    // calling `bumpGateGeneration` twice for one logical event is simply wrong twice. The trigger's
-    // own condition is a strict SUPERSET of `hasLiveBinding` (it fires on every circle-changing
-    // UPDATE, live binding or not — see its own comment in gates.ts for why that breadth is
-    // accepted), so removing this call cannot leave a case where a bump was owed and nothing pays
-    // it; it only removes the case where two things paid it at once.
     this.db.prepare(`UPDATE concepts SET circle = ?, updated_at = unixepoch() * 1000 WHERE id = ?`).run(toCircle, id);
     // KEEP rule_bindings.circle IN STEP with the concept it addresses — RULE_LIVENESS_WHERE reads
     // the BINDING's circle now, not the concept's (see RuleBindingRow.circle's own comment), so
@@ -17058,16 +16313,6 @@ export class MonetCore {
       `DELETE FROM observation_tokens WHERE observation_id IN (SELECT id FROM observations WHERE concept_id = ?)`,
     ).run(conceptId);
     this.db.prepare(`DELETE FROM observations WHERE concept_id = ?`).run(conceptId);
-    // Before the row goes: a hard delete removes a rule from the mirror exactly as a retire does,
-    // and the binding it is read from is about to be unjoinable. NOT sourced from
-    // `noteRuleTouched(conceptId)` any more (removed here — Codex round 11, item 2):
-    // trg_concepts_bump_on_delete (gates.ts, migrateGateColumns) now bumps unassisted, AFTER DELETE
-    // ON concepts, for the identical `hasLiveBinding`-shaped EXISTS condition this call used to test
-    // — an exact match, not merely a superset, despite firing at a different moment (this call ran
-    // BEFORE the DELETE below; the trigger fires AFTER it): `rule_bindings` is never explicitly
-    // deleted anywhere in this codebase (grepped — zero `DELETE FROM rule_bindings` statements), so
-    // the orphaned binding row this DELETE leaves behind reads identically to the EXISTS check
-    // whether asked a moment before or a moment after the concept row itself is gone.
     // CHOKEPOINT, LAST LINE OF DEFENCE. Every caller that can reach a live deny is guarded ahead of
     // this (merge refuses to auto-merge rules, consolidating detach refuses outright, graft skips
     // and counts), so reaching here with one blocked means a NEW caller was added without the
@@ -17307,23 +16552,15 @@ export class MonetCore {
       .prepare(`UPDATE concepts SET body = ?, title = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
       .run(body, nextTitle, concept.id);
     this.writeRevision(concept.id, concept.version, body);
-    // MIRROR CONTENT (review fix — Codex round 2, item 4): a rule's TITLE is the text a gate
-    // delivers (GateRule.text, GateMirrorEntry.text both read `concepts.title`) — this sieve-tier
-    // retitling could leave a bound rule's live gate serving new text while a materialized mirror
-    // stayed current-and-stale indefinitely, with nothing ever bumping the generation to say so.
-    // Swept for every OTHER concepts.title writer too, historically: applySynthesis (this
-    // function's agent-facing MCP twin), resolveContradiction's explicit-body-override branch, and
-    // detach()'s partial-detach (source-survives) branch all needed the identical fix, for the
-    // identical reason — each called noteRuleTouched too, until Codex round 10, items 2+3 removed
-    // all four such calls (this one included) in favor of trg_rule_bindings_follow_concept_title
-    // (gates.ts), which now bumps unassisted for the identical `hasLiveBinding` condition, closing
-    // the SAME gap for an OLD BUILD's own retitling code that predates knowing an advisory rule's
-    // retitle is mirror-relevant at all. TWO title writers were swept and left UNCHANGED,
-    // deliberately, THEN and now: the workstream-save path (its own UPDATE is `WHERE ...
-    // AND kind='workstream'`, so it can never reach a rule concept at all) and the source-file
-    // recompute path (source-owned concepts can never carry a rule binding — the same invariant
-    // assertGraftPayloadIsNativeOnly enforces on the sync boundary) — the new trigger's own EXISTS
-    // clause confirms both stay correctly silent, independent of this history.
+    // A RULE'S TITLE IS THE TEXT THE GATE DELIVERS (`GateRule.text` reads `concepts.title`), so this
+    // sieve-tier retitling can change what a bound rule says at the moment it fires. The four
+    // `concepts.title` writers that can reach a rule concept are this one, applySynthesis (its
+    // agent-facing MCP twin), resolveContradiction's explicit-body-override branch, and detach()'s
+    // partial-detach (source-survives) branch. TWO other title writers cannot and are deliberately
+    // left out of that set: the workstream-save path (its own UPDATE is `WHERE ... AND
+    // kind='workstream'`, so it can never reach a rule concept) and the source-file recompute path
+    // (source-owned concepts can never carry a rule binding — the same invariant
+    // assertGraftPayloadIsNativeOnly enforces on the sync boundary).
     return this.getRow(concept.id)!;
   }
 

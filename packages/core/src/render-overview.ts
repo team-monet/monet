@@ -106,12 +106,13 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   ) {
     lines.push(bold("GATE"));
     if (gates.total > 0) {
-      // `ungoverned` is its own number and never folded into silences: a silence is a claim that the
-      // gate LOOKED and nothing was bound, and these are the moments nothing evaluated at all.
-      lines.push(truncate(dim(
-        `  ${gates.total} moments · ${gates.fires} fired · ${gates.silences} silent · ` +
-        `${gates.ungoverned} ungoverned · ${gates.delivered} delivered`,
-      ), width));
+      // ONE NUMBER, BECAUSE THERE IS ONLY ONE POPULATION LEFT TO NAME. This line carried rates
+      // ("fired", "silent", "delivered") until 2026-08-22, and an `ungoverned` count beside the
+      // total until later the same day. The rates went because nothing writes the columns they read.
+      // `ungoverned` went because it reads `rule_ids IS NULL`, which is what the sole surviving
+      // writer hard-codes — so it equalled `total` on everything this build records, and the line
+      // was printing one population under two names. See `MomentCounts`.
+      lines.push(truncate(dim(`  ${gates.total} moments`), width));
     }
     // ITS OWN LINE, because it is in no other number here: `total` counts THIS circle's moments and
     // these have no circle at all, so without a line of their own an opened section could show
@@ -137,10 +138,12 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     if (owedByAgent > 0) {
       lines.push(truncate(yellow(`  never asked: ${owedByAgent} read and acted on without asking`), width));
     }
-    // READ, BUT TOO LATE TO HAVE ACTED ON IT. Dim and unactionable on purpose: on this host a
-    // PreToolUse advisory reaches the model beside the tool result, so this is the NORMAL end state
-    // for an advisory rather than a fault anyone can clear. It is here so that a delivered rule the
-    // agent actually went and read is not read as one nobody engaged with.
+    // READ, BUT TOO LATE TO HAVE ACTED ON IT. Dim and unactionable on purpose: a PreToolUse
+    // advisory reaches the model beside the tool result on this host, so for every moment a
+    // host-side hook recorded this is the NORMAL end state rather than a fault anyone can clear.
+    // Monet ships nothing that delivers there now, so the population can only shrink relative to
+    // the rest — it is still shown, so that a delivered rule the agent actually went and read is
+    // not rendered as one nobody engaged with.
     //
     // IN NEITHER GATING LIST, and that is the G2 lesson applied rather than repeated: a number with
     // a benign normal case that only grows would make the all-clear unreachable if it suppressed it,

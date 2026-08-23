@@ -262,7 +262,7 @@ function writeFully(fd: number, payload: Buffer): void {
  * Write the most recent startup failure beside the store. Returns the path holding the diagnosis,
  * or null if nothing could be written.
  *
- * TEMP + RENAME, matching gates.ts's sidecar and install-cli.ts's atomic write: a reader that
+ * TEMP + RENAME, matching the CLI's own `atomicWriteFile` (packages/cli/src/atomic-write.ts): a reader that
  * arrives mid-write must see the previous record or the new one, never half of either. `wx` on the
  * temp file so two servers failing at the same instant cannot land in one buffer.
  *
