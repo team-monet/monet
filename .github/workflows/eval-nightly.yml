@@ -24,6 +24,9 @@ jobs:
   semantic-eval:
     name: semantic recall gate + report
     runs-on: ubuntu-latest
+    # Serial onnx files + 600s per-test caps mean a genuinely hung run could burn ~70 min
+    # before its own timeouts fire; bound the whole job instead of inheriting the 6h default.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -72,11 +75,17 @@ jobs:
       # for their whole existence: they self-gated, were never named here, and were found failing 5 of
       # 9 assertions the first time anyone ran them. Adding a *.onnx.test.ts file means adding it here,
       # and packages/core/src/__tests__/onnx-gate-coverage.test.ts fails if you forget.
+      # RUN THEM SERIALLY, overriding vitest.config.ts's CI default of `poolOptions.forks.maxForks: 2`
+      # for this job only. Each of these four files loads the full ONNX model and embeds a corpus, so
+      # the job is bounded by CPU throughput, not by I/O: two files in flight split a 4-vCPU standard
+      # runner between them. maxForks=1 gives whichever file is running the whole runner. The flag
+      # names the same config path the file sets, so it wins regardless of the config's CI branch —
+      # and it is set HERE rather than in vitest.config.ts so the PR suite (ci.yml) keeps its 2 forks.
       - name: Recall gate (fails the job on a semantic-recall regression)
         working-directory: packages/core
         env:
           MONET_EVAL_ONNX: "1"
-        run: pnpm exec vitest run --dir src eval.onnx eval-baseline.onnx recall-floor.onnx resolution-hybrid.onnx
+        run: pnpm exec vitest run --dir src --poolOptions.forks.maxForks=1 eval.onnx eval-baseline.onnx recall-floor.onnx resolution-hybrid.onnx
 
       - name: Capture the eval report
         if: always()

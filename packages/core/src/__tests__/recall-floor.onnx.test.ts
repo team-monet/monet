@@ -70,7 +70,8 @@ describe.skipIf(!ENABLED)("NATIVE_SCORE_FLOOR — real MiniLM gate (semantic emb
         goldByQuery.set(probe.query, new Set(probe.gold.map((k) => byKey.get(k)).filter((v): v is string => Boolean(v))));
       }
     }
-  }, 240_000);
+    // 300s, not 240s: model load plus corpus seeding on a nightly runner whose CPU throughput swings ~3.5x between nights.
+  }, 300_000);
 
   afterAll(() => {
     core?.close();
@@ -129,7 +130,8 @@ describe.skipIf(!ENABLED)("NATIVE_SCORE_FLOOR — real MiniLM gate (semantic emb
     // 0.1303 when 0.12 was chosen on MiniLM; 0.3642 on bge, which is why its profile floor is 0.35.
     const effectiveFloor = nativeScoreFloorOf((embedder as { nativeScoreFloor?: number }).nativeScoreFloor);
     expect(weakest).toBeGreaterThanOrEqual(effectiveFloor);
-  }, 120_000);
+    // 600s, not 120s: red-night runners are ~3.5x slower (eval.onnx completed at 166s there, against a 180s cap); this gate never reported a true cost, since the job died at the wall. It asserts recall, not speed.
+  }, 600_000);
 
   // SKIPPED — the floor now travels (PR #172, bge = 0.35), but this assertion's TARGET is
   // unreachable in this space, which is a different and larger problem. Measured on this corpus:
@@ -148,7 +150,8 @@ describe.skipIf(!ENABLED)("NATIVE_SCORE_FLOOR — real MiniLM gate (semantic emb
     // gate, not a relevance classifier — a junk query against a broad technical corpus legitimately
     // retrieves something. A collapse well below this means the floor has stopped doing its job.
     expect(suppressed).toBeGreaterThanOrEqual(0.6);
-  }, 120_000);
+    // 600s, not 120s: same red-night throughput swing as the gate above. Raised with its siblings so un-skipping cannot silently reintroduce the tight cap.
+  }, 600_000);
 
   // SKIPPED — DOWNSTREAM OF THE FLOOR DEFECT (monet-core#170), and independently mis-specified.
   // It builds `expected` by sorting on raw cosine, but search() ranks on `rank` — cosine re-ordered
@@ -167,5 +170,6 @@ describe.skipIf(!ENABLED)("NATIVE_SCORE_FLOOR — real MiniLM gate (semantic emb
       expect(cards.map((c) => c.id)).toEqual(expected);
       for (const card of cards) expect(card.score).toBeGreaterThanOrEqual(NATIVE_SCORE_FLOOR);
     }
-  }, 120_000);
+    // 600s, not 120s: same red-night throughput swing as the gate above. Raised with its siblings so un-skipping cannot silently reintroduce the tight cap.
+  }, 600_000);
 });
