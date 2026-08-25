@@ -74,7 +74,11 @@ export interface StoredEmbedderStateInspection {
   pin: StoredEmbedderPin;
   populations: StoredEmbeddingPopulations;
   migration: StoredEmbedderMigration;
-  /** Live observations a Latin-only pin would strand. Reported whatever the CURRENT pin is. */
+  /**
+   * What a Latin-only pin would strand, split by liveness — live rows are the ones it can strand,
+   * superseded rows are counted apart because the rewrite still re-embeds them. Reported whatever
+   * the CURRENT pin is.
+   */
   nonLatin: StoredNonLatinContent;
   assessment: StoredEmbedderSafetyAssessment;
 }
@@ -93,14 +97,40 @@ export type StoredNonLatinContent =
   | {
       status: "known";
       tolerance: number;
-      /** Observations the migration re-embeds — native (including superseded) and live source. */
-      observationCount: number;
+      /**
+       * LIVE non-English observations — `superseded_by IS NULL AND superseded_at IS NULL`, the same
+       * liveness predicate `retrieval.ts` scores on.
+       *
+       * THIS IS THE ONLY COUNT A REFUSAL MAY READ, and the split exists because the combined one was
+       * read that way. The harm the refusal names is a RETRIEVAL harm — rows "become unreachable by
+       * their own content, and still surface in unrelated results" — and a superseded row is already
+       * excluded from retrieval by that same predicate, so it can suffer neither half of it. It also
+       * cannot be acted on: the refusal's remedy is "re-express them in English first", which is not
+       * a thing one does to a superseded row.
+       */
+      liveObservationCount: number;
+      /**
+       * Superseded non-English observations, reported rather than dropped.
+       *
+       * The rewrite genuinely touches them — `enforcedNativeObservationRows` (engine.ts) selects the
+       * whole table with no liveness predicate — so an operator sizing the work would be misled by a
+       * count that silently omitted them. Reporting zero for a store that holds them would be the
+       * same conflation this scan exists to end, one population over.
+       *
+       * NOT a reason to refuse a one-way move: see `liveObservationCount`.
+       */
+      supersededObservationCount: number;
       /**
        * Concept BODIES it re-embeds. Counted separately because a body is derived from its
        * observations, so one piece of non-English content appears in both populations — summing
        * them would double-report it, and an operator reads these to size a rewrite, not to total it.
        */
       conceptCount: number;
+      /**
+       * Ids an operator can act on: LIVE offending observations, then offending concept bodies.
+       * Superseded rows are deliberately absent — every message that prints these asks the reader to
+       * re-express the row in English, and a superseded row is not re-expressible.
+       */
       sampleIds: string[];
     }
   | { status: "unknown"; reason: string };
@@ -432,15 +462,36 @@ function inspectNonLatin(db: NonLatinReadDb, schema: SchemaMap): StoredNonLatinC
     return { status: "unknown", reason: "concepts table lacks id/kind/body" };
   }
   try {
+    /*
+     * LIVENESS IS SELECTED, NOT FILTERED — the scan reads every observation and classifies it.
+     *
+     * A `WHERE` that dropped superseded rows would make them unreportable, and they are not
+     * nothing: the rewrite re-embeds them (`enforcedNativeObservationRows` takes the whole table).
+     * What they must not do is drive a refusal, which is a question about which COUNT a caller
+     * reads, not about which rows the scan sees.
+     *
+     * `superseded_at` IS MIGRATION-ADDED (engine.ts: `ALTER TABLE observations ADD COLUMN
+     * superseded_at`), so a store this tool has been handed precisely because it will not open may
+     * predate it. Two fixed literal variants rather than one, chosen by the column's presence:
+     * substituting `NULL` for the absent column is exactly right for that schema, where terminal
+     * supersession could not be recorded at all and `superseded_by IS NULL` WAS the whole liveness
+     * predicate. `superseded_by` itself is original DDL; if it is somehow absent the prepare fails
+     * and the scan reports `unknown`, which is the answer this file already gives for a query that
+     * stops resolving — never a zero.
+     */
+    const supersededAtColumn = observationColumns.has("superseded_at") ? "superseded_at" : "NULL";
     // Two literals per population: the first page takes no lower bound, every page after it
     // resumes from the previous page's last rowid. Fixed literals only, exactly as in readSchema:
     // nothing from the store is ever interpolated.
-    const observationQueries = [
-      {
-        first: `SELECT rowid, id, content AS text FROM observations ORDER BY rowid LIMIT ?`,
-        next: `SELECT rowid, id, content AS text FROM observations WHERE rowid > ? ORDER BY rowid LIMIT ?`,
-      },
-    ];
+    const observationQuery = supersededAtColumn === "superseded_at"
+      ? {
+          first: `SELECT rowid, id, content AS text, superseded_by AS supersededBy, superseded_at AS supersededAt FROM observations ORDER BY rowid LIMIT ?`,
+          next: `SELECT rowid, id, content AS text, superseded_by AS supersededBy, superseded_at AS supersededAt FROM observations WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+        }
+      : {
+          first: `SELECT rowid, id, content AS text, superseded_by AS supersededBy, NULL AS supersededAt FROM observations ORDER BY rowid LIMIT ?`,
+          next: `SELECT rowid, id, content AS text, superseded_by AS supersededBy, NULL AS supersededAt FROM observations WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+        };
     // Concept bodies. applySynthesis writes these WITHOUT the script gate, so this is the one
     // population that can be non-English in a store whose every observation is English.
     const conceptQuery = {
@@ -455,36 +506,68 @@ function inspectNonLatin(db: NonLatinReadDb, schema: SchemaMap): StoredNonLatinC
      * fix, reproduced one level up. Bodies are the hard population to find by browsing, so each
      * gets its own quota and they are concatenated.
      */
-    const scan = (sql: { first: string; next: string }, into: string[], quota: number): number => {
+    type ScanRow = { rowid: number; id: string; text: string | null; supersededBy?: string | null; supersededAt?: number | null };
+    /*
+     * SAMPLES COME FROM THE LIVE SIDE ONLY, for the same reason the refusal reads the live count:
+     * every message that prints an id asks the reader to re-express that row in English. `isLive`
+     * is `() => true` for concept bodies, which have no supersession of their own in this scan.
+     */
+    const scan = (
+      sql: { first: string; next: string },
+      into: string[],
+      quota: number,
+      isLive: (row: ScanRow) => boolean,
+    ): { live: number; superseded: number } => {
       const firstPage = db.prepare(sql.first);
       const nextPage = db.prepare(sql.next);
-      let n = 0;
+      let live = 0;
+      let superseded = 0;
       // `undefined` is "no page taken yet", which is a state rather than a value — see the note
       // above on why no sentinel rowid can stand in for it.
       let cursor: number | undefined;
       for (;;) {
         const rows = (cursor === undefined
           ? firstPage.all(NON_LATIN_SCAN_PAGE_ROWS)
-          : nextPage.all(cursor, NON_LATIN_SCAN_PAGE_ROWS)) as Array<{ rowid: number; id: string; text: string | null }>;
+          : nextPage.all(cursor, NON_LATIN_SCAN_PAGE_ROWS)) as ScanRow[];
         for (const row of rows) {
           if (typeof row.text !== "string") continue;
           if (nonLatinLetterShare(row.text) > NON_LATIN_LETTER_TOLERANCE) {
-            n++;
-            if (into.length < quota) into.push(row.id);
+            if (isLive(row)) {
+              live++;
+              if (into.length < quota) into.push(row.id);
+            } else {
+              superseded++;
+            }
           }
         }
         // A short page means the LIMIT was never reached, so the table is exhausted under this
         // predicate — SQLite applies LIMIT after filtering, so this holds for the body filter too.
-        if (rows.length < NON_LATIN_SCAN_PAGE_ROWS) return n;
+        if (rows.length < NON_LATIN_SCAN_PAGE_ROWS) return { live, superseded };
         cursor = rows[rows.length - 1]!.rowid;
       }
     };
     const observationSamples: string[] = [];
     const conceptSamples: string[] = [];
-    const observationCount = observationQueries.reduce((total, sql) => total + scan(sql, observationSamples, 3), 0);
-    const conceptCount = scan(conceptQuery, conceptSamples, 2);
+    // The one predicate, spelled the same way `retrieval.ts` spells it. `== null` is avoided so a
+    // column the driver hands back as `undefined` reads the same as SQL NULL without relying on
+    // loose equality.
+    const observations = scan(
+      observationQuery,
+      observationSamples,
+      3,
+      (row) => (row.supersededBy === null || row.supersededBy === undefined)
+        && (row.supersededAt === null || row.supersededAt === undefined),
+    );
+    const concepts = scan(conceptQuery, conceptSamples, 2, () => true);
     const offenders = [...observationSamples, ...conceptSamples];
-    return { status: "known", tolerance: NON_LATIN_LETTER_TOLERANCE, observationCount, conceptCount, sampleIds: offenders };
+    return {
+      status: "known",
+      tolerance: NON_LATIN_LETTER_TOLERANCE,
+      liveObservationCount: observations.live,
+      supersededObservationCount: observations.superseded,
+      conceptCount: concepts.live,
+      sampleIds: offenders,
+    };
   } catch (error) {
     return { status: "unknown", reason: error instanceof Error ? error.message : String(error) };
   }

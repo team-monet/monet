@@ -73,7 +73,7 @@ describe("doctor's non-Latin count", () => {
     expect(inspection.nonLatin.status).toBe("known");
     if (inspection.nonLatin.status !== "known") return;
     expect(inspection.nonLatin.tolerance).toBe(NON_LATIN_LETTER_TOLERANCE);
-    expect(inspection.nonLatin.observationCount).toBe(1);
+    expect(inspection.nonLatin.liveObservationCount).toBe(1);
     // The concept BODY derived from that observation is Korean too, and the migration re-embeds it
     // separately — so it is a second offender, reported in its own population rather than summed.
     expect(inspection.nonLatin.conceptCount).toBe(1);
@@ -86,7 +86,7 @@ describe("doctor's non-Latin count", () => {
     // The seeding provider declares no restriction, and the count is still produced.
     expect(inspection.nonLatin.status).toBe("known");
     if (inspection.nonLatin.status !== "known") return;
-    expect(inspection.nonLatin.observationCount).toBe(1);
+    expect(inspection.nonLatin.liveObservationCount).toBe(1);
   });
 
   it("agrees with the write gate row for row", async () => {
@@ -115,7 +115,7 @@ describe("doctor's non-Latin count", () => {
     }
     strict.close();
 
-    expect(counted.observationCount).toBe(refused);
+    expect(counted.liveObservationCount).toBe(refused);
   });
 
   it("returns zero for an all-Latin store rather than omitting the field", async () => {
@@ -123,13 +123,25 @@ describe("doctor's non-Latin count", () => {
     const inspection = inspectStoredEmbedderState(path);
     expect(inspection.nonLatin.status).toBe("known");
     if (inspection.nonLatin.status !== "known") return;
-    expect(inspection.nonLatin.observationCount).toBe(0);
+    expect(inspection.nonLatin.liveObservationCount).toBe(0);
     expect(inspection.nonLatin.sampleIds).toEqual([]);
   });
 
-  it("counts SUPERSEDED native rows — the migration rewrites those as well", async () => {
-    // enforcedNativeObservationRows has NO supersession filter. A scan that added one under-counted
-    // exactly the rows the rewrite still touches.
+  it("REPORTS superseded native rows in their own count, and never in the live one", async () => {
+    /*
+     * BOTH HALVES ARE LOAD-BEARING, and they used to be one number that got each half wrong at a
+     * different call site.
+     *
+     * Still reported: `enforcedNativeObservationRows` has NO supersession filter, so the rewrite
+     * really does re-embed these rows — a scan that dropped them under-counted exactly the work an
+     * operator is sizing. That is what the previous version of this test pinned, and it still holds.
+     *
+     * Never live: retrieval selects on `superseded_by IS NULL AND superseded_at IS NULL`
+     * (retrieval.ts), so a superseded row is ALREADY unreachable by its own content and ALREADY
+     * absent from every result set. The refusal in repair-cli names precisely those two harms, so
+     * counting these rows as live made it refuse a one-way move that could strand nothing — measured
+     * store-wide at 22 flagged against 0 live. Being touched by the rewrite is not being lost to it.
+     */
     const dir = freshDir();
     const path = join(dir, "monet.db");
     const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
@@ -142,7 +154,33 @@ describe("doctor's non-Latin count", () => {
     const n = inspectStoredEmbedderState(path).nonLatin;
     expect(n.status).toBe("known");
     if (n.status !== "known") return;
-    expect(n.observationCount).toBeGreaterThan(0);
+    expect(n.supersededObservationCount).toBeGreaterThan(0);
+    expect(n.liveObservationCount).toBe(0);
+    // Samples are what a message tells the operator to go re-express, so a superseded observation id
+    // must not appear among them. The Korean concept BODY is still live and still sampled.
+    expect(n.sampleIds).not.toContain(stored.observationId);
+  });
+
+  it("separates the two counts when a concept holds BOTH a live and a superseded non-Latin row", async () => {
+    // The mixed store is the one a single number cannot describe: filtering to live would hide the
+    // rewrite's true size, and summing would refuse over content nothing can lose.
+    const dir = freshDir();
+    const path = join(dir, "monet.db");
+    const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
+    await core.ensureEmbedderPin();
+    const first = await core.store(KOREAN);
+    const db = (core as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
+    db.prepare(`UPDATE observations SET superseded_at = 1 WHERE id = ?`).run(first.observationId);
+    const second = await core.store(`${KOREAN} 두 번째 기록입니다.`);
+    core.close();
+
+    const n = inspectStoredEmbedderState(path).nonLatin;
+    expect(n.status).toBe("known");
+    if (n.status !== "known") return;
+    expect(n.supersededObservationCount).toBe(1);
+    expect(n.liveObservationCount).toBe(1);
+    expect(n.sampleIds).toContain(second.observationId);
+    expect(n.sampleIds).not.toContain(first.observationId);
   });
 
   it("counts a non-Latin CONCEPT BODY even when every observation is English — applySynthesis has no script gate", async () => {
@@ -161,7 +199,7 @@ describe("doctor's non-Latin count", () => {
     const n = inspectStoredEmbedderState(path).nonLatin;
     expect(n.status).toBe("known");
     if (n.status !== "known") return;
-    expect(n.observationCount).toBe(0); // every observation is English
+    expect(n.liveObservationCount).toBe(0); // every observation is English
     expect(n.conceptCount).toBe(1);      // the synthesized body is not
     expect(n.sampleIds).toContain(stored.conceptId);
   });
@@ -196,7 +234,7 @@ describe("doctor's non-Latin count", () => {
     expect(n.status).toBe("known");
     if (n.status !== "known") return;
     expect(seededKorean).toBeGreaterThan(500 / 3); // the fixture really does span pages
-    expect(n.observationCount).toBe(seededKorean);
+    expect(n.liveObservationCount).toBe(seededKorean);
   });
 
   it("counts a row whose id is the EMPTY STRING — an id-keyed cursor excluded it from every page", async () => {
@@ -221,7 +259,7 @@ describe("doctor's non-Latin count", () => {
     const n = inspectStoredEmbedderState(path).nonLatin;
     expect(n.status).toBe("known");
     if (n.status !== "known") return;
-    expect(n.observationCount).toBe(1);
+    expect(n.liveObservationCount).toBe(1);
     expect(n.sampleIds).toContain("");
   });
 
@@ -252,7 +290,7 @@ describe("doctor's non-Latin count", () => {
     expect(n.status).toBe("known");
     if (n.status !== "known") return;
     // 510, not 500: the ten rows PAST the all-NULL first page have to be reached.
-    expect(n.observationCount).toBe(510);
+    expect(n.liveObservationCount).toBe(510);
   });
 
   it("reads through a connection that already OWNS the store — a second handle is locked out (#14)", async () => {
@@ -277,7 +315,7 @@ describe("doctor's non-Latin count", () => {
       expect(owned).toEqual(unowned);
       expect(owned.status).toBe("known");
       if (owned.status !== "known") return;
-      expect(owned.observationCount).toBe(1);
+      expect(owned.liveObservationCount).toBe(1);
       expect(owned.conceptCount).toBe(1);
     } finally {
       port.close();
@@ -313,7 +351,7 @@ describe("doctor's non-Latin count", () => {
     const n = inspectStoredEmbedderState(path).nonLatin;
     expect(n.status).toBe("known");
     if (n.status !== "known") return;
-    expect(n.observationCount).toBeGreaterThanOrEqual(6);
+    expect(n.liveObservationCount).toBeGreaterThanOrEqual(6);
     expect(n.conceptCount).toBeGreaterThan(0);
     expect(n.sampleIds).toContain(english.conceptId);
   });

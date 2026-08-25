@@ -383,8 +383,39 @@ export function outcomeSha256(outcome: string): string {
 }
 
 /**
+ * Write one whole line, or throw.
+ *
+ * `fs.writeSync` DOES NOT LOOP. Measured in this repo, not assumed: `startup-diagnosis.ts`'s
+ * `writeFully` records that asking for 1 MiB against a bounded pipe returned 8192 (Codex round 1,
+ * PR #79). It issues one `write(2)` and hands back whatever the kernel took, so a caller that
+ * discards the count publishes whatever fraction happened to land. This is that function's
+ * reasoning applied to the spool; it is kept local rather than imported so this module keeps
+ * depending on nothing but `node:fs` (see the header's "never blocks, depends on no other process").
+ *
+ * WHY A SHORT WRITE IS WORSE HERE THAN AN OUTRIGHT FAILURE, and why the total catch below was never
+ * a licence to skip the loop. The spool is newline-framed and every append opens `"a"`, so a short
+ * write leaves a fragment carrying NO trailing newline, and the NEXT append lands its whole line
+ * directly behind that fragment. `readMomentSpool` splits on newlines, so the fragment and the
+ * following record are read as ONE line and fail to parse TOGETHER — a short write destroys the
+ * record that was short AND a record that wrote perfectly. Looping keeps the damage to the append
+ * that actually failed, which is the only damage the sequence-hole guarantee promises to bound.
+ *
+ * Throwing when the kernel takes nothing with bytes still owing, rather than spinning: the caller's
+ * catch swallows it, which is the documented contract. Swallowing is about never failing the user's
+ * ACTION; it was never a reason to publish half a line.
+ */
+function writeLineFully(fd: number, payload: Buffer): void {
+  let written = 0;
+  while (written < payload.length) {
+    const n = writeSync(fd, payload, written, payload.length - written);
+    if (n <= 0) throw new Error(`moment spool write stalled after ${written}/${payload.length} bytes`);
+    written += n;
+  }
+}
+
+/**
  * The single append. Consumes a sequence number, then writes one line — `openSync(path,"a",0o600)`,
- * `writeSync`, `closeSync`, nothing else. Every failure is swallowed, deliberately and without
+ * `writeLineFully`, `closeSync`, nothing else. Every failure is swallowed, deliberately and without
  * exception; see this module's header for why that is safe only because the sequence is consumed
  * first.
  *
@@ -410,7 +441,9 @@ export function appendMomentRecord(run: MomentRun, body: Record<string, unknown>
     mkdirSync(dirname(run.path), { recursive: true });
     const fd = openSync(run.path, "a", 0o600);
     try {
-      writeSync(fd, line);
+      // BYTES, not characters: the loop resumes at a byte offset, and a spool line is UTF-8 with
+      // no guarantee of being ASCII (an observation's content reaches this file).
+      writeLineFully(fd, Buffer.from(line, "utf8"));
     } finally {
       closeSync(fd);
     }

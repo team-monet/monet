@@ -363,19 +363,30 @@ function migrationLabel(inspection: StoredEmbedderStateInspection): string {
  * Not gated on the CURRENT pin: the answer only helps before the move, and the rewrite is one-way
  * for content. Measured against the same tolerance the write gate enforces, so this cannot clear a
  * row the write path would refuse.
+ *
+ * SUPERSEDED IS NAMED APART FROM LIVE, and never summed into it. Both facts are true and they
+ * answer different questions: the rewrite re-embeds superseded rows (`enforcedNativeObservationRows`
+ * takes the whole observations table with no liveness predicate), so an operator sizing the work
+ * needs them — while retrieval excludes them by `superseded_by IS NULL AND superseded_at IS NULL`,
+ * so they are not content this move can strand. Reporting one number for both is what made the
+ * refusal below fire on rows nothing could lose.
  */
 function nonLatinLabel(inspection: StoredEmbedderStateInspection): string {
   const n = inspection.nonLatin;
   if (n.status === "unknown") return `unknown (${n.reason})`;
-  if (n.observationCount === 0 && n.conceptCount === 0) {
-    return "0 detected (note: only non-Latin SCRIPT is detectable — French or Vietnamese would not be counted)";
+  const superseded = n.supersededObservationCount > 0
+    ? ` Separately, ${n.supersededObservationCount} superseded observation(s) are non-English: the rewrite ` +
+      `re-embeds them, but search already excludes them, so nothing retrievable is stranded by the move.`
+    : "";
+  if (n.liveObservationCount === 0 && n.conceptCount === 0) {
+    return "0 live (note: only non-Latin SCRIPT is detectable — French or Vietnamese would not be counted)" + superseded;
   }
   const samples = n.sampleIds.length > 0 ? `; e.g. ${n.sampleIds.join(", ")}` : "";
   // Listed, not summed: a concept body is derived from its observations, so one piece of non-English
   // content appears in both. A total would over-report what a rewrite actually has to touch.
-  return `${n.observationCount} observation(s) and ${n.conceptCount} concept body/bodies ` +
+  return `${n.liveObservationCount} live observation(s) and ${n.conceptCount} concept body/bodies ` +
     `not written in English${samples} ` +
-    `(detected by script; text in another language using Latin letters is NOT counted)`;
+    `(detected by script; text in another language using Latin letters is NOT counted)` + superseded;
 }
 
 function printInspection(
@@ -989,9 +1000,28 @@ async function runRepair(options: RepairOptions, dependencies: RecoveryCliDepend
           { dbPath, inspection, provider: providerResult, nextCommands },
         );
       }
-      if (n.observationCount > 0 || n.conceptCount > 0) {
+      /*
+       * LIVE ROWS ONLY, AND SUPERSEDED ONES DELIBERATELY NOT (this batch).
+       *
+       * The count this read was `observationCount`, which included superseded rows, so a store whose
+       * only non-English content had already been superseded refused a migration that could strand
+       * nothing — measured on the author's own store: 22 rows flagged, 0 of them live. That is a
+       * refusal an operator can only clear with --accept-non-latin-loss, i.e. by accepting a loss
+       * that was not on offer, which teaches the flag to mean nothing.
+       *
+       * The scope is settled by the harm THIS message names, not by taste: "unreachable by their own
+       * content, and still surface in unrelated results" is a statement about retrieval, and
+       * retrieval selects on `superseded_by IS NULL AND superseded_at IS NULL` (retrieval.ts) — a
+       * superseded row is already unreachable and already absent from every result set, so the move
+       * changes neither. The remedy the message prescribes settles it the same way: "re-express them
+       * in English first" is not an operation on a superseded row.
+       *
+       * Superseded rows ARE still re-embedded by the rewrite, and `monet doctor` still reports them
+       * (see `nonLatinLabel`). Being touched by the work is not the same as being lost to it.
+       */
+      if (n.liveObservationCount > 0 || n.conceptCount > 0) {
         throw new RepairOperationError(
-          `Refusing: '${targetModelId}' is an ENGLISH model, and ${n.observationCount} observation(s) plus ` +
+          `Refusing: '${targetModelId}' is an ENGLISH model, and ${n.liveObservationCount} live observation(s) plus ` +
             `${n.conceptCount} concept body/bodies are not written in English. This rewrite is ONE-WAY — ` +
             `those rows keep their text, become ` +
             `unreachable by their own content, and still surface in unrelated results. Re-express them in ` +
@@ -1027,9 +1057,12 @@ async function runRepair(options: RepairOptions, dependencies: RecoveryCliDepend
               `Refusing rather than proceeding blind on a one-way migration.`,
             );
           }
-          if (n.observationCount > 0 || n.conceptCount > 0) {
+          // LIVE ONLY, matching the preflight refusal above exactly — a recheck on a wider
+          // population than the check it re-runs would refuse a rewrite the preflight had already
+          // cleared, which reads to the operator as a race that never happened.
+          if (n.liveObservationCount > 0 || n.conceptCount > 0) {
             throw new Error(
-              `${n.observationCount} observation(s) and ${n.conceptCount} concept body/bodies not written in English ` +
+              `${n.liveObservationCount} live observation(s) and ${n.conceptCount} concept body/bodies not written in English ` +
               `appeared after preflight and before the ` +
               `rewrite; another process is writing to this store. Re-run, or pass --accept-non-latin-loss.` +
               (n.sampleIds.length > 0 ? ` Samples: ${n.sampleIds.join(", ")}.` : ""),

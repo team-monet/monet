@@ -27,6 +27,12 @@ onlyBuiltDependencies:
 
 overrides:
   esbuild: ^0.28.1
+  # GHSA-f88m-g3jw-g9cj (HIGH). Transitive-only: nothing here imports sharp — it arrives under
+  # `@huggingface/transformers`, which is an OPTIONAL dependency of both packages and declares
+  # `sharp: ^0.34.1`. An override is the only lever, since no manifest of ours names the package;
+  # it deliberately resolves outside that declared range, which is the same thing the `esbuild` pin
+  # above does to packages/cli and is the intended reading of a security override.
+  sharp: ^0.35.0
   hono: ^4.12.34
   protobufjs: ^7.6.5
   tar: ^7.5.21
