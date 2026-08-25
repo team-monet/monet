@@ -52,7 +52,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
-import { printEmbedderHeader, printStoreHeader } from "./measure-header";
+import { printEmbedderHeader, printStoreHeader, printStoredOnlySection } from "./measure-header";
 
 const DB = process.env.PROBE_DB!;
 const JUNK = [
@@ -107,12 +107,14 @@ async function main() {
 
   const { OnnxEmbeddingProvider } = await import("../src/embedding-onnx");
   const onnx: EmbeddingProvider = new OnnxEmbeddingProvider();
-  await onnx.embed("warmup");
+  const warmup = await onnx.embed("warmup"); // kept for its LENGTH — see printEmbedderHeader
   const th = onnx.recommendedThresholds;
-  // AGAINST STORED VECTORS, unconditionally: `byConcept` above is built from `o.embedding` read out
-  // of the DB and is never re-embedded, while each JUNK probe is embedded fresh by the loaded model.
-  // There is no MODEL swap on this script, so a pin mismatch here is always the corrupting kind.
-  printEmbedderHeader(storeSpace, onnx, "against-stored-vectors");
+  // THIS HEADER COVERS THE JUNK SWEEP ONLY, and the leave-one-out section further down carries its
+  // own. The two halves of this script sit in different spaces: the sweep embeds fresh probes with
+  // the loaded model and scores them against STORED vectors, so a pin mismatch corrupts it; the
+  // replay compares stored vectors on both sides and is valid whatever model is loaded. One warning
+  // in front of both would be right about one and wrong about the other.
+  printEmbedderHeader(storeSpace, onnx, "against-stored-vectors", warmup.length);
   console.log(`thresholds=${JSON.stringify(th)}\n`);
 
   // Per size bin: the distribution of best-observation cosine under OFF-TOPIC text.
@@ -175,6 +177,11 @@ async function main() {
   // sitting in an over-absorbed concept arguably BELONGS elsewhere — so read the STEAL DIRECTION
   // (what size wins when it is wrong) as the load-bearing number, not the raw rate.
   // ------------------------------------------------------------------------------------------
+  // The section header the split above promises. `probe` and every candidate below are stored
+  // vectors — there is no embed() call anywhere in this replay — so this half is wholly in the
+  // store's own space and the loaded model does not enter it. The junk sweep's cross-space warning,
+  // if it fired, does NOT apply to anything from here down.
+  printStoredOnlySection(storeSpace);
   const conceptIds = [...byConcept.keys()];
 
   /**

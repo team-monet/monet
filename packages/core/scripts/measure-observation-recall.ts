@@ -105,11 +105,13 @@ async function main(): Promise<void> {
    */
   const modelId = process.env.MODEL;
   const onnx: EmbeddingProvider = modelId ? new OnnxEmbeddingProvider({ model: modelId }) : new OnnxEmbeddingProvider();
-  await onnx.embed("warmup");
+  // The warmup vector is KEPT, not discarded: MODEL names an arbitrary checkpoint, and an unprofiled
+  // one leaves `onnx.dim` on the 384 fallback while embedding at its real width.
+  const warmup = await onnx.embed("warmup");
   // MODEL set => the loop below replaces `whole` and `segs` on every observation, so nothing stored
   // is scored and the run is wholly in the loaded space. MODEL unset => the candidates keep their
   // STORED vectors and only the cue is embedded fresh, which is the path a pin mismatch corrupts.
-  printEmbedderHeader(storeSpace, onnx, modelId !== undefined ? "replaces-stored-vectors" : "against-stored-vectors");
+  printEmbedderHeader(storeSpace, onnx, modelId !== undefined ? "replaces-stored-vectors" : "against-stored-vectors", warmup.length);
   console.log("");
   if (modelId !== undefined) {
     let done = 0;

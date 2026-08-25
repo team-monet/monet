@@ -169,6 +169,7 @@ async function measure(
   label: string,
   embedder: EmbeddingProvider,
   build: (core: MonetCore) => Promise<Seed[]>,
+  measuredDim?: number,
 ): Promise<void> {
   // PRODUCTION THRESHOLDS, not the eval harness's dedup-off convention: this measurement is about
   // where the bands land, so the bands have to be the real ones and the store has to consolidate.
@@ -262,7 +263,7 @@ async function measure(
     console.log(`\n===== ${label} =====`);
     // Four measurements run under three providers here, after one synthetic store header. The label
     // names the scenario and the provider class; this names the SPACE the bands below were seen in.
-    printProviderIdentity(label, embedder);
+    printProviderIdentity(label, embedder, measuredDim);
     console.log(`thresholds  tauAttach=${thresholds.tauAttach}  tauAmbiguous=${thresholds.tauAmbiguous}`);
     console.log(`store       ${memberScores.length} observations / ${conceptCount} concepts (${(memberScores.length / conceptCount).toFixed(2)} observations per concept) after ${total} measured writes`);
     console.log(`\n1. SCORE DISTRIBUTIONS (paired, one sample per ingest that had any candidate)`);
@@ -365,9 +366,9 @@ async function main(): Promise<void> {
   if (process.env.MONET_EVAL_ONNX === "1") {
     const { OnnxEmbeddingProvider } = await import("../src/embedding-onnx");
     const onnx = new OnnxEmbeddingProvider();
-    await onnx.embed("warmup"); // force model load before anything is measured
-    await measure(`A. natural ingest — ${onnx.modelId} (semantic — what ships)`, onnx, naturalIngest);
-    await measure(`B. consolidated store — ${onnx.modelId} (semantic — what ships)`, onnx, consolidated);
+    const warmup = await onnx.embed("warmup"); // force model load before anything is measured
+    await measure(`A. natural ingest — ${onnx.modelId} (semantic — what ships)`, onnx, naturalIngest, warmup.length);
+    await measure(`B. consolidated store — ${onnx.modelId} (semantic — what ships)`, onnx, consolidated, warmup.length);
   } else {
     console.log("\n(set MONET_EVAL_ONNX=1 to also measure the SHIPPING semantic space — the one the product resolves in)");
   }

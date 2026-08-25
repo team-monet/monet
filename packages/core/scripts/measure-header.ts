@@ -62,16 +62,26 @@ export interface StoreSpace {
 }
 
 /**
- * ONE row per population. A LIMIT 1 sample proves what that row is, not what every row is: a store
- * with mixed widths INSIDE one table reads as uniform here. That is deliberate — `monet doctor` and
- * src/embedding-state.ts own the full census, and duplicating a scan into a header would make every
- * measurement pay for it. What this catches is the cross-population split, which is the one these
- * scripts produce for themselves.
+ * ONE row per population, FROM THE ROWS THE CONSUMERS ACTUALLY SCORE.
+ *
+ * `kind != 'source'` is not a tidiness filter, it is the difference between a right and a wrong
+ * answer. scripts/reembed-store.ts re-embeds `WHERE kind != 'source'` (its own query) and leaves
+ * source observations on the old model, so a prepped copy holds BOTH widths in one table. An
+ * unqualified `LIMIT 1` can land on either — and landing on a source row reports the retired width,
+ * which agrees with the untouched concepts and therefore suppresses the split NOTE and inverts the
+ * width warning, on exactly the store shape this module was extended to catch. Every consumer here
+ * filters `o.kind != 'source'` and `c.kind != 'source'`, so the sampler matches them.
+ *
+ * A LIMIT 1 sample still proves what that row is, not what every row is: a store with mixed widths
+ * inside one KIND reads as uniform. That is deliberate — `monet doctor` and src/embedding-state.ts
+ * own the full census, and duplicating a scan into a header would make every measurement pay for
+ * it. What this catches is the cross-population split, which is the one these scripts produce for
+ * themselves.
  */
 function sampleDimension(db: HeaderReader, table: "concepts" | "observations"): number | null {
   try {
     const row = db.prepare(
-      `SELECT embedding AS e FROM ${table} WHERE embedding IS NOT NULL LIMIT 1`,
+      `SELECT embedding AS e FROM ${table} WHERE embedding IS NOT NULL AND kind != 'source' LIMIT 1`,
     ).get() as { e: string } | undefined;
     if (row === undefined) return null;
     const parsed = JSON.parse(row.e) as unknown;
@@ -159,9 +169,50 @@ export function embedderIdentity(embedder: { modelId?: string; dim: number }): s
   return embedder.modelId ?? `(no modelId — dim=${embedder.dim}, nothing here names this space)`;
 }
 
+/**
+ * THE WIDTH TO REPORT, and why the provider's own field is not automatically it.
+ *
+ * `OnnxEmbeddingProvider.dim` is `opts.dim ?? profile?.dim ?? 384` (embedding-onnx.ts), and that
+ * file says of the field: "it is declarative only". `embed()` never consults it — it returns
+ * `Float32Array.from(output.data)`, the checkpoint's real output width. So an UNPROFILED candidate
+ * model with no explicit `dim` reports 384 while producing 768 or 1024, and a header that trusted
+ * the field would stamp the wrong width on the run that most needs the right one: the one
+ * evaluating a model no profile describes yet.
+ *
+ * `measured` is the length of a vector this run actually produced. It wins where it exists, and the
+ * line says which it is rather than quietly presenting one as the other. scripts/reembed-store.ts
+ * already logs `dim=${warmup.length}` for the same reason.
+ */
+function describeWidth(declared: number, measured?: number): string {
+  if (measured === undefined) return `${declared} (declared by the profile; no vector measured yet)`;
+  if (measured === declared) return `${measured} (measured)`;
+  return `${measured} (MEASURED — the provider DECLARES ${declared}, a profile fallback that does not describe this checkpoint)`;
+}
+
 /** Name the provider one measurement is about to run under, beside that measurement's own label. */
-export function printProviderIdentity(label: string, embedder: { modelId?: string; dim: number }): void {
-  console.log(`  provider space: ${embedderIdentity(embedder)}  dim=${embedder.dim}   [${label}]`);
+export function printProviderIdentity(
+  label: string,
+  embedder: { modelId?: string; dim: number },
+  measuredDim?: number,
+): void {
+  console.log(`  provider space: ${embedderIdentity(embedder)}  dim=${describeWidth(embedder.dim, measuredDim)}   [${label}]`);
+}
+
+/**
+ * Mark a section whose cosines are STORED-vector-to-STORED-vector on both sides.
+ *
+ * A script can hold sections in different spaces — measure-nomination-size-bias.ts embeds fresh
+ * probes for its junk sweep and then replays leave-one-out over stored vectors only — and a single
+ * header in front of both is necessarily wrong about one of them. This says which space the lines
+ * below are in, and it is the store's own regardless of what model the process loaded.
+ */
+export function printStoredOnlySection(space: StoreSpace | null): void {
+  const pin = space === null || !space.pinReadable ? "(unavailable)" : (space.pin ?? "(no pin)");
+  console.log(
+    `\n-- stored-vector section: both sides of every comparison below are read from the store, with\n` +
+    `-- no embedding performed, so this is the store's own space (pin=${pin}) whatever model is\n` +
+    `-- loaded. Any loaded-embedder warning above applies to the earlier section, not to this one.`,
+  );
 }
 
 /**
@@ -187,17 +238,22 @@ export function printEmbedderHeader(
   space: StoreSpace | null,
   embedder: { modelId?: string; dim: number },
   scoring: ScoringSide,
+  measuredDim?: number,
 ): void {
   const modelId = embedder.modelId ?? "(no modelId)";
-  console.log(`loaded embedder: model=${modelId}  dim=${embedder.dim}`);
+  // The width that will actually meet the stored vectors is the one embed() produces, not the one
+  // the provider declares — see describeWidth. Comparing on the declared value would let an
+  // unprofiled 1024-dim candidate pass a 1024-dim store's check while reporting 384, or fail it.
+  const effectiveDim = measuredDim ?? embedder.dim;
+  console.log(`loaded embedder: model=${modelId}  dim=${describeWidth(embedder.dim, measuredDim)}`);
 
   // WIDTH — independent of the pin. Compare against the population this run will actually meet.
-  if (space !== null && scoring === "against-stored-vectors" && space.dim !== null && space.dim !== embedder.dim) {
+  if (space !== null && scoring === "against-stored-vectors" && space.dim !== null && space.dim !== effectiveDim) {
     const pinNote = space.pinReadable && space.pin !== null
       ? `The store pin is '${space.pin}'.`
       : `The store carries no pin to corroborate which space its vectors are in.`;
     console.log(
-      `!! WARNING: this embedder produces ${embedder.dim}-dim vectors and the stored vectors this run\n` +
+      `!! WARNING: this embedder produces ${effectiveDim}-dim vectors and the stored vectors this run\n` +
       `!! scores against are ${space.dim}-dim${space.dimSplit ? ` (observations; concepts are ${space.conceptDim}-dim)` : ""}. ${pinNote}\n` +
       `!! cosine() truncates to the SHORTER of the two widths — it does not throw and does not return\n` +
       `!! NaN — so every figure below is a dot product over a prefix, not a similarity. Do not read it.`,

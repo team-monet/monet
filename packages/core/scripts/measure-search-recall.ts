@@ -156,10 +156,11 @@ async function main(): Promise<void> {
   if (swapModel !== undefined) {
     const { OnnxEmbeddingProvider: Swap } = await import("../src/embedding-onnx");
     const alt: EmbeddingProvider = new Swap({ model: swapModel });
-    await alt.embed("warmup");
+    // Kept for its LENGTH: MODEL names an arbitrary checkpoint and `alt.dim` may be the 384 fallback.
+    const warmup = await alt.embed("warmup");
     // The loop directly below rewrites `whole` and `segs` for every observation, so no stored vector
     // survives into the scoring — a candidate-model run, not a cross-space comparison.
-    printEmbedderHeader(storeSpace, alt, "replaces-stored-vectors");
+    printEmbedderHeader(storeSpace, alt, "replaces-stored-vectors", warmup.length);
     console.log(`re-embedding with ${swapModel}...`);
     for (const o of observations) {
       o.whole = await alt.embed(o.content);
@@ -178,8 +179,8 @@ async function main(): Promise<void> {
   // so the space it embeds cues in is reported here, at the point it becomes real. Reached only when
   // no swap happened, which means every candidate below is still a STORED vector.
   if (swapped === null) {
-    await onnx.embed("warmup");
-    printEmbedderHeader(storeSpace, onnx, "against-stored-vectors");
+    const warmup = await onnx.embed("warmup");
+    printEmbedderHeader(storeSpace, onnx, "against-stored-vectors", warmup.length);
   }
   const cache = new Map<string, Float32Array>();
   await run("opening sentence", async (o) => {
