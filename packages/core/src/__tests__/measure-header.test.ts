@@ -40,6 +40,14 @@ function stubReader(opts: {
   sourceDim?: number;
   pin?: string | null;
   syncMetaMissing?: boolean;
+  /** `sync_meta.embedder_pinned_at`. A value later than a marker's completion supersedes it. */
+  pinnedAt?: number | null;
+  /** Rows in the engine's `embedder_migration` sentinel => an official migration is unfinished. */
+  migrationRows?: number;
+  /** Omit the table entirely (old schema) rather than reporting zero rows. */
+  migrationTableMissing?: boolean;
+  /** MAX(created_at, updated_at) over scored observations; `null` => the query cannot be answered. */
+  latestRowWriteAt?: number | null;
   /** Present => the copy carries scripts/reembed-store.ts's marker. Absent => no such table. */
   reembed?: {
     candidate_model_id: string | null; requested_model: string; pooling?: string | null;
@@ -69,9 +77,17 @@ function stubReader(opts: {
               completed_at: opts.reembed.completed_at === undefined ? 1756000060000 : opts.reembed.completed_at,
             };
           }
+          if (sql.includes("embedder_migration")) {
+            if (opts.migrationTableMissing) throw new Error("no such table: embedder_migration");
+            return { n: opts.migrationRows ?? 0 };
+          }
+          if (sql.includes("MAX(created_at)")) {
+            if (opts.latestRowWriteAt === null) throw new Error("no such column: created_at");
+            return { t: opts.latestRowWriteAt ?? 1755000000000 }; // default: older than any marker below
+          }
           if (sql.includes("sync_meta")) {
             if (opts.syncMetaMissing) throw new Error("no such table: sync_meta");
-            return { m: opts.pin ?? null };
+            return { m: opts.pin ?? null, at: opts.pinnedAt ?? null };
           }
           // An unfiltered scan can land on a stale source row; a filtered one cannot.
           if (opts.sourceDim !== undefined && !nativeOnly(sql)) return { e: vec(opts.sourceDim) };
@@ -397,7 +413,8 @@ describe("measure-header — interrupted preparation", () => {
     const out = captured(() =>
       printEmbedderHeader(space, { modelId: "Xenova/bge-base-en-v1.5", dim: 384 }, "against-stored-vectors", 384));
     expect(out).toMatch(/REFUSING TO ATTRIBUTE/);
-    expect(out).toMatch(/not a question with an answer/);
+    expect(out).toMatch(/INTERRUPTED fixture preparation/);
+    expect(out).toMatch(/not a question\n!! with an answer/);
     expect(out).not.toMatch(/does NOT match/);
   });
 
@@ -407,5 +424,141 @@ describe("measure-header — interrupted preparation", () => {
       printEmbedderHeader(space, { modelId: "Xenova/bge-base-en-v1.5", dim: 384 }, "replaces-stored-vectors", 384));
     expect(out).not.toMatch(/REFUSING/);
     expect(out).not.toMatch(/WARNING/);
+  });
+});
+
+/**
+ * THE MARKER'S LIFETIME IS SHORTER THAN THE STORE'S.
+ *
+ * A completed marker describes the copy at one instant. Two ordinary things invalidate it and
+ * neither touches its row: an official `migrateEmbeddings` (rewrites every vector, re-pins
+ * `sync_meta`) and plain engine writes (new observations, embedded in the PINNED space). When the
+ * candidate and the pin share a width, no dimension check sees either. The marker is therefore
+ * dated against durable engine-side facts rather than trusted on sight.
+ */
+describe("measure-header — a completed marker is dated, not trusted", () => {
+  const PREPARED_AT = 1756000060000; // the stub's completed_at
+  const BASE = {
+    pin: "Xenova/bge-small-en-v1.5",
+    conceptDim: 384,
+    observationDim: 384,
+    reembed: { candidate_model_id: "Xenova/bge-base-en-v1.5", requested_model: "Xenova/bge-base-en-v1.5", measured_dim: 384 },
+  };
+
+  it("SUPERSEDED by a later official re-pin: the pin is authoritative again, for both populations", () => {
+    // migrateEmbeddings rewrote every vector the marker described and stamped a new pin time.
+    const space = readStoreSpace(stubReader({ ...BASE, pinnedAt: PREPARED_AT + 60_000 }), "/tmp/repinned.db");
+    expect(space.attribution.state).toBe("marker-superseded");
+    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({
+      id: "Xenova/bge-small-en-v1.5", source: "pin", trustable: true,
+    });
+    expect(scoredSpaceIdentity(space, "concepts")).toMatchObject({ id: "Xenova/bge-small-en-v1.5", source: "pin" });
+
+    const out = captured(() => printStoreHeader(stubReader({ ...BASE, pinnedAt: PREPARED_AT + 60_000 }), "/tmp/repinned.db"));
+    expect(out).toMatch(/SUPERSEDED/);
+    expect(out).toMatch(/authoritative for both populations/);
+    // It must NOT still be presenting the candidate as the scored side's identity.
+    expect(out).not.toMatch(/observations \+ segments -> Xenova\/bge-base/);
+  });
+
+  it("a re-pin BEFORE the preparation does not supersede it — the marker is still the later fact", () => {
+    const space = readStoreSpace(stubReader({ ...BASE, pinnedAt: PREPARED_AT - 60_000 }), "/tmp/ok.db");
+    expect(space.attribution.state).toBe("candidate");
+    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({ id: "Xenova/bge-base-en-v1.5" });
+  });
+
+  it("PARTIAL when the engine wrote rows after the preparation — no clean candidate attribution", () => {
+    const later = { ...BASE, latestRowWriteAt: PREPARED_AT + 5_000 };
+    const space = readStoreSpace(stubReader(later), "/tmp/partial.db");
+    expect(space.attribution).toMatchObject({ state: "marker-partial", completedAt: PREPARED_AT });
+    const identity = scoredSpaceIdentity(space, "observations");
+    expect(identity.trustable).toBe(false);
+    expect(identity.id).toBeNull();
+    expect(identity.source).toBe("marker-partial");
+    expect(identity.label).toMatch(/PARTIAL/);
+
+    const out = captured(() => printStoreHeader(stubReader(later), "/tmp/partial.db"));
+    expect(out).toMatch(/WARNING: this copy carries a reembed-store\.ts marker AND has been written to since/);
+    expect(out).toMatch(/newest observation write/);
+    expect(out).toMatch(/no clean attribution for this run/);
+    // The clean two-population NOTE must not also print — the split is by TIMESTAMP here.
+    expect(out).not.toMatch(/NOTE: this copy was prepared/);
+  });
+
+  it("refuses to attribute an embedder against a PARTIAL store, naming that cause specifically", () => {
+    const space = readStoreSpace(stubReader({ ...BASE, latestRowWriteAt: PREPARED_AT + 5_000 }), "/tmp/partial.db");
+    const out = captured(() =>
+      printEmbedderHeader(space, { modelId: "Xenova/bge-base-en-v1.5", dim: 384 }, "against-stored-vectors", 384));
+    expect(out).toMatch(/REFUSING TO ATTRIBUTE/);
+    expect(out).toMatch(/WRITTEN TO AGAIN/);
+  });
+
+  it("UNVERIFIABLE when the dating signals cannot be read — unknown, not fine", () => {
+    const space = readStoreSpace(stubReader({ ...BASE, latestRowWriteAt: null }), "/tmp/unknown.db");
+    expect(space.attribution).toMatchObject({ state: "marker-unverifiable" });
+    expect(scoredSpaceIdentity(space, "observations").trustable).toBe(false);
+    const out = captured(() => printStoreHeader(stubReader({ ...BASE, latestRowWriteAt: null }), "/tmp/unknown.db"));
+    expect(out).toMatch(/could not be established/);
+    expect(out).toMatch(/An unverified marker is not a verified one/);
+  });
+
+  it("stays CANDIDATE when nothing is newer than the preparation", () => {
+    const space = readStoreSpace(stubReader(BASE), "/tmp/clean.db");
+    expect(space.attribution.state).toBe("candidate");
+    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({ id: "Xenova/bge-base-en-v1.5", trustable: true });
+  });
+});
+
+/**
+ * THE ENGINE'S OWN INTERRUPTED MIGRATION — a store that reads as coherent and is not.
+ *
+ * `beginEmbedderMigration` inserts the `embedder_migration` sentinel and then IMMEDIATELY calls
+ * `writeMigratedEmbedderPin`, so `sync_meta` names the TARGET before any vector has been rewritten;
+ * `completeEmbedderMigration` deletes the sentinel as its last act. Rows present therefore means:
+ * the pin is the target, the vectors are partly the old model's, and nothing else disagrees.
+ */
+describe("measure-header — interrupted OFFICIAL migration", () => {
+  const MIGRATING = { pin: "Xenova/bge-m3:cls:q8", conceptDim: 384, observationDim: 384, migrationRows: 1 };
+
+  it("STOPs for BOTH populations and says it is the engine's migration, not a fixture preparation", () => {
+    const space = readStoreSpace(stubReader(MIGRATING), "/tmp/migrating.db");
+    expect(space.migrationInterrupted).toBe(true);
+    expect(space.attribution.state).toBe("official-migration-interrupted");
+    for (const population of ["observations", "concepts"] as const) {
+      const identity = scoredSpaceIdentity(space, population);
+      expect(identity.trustable).toBe(false);
+      expect(identity.source).toBe("engine-migration-interrupted");
+    }
+    const out = captured(() => printStoreHeader(stubReader(MIGRATING), "/tmp/migrating.db"));
+    expect(out).toMatch(/STOP: this store's embedder_migration sentinel is SET/);
+    expect(out).toMatch(/OFFICIAL migration started and\n!! never completed/);
+    expect(out).toMatch(/the pin above is the migration's TARGET, written at its START/i);
+    // Distinct from the fixture message, which names reembed-store.ts.
+    expect(out).not.toMatch(/reembed-store\.ts began preparing/);
+  });
+
+  it("outranks a fixture marker — the engine's own half-finished migration is the bigger fact", () => {
+    const space = readStoreSpace(
+      stubReader({ ...MIGRATING, reembed: { candidate_model_id: "x/y", requested_model: "x/y", measured_dim: 384 } }),
+      "/tmp/both.db",
+    );
+    expect(space.attribution.state).toBe("official-migration-interrupted");
+  });
+
+  it("advises the migration remedy, not 'rebuild the copy', when refusing attribution", () => {
+    const space = readStoreSpace(stubReader(MIGRATING), "/tmp/migrating.db");
+    const out = captured(() =>
+      printEmbedderHeader(space, { modelId: "Xenova/bge-m3:cls:q8", dim: 1024 }, "against-stored-vectors", 1024));
+    expect(out).toMatch(/REFUSING TO ATTRIBUTE/);
+    expect(out).toMatch(/monet doctor/);
+    expect(out).not.toMatch(/rebuild the copy\./);
+  });
+
+  it("a sentinel table that does not exist is NOT read as a clean store", () => {
+    const space = readStoreSpace(stubReader({ pin: "m", observationDim: 384, migrationTableMissing: true }), "/tmp/old.db");
+    expect(space.migrationInterrupted).toBeNull();
+    // Unknown here degrades to the pin rather than to a STOP: an old schema predates the sentinel
+    // entirely, so its absence is genuinely uninformative rather than alarming.
+    expect(space.attribution.state).toBe("pin");
   });
 });

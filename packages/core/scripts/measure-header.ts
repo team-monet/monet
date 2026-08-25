@@ -76,6 +76,38 @@ export interface ReembedProvenance {
  */
 export type ScoredPopulation = "observations" | "concepts";
 
+/**
+ * THE ONE RESOLVED ANSWER to "what space is this store in", computed once in readStoreSpace.
+ *
+ * A discriminated union rather than a pile of booleans, because these states are mutually exclusive
+ * and each demands a different thing of the reader — and because a header that stacked flags would
+ * let two of them print at once and leave the precedence to whoever read the output last. The order
+ * below IS the precedence, most severe first.
+ *
+ *   official-migration-interrupted  the ENGINE's own migration died partway. `sync_meta` already
+ *                                   names the TARGET (the pin is written at migration START), so
+ *                                   the store looks coherent and is not.
+ *   fixture-interrupted             reembed-store.ts began a preparation and never published it.
+ *   marker-superseded               a completed fixture marker, then a LATER official re-pin. The
+ *                                   migration rewrote the vectors the marker described; the marker
+ *                                   is dead history and the pin is authoritative again.
+ *   marker-partial                  a completed fixture marker, then later ordinary engine writes.
+ *                                   Rows created after the cutoff are in the PINNED space; the ones
+ *                                   before it are the candidate's. Both, in one table.
+ *   marker-unverifiable             a completed fixture marker, but the signals that would date it
+ *                                   could not be read. Unknown is not the same as fine.
+ *   candidate                       a completed fixture marker with nothing newer than it.
+ *   pin                             no fixture marker; the pin is the identity. The common case.
+ */
+export type SpaceAttribution =
+  | { state: "official-migration-interrupted" }
+  | { state: "fixture-interrupted" }
+  | { state: "marker-superseded"; pinnedAt: number; completedAt: number }
+  | { state: "marker-partial"; latestRowWriteAt: number; completedAt: number }
+  | { state: "marker-unverifiable"; reason: string }
+  | { state: "candidate" }
+  | { state: "pin" };
+
 export interface StoreSpace {
   /** The path the script actually resolved, whatever env var it read to get there. */
   dbPath: string;
@@ -97,6 +129,25 @@ export interface StoreSpace {
   dimSplit: boolean;
   /** scripts/reembed-store.ts's marker, when this copy was prepared by it; null otherwise. */
   reembed: ReembedProvenance | null;
+  /**
+   * `sync_meta.embedder_pinned_at`. The engine stamps this on every pin write — creation, backfill,
+   * and `writeMigratedEmbedderPin` — so a value later than a fixture marker's completion means an
+   * official migration has since rewritten the vectors that marker described.
+   */
+  pinnedAt: number | null;
+  /**
+   * True when the engine's `embedder_migration` sentinel has a row: an OFFICIAL migration is running
+   * or died. Null when the table could not be read at all (an old schema), which is not the same as
+   * knowing there is none.
+   */
+  migrationInterrupted: boolean | null;
+  /**
+   * Newest write across the populations these scripts score, or null when it could not be read.
+   * See readLatestRowWrite for which columns are trustworthy and which are not.
+   */
+  latestRowWriteAt: number | null;
+  /** The single resolved verdict. Every consumer reads this rather than re-deriving it. */
+  attribution: SpaceAttribution;
 }
 
 /**
@@ -113,9 +164,12 @@ export interface StoreSpace {
 export function scoredSpaceIdentity(space: StoreSpace, population: ScoredPopulation = "observations"): {
   id: string | null;
   known: boolean;
-  /** False when the store is in a state no identity describes — an interrupted preparation. */
+  /** False when the store is in a state no single identity describes — see SpaceAttribution. */
   trustable: boolean;
-  source: "reembed-marker" | "reembed-interrupted" | "pin";
+  source:
+    | "reembed-marker" | "pin"
+    | "reembed-interrupted" | "engine-migration-interrupted"
+    | "marker-partial" | "marker-unverifiable";
   label: string;
 } {
   const r = space.reembed;
@@ -123,18 +177,42 @@ export function scoredSpaceIdentity(space: StoreSpace, population: ScoredPopulat
     space.pinReadable && space.pin !== null
       ? { id: space.pin, known: true, trustable: true, source: "pin", label: space.pin }
       : { id: null, known: false, trustable: true, source: "pin", label: space.pinReadable ? "(no pin)" : "(unavailable)" };
+  const untrustable = (
+    source: "reembed-interrupted" | "engine-migration-interrupted" | "marker-partial" | "marker-unverifiable",
+    label: string,
+  ): { id: null; known: false; trustable: false; source: typeof source; label: string } =>
+    ({ id: null, known: false, trustable: false, source, label });
 
-  if (r === null) return pinIdentity();
-
-  // AN INTERRUPTED PREPARATION POISONS BOTH POPULATIONS' ANSWERS, not just the one being rewritten:
-  // some observations are in the candidate space and some are still in the pin's, so even the
-  // concept side's "unchanged, therefore the pin" reasoning is only half the picture the reader
-  // needs. Refuse to name a space rather than name one that describes part of the rows.
-  if (r.completedAt === null) {
-    return {
-      id: null, known: false, trustable: false, source: "reembed-interrupted",
-      label: `INTERRUPTED preparation toward ${r.candidateModelId ?? r.requestedModel} — vectors are a MIX of spaces`,
-    };
+  switch (space.attribution.state) {
+    // BOTH POPULATIONS ARE POISONED by an interrupted rewrite, not just the one being written: some
+    // rows are in the new space and some in the old, so even the concept side's "untouched, therefore
+    // the pin" reasoning describes only part of the store. Refuse to name a space.
+    case "official-migration-interrupted":
+      return untrustable(
+        "engine-migration-interrupted",
+        `INTERRUPTED OFFICIAL MIGRATION toward ${space.pin ?? "(unreadable target)"} — vectors are a MIX of spaces`,
+      );
+    case "fixture-interrupted":
+      return untrustable(
+        "reembed-interrupted",
+        `INTERRUPTED fixture preparation toward ${r?.candidateModelId ?? r?.requestedModel ?? "(unknown)"} — vectors are a MIX of spaces`,
+      );
+    // The migration that re-pinned rewrote everything the marker described, so the marker is dead
+    // history and the pin is authoritative again — for BOTH populations.
+    case "marker-superseded":
+      return pinIdentity();
+    case "marker-partial":
+      return untrustable(
+        "marker-partial",
+        `PARTIAL: rows written before ${new Date(space.attribution.completedAt).toISOString()} are ` +
+        `${r?.candidateModelId ?? r?.requestedModel ?? "the candidate"}'s, rows after it are ${space.pin ?? "(no pin)"}'s`,
+      );
+    case "marker-unverifiable":
+      return untrustable("marker-unverifiable", `UNVERIFIABLE: ${space.attribution.reason}`);
+    case "pin":
+      return pinIdentity();
+    case "candidate":
+      break;
   }
 
   // CONCEPTS ARE NOT REWRITTEN by that script — its own marker says so — so their identity is the
@@ -142,15 +220,15 @@ export function scoredSpaceIdentity(space: StoreSpace, population: ScoredPopulat
   // class of error as attributing an observation-scoring one to the pin.
   if (population === "concepts") return pinIdentity();
 
-  const detail = [r.pooling ? `pooling=${r.pooling}` : null, r.dtype ? `dtype=${r.dtype}` : null]
+  const detail = [r!.pooling ? `pooling=${r!.pooling}` : null, r!.dtype ? `dtype=${r!.dtype}` : null]
     .filter((x) => x !== null).join(", ");
   const suffix = detail === "" ? "" : ` [${detail}]`;
-  if (r.candidateModelId !== null) {
-    return { id: r.candidateModelId, known: true, trustable: true, source: "reembed-marker", label: `${r.candidateModelId}${suffix}` };
+  if (r!.candidateModelId !== null) {
+    return { id: r!.candidateModelId, known: true, trustable: true, source: "reembed-marker", label: `${r!.candidateModelId}${suffix}` };
   }
   return {
     id: null, known: false, trustable: true, source: "reembed-marker",
-    label: `${r.requestedModel} (off-profile: no id names this space)${suffix}`,
+    label: `${r!.requestedModel} (off-profile: no id names this space)${suffix}`,
   };
 }
 
@@ -216,16 +294,107 @@ function readReembedProvenance(db: HeaderReader): ReembedProvenance | null {
   }
 }
 
+/**
+ * Is the ENGINE's own migration sentinel set? Rows present = a migration started and has not
+ * completed; `completeEmbedderMigration` deletes the row as its last act (engine.ts), and the
+ * findings' §1 verification reads `COUNT(*) = 0` as proof of completion.
+ *
+ * This matters more than it looks, because `beginEmbedderMigration` calls `writeMigratedEmbedderPin`
+ * IMMEDIATELY after inserting the sentinel — the pin names the TARGET model from the moment the
+ * migration starts, before a single vector has been rewritten. A store in this state therefore reads
+ * as perfectly coherent: a pin, a uniform sampled width, no split. It is not coherent; its vectors
+ * are partly the old model's and partly the target's.
+ *
+ * Returns null when the table cannot be read, which is an old schema rather than a clean store.
+ */
+function readMigrationInterrupted(db: HeaderReader): boolean | null {
+  try {
+    const row = db.prepare(`SELECT COUNT(*) AS n FROM embedder_migration`).get() as { n: number } | undefined;
+    return row === undefined ? null : row.n > 0;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The newest engine write across the scored populations — the cutoff a fixture marker is dated
+ * against.
+ *
+ * WHICH COLUMNS CAN BE BELIEVED. `created_at` is a SCHEMA DEFAULT (`DEFAULT (unixepoch() * 1000)`,
+ * engine.ts) and the local ingest path omits the column, so SQLite stamps it on every insert
+ * unconditionally. `updated_at` shares that default but is MAINTAINED by the sync triggers, which
+ * are gated `WHEN ... (SELECT applying_remote FROM sync_meta ...) = 0` — and `applying_remote` can
+ * sit latched at 1 (findings §3.2), in which case the trigger never fires and `updated_at` stays at
+ * its insert value. MAX over both is therefore safe in the direction that matters: it can only
+ * UNDER-report a mutation, never invent one.
+ *
+ * Two other known under-reports, stated rather than papered over: a grafted row carries the ORIGIN's
+ * `created_at`, so a recent sync of old evidence dates as old; and `observation_segments` has no
+ * timestamps at all (it inherits liveness from its observation and is written in the same
+ * transaction), so the observation row's stamp stands in for its segments.
+ */
+function readLatestRowWrite(db: HeaderReader): number | null {
+  try {
+    const row = db.prepare(
+      `SELECT MAX(MAX(created_at), MAX(updated_at)) AS t FROM observations WHERE kind != 'source'`,
+    ).get() as { t: number | null } | undefined;
+    return row?.t ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the ONE state. Precedence is severity, and it is expressed as an ordered sequence of
+ * early returns so that adding a state later cannot silently reorder the existing ones.
+ */
+function resolveAttribution(
+  reembed: ReembedProvenance | null,
+  migrationInterrupted: boolean | null,
+  pinnedAt: number | null,
+  latestRowWriteAt: number | null,
+): SpaceAttribution {
+  if (migrationInterrupted === true) return { state: "official-migration-interrupted" };
+  if (reembed === null) return { state: "pin" };
+  if (reembed.completedAt === null) return { state: "fixture-interrupted" };
+  const completedAt = reembed.completedAt;
+
+  // A LATER OFFICIAL RE-PIN KILLS THE MARKER OUTRIGHT. migrateEmbeddings rewrites every vector and
+  // stamps a new embedder_pinned_at, so whatever the fixture preparation did has been overwritten
+  // and the pin is authoritative again. Checked before the partial case: this is not "some rows are
+  // newer", it is "all of them are".
+  if (pinnedAt !== null && pinnedAt > completedAt) return { state: "marker-superseded", pinnedAt, completedAt };
+
+  // The signals are what date the marker. Without them the marker's age is unknown, and unknown is
+  // its own answer — the whole reason this module exists is to stop absence reading as agreement.
+  if (pinnedAt === null && latestRowWriteAt === null) {
+    return { state: "marker-unverifiable", reason: "neither embedder_pinned_at nor an observation timestamp could be read" };
+  }
+  if (latestRowWriteAt === null) {
+    return { state: "marker-unverifiable", reason: "no observation timestamp could be read, so later writes cannot be ruled out" };
+  }
+  if (latestRowWriteAt > completedAt) return { state: "marker-partial", latestRowWriteAt, completedAt };
+  return { state: "candidate" };
+}
+
 export function readStoreSpace(db: HeaderReader, dbPath: string): StoreSpace {
   let pin: string | null = null;
   let pinReadable = true;
+  let pinnedAt: number | null = null;
   try {
-    pin = (db.prepare(`SELECT embedder_model_id AS m FROM sync_meta`).get() as { m: string | null } | undefined)?.m ?? null;
+    const row = db.prepare(
+      `SELECT embedder_model_id AS m, embedder_pinned_at AS at FROM sync_meta`,
+    ).get() as { m: string | null; at: number | null } | undefined;
+    pin = row?.m ?? null;
+    pinnedAt = row?.at ?? null;
   } catch {
     pinReadable = false;
   }
   const conceptDim = sampleDimension(db, "concepts");
   const observationDim = sampleDimension(db, "observations");
+  const reembed = readReembedProvenance(db);
+  const migrationInterrupted = readMigrationInterrupted(db);
+  const latestRowWriteAt = readLatestRowWrite(db);
   return {
     dbPath,
     pin,
@@ -234,7 +403,11 @@ export function readStoreSpace(db: HeaderReader, dbPath: string): StoreSpace {
     observationDim,
     dim: observationDim ?? conceptDim,
     dimSplit: conceptDim !== null && observationDim !== null && conceptDim !== observationDim,
-    reembed: readReembedProvenance(db),
+    reembed,
+    pinnedAt,
+    migrationInterrupted,
+    latestRowWriteAt,
+    attribution: resolveAttribution(reembed, migrationInterrupted, pinnedAt, latestRowWriteAt),
   };
 }
 
@@ -256,24 +429,68 @@ export function printStoreHeader(db: HeaderReader, dbPath: string): StoreSpace {
   const pin = space.pinReadable ? (space.pin ?? "(no pin)") : "(unavailable)";
   console.log(`db=${dbPath}`);
   console.log(`store space: pin=${pin}  dim=${describeDim(space)}`);
-  if (space.reembed !== null) {
-    const r = space.reembed;
-    if (r.completedAt === null) {
-      // INTERRUPTED — the loudest state this module has, and deliberately not a variant of the
-      // stale-width warning below. That one says "the marker names the wrong space"; this one says
-      // there is no single space to name: the rewrite died partway, so some observations are the
-      // candidate's and some are still the pin's, IN THE SAME TABLE. A sample of one row cannot
-      // tell which, and no measurement taken here means anything.
+  const r = space.reembed;
+  const a = space.attribution;
+  // ONE BRANCH PER RESOLVED STATE. Exhaustive over SpaceAttribution so a new state cannot be added
+  // without deciding what the header says about it, and so two of these can never print at once.
+  switch (a.state) {
+    case "official-migration-interrupted":
+      // The ENGINE's migration, not the fixture script's — a different fault with a different fix,
+      // so a different message. `sync_meta` above already names the TARGET model because
+      // beginEmbedderMigration writes the pin before rewriting any vector, which is exactly why this
+      // store reads as coherent and is not.
+      console.log(
+        `!! STOP: this store's embedder_migration sentinel is SET — an OFFICIAL migration started and\n` +
+        `!! never completed (the engine deletes that row as the last act of a successful one).\n` +
+        `!! The pin above is the migration's TARGET, written at its START, so it names a space the\n` +
+        `!! vectors are only PARTLY in: some rows were rewritten before the interruption and some were\n` +
+        `!! not. Nothing here can tell which. Run 'monet doctor' and finish or abandon the migration\n` +
+        `!! before taking any measurement against this store.`,
+      );
+      break;
+    case "fixture-interrupted":
+      // Deliberately not a variant of the stale-width warning: that one says "the marker names the
+      // wrong space", this one says there is no single space to name.
       console.log(
         `!! STOP: scripts/reembed-store.ts began preparing this copy and never finished.\n` +
-        `!!   started: ${new Date(r.startedAt).toISOString()}  (no completion recorded)\n` +
-        `!!   toward:  ${r.candidateModelId ?? r.requestedModel}, ${r.measuredDim}-dim\n` +
+        `!!   started: ${new Date(r!.startedAt).toISOString()}  (no completion recorded)\n` +
+        `!!   toward:  ${r!.candidateModelId ?? r!.requestedModel}, ${r!.measuredDim}-dim\n` +
         `!! Its observation and segment vectors are a MIX of that candidate's space and the pinned\n` +
         `!! one, in proportions nothing here can determine. No identity describes this store and no\n` +
         `!! measurement taken against it is interpretable. Rebuild the copy from the source store and\n` +
         `!! re-run the preparation before reading anything below.`,
       );
-    } else {
+      break;
+    case "marker-superseded":
+      // Not a warning — a correction. The marker is real history that has been overtaken, and the
+      // right response is to ignore it, which the header does on the reader's behalf.
+      console.log(
+        `   (a reembed-store.ts marker is present but SUPERSEDED: it completed at\n` +
+        `   ${new Date(a.completedAt).toISOString()}, and the store was re-pinned at\n` +
+        `   ${new Date(a.pinnedAt).toISOString()} — an official migration has since rewritten every\n` +
+        `   vector the marker described. The pin above is authoritative for both populations.)`,
+      );
+      break;
+    case "marker-partial":
+      console.log(
+        `!! WARNING: this copy carries a reembed-store.ts marker AND has been written to since.\n` +
+        `!!   preparation completed: ${new Date(a.completedAt).toISOString()}\n` +
+        `!!   newest observation write: ${new Date(a.latestRowWriteAt).toISOString()}\n` +
+        `!! Rows older than that cutoff are in ${r!.candidateModelId ?? r!.requestedModel}'s space;\n` +
+        `!! rows newer than it were embedded by the ENGINE, in the pinned space (${pin}). The scored\n` +
+        `!! population is therefore SPLIT along a timestamp, which no dimension check can see when the\n` +
+        `!! two models share a width. There is no clean attribution for this run — rebuild the copy.`,
+      );
+      break;
+    case "marker-unverifiable":
+      console.log(
+        `!! WARNING: this copy carries a completed reembed-store.ts marker, but whether it still\n` +
+        `!! describes the store could not be established: ${a.reason}.\n` +
+        `!! An unverified marker is not a verified one — treat the space below as UNKNOWN rather than\n` +
+        `!! as the candidate's, and rebuild the copy if the measurement matters.`,
+      );
+      break;
+    case "candidate": {
       const scored = scoredSpaceIdentity(space, "observations");
       const concepts = scoredSpaceIdentity(space, "concepts");
       // THE SPLIT THE PIN CANNOT SHOW. Announced whether or not the widths differ — a same-width
@@ -281,21 +498,24 @@ export function printStoreHeader(db: HeaderReader, dbPath: string): StoreSpace {
       console.log(
         `!! NOTE: this copy was prepared by scripts/reembed-store.ts, so its two populations are in\n` +
         `!! DIFFERENT spaces and the pin above describes only one of them:\n` +
-        `!!   observations + segments -> ${scored.label}, ${r.measuredDim}-dim measured\n` +
+        `!!   observations + segments -> ${scored.label}, ${r!.measuredDim}-dim measured\n` +
         `!!   concepts + sync_meta    -> ${concepts.label} (untouched by that rewrite)\n` +
-        `!!   rewrote: ${r.populations}\n` +
-        `!!   prepared: ${new Date(r.completedAt).toISOString()}\n` +
+        `!!   rewrote: ${r!.populations}\n` +
+        `!!   prepared: ${new Date(r!.completedAt!).toISOString()}\n` +
         `!! A measurement below is in whichever of those two its population belongs to — sections that\n` +
         `!! read concept vectors are still in the PIN's space. Attribute each one accordingly.`,
       );
-      if (space.observationDim !== null && space.observationDim !== r.measuredDim) {
+      if (space.observationDim !== null && space.observationDim !== r!.measuredDim) {
         console.log(
-          `!! WARNING: the marker records a ${r.measuredDim}-dim rewrite but the observations sampled\n` +
+          `!! WARNING: the marker records a ${r!.measuredDim}-dim rewrite but the observations sampled\n` +
           `!! ${space.observationDim}-dim. Something rewrote these vectors AFTER that preparation, so the\n` +
           `!! marker names a space the rows are no longer in. Trust neither until the copy is rebuilt.`,
         );
       }
+      break;
     }
+    case "pin":
+      break; // the common case: the pin line above already said everything there is to say
   }
   if (space.dimSplit) {
     console.log(
@@ -446,10 +666,23 @@ export function printEmbedderHeader(
   // line from quietly following it with a verdict that implies otherwise.
   if (!scored.trustable) {
     if (scoring === "against-stored-vectors") {
+      // Name the CAUSE — the four untrustable states need four different remedies, and "rebuild the
+      // copy" is wrong advice for a store whose own migration is half-finished.
+      const cause = {
+        "engine-migration-interrupted":
+          "an INTERRUPTED OFFICIAL MIGRATION (see the STOP above) — finish or abandon it with 'monet doctor'",
+        "reembed-interrupted":
+          "an INTERRUPTED fixture preparation (see the STOP above) — rebuild the copy",
+        "marker-partial":
+          "a copy that was re-embedded and then WRITTEN TO AGAIN (see the WARNING above) — rebuild the copy",
+        "marker-unverifiable":
+          "a copy whose provenance could not be dated (see the WARNING above) — rebuild the copy",
+      }[scored.source as "engine-migration-interrupted" | "reembed-interrupted" | "marker-partial" | "marker-unverifiable"];
       console.log(
-        `!! REFUSING TO ATTRIBUTE: the stored vectors this run scores against come from an\n` +
-        `!! INTERRUPTED re-embed (see the STOP above), so they are a mix of two spaces. Whether\n` +
-        `!! '${modelId}' matches them is not a question with an answer. Rebuild the copy.`,
+        `!! REFUSING TO ATTRIBUTE: the stored vectors this run scores against come from\n` +
+        `!! ${cause}.\n` +
+        `!! They are not all in one space, so whether '${modelId}' matches them is not a question\n` +
+        `!! with an answer. Nothing below is interpretable as a measurement of any single model.`,
       );
     }
     return;
