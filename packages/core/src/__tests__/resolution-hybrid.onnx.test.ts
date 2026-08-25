@@ -66,7 +66,8 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
     process.env.MONET_EMBEDDER = "onnx"; // require MiniLM; a broken model must fail loudly
     embedder = await createLocalEmbedder();
     expect(embedder.constructor.name).toBe("OnnxEmbeddingProvider");
-  }, 240_000);
+    // 300s, not 240s: model load on a nightly runner whose CPU throughput swings ~3.5x between nights.
+  }, 300_000);
 
   afterAll(() => {
     if (priorEmbedderEnv === undefined) delete process.env.MONET_EMBEDDER;
@@ -134,7 +135,8 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
     } finally {
       core.close();
     }
-  }, 120_000);
+    // 600s, not 120s: same red-night throughput swing as the gates below. Raised with its siblings so un-skipping cannot silently reintroduce the tight cap.
+  }, 600_000);
 
   it("still attaches a restatement to a COHERENT concept, at the same bands", async () => {
     // The control the fork signal has to survive: consolidation must still work at shipped bands,
@@ -161,7 +163,8 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
     } finally {
       core.close();
     }
-  }, 120_000);
+    // 600s, not 120s: red-night runners are ~3.5x slower (eval.onnx completed at 166s there, against a 180s cap); this gate never reported a true cost, since the job died at the wall. It asserts recall, not speed.
+  }, 600_000);
 
   it("creates, and pairs nothing, for genuinely novel evidence at the same bands", async () => {
     const core = shippedCore();
@@ -179,7 +182,8 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
     } finally {
       core.close();
     }
-  }, 120_000);
+    // 600s, not 120s: red-night runners are ~3.5x slower (eval.onnx completed at 166s there, against a 180s cap); this gate never reported a true cost, since the job died at the wall. It asserts recall, not speed.
+  }, 600_000);
 
   /**
    * BLUR-DUPLICATE IS RARE AT SHIPPED BANDS, and this pins why rather than leaving it to be
@@ -232,5 +236,6 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
     } finally {
       core.close();
     }
-  }, 120_000);
+    // 600s, not 120s: same red-night throughput swing as the gates above. Raised with its siblings so un-skipping cannot silently reintroduce the tight cap.
+  }, 600_000);
 });

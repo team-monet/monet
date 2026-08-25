@@ -31,7 +31,8 @@ describe.skipIf(!ENABLED)("memory eval — real MiniLM recall gate (semantic emb
     process.env.MONET_EMBEDDER = "onnx";
     embedder = await createLocalEmbedder();
     expect(embedder.constructor.name).toBe("OnnxEmbeddingProvider");
-  }, 120_000);
+    // 300s, not 120s: model load on a nightly runner whose CPU throughput swings ~3.5x between nights.
+  }, 300_000);
 
   afterAll(() => {
     if (priorEmbedderEnv === undefined) delete process.env.MONET_EMBEDDER;
@@ -56,5 +57,6 @@ describe.skipIf(!ENABLED)("memory eval — real MiniLM recall gate (semantic emb
     // And memory clearly helps on single-fact recall at a reasonable budget.
     expect(search.byK[5].repeatedMistakeRate).toBeLessThan(1);
     expect(search.byK[5].reExplainRate).toBeLessThan(1);
-  }, 180_000);
+    // 600s, not 180s: THIS test completed at 166s on a red night — 14s under the old cap — and nightly runner throughput swings ~3.5x. It asserts recall, not speed.
+  }, 600_000);
 });

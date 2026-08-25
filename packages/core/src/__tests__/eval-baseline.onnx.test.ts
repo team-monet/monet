@@ -33,7 +33,8 @@ describe.skipIf(!ENABLED)("md-baseline eval — real MiniLM recall gate (semanti
     process.env.MONET_EMBEDDER = "onnx";
     embedder = await createLocalEmbedder();
     expect(embedder.constructor.name).toBe("OnnxEmbeddingProvider");
-  }, 120_000);
+    // 300s, not 120s: model load on a nightly runner whose CPU throughput swings ~3.5x between nights.
+  }, 300_000);
 
   afterAll(() => {
     if (priorEmbedderEnv === undefined) delete process.env.MONET_EMBEDDER;
@@ -63,5 +64,6 @@ describe.skipIf(!ENABLED)("md-baseline eval — real MiniLM recall gate (semanti
     const deployGateProbe = chunkCosineRag.probes.find((p) => p.scenarioId === "deploy-gate");
     expect(deployGateProbe).toBeDefined();
     expect(deployGateProbe!.recallByK[5]).toBeGreaterThan(0);
-  }, 180_000);
+    // 600s, not 180s: this gate was TRUNCATED at the old 180s cap on red nights, so its true cost is unknown; eval.onnx completed at 166s on the same runner, whose throughput swings ~3.5x. It asserts recall, not speed.
+  }, 600_000);
 });
