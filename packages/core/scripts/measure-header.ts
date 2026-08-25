@@ -200,7 +200,15 @@ export function scoredSpaceIdentity(space: StoreSpace, population: ScoredPopulat
   const pinIdentity = (): { id: string | null; known: boolean; trustable: boolean; source: "pin"; label: string } =>
     space.pinReadable && space.pin !== null
       ? { id: space.pin, known: true, trustable: true, source: "pin", label: space.pin }
-      : { id: null, known: false, trustable: true, source: "pin", label: space.pinReadable ? "(no pin)" : "(unavailable)" };
+      // NO PIN IS NOT AN IDENTITY. On an unpinned copy the concept population has no name at all —
+      // nothing ever declared what space wrote those vectors — so the label says the identity is
+      // unavailable rather than presenting the absence as though it were the answer. `trustable`
+      // stays true: an absent pin is not a mixed store, it is an unnamed one, and the observation
+      // side is still fully attributed by the marker.
+      : {
+        id: null, known: false, trustable: true, source: "pin",
+        label: space.pinReadable ? "(no pin — identity unavailable)" : "(unavailable)",
+      };
   const untrustable = (
     source: "reembed-interrupted" | "engine-migration-interrupted" | "fixture-invalid",
     label: string,
@@ -314,8 +322,12 @@ function readReembedProvenance(db: HeaderReader): MarkerRead {
   let row: Record<string, unknown> | undefined;
   try {
     row = db.prepare(
+      // `run_token` is named here but never USED: the header does not care which run owns a marker,
+      // only reembed-store's own publish check does. Naming it is what makes a token-less marker —
+      // written by a build that had the two-preparation race, and therefore possibly published onto
+      // by the wrong run — fail this SELECT and classify as unverifiable rather than as valid.
       `SELECT candidate_model_id, requested_model, pooling, dtype, measured_dim, populations,
-              started_at, completed_at, rows_max_at
+              started_at, completed_at, rows_max_at, run_token
          FROM reembed_provenance WHERE singleton = 1`,
     ).get() as Record<string, unknown> | undefined;
   } catch {
@@ -458,15 +470,20 @@ function resolveAttribution(
   if (!pinReadable) {
     return invalid("sync_meta could not be read, so a pin write during or after the preparation cannot be ruled out");
   }
-  if (pinnedAt === null) {
-    return invalid("sync_meta carries no embedder_pinned_at, so a pin write during or after the preparation cannot be ruled out");
-  }
+  // A READABLE NULL IS AN ANSWER, NOT A GAP. Every path that pins a store — create, backfill,
+  // migrate — populates `embedder_pinned_at` (engine.ts), so a column that is readable and empty
+  // establishes the negative this check is looking for: no official pin write has happened at all,
+  // therefore none happened during or after the preparation. Treating it as unverifiable, as an
+  // earlier draft did, refused every otherwise-complete fixture built from a legitimately unpinned
+  // copy — on the one signal that was actually reassuring. Unreadable `sync_meta` is different and
+  // is still refused, above: there the question could not be asked.
+  //
   // ANY pin write from `startedAt` onward invalidates, and the SOURCE of it is deliberately not
   // distinguished: migrate, adopt and backfill all stamp this same column, they are indistinguishable
   // after the fact, and all three mean the space was rewritten or re-declared under the preparation.
   // Dated from startedAt rather than completedAt because a pin write DURING the rewrite is at least
   // as bad as one after it.
-  if (pinnedAt >= reembed.startedAt) {
+  if (pinnedAt !== null && pinnedAt >= reembed.startedAt) {
     return invalid(
       `the store was pinned at ${iso(pinnedAt)}, at or after this preparation started (${iso(reembed.startedAt)}) — ` +
       `a migration, adopt or backfill has rewritten or re-declared the space since`,

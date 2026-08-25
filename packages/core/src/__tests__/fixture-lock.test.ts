@@ -18,7 +18,7 @@ import Database from "better-sqlite3";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireExclusiveWriteLock, releaseExclusiveWriteLock } from "../../scripts/fixture-lock";
+import { acquireExclusiveWriteLock, publishFixtureMarker, releaseExclusiveWriteLock } from "../../scripts/fixture-lock";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -183,6 +183,120 @@ describe("fixture-lock — a second writer is excluded for the whole preparation
 });
 
 /**
+ * TWO PREPARATIONS STARTING TOGETHER — the gap the write lock structurally cannot close.
+ *
+ * The opening marker is committed BEFORE the lock so an interrupted run stays visible as one. That
+ * leaves a window: A and B both run phase-1, B's `ON CONFLICT DO UPDATE` overwrites A's identity
+ * columns, and only then does one of them win the lock and rewrite. A completion keyed on
+ * `singleton = 1` alone would stamp "valid" onto B's description of a store A had just written with
+ * a different model — a fixture that passes every downstream check while naming the wrong model.
+ */
+describe("fixture-lock — a run publishes only onto the marker it opened", () => {
+  const MARKER_DDL = `
+    CREATE TABLE reembed_provenance (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      candidate_model_id TEXT, requested_model TEXT NOT NULL, pooling TEXT, dtype TEXT,
+      measured_dim INTEGER NOT NULL, populations TEXT NOT NULL, started_at INTEGER NOT NULL,
+      completed_at INTEGER, rows_max_at INTEGER, run_token TEXT NOT NULL)`;
+
+  /** Exactly reembed-store.ts's phase-1 statement, including its ON CONFLICT clause. */
+  const openMarker = (db: Database.Database, model: string, token: string, startedAt: number): void => {
+    db.prepare(
+      `INSERT INTO reembed_provenance
+         (singleton, candidate_model_id, requested_model, pooling, dtype, measured_dim, populations,
+          started_at, completed_at, run_token)
+       VALUES (1, ?, ?, NULL, NULL, 384, 'obs+segs', ?, NULL, ?)
+       ON CONFLICT(singleton) DO UPDATE SET
+         candidate_model_id = excluded.candidate_model_id, requested_model = excluded.requested_model,
+         measured_dim = excluded.measured_dim, started_at = excluded.started_at,
+         completed_at = NULL, run_token = excluded.run_token`,
+    ).run(model, model, startedAt, token);
+  };
+
+  const makeMarkerDb = (): Database.Database => {
+    const dir = mkdtempSync(join(tmpdir(), "fixture-marker-"));
+    dirs.push(dir);
+    const db = new Database(join(dir, "copy.db"));
+    db.pragma("journal_mode = WAL");
+    db.exec(MARKER_DDL);
+    return db;
+  };
+
+  it("REFUSES to publish onto a marker another preparation replaced, and leaves it incomplete", () => {
+    const db = makeMarkerDb();
+    try {
+      const tokenA = "run-A";
+      const tokenB = "run-B";
+      openMarker(db, "model-A", tokenA, 1000);            // A opens
+      openMarker(db, "model-B", tokenB, 2000);            // B starts and overwrites A's row
+
+      // A wins the lock, rewrites with model A, and tries to complete.
+      const result = publishFixtureMarker(db, tokenA, 3000, 9999);
+      expect(result.published).toBe(false);
+      expect(result.changes).toBe(0);
+
+      // The marker is untouched: still B's identity, still incomplete. A copy in this state reads as
+      // an interrupted preparation, which is exactly what it is.
+      const row = db.prepare(
+        `SELECT candidate_model_id AS m, completed_at AS c, rows_max_at AS r, run_token AS t
+           FROM reembed_provenance WHERE singleton = 1`,
+      ).get() as { m: string; c: number | null; r: number | null; t: string };
+      expect(row).toEqual({ m: "model-B", c: null, r: null, t: tokenB });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("PREMISE: a completion keyed on singleton alone would have published onto B's marker", () => {
+    // The pre-fix statement, verbatim. If this ever stops succeeding, the test above proves nothing.
+    const db = makeMarkerDb();
+    try {
+      openMarker(db, "model-A", "run-A", 1000);
+      openMarker(db, "model-B", "run-B", 2000);
+      const legacy = db.prepare(
+        `UPDATE reembed_provenance SET completed_at = ?, rows_max_at = ? WHERE singleton = 1`,
+      ).run(3000, 9999);
+      expect(legacy.changes).toBe(1);
+      const row = db.prepare(
+        `SELECT candidate_model_id AS m, completed_at AS c FROM reembed_provenance WHERE singleton = 1`,
+      ).get() as { m: string; c: number };
+      // A's rewrite, certified valid, attributed to B. The defect, reproduced.
+      expect(row).toEqual({ m: "model-B", c: 3000 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("publishes normally for a single run — the ordinary path is unchanged", () => {
+    const db = makeMarkerDb();
+    try {
+      openMarker(db, "model-A", "run-A", 1000);
+      const result = publishFixtureMarker(db, "run-A", 3000, 9999);
+      expect(result).toEqual({ published: true, changes: 1 });
+      expect(db.prepare(
+        `SELECT completed_at AS c, rows_max_at AS r FROM reembed_provenance WHERE singleton = 1`,
+      ).get()).toEqual({ c: 3000, r: 9999 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("a re-run by the same script mints a NEW token, so a stale one cannot publish afterwards", () => {
+    const db = makeMarkerDb();
+    try {
+      openMarker(db, "model-A", "run-A", 1000);
+      expect(publishFixtureMarker(db, "run-A", 3000, 9999).published).toBe(true);
+      openMarker(db, "model-A", "run-A2", 4000);  // same model, second run
+      // The first run's token no longer owns the row, even though nothing else changed.
+      expect(publishFixtureMarker(db, "run-A", 5000, 1).published).toBe(false);
+      expect(publishFixtureMarker(db, "run-A2", 5000, 1).published).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+/**
  * The ORDER inside reembed-store.ts is load-bearing and invisible to any unit test of the lock
  * itself, so it is asserted on the source — the same technique the measure-* classification uses.
  */
@@ -217,11 +331,21 @@ describe("reembed-store — what happens inside the lock, and what deliberately 
   it("reads the baseline and publishes the marker BEFORE releasing", () => {
     const [baseline, publish, release] = indexOfAll(source(), [
       "const rowsMaxAt = ",
-      "UPDATE reembed_provenance SET completed_at = ?, rows_max_at = ?",
+      "publishFixtureMarker(db, RUN_TOKEN,",
       "releaseExclusiveWriteLock(",
     ]);
     expect(baseline).toBeLessThan(release);
     expect(publish).toBeLessThan(release);
+    // And the publish is guarded: an unchecked result would republish onto whatever marker is there.
+    expect(source()).toMatch(/if \(!published\.published\)/);
+  });
+
+  it("opens the marker with a run token, so the publish has something to verify ownership against", () => {
+    const src = source();
+    expect(src).toMatch(/const RUN_TOKEN = randomUUID\(\);/);
+    expect(src).toMatch(/run_token TEXT NOT NULL/);
+    // The ON CONFLICT path must claim the token too, or a second run would inherit the first's.
+    expect(src).toMatch(/run_token = excluded\.run_token/);
   });
 
   it("no longer wraps individual rewrites in their own transactions", () => {

@@ -65,6 +65,8 @@ function stubReader(opts: {
   reembedTableEmpty?: boolean;
   /** Table present, written by an older build: the column-naming SELECT throws. */
   reembedLegacyShape?: boolean;
+  /** Table present, but pre-dating the run_token column — the build with the publish race. */
+  reembedNoToken?: boolean;
   /** Table present, row present, required fields NULL. */
   reembedBadTypes?: boolean;
 }) {
@@ -80,11 +82,12 @@ function stubReader(opts: {
             // probe; the column-naming SELECT is what a legacy shape fails.
             const isProbe = sql.includes("SELECT 1");
             if (opts.reembedTableAbsent || (opts.reembed === undefined && !opts.reembedTableEmpty
-                && !opts.reembedLegacyShape && !opts.reembedBadTypes)) {
+                && !opts.reembedLegacyShape && !opts.reembedBadTypes && !opts.reembedNoToken)) {
               throw new Error("no such table: reembed_provenance");
             }
             if (isProbe) return {}; // table exists
             if (opts.reembedLegacyShape) throw new Error("no such column: rows_max_at");
+            if (opts.reembedNoToken) throw new Error("no such column: run_token");
             if (opts.reembedTableEmpty) return undefined;
             if (opts.reembedBadTypes) {
               return {
@@ -603,9 +606,57 @@ describe("measure-header — fixture-invalid subsumes every way a marker stops d
 
   it("UNREADABILITY invalidates too — an unchecked signal is not a passed one", () => {
     expect(reasonOf({ ...BASE, latestRowWriteAt: null })).toMatch(/no observation timestamp could be read/);
-    expect(reasonOf({ ...BASE, pinnedAt: null })).toMatch(/carries no embedder_pinned_at/);
     expect(reasonOf({ ...BASE, syncMetaMissing: true })).toMatch(/sync_meta could not be read/);
     expect(reasonOf({ ...BASE, migrationTableMissing: true })).toMatch(/embedder_migration sentinel could not be read/);
+  });
+
+  /**
+   * AN EMPTY COLUMN THAT COULD BE READ IS EVIDENCE, NOT A GAP — the mirror of the marker rule.
+   *
+   * Every path that pins a store populates `embedder_pinned_at`, so a readable NULL establishes
+   * that no official pin write happened at all — which is exactly what the timing check is asking.
+   * Refusing it, as an earlier draft did, rejected every otherwise-complete fixture built from a
+   * legitimately unpinned copy, on the one signal that was actually reassuring.
+   */
+  it("an UNPINNED but readable store passes the pin-timing check vacuously", () => {
+    const unpinned = { ...BASE, pin: null, pinnedAt: null };
+    const space = readStoreSpace(stubReader(unpinned), "/tmp/unpinned.db");
+    expect(space.pinReadable).toBe(true);
+    expect(space.pinnedAt).toBeNull();
+    expect(space.attribution.state).toBe("candidate");
+    expect(() => requireTrustableSpace(space)).not.toThrow();
+
+    // The observation side is attributed by the marker exactly as on a pinned copy...
+    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({
+      id: "Xenova/bge-base-en-v1.5", source: "reembed-marker", trustable: true,
+    });
+    // ...and the concept side has no name at all, which is said rather than papered over.
+    const concepts = scoredSpaceIdentity(space, "concepts");
+    expect(concepts.known).toBe(false);
+    expect(concepts.trustable).toBe(true);
+    expect(concepts.label).toBe("(no pin — identity unavailable)");
+
+    const out = captured(() => printStoreHeader(stubReader(unpinned), "/tmp/unpinned.db"));
+    expect(out).toContain("pin=(no pin)");
+    expect(out).toContain("concepts + sync_meta    -> (no pin — identity unavailable)");
+  });
+
+  it("an unpinned store WITHOUT a marker is unchanged — the ordinary no-pin path", () => {
+    const space = readStoreSpace(
+      stubReader({ pin: null, pinnedAt: null, conceptDim: 1024, observationDim: 1024 }), "/tmp/bare.db");
+    expect(space.attribution.state).toBe("pin");
+    expect(() => requireTrustableSpace(space)).not.toThrow();
+    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({ known: false, source: "pin", trustable: true });
+    expect(captured(() => printStoreHeader(
+      stubReader({ pin: null, pinnedAt: null, conceptDim: 1024, observationDim: 1024 }), "/tmp/bare.db")))
+      .toContain("store space: pin=(no pin)");
+  });
+
+  it("a marker with no run_token is a legacy shape — the build that wrote it had the publish race", () => {
+    const space = readStoreSpace(stubReader({ pin: "m", observationDim: 384, reembedNoToken: true }), "/tmp/pre-token.db");
+    expect(space.attribution.state).toBe("fixture-invalid");
+    expect((space.attribution as { reason: string }).reason)
+      .toMatch(/provenance marker exists but cannot be verified/);
   });
 
   it("gives every one of them the SAME instruction and the same state", () => {

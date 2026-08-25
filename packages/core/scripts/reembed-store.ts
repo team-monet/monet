@@ -17,7 +17,8 @@
  * govern it, before anyone commits to a pin. Point it at a copy.
  */
 import Database from "better-sqlite3";
-import { acquireExclusiveWriteLock, releaseExclusiveWriteLock } from "./fixture-lock";
+import { randomUUID } from "node:crypto";
+import { acquireExclusiveWriteLock, publishFixtureMarker, releaseExclusiveWriteLock } from "./fixture-lock";
 import { embToJson } from "../src/embedding";
 import { OnnxEmbeddingProvider } from "../src/embedding-onnx";
 
@@ -31,6 +32,12 @@ const MODEL = process.env.MODEL!;
  */
 const POOLING = process.env.POOLING as "mean" | "cls" | undefined;
 const DTYPE = process.env.DTYPE;
+/**
+ * THIS RUN'S OWNERSHIP OF THE MARKER IT OPENS. Minted once per process and verified at publish
+ * time — see the completion statement for the race it closes. Uniqueness is all that is asked of
+ * it; it names no space and is never read by the header.
+ */
+const RUN_TOKEN = randomUUID();
 
 async function main(): Promise<void> {
   const db = new Database(DB);
@@ -75,19 +82,22 @@ async function main(): Promise<void> {
       populations TEXT NOT NULL,
       started_at INTEGER NOT NULL,
       completed_at INTEGER,
-      rows_max_at INTEGER
+      rows_max_at INTEGER,
+      run_token TEXT NOT NULL
     );
   `);
   db.prepare(
     `INSERT INTO reembed_provenance
        (singleton, candidate_model_id, requested_model, pooling, dtype, measured_dim, populations,
-        started_at, completed_at)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, NULL)
+        started_at, completed_at, run_token)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
      ON CONFLICT(singleton) DO UPDATE SET
        candidate_model_id = excluded.candidate_model_id, requested_model = excluded.requested_model,
        pooling = excluded.pooling, dtype = excluded.dtype, measured_dim = excluded.measured_dim,
        populations = excluded.populations, started_at = excluded.started_at,
-       completed_at = NULL`, // the previous run's completion never carries over onto this one
+       -- a previous run's completion never carries over onto this one, and the token that
+       -- authorises publishing becomes THIS run's
+       completed_at = NULL, run_token = excluded.run_token`,
   ).run(
     // NULL, not a fabricated id, when the checkpoint is off-profile: modelId is undefined exactly
     // when nothing names this space, and `requested_model` still records what was asked for.
@@ -98,6 +108,7 @@ async function main(): Promise<void> {
     warmup.length,
     "observations+segments where kind != 'source'; concepts and sync_meta UNTOUCHED",
     Date.now(),
+    RUN_TOKEN,
   );
 
   /*
@@ -182,13 +193,39 @@ async function main(): Promise<void> {
   const rowsMaxAt = (db.prepare(
     `SELECT MAX(MAX(created_at), MAX(updated_at)) AS t FROM observations WHERE kind != 'source'`,
   ).get() as { t: number | null }).t;
-  db.prepare(
-    `UPDATE reembed_provenance SET completed_at = ?, rows_max_at = ? WHERE singleton = 1`,
-  ).run(Date.now(), rowsMaxAt);
 
-  // STILL UNDER THE LOCK for both of the two statements above, which is what makes the baseline
+  /*
+   * PUBLISH ONLY ONTO OUR OWN MARKER — the one gap the write lock cannot close.
+   *
+   * The opening marker is committed BEFORE the lock, deliberately, so an interrupted run stays
+   * visible as one. That leaves a window: two preparations starting together both run their phase-1
+   * INSERT, and the second's `ON CONFLICT DO UPDATE` overwrites the first's identity columns —
+   * candidate model, pooling, dtype, width, all of it. Only then does one of them win the lock and
+   * rewrite. Its completion used to be `SET completed_at = ?, rows_max_at = ? WHERE singleton = 1`,
+   * which touches neither identity nor ownership: it would stamp "valid" onto the OTHER run's
+   * description of a store this run had just written with a different model. A fixture that passes
+   * every check while naming the wrong model is the exact failure this whole file exists to prevent.
+   *
+   * The token makes ownership checkable. It is written with the opening marker and verified here,
+   * under the lock, as part of the publishing statement itself — so there is no read-then-write race
+   * of its own. Zero rows updated means someone else's marker is in place, and the honest response
+   * is to publish nothing and fail: the rewrites roll back with the uncommitted transaction, the
+   * loser's incomplete marker remains, and the copy reads as an interrupted preparation, which it is.
+   */
+  const published = publishFixtureMarker(db, RUN_TOKEN, Date.now(), rowsMaxAt);
+  if (!published.published) {
+    throw new Error(
+      `Another preparation raced this one: the provenance marker in this copy is no longer the one ` +
+      `this run opened (run_token ${RUN_TOKEN} matched ${published.changes} rows). Nothing has been ` +
+      `published and this run's rewrites are being rolled back, so the copy is not describable by ` +
+      `either run — rebuild it, with one preparation at a time.`,
+    );
+  }
+
+  // STILL UNDER THE LOCK for all three of the statements above, which is what makes the baseline
   // mean anything: no writer could have committed between the last rewrite, the MAX that reads it,
-  // and the marker that records it. Releasing publishes all of it at once.
+  // and the marker that records it. Releasing publishes all of it at once. Reached only on the
+  // success path — the throw above leaves the transaction uncommitted on purpose.
   releaseExclusiveWriteLock(db);
 
   db.close();

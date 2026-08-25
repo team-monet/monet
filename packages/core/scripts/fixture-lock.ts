@@ -54,3 +54,37 @@ export function acquireExclusiveWriteLock(db: LockableDatabase, what: string): v
 export function releaseExclusiveWriteLock(db: LockableDatabase): void {
   if (db.inTransaction) db.prepare("COMMIT").run();
 }
+
+interface PublishableDatabase {
+  prepare(sql: string): { run(...params: unknown[]): { changes: number } };
+}
+
+/**
+ * Mark the preparation complete — but ONLY on the marker this run opened.
+ *
+ * THE ONE GAP THE LOCK CANNOT CLOSE. The opening marker is committed BEFORE the lock, deliberately,
+ * so an interrupted run stays visible as one (see reembed-store.ts). That leaves a window in which
+ * two preparations starting together both run their phase-1 INSERT, and the second's
+ * `ON CONFLICT DO UPDATE` overwrites the first's identity columns — candidate model, pooling, dtype,
+ * width. Only afterwards does one of them win the lock and rewrite. A completion written as
+ * `SET completed_at = ?, rows_max_at = ? WHERE singleton = 1` touches neither identity nor
+ * ownership, so it would stamp "valid" onto the OTHER run's description of a store this run had just
+ * written with a different model. Every downstream check then passes, because the marker itself
+ * certifies the wrong answer.
+ *
+ * The token is checked IN the UPDATE rather than read first and compared: a read-then-write would
+ * have a race of its own. Zero rows changed means someone else's marker is in place, and the caller
+ * must publish nothing and fail — leaving its own rewrites to roll back with the uncommitted
+ * transaction, and the copy reading as the interrupted preparation it now is.
+ */
+export function publishFixtureMarker(
+  db: PublishableDatabase,
+  runToken: string,
+  completedAt: number,
+  rowsMaxAt: number | null,
+): { published: boolean; changes: number } {
+  const result = db.prepare(
+    `UPDATE reembed_provenance SET completed_at = ?, rows_max_at = ? WHERE singleton = 1 AND run_token = ?`,
+  ).run(completedAt, rowsMaxAt, runToken);
+  return { published: result.changes === 1, changes: result.changes };
+}
