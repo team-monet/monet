@@ -32,6 +32,7 @@
  */
 import { MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider, cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
+import { printProviderIdentity, printSyntheticStoreHeader, requireTrustableSpace } from "./measure-header";
 import { NATIVE_SCORE_FLOOR, nativeScoreFloorOf } from "../src/retrieval";
 import { STARTER_SUITE, BACKGROUND } from "../src/eval/scenarios";
 import type { StoragePort } from "../src/storage";
@@ -110,7 +111,7 @@ function observationMaxByConcept(db: StoragePort, emb: Float32Array): Map<string
 const pct = (sorted: number[], p: number): number =>
   sorted.length === 0 ? NaN : sorted[Math.min(sorted.length - 1, Math.max(0, Math.round((p / 100) * (sorted.length - 1))))];
 
-async function measure(label: string, embedder: EmbeddingProvider): Promise<void> {
+async function measure(label: string, embedder: EmbeddingProvider, measuredDim?: number): Promise<void> {
   // The floor TRAVELS (#172), so the marker and the warning must resolve the provider's own value.
   // Marking the module fallback would label the wrong threshold active and stay silent while
   // search() drops gold sitting between the fallback and the real floor.
@@ -141,6 +142,9 @@ async function measure(label: string, embedder: EmbeddingProvider): Promise<void
     const f = (x: number): string => x.toFixed(4);
 
     console.log(`\n===== ${label} — ${queries.length} probe queries, ${JUNK_QUERIES.length} junk queries =====`);
+    // The prose label says which provider CLASS this is; the identity line says which SPACE, which is
+    // the fact a floor derived here has to be read against. There is no store pin to supply it.
+    printProviderIdentity(label, embedder, measuredDim);
     console.log(`GOLD      min=${f(g[0])} p05=${f(pct(g, 5))} p25=${f(pct(g, 25))} median=${f(pct(g, 50))} max=${f(g[g.length - 1])}  n=${g.length}`);
     console.log(`NON-GOLD  median=${f(pct(n, 50))} p90=${f(pct(n, 90))} p99=${f(pct(n, 99))}  n=${n.length}`);
     console.log(`JUNK      p50=${f(pct(j, 50))} p95=${f(pct(j, 95))} p99=${f(pct(j, 99))} max=${f(j[j.length - 1])}  n=${j.length}`);
@@ -165,6 +169,13 @@ async function measure(label: string, embedder: EmbeddingProvider): Promise<void
 }
 
 async function main(): Promise<void> {
+  // No store to name: this script seeds a fresh :memory: MonetCore per provider, so the space is
+  // whatever each `measure(...)` below constructs, and each one is labelled with its own embedder.
+  printSyntheticStoreHeader("one :memory: MonetCore seeded per provider");
+  // Same gate as the store-reading scripts, in the same place. This one builds its own store, so
+  // there is nothing to attribute and nothing to refuse — the call documents that rather than
+  // leaving a reader to wonder whether the check was forgotten here.
+  requireTrustableSpace(null);
   console.log(`NATIVE_SCORE_FLOOR = ${NATIVE_SCORE_FLOOR}`);
   await measure("HashingEmbeddingProvider (lexical — what CI runs)", new HashingEmbeddingProvider());
   if (process.env.MONET_EVAL_ONNX === "1") {
@@ -173,8 +184,11 @@ async function main(): Promise<void> {
     // happens to be, which is the wrong instrument for deriving a CANDIDATE model's own floor — the
     // one job that brings anyone here while a default is being changed.
     const onnx = new OnnxEmbeddingProvider({ model: process.env.MONET_EVAL_MODEL });
-    await onnx.embed("warmup"); // force model load before timing anything
-    await measure(`${onnx.modelId} (semantic — what ships)`, onnx);
+    // MONET_EVAL_MODEL is by definition a model no profile may describe, so `onnx.dim` can be the
+    // declarative 384 fallback while the checkpoint embeds wider. Keep the warmup vector and report
+    // the width this run actually produced.
+    const warmup = await onnx.embed("warmup"); // force model load before timing anything
+    await measure(`${onnx.modelId} (semantic — what ships)`, onnx, warmup.length);
   } else {
     console.log("\n(set MONET_EVAL_ONNX=1 to also measure the SHIPPING semantic space — the one the floor is calibrated for)");
   }

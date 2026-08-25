@@ -52,6 +52,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
+import { printEmbedderHeader, printStoreHeader, printStoredOnlySection, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 const DB = process.env.PROBE_DB!;
 const JUNK = [
@@ -75,12 +76,21 @@ const q = (xs: number[], p: number) => (xs.length === 0 ? NaN : [...xs].sort((a,
 
 async function main() {
   const db = new Database(DB, { readonly: true });
+  // ONE VIEW for the header and the data it describes: without this, a preparation
+  // committing between these reads yields a mixture no single space explains. See
+  // beginStoreReadSnapshot.
+  beginStoreReadSnapshot(db);
+  const storeSpace = printStoreHeader(db, DB);
+  // consumesStoredVectors=TRUE. The junk probes are freshly embedded, but every CANDIDATE they
+  // score against is a stored vector, and the leave-one-out half below is stored-vs-stored on
+  // both sides — so a mixed store corrupts both halves of this script.
+  requireTrustableSpace(storeSpace);
 
   // The nomination scan runs inside ONE circle. Measure the largest, which is where the blobs are.
   const circle = (db.prepare(
     `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
   ).get() as { circle: string; n: number });
-  console.log(`store=${DB}\ncircle=${circle.circle} (${circle.n} non-source concepts)\n`);
+  console.log(`circle=${circle.circle} (${circle.n} non-source concepts)\n`);
 
   // Exactly the rows scoreNativeConceptsByObservation reads: live, non-source.
   const rows = db.prepare(
@@ -89,6 +99,9 @@ async function main() {
       WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
         AND o.kind != 'source' AND c.circle = ? AND c.kind != 'source'`,
   ).all(circle.circle) as Array<{ cid: string; emb: string }>;
+  // Reads are done. Released HERE and not at db.close(): an ONNX model loads below and the run
+  // embeds for minutes, and a read snapshot held across that would pin the WAL for no purpose.
+  endStoreReadSnapshot(db);
 
   const byConcept = new Map<string, Float32Array[]>();
   for (const r of rows) {
@@ -105,9 +118,15 @@ async function main() {
 
   const { OnnxEmbeddingProvider } = await import("../src/embedding-onnx");
   const onnx: EmbeddingProvider = new OnnxEmbeddingProvider();
-  await onnx.embed("warmup");
+  const warmup = await onnx.embed("warmup"); // kept for its LENGTH — see printEmbedderHeader
   const th = onnx.recommendedThresholds;
-  console.log(`embedder=${(onnx as any).modelId}  thresholds=${JSON.stringify(th)}\n`);
+  // THIS HEADER COVERS THE JUNK SWEEP ONLY, and the leave-one-out section further down carries its
+  // own. The two halves of this script sit in different spaces: the sweep embeds fresh probes with
+  // the loaded model and scores them against STORED vectors, so a pin mismatch corrupts it; the
+  // replay compares stored vectors on both sides and is valid whatever model is loaded. One warning
+  // in front of both would be right about one and wrong about the other.
+  printEmbedderHeader(storeSpace, onnx, "against-stored-vectors", warmup.length);
+  console.log(`thresholds=${JSON.stringify(th)}\n`);
 
   // Per size bin: the distribution of best-observation cosine under OFF-TOPIC text.
   const perBin = new Map<string, number[]>(ORDER.map((b) => [b, []]));
@@ -169,6 +188,11 @@ async function main() {
   // sitting in an over-absorbed concept arguably BELONGS elsewhere — so read the STEAL DIRECTION
   // (what size wins when it is wrong) as the load-bearing number, not the raw rate.
   // ------------------------------------------------------------------------------------------
+  // The section header the split above promises. `probe` and every candidate below are stored
+  // vectors — there is no embed() call anywhere in this replay — so this half is wholly in the
+  // store's own space and the loaded model does not enter it. The junk sweep's cross-space warning,
+  // if it fired, does NOT apply to anything from here down.
+  printStoredOnlySection(storeSpace);
   const conceptIds = [...byConcept.keys()];
 
   /**

@@ -69,6 +69,7 @@
  */
 import { AmbiguousNominationError, MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider, cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
+import { printProviderIdentity, printSyntheticStoreHeader, requireTrustableSpace } from "./measure-header";
 import { resolveIncoming, type ResolutionMode, type ResolutionNomination } from "../src/resolution";
 import { STARTER_SUITE, BACKGROUND, type Seed } from "../src/eval/scenarios";
 import type { StoragePort } from "../src/storage";
@@ -168,6 +169,7 @@ async function measure(
   label: string,
   embedder: EmbeddingProvider,
   build: (core: MonetCore) => Promise<Seed[]>,
+  measuredDim?: number,
 ): Promise<void> {
   // PRODUCTION THRESHOLDS, not the eval harness's dedup-off convention: this measurement is about
   // where the bands land, so the bands have to be the real ones and the store has to consolidate.
@@ -259,6 +261,9 @@ async function measure(
     const total = incoming.length;
 
     console.log(`\n===== ${label} =====`);
+    // Four measurements run under three providers here, after one synthetic store header. The label
+    // names the scenario and the provider class; this names the SPACE the bands below were seen in.
+    printProviderIdentity(label, embedder, measuredDim);
     console.log(`thresholds  tauAttach=${thresholds.tauAttach}  tauAmbiguous=${thresholds.tauAmbiguous}`);
     console.log(`store       ${memberScores.length} observations / ${conceptCount} concepts (${(memberScores.length / conceptCount).toFixed(2)} observations per concept) after ${total} measured writes`);
     console.log(`\n1. SCORE DISTRIBUTIONS (paired, one sample per ingest that had any candidate)`);
@@ -352,15 +357,22 @@ const consolidated = async (core: MonetCore): Promise<Seed[]> => {
 };
 
 async function main(): Promise<void> {
+  // No store to name: every `measure(...)` below builds its own :memory: MonetCore, so the space is
+  // the provider each run is labelled with rather than a persisted pin.
+  printSyntheticStoreHeader("one :memory: MonetCore seeded per measurement");
+  // Same gate as the store-reading scripts, in the same place. This one builds its own store, so
+  // there is nothing to attribute and nothing to refuse — the call documents that rather than
+  // leaving a reader to wonder whether the check was forgotten here.
+  requireTrustableSpace(null);
   const lexical = "HashingEmbeddingProvider (lexical — what CI runs)";
   await measure(`A. natural ingest — ${lexical}`, new HashingEmbeddingProvider(), naturalIngest);
   await measure(`B. consolidated store — ${lexical}`, new HashingEmbeddingProvider(), consolidated);
   if (process.env.MONET_EVAL_ONNX === "1") {
     const { OnnxEmbeddingProvider } = await import("../src/embedding-onnx");
     const onnx = new OnnxEmbeddingProvider();
-    await onnx.embed("warmup"); // force model load before anything is measured
-    await measure(`A. natural ingest — ${onnx.modelId} (semantic — what ships)`, onnx, naturalIngest);
-    await measure(`B. consolidated store — ${onnx.modelId} (semantic — what ships)`, onnx, consolidated);
+    const warmup = await onnx.embed("warmup"); // force model load before anything is measured
+    await measure(`A. natural ingest — ${onnx.modelId} (semantic — what ships)`, onnx, naturalIngest, warmup.length);
+    await measure(`B. consolidated store — ${onnx.modelId} (semantic — what ships)`, onnx, consolidated, warmup.length);
   } else {
     console.log("\n(set MONET_EVAL_ONNX=1 to also measure the SHIPPING semantic space — the one the product resolves in)");
   }

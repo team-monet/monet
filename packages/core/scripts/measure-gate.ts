@@ -42,8 +42,9 @@
  * engine leaves the margin undefined when a probe yields no lexical tokens for exactly this reason.
  */
 import Database from "better-sqlite3";
-import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
+import { cosine, isZeroVector, jsonToEmb, normalizeVector } from "../src/embedding";
 import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/lexical-overlap";
+import { printStoreHeader, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const TAU = Number(process.env.TAU ?? "0.70");
@@ -52,6 +53,14 @@ const DELTAS = (process.env.DELTAS ?? "0,0.01,0.02,0.03,0.05,0.08,0.12,0.20")
   .split(",").map((s) => Number(s.trim()));
 
 const db = new Database(DB, { readonly: true });
+// ONE VIEW for the header and the data it describes: without this, a preparation
+// committing between these reads yields a mixture no single space explains. See
+// beginStoreReadSnapshot.
+beginStoreReadSnapshot(db);
+const storeSpace = printStoreHeader(db, DB);
+// consumesStoredVectors=TRUE (the default): every figure below is scored from vectors read out
+// of this store, so an unattributable one must abort before any measurement work happens.
+requireTrustableSpace(storeSpace);
 const circle = process.env.CIRCLE ?? (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' AND status!='retired' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
@@ -86,6 +95,8 @@ const contentRows = db.prepare(
     WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
       AND o.kind != 'source' AND c.kind != 'source' AND c.status != 'retired' AND c.circle = ?`,
 ).all(circle) as Array<{ oid: string; content: string }>;
+// Reads are done — release the snapshot before the handle closes.
+endStoreReadSnapshot(db);
 db.close();
 
 interface Obs { oid: string; cid: string; vecs: Float32Array[]; toks: Set<string>; whole?: Float32Array }
@@ -173,6 +184,13 @@ const best = (probe: Obs, other: Obs): number => {
  * withheld observation back into its own confirmation. recomputeNativeConceptProjection derives a
  * native concept's vector by centroiding its live observations, so the mean of the survivors is the
  * reconstruction of that same quantity.
+ *
+ * NORMALIZED, and it was not before (findings 2026-08-25 §3.1). `cosine` below is a bare dot
+ * product, so an un-normalised mean prices every `centroid` column SHORT — a mean of members that
+ * disagree is under 1.0 long, and on monet-hq's own concepts that deflation ran to ~24%. The
+ * engine's recompute carried the identical omission and now normalizes too, so this reconstruction
+ * and the quantity it reconstructs stay the same thing. Centroid columns from runs BEFORE this
+ * change are not comparable with runs after it.
  */
 const centroidWithout = (members: Obs[], excludeOid: string): Float32Array | null => {
   const vecs = members.filter((m) => m.oid !== excludeOid && m.whole !== undefined).map((m) => m.whole!);
@@ -180,7 +198,7 @@ const centroidWithout = (members: Obs[], excludeOid: string): Float32Array | nul
   const out = new Float32Array(vecs[0]!.length);
   for (const v of vecs) for (let i = 0; i < out.length; i++) out[i]! += v[i]!;
   for (let i = 0; i < out.length; i++) out[i]! /= vecs.length;
-  return out;
+  return normalizeVector(out);
 };
 
 interface Candidate { cid: string; score: number; rank: number; centroid: number }

@@ -36,6 +36,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, type EmbeddingProvider } from "../src/embedding";
+import { printEmbedderHeader, printStoreHeader, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 const DB = process.env.PROBE_DB!;
 /** Cross-concept pairs sampled on a fixed stride (no clock, no RNG). Same budget for every variant
@@ -100,6 +101,15 @@ const pctl = (xs: number[], p: number) => xs[Math.min(xs.length - 1, Math.floor(
 
 async function main() {
   const db = new Database(DB, { readonly: true });
+  // ONE VIEW for the header and the data it describes: without this, a preparation
+  // committing between these reads yields a mixture no single space explains. See
+  // beginStoreReadSnapshot.
+  beginStoreReadSnapshot(db);
+  const storeSpace = printStoreHeader(db, DB);
+  // consumesStoredVectors=FALSE: the query below selects `o.content` and no embedding column, the
+  // handle is closed before the model loads, and every vector scored is produced here from text. A
+  // mixed store cannot reach these numbers, so an unattributable one is reported and not refused.
+  requireTrustableSpace(storeSpace, false);
   const circle = (db.prepare(
     `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
   ).get() as { circle: string }).circle;
@@ -110,15 +120,21 @@ async function main() {
         AND o.kind != 'source' AND c.circle = ? AND c.kind != 'source'
       ORDER BY o.id`,
   ).all(circle) as Array<{ cid: string; content: string }>;
+  // Reads are done — release the snapshot before the handle closes.
+  endStoreReadSnapshot(db);
   db.close();
 
   const { OnnxEmbeddingProvider } = await import("../src/embedding-onnx");
   const onnx: EmbeddingProvider = new OnnxEmbeddingProvider();
-  await onnx.embed("warmup");
+  const warmup = await onnx.embed("warmup"); // kept for its LENGTH — see printEmbedderHeader
   const th = onnx.recommendedThresholds;
 
   console.log(`circle=${circle}   ${rows.length} observations, ${new Set(rows.map((r) => r.cid)).size} concepts`);
-  console.log(`embedder=${(onnx as any).modelId}  tauAttach=${th?.tauAttach}  cross-pair budget=${MAX_CROSS}\n`);
+  // BOTH SIDES ARE EMBEDDED FROM TEXT here: the query above selects `o.content` and no embedding
+  // column, and the handle is closed before the model loads. No stored vector is ever read, so the
+  // results are wholly in the loaded space — the store supplies the corpus, not the vectors.
+  printEmbedderHeader(storeSpace, onnx, "replaces-stored-vectors", warmup.length);
+  console.log(`tauAttach=${th?.tauAttach}  cross-pair budget=${MAX_CROSS}\n`);
 
   // Which (i, j) pairs to score — decided ONCE so every variant is measured on identical pairs.
   const samePairs: Array<[number, number]> = [];

@@ -53,9 +53,12 @@ const TOKEN = /[a-z0-9][a-z0-9_-]{2,}/gu;
  * Below this share of a text readable by TOKEN, a rank gap is not the quantity a lexically-blended
  * threshold was calibrated against, and any such threshold must stand down (see tauMargin).
  *
- * MEASURED, NOT PICKED. On the corpus tauMargin was derived from (monet-hq, n=1011 live
- * observations) coverage runs min 0.845, p01 0.902, p05 0.920, p50 0.955 — so every observation that
- * produced the threshold clears this bar with room. The cases it has to exclude sit far below:
+ * MEASURED, NOT PICKED. On the corpus tauMargin was derived from — monet-hq, n=1011 live
+ * observations, in the `Xenova/bge-small-en-v1.5` 384-dim space that store held BEFORE its
+ * 2026-08-24 migration to bge-m3 (naming the space, not just the corpus, is the point: see the
+ * LEXICAL_BOOST block below for what a corpus-only label cost) — coverage runs min 0.845, p01
+ * 0.902, p05 0.920, p50 0.955 — so every observation that produced the threshold clears this bar
+ * with room. The cases it has to exclude sit far below:
  * Korean scores 0.000, Korean carrying an ASCII identifier 0.200, and accented French 0.571. The
  * band between 0.571 and 0.845 is empty on both sides, and this sits inside it.
  *
@@ -143,18 +146,38 @@ export function lexicalOverlap(
  * the floor of the decision and lets the lexical arm only re-order candidates that already have
  * semantic support. A concept the embedding rejects cannot be talked into winning by vocabulary.
  *
- * THE WEIGHT WAS A PLATEAU ON THE EMBEDDERS IT WAS MEASURED ON, AND IS A PEAK ON THE ONE THAT
- * SHIPS. Measured at the shipped observation-unit overlap, argmax accuracy ran 0.5 -> 67.1%,
+ * THE WEIGHT 1.0 HOLDS IN EVERY SPACE IT HAS BEEN MEASURED IN; THE SHAPE AROUND IT VARIES BY
+ * SPACE — A PLATEAU'S START, A PEAK, OR A FLAT REGION'S TOP EDGE (all four runs below).
+ * Measured at the shipped observation-unit overlap, argmax accuracy ran 0.5 -> 67.1%,
  * 1.0 -> 72.1%, 2.0 -> 72.7%, 4.0 -> 73.2% on the then-current embedder, and 72.8 / 73.9 / 74.2 /
  * 73.3 on bge-small-en — one plateau from 1.0 upward, inside the ~1.8pt standard error at n=739.
+ * (This heading read "AND IS A PEAK ON THE ONE THAT SHIPS" until 2026-08-25; the run it rested on
+ * turned out to be a bge-small run wearing a bge-m3 label. See the next paragraph.)
  *
- * RE-MEASURED 2026-08-23 ON bge-m3 (the shipping embedder) over the live monet-hq corpus, n=788:
- * 0 -> 66.0%, 0.25 -> 71.6%, 0.5 -> 72.8%, 1.0 -> 73.9%, 2.0 -> 72.8%, 4.0 -> 72.1%. There is no
- * plateau in this space — accuracy falls monotonically above 1.0, which inverts the ordering the
- * paragraph above reports. 1.0 remains correct, but as the PEAK, not as a conservative point on a
- * flat region; do not read the plateau as licence to raise it. The zero point was never measured
- * before this: the lexical arm is worth +62 observations (66.0% -> 73.9%) and is net positive in
- * every home-concept size bin, so it earns its place — 21.8% of the residual misfiles at 1.0 are
+ * TWO RUNS, TWO SPACES — AND THE FIRST ONE WAS MISLABELLED. This block used to report the
+ * 2026-08-23 run as "RE-MEASURED ON bge-m3 (the shipping embedder)". It was not. That run reads
+ * whatever vectors the DB it is pointed at holds (scripts/measure-nomination-signals.ts imports no
+ * embedder), and monet-hq did not migrate to bge-m3 until 2026-08-24 09:51 UTC. Pointing the same
+ * script at the pre-migration snapshot reproduces every figure to the decimal, which is what
+ * settles it. Both runs, each against the space it actually read:
+ *
+ *   bge-small-en-v1.5, 384-dim, pre-migration monet-hq, 2026-08-23, n=788
+ *     0 -> 66.0%, 0.25 -> 71.6%, 0.5 -> 72.8%, 1.0 -> 73.9%, 2.0 -> 72.8%, 4.0 -> 72.1%
+ *   bge-m3:cls:q8, 1024-dim, post-migration monet-hq, 2026-08-25, n=788 (the space that SHIPS)
+ *     0 -> 72.0%, 0.25 -> 75.6%, 0.35 -> 76.3%, 0.5 -> 76.3%, 1.0 -> 76.3%, 2.0 -> 75.8%,
+ *     4.0 -> 75.1%
+ *
+ * The conclusion drawn from the mislabelled run — "there is no plateau in this space, accuracy
+ * falls monotonically above 1.0, so 1.0 is the PEAK rather than a conservative point on a flat
+ * region" — is TRUE OF bge-small AND FALSE OF bge-m3, and is retired as a statement about the
+ * shipping space. In bge-m3, 0.35, 0.5 and 1.0 all tie at 76.3%: a genuine flat region, with 1.0
+ * at its TOP edge. So 1.0 stands under both readings — the conservative-point argument that
+ * originally chose it holds again in the space that ships, and there is still no measurement above
+ * 1.0 that argues for raising it (2.0 and 4.0 fall in both spaces).
+ *
+ * The zero point was never measured before 2026-08-23: the lexical arm is worth +62 observations
+ * (66.0% -> 73.9%) on bge-small and +34 (72.0% -> 76.3%) on bge-m3, and is net positive in every
+ * home-concept size bin, so it earns its place in both — 21.8% of the residual misfiles at 1.0 are
  * won on a LOWER raw cosine, and that is the price of the gain rather than a defect to remove.
  *
  * An earlier draft of this file claimed 0.5 was optimal and that higher weights scored worse. That

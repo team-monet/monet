@@ -36,13 +36,32 @@ export interface EmbeddingThresholds {
    * without asking. A separate question from tauAttach, and the one that actually discriminates:
    * `score >= tauAttach` asks "is this similar enough", never "am I sure it is THIS one".
    *
-   * WHY A SECOND GATE RATHER THAN A HIGHER FIRST ONE. Precision of attaches is FLAT at ~74% across
-   * the whole tauAttach range (measured 0.50 -> 0.75 on the live monet-hq corpus, n=788): raising
-   * tauAttach trades correct attaches for forks without improving which concept wins. The margin
-   * does separate — among misfiles its median is 0.0335, below the p10 of 0.0346 for correct
-   * decisions. Below this bar the winner is wrong ~64% of the time, which is worse than a coin
-   * flip, so the decision is handed to the caller (see resolution.ts's ASK outcome) instead of
-   * being taken on evidence that does not identify a unique target.
+   * WHY A SECOND GATE RATHER THAN A HIGHER FIRST ONE. The margin separates where tauAttach does
+   * not: among misfiles its median is 0.0335, below the p10 of 0.0346 for correct decisions. Below
+   * this bar the winner is wrong ~64% of the time, which is worse than a coin flip, so the decision
+   * is handed to the caller (see resolution.ts's ASK outcome) instead of being taken on evidence
+   * that does not identify a unique target.
+   *
+   * THE FLATNESS ARGUMENT THAT ORIGINALLY MADE THIS CASE IS SUPERSEDED (2026-08-25). It read:
+   * "Precision of attaches is FLAT at ~74% across the whole tauAttach range (measured 0.50 -> 0.75
+   * on the live monet-hq corpus, n=788): raising tauAttach trades correct attaches for forks
+   * without improving which concept wins." That sweep is a `Xenova/bge-small-en-v1.5` 384-dim
+   * measurement — scripts/measure-attach-thresholds.ts imports no embedder and reads the store's
+   * stored vectors, and monet-hq did not migrate to bge-m3 until 2026-08-24. On bge-small it
+   * reproduces (73.9% -> 76.9%, near-flat until the top). Re-run on the bge-m3 store 2026-08-25,
+   * same script, same n=788, precision RISES across the sweep:
+   *
+   *   0.50 -> 76.3%   0.55 -> 76.3%   0.58 -> 76.3%   0.60 -> 76.3%   0.62 -> 76.2%
+   *   0.65 -> 76.9%   0.68 -> 77.9%   0.70 -> 79.6%   0.72 -> 81.3%   0.75 -> 86.2%
+   *
+   * So in the space that ships, raising tauAttach DOES buy precision — nearly 10 points of it — and
+   * "flat, therefore pointless" is no longer a reason to prefer the margin gate. What survives is
+   * the reason above, which never depended on flatness: tauAttach asks "similar enough", the margin
+   * asks "sure it is THIS one", and only the second is a statement about identity. The two are not
+   * alternatives, and no constant here moves on this measurement — but anyone reaching for the
+   * flatness claim to argue against a tauAttach change should know it was never measured in this
+   * space. (resolution.ts's ASK branch carried a copy of the same sentence — never a second
+   * measurement — and was retired with it on the same day.)
    *
    * PER-MODEL, AND NOT OPTIONAL-BY-ACCIDENT: this is a gap between two `rank` values, and `rank` is
    * `cosine * (1 + LEXICAL_BOOST * overlap)` — so it scales with the space AND with how much
@@ -285,7 +304,7 @@ export class HashingEmbeddingProvider implements EmbeddingProvider {
       for (let i = 0; i + 3 <= s.length; i++) add("t:" + s.slice(i, i + 3), 0.5);
     }
 
-    return normalize(v);
+    return normalizeVector(v);
   }
 }
 
@@ -324,7 +343,7 @@ export function blend(current: Float32Array, next: Float32Array, currentCount: n
   for (let i = 0; i < out.length; i++) {
     out[i] = (current[i] * currentCount + next[i]) / (currentCount + 1);
   }
-  return normalize(out);
+  return normalizeVector(out);
 }
 
 /**
@@ -336,10 +355,25 @@ export function blendWeighted(a: Float32Array, wa: number, b: Float32Array, wb: 
   const out = new Float32Array(a.length);
   const total = wa + wb || 1;
   for (let i = 0; i < out.length; i++) out[i] = (a[i] * wa + b[i] * wb) / total;
-  return normalize(out);
+  return normalizeVector(out);
 }
 
-function normalize(v: Float32Array): Float32Array {
+/**
+ * L2-normalize IN PLACE, returning the same array.
+ *
+ * EXPORTED because `cosine()` above is a bare dot product that asserts "both vectors are
+ * L2-normalized", and every path that persists a vector therefore owes that invariant. It was
+ * module-private, so a caller outside this file that built a vector arithmetically — the concept
+ * centroid in engine.ts's recomputeNativeConceptProjection — could not honour it and wrote a
+ * short vector that every centroid comparison then read as a low cosine.
+ *
+ * A ZERO VECTOR STAYS ZERO (`mag || 1` divides by 1, not by 0). That is load-bearing, not an
+ * accident: an all-zero embedding is the PLACEHOLDER isZeroVector exists to detect, and scaling it
+ * to unit length would turn a "not measured" into a measurement. Callers relying on that contract:
+ * HashingEmbeddingProvider.embed (a text that tokenizes to nothing), and the concept centroid of a
+ * concept whose every live observation is still a placeholder.
+ */
+export function normalizeVector(v: Float32Array): Float32Array {
   let mag = 0;
   for (let i = 0; i < v.length; i++) mag += v[i] * v[i];
   mag = Math.sqrt(mag) || 1;

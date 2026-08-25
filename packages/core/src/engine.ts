@@ -46,6 +46,7 @@ import {
   blendWeighted,
   embToJson,
   jsonToEmb,
+  normalizeVector,
 } from "./embedding";
 export { EmbedderOutputDimensionError, EmbedderOutputNonFiniteError } from "./embedding";
 import {
@@ -14598,6 +14599,17 @@ export class MonetCore {
       for (const vector of vectors) sum += vector[d] ?? 0;
       centroid[d] = sum / vectors.length;
     }
+    // NORMALIZE, like every other writer of this column. An arithmetic mean of unit vectors is
+    // SHORT whenever its members disagree — two at 60° average to 0.87 — and `cosine()` is a bare
+    // dot product, so a short centroid deflates every read of it: nominateByObservation's
+    // `centroidScore` against tauAmbiguous, and rankByCentroid's edge-neighbour scan. The direction
+    // is right and the length is not, which is the failure mode that reads as a confident low score
+    // rather than as an error. `create` (the provider's own output), `attach` (blend) and
+    // mergeConceptInto (blendWeighted) all normalize; this path was the only one that could not,
+    // because the normalizer was module-private in embedding.ts until it was exported for this.
+    // A concept whose every live observation is still a zero PLACEHOLDER stays zero — see
+    // normalizeVector's `mag || 1` — so isZeroVector keeps meaning "not measured" here.
+    normalizeVector(centroid);
     const sessions = new Set(observations.map((o) => o.session_id).filter((id): id is string => !!id));
     const evidenceConfidence = Math.min(1, 0.6 + Math.max(0, sessions.size - 1) * 0.1 + (contradictionStats.resolved_count ?? 0) * 0.2);
     const confidence = hasOpen ? Math.min(0.5, evidenceConfidence) : evidenceConfidence;

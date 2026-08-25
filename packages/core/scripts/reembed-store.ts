@@ -17,11 +17,43 @@
  * govern it, before anyone commits to a pin. Point it at a copy.
  */
 import Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
+import { acquireExclusiveWriteLock, publishFixtureMarker, releaseExclusiveWriteLock } from "./fixture-lock";
 import { embToJson } from "../src/embedding";
 import { OnnxEmbeddingProvider } from "../src/embedding-onnx";
 
 const DB = process.env.MONET_DB!;
 const MODEL = process.env.MODEL!;
+
+/*
+ * "POINT IT AT A COPY" WAS ONLY EVER PROSE. This script rewrites every observation and segment
+ * vector and now also normalizes `sync_meta.applying_remote` — the second of which is a sync-visible
+ * setting, not just a vector. Both are catastrophic on a real store and neither was guarded by
+ * anything but the sentence in the header comment above.
+ *
+ * The refusal is a path check, which is a heuristic and says so: it catches the standard location
+ * (`~/.monet/...`) and nothing else. It is a guardrail against the obvious slip, not a proof of
+ * scratch-ness — the contract that this is a disposable copy still rests on the operator.
+ *
+ * BOTH SEPARATORS, AND CASE-FOLDED. A guard that only knows `/` waves through
+ * `C:\Users\me\.monet\monet.db` — the very path it exists to stop, on the one platform where the
+ * operator is least likely to notice. Windows paths are also case-insensitive, so `.MONET\` must
+ * match too. Backslashes are folded to forward slashes and the whole path lowercased before the
+ * test, which costs nothing and removes the platform from the question.
+ */
+if (DB === undefined || DB.trim() === "") {
+  console.error("MONET_DB is required: point it at a scratch COPY of the store, never the live one.");
+  process.exit(1);
+}
+if (/(^|\/)\.monet\//.test(DB.replace(/\\/g, "/").toLowerCase())) {
+  console.error(
+    `Refusing to prepare '${DB}': it is inside a .monet directory, which is where the LIVE store ` +
+    `lives. This script rewrites every vector and enables the copy's sync triggers — both are ` +
+    `destructive. Back the store up first (sqlite3 <store> \".backup '/tmp/copy.db'\") and point ` +
+    `MONET_DB at the copy.`,
+  );
+  process.exit(1);
+}
 /*
  * POOLING and DTYPE are part of the candidate SPACE, not decoration on the model id: a checkpoint
  * pooled the way it was not trained, or loaded at a quantized precision, produces vectors a measured
@@ -30,14 +62,149 @@ const MODEL = process.env.MODEL!;
  */
 const POOLING = process.env.POOLING as "mean" | "cls" | undefined;
 const DTYPE = process.env.DTYPE;
+/**
+ * THIS RUN'S OWNERSHIP OF THE MARKER IT OPENS. Minted once per process and verified at publish
+ * time — see the completion statement for the race it closes. Uniqueness is all that is asked of
+ * it; it names no space and is never read by the header.
+ */
+const RUN_TOKEN = randomUUID();
 
 async function main(): Promise<void> {
   const db = new Database(DB);
   const provider = new OnnxEmbeddingProvider({ model: MODEL, dim: Number(process.env.DIM) || undefined, pooling: POOLING, dtype: DTYPE });
   const warmup = await provider.embed("warmup");
 
-  const segs = db.prepare(`SELECT observation_id, segment_index, content FROM observation_segments`)
-    .all() as Array<{ observation_id: string; segment_index: number; content: string }>;
+  /*
+   * PROVENANCE, WRITTEN INTO THE COPY — the durable half of the note above.
+   *
+   * That note fixed the LOG so a run says which space it produced. A log scrolls away; the .db file
+   * is what a calibration script opens days later, and it carries no trace of this run at all. Width
+   * cannot supply one: swapping one 384-dim model for another, or re-running the SAME model at a
+   * different pooling or dtype, rewrites every vector and changes NO observable property of the
+   * file. `sync_meta` still names the old pin, the concept vectors are still in the old space, and a
+   * header sampling widths reports a tidy, uniform, WRONG answer. The only fix is for the run to say
+   * so in the copy, which is what this row is.
+   *
+   * TWO-PHASE, AND OPENED BEFORE THE FIRST VECTOR MOVES. Publishing only on success is what the
+   * first version did, and it made an interruption invisible in the worst possible way: a rerun that
+   * dies partway leaves the PREVIOUS run's row standing over a store that is now half one space and
+   * half another, and the row reads as authoritative. Same-width swaps evade even the dimension
+   * check, so nothing anywhere would notice. The engine's own `embedder_migration` table solves this
+   * with a sentinel — present means interrupted, absent means completed (findings §1) — and this is
+   * that idea shaped for a row that must SURVIVE completion: `completed_at` NULL means the
+   * preparation is still running or died, and the vectors are a mix that no identity describes.
+   *
+   * ONE ROW, REPLACED ON RE-RUN: the last preparation is the state of the file, and a history of
+   * superseded preparations would just be another thing to read wrong.
+   *
+   * THIS SCRIPT ONLY EVER TOUCHES THE COPY IT WAS POINTED AT — now enforced rather than asserted:
+   * see the `.monet/` refusal at the top of the file, added when the preparation started writing
+   * `sync_meta` as well as vectors.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS reembed_provenance (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      candidate_model_id TEXT,
+      requested_model TEXT NOT NULL,
+      pooling TEXT,
+      dtype TEXT,
+      measured_dim INTEGER NOT NULL,
+      populations TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      rows_max_at INTEGER,
+      run_token TEXT NOT NULL
+    );
+  `);
+  db.prepare(
+    `INSERT INTO reembed_provenance
+       (singleton, candidate_model_id, requested_model, pooling, dtype, measured_dim, populations,
+        started_at, completed_at, run_token)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+     ON CONFLICT(singleton) DO UPDATE SET
+       candidate_model_id = excluded.candidate_model_id, requested_model = excluded.requested_model,
+       pooling = excluded.pooling, dtype = excluded.dtype, measured_dim = excluded.measured_dim,
+       populations = excluded.populations, started_at = excluded.started_at,
+       -- a previous run's completion never carries over onto this one, and the token that
+       -- authorises publishing becomes THIS run's
+       completed_at = NULL, run_token = excluded.run_token`,
+  ).run(
+    // NULL, not a fabricated id, when the checkpoint is off-profile: modelId is undefined exactly
+    // when nothing names this space, and `requested_model` still records what was asked for.
+    provider.modelId ?? null,
+    MODEL,
+    POOLING ?? null,
+    DTYPE ?? null,
+    warmup.length,
+    // What this preparation did to the copy, in the copy. It used to end "concepts and sync_meta
+    // UNTOUCHED" — no longer true once the run normalizes applying_remote, so the record says so.
+    "observations+segments where kind != 'source'; concept vectors and the embedder pin UNTOUCHED; " +
+      "sync_meta.applying_remote normalized to 0 so this copy's sync triggers detect later writes",
+    Date.now(),
+    RUN_TOKEN,
+  );
+
+  /*
+   * EVERYTHING FROM HERE TO THE COMMIT HAPPENS UNDER ONE WRITE LOCK — see scripts/fixture-lock.ts
+   * for the contract and why BEGIN IMMEDIATE rather than locking_mode=EXCLUSIVE.
+   *
+   * THE OPENING MARKER IS DELIBERATELY OUTSIDE IT, committed just above. If it were inside, a
+   * process killed mid-run would roll it back along with the rewrites and the copy would read as an
+   * ordinary un-prepared store — losing the one signal the two-phase marker exists to give. Outside,
+   * an interrupted run leaves `completed_at` NULL and the header says so.
+   *
+   * THE POPULATION SNAPSHOT IS INSIDE IT, and that is the whole reason the lock starts here rather
+   * than after the SELECTs. Reading the row lists before taking the lock leaves a window in which
+   * another writer can INSERT an observation: the snapshot would not contain it, so this run would
+   * never rewrite it, and the baseline below would absorb its timestamp — a row in the old space,
+   * inside a fixture certified as entirely in the new one, with nothing left to detect it. Taking
+   * the lock first means every row that exists is in the snapshot and every row in the snapshot is
+   * rewritten.
+   */
+  acquireExclusiveWriteLock(db, "re-embedding this copy");
+
+  /*
+   * NORMALIZE THE COPY'S SYNC TRIGGERS — the structural close of a gap no timestamp rule could.
+   *
+   * `applying_remote` gates every sync trigger (`WHEN ... (SELECT applying_remote FROM sync_meta) = 0`,
+   * engine.ts). The live store has it LATCHED AT 1 (findings §3.2), so every `.backup` copy inherits
+   * a store whose triggers are OFF — and with them off, `updated_at` is not maintained at all. A
+   * post-preparation UPDATE then leaves the row's old timestamp in place, and a same-second INSERT
+   * lands on the truncated `unixepoch() * 1000` default. Both sit at or below the recorded baseline,
+   * so both escape the `>` comparison, and pinned-space rows mix into the candidate population with
+   * nothing anywhere to notice.
+   *
+   * Another timestamp heuristic cannot fix that — the timestamps are simply not being written. What
+   * fixes it is turning the writer back on. The preparation owns this copy (it is scratch by the
+   * contract enforced above), enabling triggers on a throwaway file has no sync consequence, and
+   * once on, the trigger body's `MAX(last_mutation_at + 1, <now>)` is a MONOTONIC counter: every
+   * later engine write — UPDATE via sync_observations_update, INSERT via sync_observations_insert,
+   * both of which stamp `updated_at` from that counter — lands strictly above any baseline read
+   * before it, to the millisecond, regardless of clock granularity.
+   *
+   * `sync_meta` carries no trigger of its own (engine.ts installs them on concepts, observations,
+   * circle_aliases, contradictions, first_block and sessions), so this write does not self-fire.
+   * It happens BEFORE the rewrites so that this run's own writes are trigger-stamped too, which is
+   * exactly what makes the baseline below contain them.
+   *
+   * ONE RESIDUAL, STATED RATHER THAN GLOSSED: the INSERT trigger is gated `WHEN NEW.sync_writer IS
+   * NULL`, and the graft path supplies `sync_writer` explicitly. A row arriving by SYNC therefore
+   * still escapes the counter. Sync into a scratch measurement copy is not a thing that happens by
+   * design, but it is not impossible, and the PREPARE -> MEASURE -> DISCARD contract remains the
+   * outer guarantee.
+   */
+  db.prepare(`UPDATE sync_meta SET applying_remote = 0 WHERE singleton = 1`).run();
+
+  // NATIVE-ONLY ON BOTH POPULATIONS. The observation query has always filtered `kind != 'source'`;
+  // the segment query did not, so a prepped copy came out in a THIRD state nobody described — source
+  // observations on the old model, their own segments on the new one. Aligning them means the
+  // provenance marker above can state what was rewritten in one sentence and have it be true.
+  const segs = db.prepare(
+    `SELECT s.observation_id AS observation_id, s.segment_index AS segment_index, s.content AS content
+       FROM observation_segments s
+       JOIN observations o ON o.id = s.observation_id
+      WHERE o.kind != 'source'`,
+  ).all() as Array<{ observation_id: string; segment_index: number; content: string }>;
   const obs = db.prepare(`SELECT id, content FROM observations WHERE kind != 'source'`)
     .all() as Array<{ id: string; content: string }>;
   // THE EFFECTIVE SPACE, not the requested model (Codex review, PR #178). A copy written with
@@ -51,21 +218,82 @@ async function main(): Promise<void> {
       + `[pooling=${POOLING ?? "profile default"}, dtype=${DTYPE ?? "profile default"}, dim=${warmup.length}]`,
   );
 
+  // No per-row `db.transaction(...)` any more: the enclosing lock IS the transaction, and wrapping
+  // each row would only add a savepoint per write.
   const updSeg = db.prepare(`UPDATE observation_segments SET embedding = ? WHERE observation_id = ? AND segment_index = ?`);
   let i = 0;
   for (const s of segs) {
     const v = embToJson(await provider.embed(s.content));
-    db.transaction(() => updSeg.run(v, s.observation_id, s.segment_index))();
+    updSeg.run(v, s.observation_id, s.segment_index);
     if (++i % 500 === 0) console.log(`  segments ${i}/${segs.length}`);
   }
   const updObs = db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`);
   i = 0;
   for (const o of obs) {
     const v = embToJson(await provider.embed(o.content));
-    db.transaction(() => updObs.run(v, o.id))();
+    updObs.run(v, o.id);
     if (++i % 500 === 0) console.log(`  observations ${i}/${obs.length}`);
   }
+  /*
+   * PHASE 2 — publish, WITH THE OBSERVED ROW-WRITE BASELINE.
+   *
+   * `rows_max_at` is the newest row timestamp AS IT STANDS RIGHT NOW, read after this run's own
+   * writes have landed. The header later invalidates the fixture when the current max EXCEEDS this
+   * value, which is a comparison of one observed number against another — no clock, no precision
+   * assumption, no arithmetic relating two different time sources.
+   *
+   * IT HAS TO BE OBSERVED, because THIS SCRIPT'S OWN WRITES MOVE IT. On a healthy copy
+   * (`applying_remote = 0`) the `UPDATE observations SET embedding = ...` above fires
+   * `sync_observations_update`, whose body advances `sync_meta.last_mutation_at` to now and then
+   * stamps `updated_at` from it — so every row this run touched carries a timestamp from moments
+   * ago. Comparing that against a wall-clock cutoff taken here declares the fixture stale the
+   * instant it is built. Recording the baseline instead subtracts this run's own footprint exactly:
+   * what it wrote is in the number, so only what someone ELSE writes can exceed it.
+   *
+   * The trigger is also what makes a LATER engine write detectable to the millisecond. Its
+   * `MAX(last_mutation_at + 1, <now>)` is monotonic by construction, so the next engine insert or
+   * update stamps strictly above this baseline even inside the same second — which a second-
+   * granularity `created_at` alone could not promise.
+   */
+  const rowsMaxAt = (db.prepare(
+    `SELECT MAX(MAX(created_at), MAX(updated_at)) AS t FROM observations WHERE kind != 'source'`,
+  ).get() as { t: number | null }).t;
+
+  /*
+   * PUBLISH ONLY ONTO OUR OWN MARKER — the one gap the write lock cannot close.
+   *
+   * The opening marker is committed BEFORE the lock, deliberately, so an interrupted run stays
+   * visible as one. That leaves a window: two preparations starting together both run their phase-1
+   * INSERT, and the second's `ON CONFLICT DO UPDATE` overwrites the first's identity columns —
+   * candidate model, pooling, dtype, width, all of it. Only then does one of them win the lock and
+   * rewrite. Its completion used to be `SET completed_at = ?, rows_max_at = ? WHERE singleton = 1`,
+   * which touches neither identity nor ownership: it would stamp "valid" onto the OTHER run's
+   * description of a store this run had just written with a different model. A fixture that passes
+   * every check while naming the wrong model is the exact failure this whole file exists to prevent.
+   *
+   * The token makes ownership checkable. It is written with the opening marker and verified here,
+   * under the lock, as part of the publishing statement itself — so there is no read-then-write race
+   * of its own. Zero rows updated means someone else's marker is in place, and the honest response
+   * is to publish nothing and fail: the rewrites roll back with the uncommitted transaction, the
+   * loser's incomplete marker remains, and the copy reads as an interrupted preparation, which it is.
+   */
+  const published = publishFixtureMarker(db, RUN_TOKEN, Date.now(), rowsMaxAt);
+  if (!published.published) {
+    throw new Error(
+      `Another preparation raced this one: the provenance marker in this copy is no longer the one ` +
+      `this run opened (run_token ${RUN_TOKEN} matched ${published.changes} rows). Nothing has been ` +
+      `published and this run's rewrites are being rolled back, so the copy is not describable by ` +
+      `either run — rebuild it, with one preparation at a time.`,
+    );
+  }
+
+  // STILL UNDER THE LOCK for all three of the statements above, which is what makes the baseline
+  // mean anything: no writer could have committed between the last rewrite, the MAX that reads it,
+  // and the marker that records it. Releasing publishes all of it at once. Reached only on the
+  // success path — the throw above leaves the transaction uncommitted on purpose.
+  releaseExclusiveWriteLock(db);
+
   db.close();
-  console.log(`done`);
+  console.log(`done — provenance recorded in reembed_provenance (concepts and the pin are unchanged)`);
 }
 void main();

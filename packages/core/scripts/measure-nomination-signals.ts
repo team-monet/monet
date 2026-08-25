@@ -29,9 +29,18 @@
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
 import { extractEntities } from "../src/extract-entities";
+import { printStoreHeader, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
+// ONE VIEW for the header and the data it describes: without this, a preparation
+// committing between these reads yields a mixture no single space explains. See
+// beginStoreReadSnapshot.
+beginStoreReadSnapshot(db);
+const storeSpace = printStoreHeader(db, DB);
+// consumesStoredVectors=TRUE (the default): every figure below is scored from vectors read out
+// of this store, so an unattributable one must abort before any measurement work happens.
+requireTrustableSpace(storeSpace);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
@@ -50,6 +59,8 @@ const segRows = db.prepare(
     WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
       AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?`,
 ).all(circle) as Array<{ oid: string; emb: string }>;
+// Reads are done — release the snapshot before the handle closes.
+endStoreReadSnapshot(db);
 db.close();
 
 const TOKEN = /[a-z0-9][a-z0-9_-]{2,}/gu;

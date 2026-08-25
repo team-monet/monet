@@ -34,9 +34,23 @@
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
 import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/lexical-overlap";
+import { printEmbedderHeader, printStoreHeader, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
+// ONE VIEW for the header and the data it describes: without this, a preparation
+// committing between these reads yields a mixture no single space explains. See
+// beginStoreReadSnapshot.
+beginStoreReadSnapshot(db);
+const storeSpace = printStoreHeader(db, DB);
+// UNCONDITIONAL, INCLUDING THE MODEL PATH — same reason as measure-observation-recall.ts. The swap
+// loop rewrites every `whole`/`segs` VALUE, but `observations` above was already filtered to rows
+// holding a nonzero stored whole vector AND at least one stored segment, and the swap iterates that
+// filtered list. Membership is stored state. On a store whose official migration was interrupted,
+// the migrated rows have had their segments deleted (engine.ts, migrateEmbeddings) and would be
+// silently excluded, turning a "replaces everything" run into a measurement of whatever the
+// migration had not yet reached. Refuse instead.
+requireTrustableSpace(storeSpace);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
@@ -55,6 +69,8 @@ const segRows = db.prepare(
     WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
       AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?`,
 ).all(circle) as Array<{ oid: string; emb: string; content: string }>;
+// Reads are done — release the snapshot before the handle closes.
+endStoreReadSnapshot(db);
 db.close();
 
 const segTextByObs = new Map<string, string[]>();
@@ -154,7 +170,11 @@ async function main(): Promise<void> {
   if (swapModel !== undefined) {
     const { OnnxEmbeddingProvider: Swap } = await import("../src/embedding-onnx");
     const alt: EmbeddingProvider = new Swap({ model: swapModel });
-    await alt.embed("warmup");
+    // Kept for its LENGTH: MODEL names an arbitrary checkpoint and `alt.dim` may be the 384 fallback.
+    const warmup = await alt.embed("warmup");
+    // The loop directly below rewrites `whole` and `segs` for every observation, so no stored vector
+    // survives into the scoring — a candidate-model run, not a cross-space comparison.
+    printEmbedderHeader(storeSpace, alt, "replaces-stored-vectors", warmup.length);
     console.log(`re-embedding with ${swapModel}...`);
     for (const o of observations) {
       o.whole = await alt.embed(o.content);
@@ -169,7 +189,13 @@ async function main(): Promise<void> {
 
   const { OnnxEmbeddingProvider } = await import("../src/embedding-onnx");
   const onnx: EmbeddingProvider = swapped ?? new OnnxEmbeddingProvider();
-  if (swapped === null) await onnx.embed("warmup");
+  // Loaded here rather than at startup — the "full observation" shape above needs no model at all —
+  // so the space it embeds cues in is reported here, at the point it becomes real. Reached only when
+  // no swap happened, which means every candidate below is still a STORED vector.
+  if (swapped === null) {
+    const warmup = await onnx.embed("warmup");
+    printEmbedderHeader(storeSpace, onnx, "against-stored-vectors", warmup.length);
+  }
   const cache = new Map<string, Float32Array>();
   await run("opening sentence", async (o) => {
     const text = opening(o.content);

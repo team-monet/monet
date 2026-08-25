@@ -36,8 +36,20 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
+import { printStoreHeader, printStoredOnlySection, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
-const DB = process.env.MONET_DB ?? `${process.env.HOME}/.monet/monet.db`;
+/*
+ * NO DEFAULT. This script used to fall back to `~/.monet/monet.db` when MONET_DB was unset — the
+ * LIVE store, read by a run that takes minutes while sessions write to it underneath. It was the
+ * only one of the twelve that did. A measurement never silently reads the live store: the cost of
+ * forgetting the variable should be a one-line refusal, not a plausible set of numbers taken from a
+ * moving target.
+ */
+const DB = process.env.MONET_DB;
+if (DB === undefined || DB.trim() === "") {
+  console.error("MONET_DB is required: point it at a COPY of the store, never the live one.");
+  process.exit(1);
+}
 const EDGE_CANDIDATES = (process.env.EDGE_MINS ?? "0.40,0.45,0.50,0.55,0.60,0.65,0.70")
   .split(",").map((s) => Number(s.trim()));
 const TAU_ATTACH = Number(process.env.TAU_ATTACH ?? 0.78);
@@ -45,11 +57,23 @@ const AMBIG_CANDIDATES = (process.env.TAU_AMBIGS ?? "0.40,0.50,0.55,0.60,0.65,0.
   .split(",").map((s) => Number(s.trim()));
 
 const db = new Database(DB, { readonly: true });
-const pin = (db.prepare(`SELECT embedder_model_id AS m FROM sync_meta`).get() as { m: string } | undefined)?.m;
+// This script's own db=/pin= header was the only one of the twelve that recorded the space at all;
+// it now goes through the shared printer so every measure-* run reports it in one format, and so a
+// sampled dimension travels beside the pin. The dimension is one row per population (LIMIT 1), not
+// a census: it separates 384 from 1024 on a uniform store and cannot see a store whose widths are
+// mixed within a table — `monet doctor` owns that.
+// ONE VIEW for the header and the data it describes: without this, a preparation
+// committing between these reads yields a mixture no single space explains. See
+// beginStoreReadSnapshot.
+beginStoreReadSnapshot(db);
+const storeSpace = printStoreHeader(db, DB);
+// consumesStoredVectors=TRUE (the default): every figure below is scored from vectors read out
+// of this store, so an unattributable one must abort before any measurement work happens.
+requireTrustableSpace(storeSpace);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
-console.log(`db=${DB}\npin=${pin ?? "(none)"}  circle=${circle}  tauAttach=${TAU_ATTACH}\n`);
+console.log(`circle=${circle}  tauAttach=${TAU_ATTACH}\n`);
 
 const pct = (n: number, d: number): string => `${((100 * n) / Math.max(d, 1)).toFixed(1)}%`;
 const quantile = (sorted: number[], q: number): number =>
@@ -105,6 +129,10 @@ for (const [obsId, obsSegs] of byObs) {
 }
 forkScores.sort((a, b) => a - b);
 
+// THIS SCRIPT SCORES TWO DIFFERENT POPULATIONS, and on a reembed-prepped copy they are in two
+// different spaces — segments rewritten to the candidate, concepts left on the pin. Each section
+// therefore names its own, rather than the run carrying one identity that is right about half of it.
+printStoredOnlySection(storeSpace, "observations");
 console.log(`===== tauAmbiguous — ${byObs.size} observations replayed, ${attached} attach, ${forkScores.length} FORK =====`);
 console.log(`fork argmax score:  min=${forkScores[0]?.toFixed(4)}  p05=${quantile(forkScores, 0.05).toFixed(4)}  ` +
   `p25=${quantile(forkScores, 0.25).toFixed(4)}  median=${quantile(forkScores, 0.5).toFixed(4)}  max=${forkScores.at(-1)?.toFixed(4)}`);
@@ -124,6 +152,10 @@ for (const row of db.prepare(
   if (!isZeroVector(v)) concepts.push({ id: row.id, v });
 }
 
+// Both populations are loaded — segments above, concepts here. This script imports no embedder,
+// so the snapshot spans only reads and the arithmetic between them.
+endStoreReadSnapshot(db);
+
 const pairScores: number[] = [];
 const degrees = new Map<number, Map<string, number>>(EDGE_CANDIDATES.map((t) => [t, new Map()]));
 for (let i = 0; i < concepts.length; i++) {
@@ -142,6 +174,10 @@ for (let i = 0; i < concepts.length; i++) {
 pairScores.sort((a, b) => a - b);
 const totalPairs = pairScores.length;
 
+// The concept side. `edgeSimMin` is derived from concept-pair cosines, and concept vectors are the
+// population reembed-store.ts leaves alone — so on a prepped copy this band is measured in the
+// PINNED space while everything above it is in the candidate's.
+printStoredOnlySection(storeSpace, "concepts");
 console.log(`\n===== edgeSimMin — ${concepts.length} active concepts, ${totalPairs} pairs =====`);
 console.log(`concept-pair cosine:  min=${pairScores[0]?.toFixed(4)}  p25=${quantile(pairScores, 0.25).toFixed(4)}  ` +
   `median=${quantile(pairScores, 0.5).toFixed(4)}  p95=${quantile(pairScores, 0.95).toFixed(4)}  max=${pairScores.at(-1)?.toFixed(4)}`);
