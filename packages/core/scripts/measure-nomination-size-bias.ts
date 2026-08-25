@@ -52,7 +52,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
-import { printEmbedderHeader, printStoreHeader, printStoredOnlySection } from "./measure-header";
+import { printEmbedderHeader, printStoreHeader, printStoredOnlySection, requireTrustableSpace } from "./measure-header";
 
 const DB = process.env.PROBE_DB!;
 const JUNK = [
@@ -77,6 +77,8 @@ const q = (xs: number[], p: number) => (xs.length === 0 ? NaN : [...xs].sort((a,
 async function main() {
   const db = new Database(DB, { readonly: true });
   const storeSpace = printStoreHeader(db, DB);
+  // ABORT before any measurement work: an unattributable store must not produce a figure at all.
+  requireTrustableSpace(storeSpace);
 
   // The nomination scan runs inside ONE circle. Measure the largest, which is where the blobs are.
   const circle = (db.prepare(

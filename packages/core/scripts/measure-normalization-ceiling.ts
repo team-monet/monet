@@ -36,7 +36,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, type EmbeddingProvider } from "../src/embedding";
-import { printEmbedderHeader, printStoreHeader } from "./measure-header";
+import { printEmbedderHeader, printStoreHeader, requireTrustableSpace } from "./measure-header";
 
 const DB = process.env.PROBE_DB!;
 /** Cross-concept pairs sampled on a fixed stride (no clock, no RNG). Same budget for every variant
@@ -102,6 +102,8 @@ const pctl = (xs: number[], p: number) => xs[Math.min(xs.length - 1, Math.floor(
 async function main() {
   const db = new Database(DB, { readonly: true });
   const storeSpace = printStoreHeader(db, DB);
+  // ABORT before any measurement work: an unattributable store must not produce a figure at all.
+  requireTrustableSpace(storeSpace);
   const circle = (db.prepare(
     `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
   ).get() as { circle: string }).circle;

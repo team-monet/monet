@@ -32,7 +32,7 @@
  */
 import { MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider, cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
-import { printProviderIdentity, printSyntheticStoreHeader } from "./measure-header";
+import { printProviderIdentity, printSyntheticStoreHeader, requireTrustableSpace } from "./measure-header";
 import { NATIVE_SCORE_FLOOR, nativeScoreFloorOf } from "../src/retrieval";
 import { STARTER_SUITE, BACKGROUND } from "../src/eval/scenarios";
 import type { StoragePort } from "../src/storage";
@@ -172,6 +172,10 @@ async function main(): Promise<void> {
   // No store to name: this script seeds a fresh :memory: MonetCore per provider, so the space is
   // whatever each `measure(...)` below constructs, and each one is labelled with its own embedder.
   printSyntheticStoreHeader("one :memory: MonetCore seeded per provider");
+  // Same gate as the store-reading scripts, in the same place. This one builds its own store, so
+  // there is nothing to attribute and nothing to refuse — the call documents that rather than
+  // leaving a reader to wonder whether the check was forgotten here.
+  requireTrustableSpace(null);
   console.log(`NATIVE_SCORE_FLOOR = ${NATIVE_SCORE_FLOOR}`);
   await measure("HashingEmbeddingProvider (lexical — what CI runs)", new HashingEmbeddingProvider());
   if (process.env.MONET_EVAL_ONNX === "1") {

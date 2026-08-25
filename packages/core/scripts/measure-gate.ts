@@ -44,7 +44,7 @@
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, normalizeVector } from "../src/embedding";
 import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/lexical-overlap";
-import { printStoreHeader } from "./measure-header";
+import { printStoreHeader, requireTrustableSpace } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const TAU = Number(process.env.TAU ?? "0.70");
@@ -53,7 +53,9 @@ const DELTAS = (process.env.DELTAS ?? "0,0.01,0.02,0.03,0.05,0.08,0.12,0.20")
   .split(",").map((s) => Number(s.trim()));
 
 const db = new Database(DB, { readonly: true });
-printStoreHeader(db, DB);
+const storeSpace = printStoreHeader(db, DB);
+// ABORT before any measurement work: an unattributable store must not produce a figure at all.
+requireTrustableSpace(storeSpace);
 const circle = process.env.CIRCLE ?? (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' AND status!='retired' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;

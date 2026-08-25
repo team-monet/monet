@@ -45,7 +45,7 @@
  */
 import { MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider } from "../src/embedding";
-import { printProviderIdentity, printSyntheticStoreHeader } from "./measure-header";
+import { printProviderIdentity, printSyntheticStoreHeader, requireTrustableSpace } from "./measure-header";
 import type { StoragePort } from "../src/storage";
 
 const CIRCLE = "perf";
@@ -93,6 +93,10 @@ async function main(): Promise<void> {
   // meaning — but a timing on 256-dim hashing vectors is not a timing on 1024-dim semantic ones,
   // which is reason enough for the run to say which it was.
   printSyntheticStoreHeader(`${CONCEPTS} concepts x ${OBS_PER_CONCEPT + 1} observations`);
+  // Same gate as the store-reading scripts, in the same place. This one builds its own store, so
+  // there is nothing to attribute and nothing to refuse — the call documents that rather than
+  // leaving a reader to wonder whether the check was forgotten here.
+  requireTrustableSpace(null);
   printProviderIdentity("timings below", embedder);
   const core = new MonetCore(":memory:", {
     embedder, tauAttach: 1.1, tauAmbiguous: 1.1, // dedup off => exact shape

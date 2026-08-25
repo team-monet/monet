@@ -36,9 +36,20 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
-import { printStoreHeader, printStoredOnlySection } from "./measure-header";
+import { printStoreHeader, printStoredOnlySection, requireTrustableSpace } from "./measure-header";
 
-const DB = process.env.MONET_DB ?? `${process.env.HOME}/.monet/monet.db`;
+/*
+ * NO DEFAULT. This script used to fall back to `~/.monet/monet.db` when MONET_DB was unset — the
+ * LIVE store, read by a run that takes minutes while sessions write to it underneath. It was the
+ * only one of the twelve that did. A measurement never silently reads the live store: the cost of
+ * forgetting the variable should be a one-line refusal, not a plausible set of numbers taken from a
+ * moving target.
+ */
+const DB = process.env.MONET_DB;
+if (DB === undefined || DB.trim() === "") {
+  console.error("MONET_DB is required: point it at a COPY of the store, never the live one.");
+  process.exit(1);
+}
 const EDGE_CANDIDATES = (process.env.EDGE_MINS ?? "0.40,0.45,0.50,0.55,0.60,0.65,0.70")
   .split(",").map((s) => Number(s.trim()));
 const TAU_ATTACH = Number(process.env.TAU_ATTACH ?? 0.78);
@@ -52,6 +63,8 @@ const db = new Database(DB, { readonly: true });
 // a census: it separates 384 from 1024 on a uniform store and cannot see a store whose widths are
 // mixed within a table — `monet doctor` owns that.
 const storeSpace = printStoreHeader(db, DB);
+// ABORT before any measurement work: an unattributable store must not produce a figure at all.
+requireTrustableSpace(storeSpace);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;

@@ -19,9 +19,10 @@
  * The reader is a hand-built stub rather than a real database: these are pure functions over a
  * `prepare(...).get()` shape, and driving them with SQL would test better-sqlite3.
  */
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
-  printEmbedderHeader, printStoreHeader, printStoredOnlySection, readStoreSpace, scoredSpaceIdentity,
+  printEmbedderHeader, printStoreHeader, printStoredOnlySection, readStoreSpace,
+  requireTrustableSpace, scoredSpaceIdentity,
 } from "../../scripts/measure-header";
 
 type Row = { e: string } | { m: string | null } | Record<string, unknown> | undefined;
@@ -87,7 +88,9 @@ function stubReader(opts: {
           }
           if (sql.includes("sync_meta")) {
             if (opts.syncMetaMissing) throw new Error("no such table: sync_meta");
-            return { m: opts.pin ?? null, at: opts.pinnedAt ?? null };
+            // Default pin time sits BEFORE any marker below, so a fixture is clean unless a test
+            // deliberately moves it. `null` models a store carrying no pin timestamp at all.
+            return { m: opts.pin ?? null, at: opts.pinnedAt === undefined ? 1754000000000 : opts.pinnedAt };
           }
           // An unfiltered scan can land on a stale source row; a filtered one cannot.
           if (opts.sourceDim !== undefined && !nativeOnly(sql)) return { e: vec(opts.sourceDim) };
@@ -307,10 +310,13 @@ describe("measure-header — candidate provenance on a same-width re-embed", () 
     expect(out).toContain("pooling=cls, dtype=q8");
   });
 
-  it("warns when the marker's recorded width disagrees with the rows — something rewrote them after", () => {
+  it("a width that disagrees with the marker invalidates the fixture like anything else does", () => {
     const stale = { ...SWAP, observationDim: 1024 };
+    const space = readStoreSpace(stubReader(stale), "/tmp/swap.db");
+    expect(space.attribution).toMatchObject({ state: "fixture-invalid" });
     const out = captured(() => printStoreHeader(stubReader(stale), "/tmp/swap.db"));
-    expect(out).toMatch(/marker records a 384-dim rewrite but the observations sampled/);
+    expect(out).toMatch(/not a valid fixture — rebuild it with reembed-store\.ts/);
+    expect(out).toMatch(/384-dim rewrite but the observations sample 1024-dim/);
   });
 
   it("attributes the CONCEPT population to the pin and the OBSERVATION population to the candidate, on one store", () => {
@@ -428,88 +434,6 @@ describe("measure-header — interrupted preparation", () => {
 });
 
 /**
- * THE MARKER'S LIFETIME IS SHORTER THAN THE STORE'S.
- *
- * A completed marker describes the copy at one instant. Two ordinary things invalidate it and
- * neither touches its row: an official `migrateEmbeddings` (rewrites every vector, re-pins
- * `sync_meta`) and plain engine writes (new observations, embedded in the PINNED space). When the
- * candidate and the pin share a width, no dimension check sees either. The marker is therefore
- * dated against durable engine-side facts rather than trusted on sight.
- */
-describe("measure-header — a completed marker is dated, not trusted", () => {
-  const PREPARED_AT = 1756000060000; // the stub's completed_at
-  const BASE = {
-    pin: "Xenova/bge-small-en-v1.5",
-    conceptDim: 384,
-    observationDim: 384,
-    reembed: { candidate_model_id: "Xenova/bge-base-en-v1.5", requested_model: "Xenova/bge-base-en-v1.5", measured_dim: 384 },
-  };
-
-  it("SUPERSEDED by a later official re-pin: the pin is authoritative again, for both populations", () => {
-    // migrateEmbeddings rewrote every vector the marker described and stamped a new pin time.
-    const space = readStoreSpace(stubReader({ ...BASE, pinnedAt: PREPARED_AT + 60_000 }), "/tmp/repinned.db");
-    expect(space.attribution.state).toBe("marker-superseded");
-    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({
-      id: "Xenova/bge-small-en-v1.5", source: "pin", trustable: true,
-    });
-    expect(scoredSpaceIdentity(space, "concepts")).toMatchObject({ id: "Xenova/bge-small-en-v1.5", source: "pin" });
-
-    const out = captured(() => printStoreHeader(stubReader({ ...BASE, pinnedAt: PREPARED_AT + 60_000 }), "/tmp/repinned.db"));
-    expect(out).toMatch(/SUPERSEDED/);
-    expect(out).toMatch(/authoritative for both populations/);
-    // It must NOT still be presenting the candidate as the scored side's identity.
-    expect(out).not.toMatch(/observations \+ segments -> Xenova\/bge-base/);
-  });
-
-  it("a re-pin BEFORE the preparation does not supersede it — the marker is still the later fact", () => {
-    const space = readStoreSpace(stubReader({ ...BASE, pinnedAt: PREPARED_AT - 60_000 }), "/tmp/ok.db");
-    expect(space.attribution.state).toBe("candidate");
-    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({ id: "Xenova/bge-base-en-v1.5" });
-  });
-
-  it("PARTIAL when the engine wrote rows after the preparation — no clean candidate attribution", () => {
-    const later = { ...BASE, latestRowWriteAt: PREPARED_AT + 5_000 };
-    const space = readStoreSpace(stubReader(later), "/tmp/partial.db");
-    expect(space.attribution).toMatchObject({ state: "marker-partial", completedAt: PREPARED_AT });
-    const identity = scoredSpaceIdentity(space, "observations");
-    expect(identity.trustable).toBe(false);
-    expect(identity.id).toBeNull();
-    expect(identity.source).toBe("marker-partial");
-    expect(identity.label).toMatch(/PARTIAL/);
-
-    const out = captured(() => printStoreHeader(stubReader(later), "/tmp/partial.db"));
-    expect(out).toMatch(/WARNING: this copy carries a reembed-store\.ts marker AND has been written to since/);
-    expect(out).toMatch(/newest observation write/);
-    expect(out).toMatch(/no clean attribution for this run/);
-    // The clean two-population NOTE must not also print — the split is by TIMESTAMP here.
-    expect(out).not.toMatch(/NOTE: this copy was prepared/);
-  });
-
-  it("refuses to attribute an embedder against a PARTIAL store, naming that cause specifically", () => {
-    const space = readStoreSpace(stubReader({ ...BASE, latestRowWriteAt: PREPARED_AT + 5_000 }), "/tmp/partial.db");
-    const out = captured(() =>
-      printEmbedderHeader(space, { modelId: "Xenova/bge-base-en-v1.5", dim: 384 }, "against-stored-vectors", 384));
-    expect(out).toMatch(/REFUSING TO ATTRIBUTE/);
-    expect(out).toMatch(/WRITTEN TO AGAIN/);
-  });
-
-  it("UNVERIFIABLE when the dating signals cannot be read — unknown, not fine", () => {
-    const space = readStoreSpace(stubReader({ ...BASE, latestRowWriteAt: null }), "/tmp/unknown.db");
-    expect(space.attribution).toMatchObject({ state: "marker-unverifiable" });
-    expect(scoredSpaceIdentity(space, "observations").trustable).toBe(false);
-    const out = captured(() => printStoreHeader(stubReader({ ...BASE, latestRowWriteAt: null }), "/tmp/unknown.db"));
-    expect(out).toMatch(/could not be established/);
-    expect(out).toMatch(/An unverified marker is not a verified one/);
-  });
-
-  it("stays CANDIDATE when nothing is newer than the preparation", () => {
-    const space = readStoreSpace(stubReader(BASE), "/tmp/clean.db");
-    expect(space.attribution.state).toBe("candidate");
-    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({ id: "Xenova/bge-base-en-v1.5", trustable: true });
-  });
-});
-
-/**
  * THE ENGINE'S OWN INTERRUPTED MIGRATION — a store that reads as coherent and is not.
  *
  * `beginEmbedderMigration` inserts the `embedder_migration` sentinel and then IMMEDIATELY calls
@@ -558,7 +482,156 @@ describe("measure-header — interrupted OFFICIAL migration", () => {
     const space = readStoreSpace(stubReader({ pin: "m", observationDim: 384, migrationTableMissing: true }), "/tmp/old.db");
     expect(space.migrationInterrupted).toBeNull();
     // Unknown here degrades to the pin rather than to a STOP: an old schema predates the sentinel
-    // entirely, so its absence is genuinely uninformative rather than alarming.
+    // entirely, so its absence is genuinely uninformative rather than alarming. With NO marker there
+    // is no fixture claim to invalidate, so the pin stands on its own as it always has.
     expect(space.attribution.state).toBe("pin");
+  });
+});
+
+/**
+ * ONE INVALID STATE, MANY REASONS.
+ *
+ * A completed marker is trusted only when EVERY checkable signal is clean. Each failure below used
+ * to be its own state with its own message; they collapse here because they end in one instruction.
+ * What each test pins is that the reason survives the collapse — the state is shared, the diagnosis
+ * is not.
+ */
+describe("measure-header — fixture-invalid subsumes every way a marker stops describing the copy", () => {
+  const PREPARED_AT = 1756000060000; // the stub's completed_at
+  const STARTED_AT = 1756000000000;  // the stub's started_at
+  const BASE = {
+    pin: "Xenova/bge-small-en-v1.5",
+    conceptDim: 384,
+    observationDim: 384,
+    reembed: { candidate_model_id: "Xenova/bge-base-en-v1.5", requested_model: "Xenova/bge-base-en-v1.5", measured_dim: 384 },
+  };
+  const reasonOf = (opts: Parameters<typeof stubReader>[0]): string => {
+    const a = readStoreSpace(stubReader(opts), "/tmp/f.db").attribution;
+    expect(a.state).toBe("fixture-invalid");
+    return (a as { state: "fixture-invalid"; reason: string }).reason;
+  };
+
+  it("a pin written AT OR AFTER the preparation started invalidates — whatever wrote it", () => {
+    // migrate, adopt and backfill all stamp embedder_pinned_at and are indistinguishable afterward,
+    // so the check is on the timestamp alone. `>=` because a pin write DURING the rewrite is at
+    // least as damaging as one after it.
+    expect(reasonOf({ ...BASE, pinnedAt: STARTED_AT })).toMatch(/at or after this preparation started/);
+    expect(reasonOf({ ...BASE, pinnedAt: STARTED_AT + 1 })).toMatch(/at or after this preparation started/);
+    expect(reasonOf({ ...BASE, pinnedAt: PREPARED_AT + 60_000 })).toMatch(/migration, adopt or backfill/);
+    // Strictly before the start is the only clean case.
+    expect(readStoreSpace(stubReader({ ...BASE, pinnedAt: STARTED_AT - 1 }), "/tmp/f.db").attribution.state)
+      .toBe("candidate");
+  });
+
+  it("INCLUSIVE SECOND: a row written in the same second as completion invalidates", () => {
+    // `created_at` is `unixepoch() * 1000` — whole seconds — while completed_at carries milliseconds.
+    // A row from the same second stamps BELOW completed_at, so a `>` test would call this clean.
+    const sameSecond = 1756000060000; // floor(PREPARED_AT) exactly
+    expect(reasonOf({ ...BASE, latestRowWriteAt: sameSecond })).toMatch(/at or after the preparation completed/);
+    // One second earlier is genuinely before it.
+    expect(readStoreSpace(stubReader({ ...BASE, latestRowWriteAt: sameSecond - 1000 }), "/tmp/f.db").attribution.state)
+      .toBe("candidate");
+  });
+
+  it("still catches a plainly later write", () => {
+    expect(reasonOf({ ...BASE, latestRowWriteAt: PREPARED_AT + 5_000 })).toMatch(/the engine has written to this copy since/);
+  });
+
+  it("UNREADABILITY invalidates too — an unchecked signal is not a passed one", () => {
+    expect(reasonOf({ ...BASE, latestRowWriteAt: null })).toMatch(/no observation timestamp could be read/);
+    expect(reasonOf({ ...BASE, pinnedAt: null })).toMatch(/carries no embedder_pinned_at/);
+    expect(reasonOf({ ...BASE, syncMetaMissing: true })).toMatch(/sync_meta could not be read/);
+    expect(reasonOf({ ...BASE, migrationTableMissing: true })).toMatch(/embedder_migration sentinel could not be read/);
+  });
+
+  it("gives every one of them the SAME instruction and the same state", () => {
+    for (const opts of [
+      { ...BASE, pinnedAt: PREPARED_AT + 1 },
+      { ...BASE, latestRowWriteAt: PREPARED_AT },
+      { ...BASE, latestRowWriteAt: null },
+      { ...BASE, observationDim: 1024 },
+    ]) {
+      const space = readStoreSpace(stubReader(opts), "/tmp/f.db");
+      expect(space.attribution.state).toBe("fixture-invalid");
+      // Neither population is attributed, and both carry the one instruction.
+      for (const population of ["observations", "concepts"] as const) {
+        const identity = scoredSpaceIdentity(space, population);
+        expect(identity.trustable).toBe(false);
+        expect(identity.source).toBe("fixture-invalid");
+        expect(identity.label).toContain("not a valid fixture — rebuild it with reembed-store.ts");
+      }
+      expect(captured(() => printStoreHeader(stubReader(opts), "/tmp/f.db")))
+        .toMatch(/PREPARE -> MEASURE -> DISCARD/);
+    }
+  });
+
+  it("a CLEAN fixture still passes, and says the contract is what keeps it sound", () => {
+    const space = readStoreSpace(stubReader(BASE), "/tmp/clean.db");
+    expect(space.attribution.state).toBe("candidate");
+    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({ id: "Xenova/bge-base-en-v1.5", trustable: true });
+    const out = captured(() => printStoreHeader(stubReader(BASE), "/tmp/clean.db"));
+    expect(out).toMatch(/VALID AS OF THIS READ/);
+    // The undetectable case is stated on the PASSING path too — that is the whole point of a contract
+    // term: it governs where the check cannot reach.
+    expect(out).toMatch(/a segment rewrite leaves no timestamp to check/);
+  });
+});
+
+/**
+ * THE REFUSAL HAS TEETH.
+ *
+ * Every state above already printed a STOP, and a printed STOP is worth exactly the reader's
+ * attention — which is nil when the figure is read off the bottom of an eighteen-second run. The
+ * measurement must not happen at all.
+ */
+describe("measure-header — requireTrustableSpace aborts rather than decorating", () => {
+  const BASE = {
+    pin: "Xenova/bge-small-en-v1.5", conceptDim: 384, observationDim: 384,
+    reembed: { candidate_model_id: "Xenova/bge-base-en-v1.5", requested_model: "Xenova/bge-base-en-v1.5", measured_dim: 384 },
+  };
+  const INVALID = { ...BASE, latestRowWriteAt: 1756000065000 };
+  const MIGRATING = { pin: "m", observationDim: 384, migrationRows: 1 };
+  const INTERRUPTED = { ...BASE, reembed: { ...BASE.reembed, completed_at: null } };
+
+  afterEach(() => { delete process.env.MEASURE_ALLOW_MIXED; });
+
+  it("throws on every untrustable state, naming the state and the escape hatch", () => {
+    for (const opts of [INVALID, MIGRATING, INTERRUPTED]) {
+      const space = readStoreSpace(stubReader(opts), "/tmp/x.db");
+      expect(() => requireTrustableSpace(space)).toThrow(/Refusing to measure/);
+      expect(() => requireTrustableSpace(space)).toThrow(/MEASURE_ALLOW_MIXED=1/);
+    }
+  });
+
+  it("names the specific rebuild instruction when the fixture is merely invalid", () => {
+    const space = readStoreSpace(stubReader(INVALID), "/tmp/x.db");
+    expect(() => requireTrustableSpace(space)).toThrow(/not a valid fixture — rebuild it with reembed-store\.ts/);
+  });
+
+  it("proceeds — loudly — when MEASURE_ALLOW_MIXED=1", () => {
+    process.env.MEASURE_ALLOW_MIXED = "1";
+    const space = readStoreSpace(stubReader(INVALID), "/tmp/x.db");
+    const out = captured(() => expect(() => requireTrustableSpace(space)).not.toThrow());
+    expect(out).toMatch(/MEASURE_ALLOW_MIXED=1 — proceeding/);
+    expect(out).toMatch(/deliberately unattributed/);
+  });
+
+  it("only '1' opens the hatch — any other value still aborts", () => {
+    process.env.MEASURE_ALLOW_MIXED = "true";
+    const space = readStoreSpace(stubReader(INVALID), "/tmp/x.db");
+    expect(() => requireTrustableSpace(space)).toThrow(/Refusing to measure/);
+  });
+
+  it("passes silently for a clean fixture and for an ordinary pinned store", () => {
+    for (const opts of [BASE, { pin: "m", observationDim: 1024, conceptDim: 1024 }]) {
+      const space = readStoreSpace(stubReader(opts), "/tmp/x.db");
+      const out = captured(() => expect(() => requireTrustableSpace(space)).not.toThrow());
+      expect(out).toBe("");
+    }
+  });
+
+  it("accepts null — a script that builds its own in-memory store has nothing to refuse", () => {
+    const out = captured(() => expect(() => requireTrustableSpace(null)).not.toThrow());
+    expect(out).toBe("");
   });
 });

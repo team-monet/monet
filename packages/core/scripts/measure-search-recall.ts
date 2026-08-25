@@ -34,11 +34,13 @@
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
 import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/lexical-overlap";
-import { printEmbedderHeader, printStoreHeader } from "./measure-header";
+import { printEmbedderHeader, printStoreHeader, requireTrustableSpace } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
 const storeSpace = printStoreHeader(db, DB);
+// ABORT before any measurement work: an unattributable store must not produce a figure at all.
+requireTrustableSpace(storeSpace);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
