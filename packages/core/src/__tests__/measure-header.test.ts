@@ -58,6 +58,14 @@ function stubReader(opts: {
     /** The row-write baseline the preparation observed. Omitted => the stub's default clean value. */
     rows_max_at?: number | null;
   };
+  /** No `reembed_provenance` table at all — the ordinary un-prepared store. */
+  reembedTableAbsent?: boolean;
+  /** Table present, no marker row. */
+  reembedTableEmpty?: boolean;
+  /** Table present, written by an older build: the column-naming SELECT throws. */
+  reembedLegacyShape?: boolean;
+  /** Table present, row present, required fields NULL. */
+  reembedBadTypes?: boolean;
 }) {
   const vec = (n: number): string => JSON.stringify(new Array(n).fill(0.1));
   const nativeOnly = (sql: string): boolean => sql.includes("kind != 'source'");
@@ -66,9 +74,25 @@ function stubReader(opts: {
       return {
         get(): Row {
           if (sql.includes("reembed_provenance")) {
-            // The normal case is that this table does not exist at all, and the reader must treat
-            // that as "no candidate rewrite", not as a fault.
-            if (opts.reembed === undefined) throw new Error("no such table: reembed_provenance");
+            // Three distinguishable worlds, and the stub has to model all three or the reader's
+            // three-way classification cannot be tested. `SELECT 1 ... LIMIT 1` is the existence
+            // probe; the column-naming SELECT is what a legacy shape fails.
+            const isProbe = sql.includes("SELECT 1");
+            if (opts.reembedTableAbsent || (opts.reembed === undefined && !opts.reembedTableEmpty
+                && !opts.reembedLegacyShape && !opts.reembedBadTypes)) {
+              throw new Error("no such table: reembed_provenance");
+            }
+            if (isProbe) return {}; // table exists
+            if (opts.reembedLegacyShape) throw new Error("no such column: rows_max_at");
+            if (opts.reembedTableEmpty) return undefined;
+            if (opts.reembedBadTypes) {
+              return {
+                candidate_model_id: null, requested_model: null, pooling: null, dtype: null,
+                measured_dim: null, populations: null, started_at: null, completed_at: null, rows_max_at: null,
+              };
+            }
+            // Table present but no marker data supplied — the row-absent world, same as above.
+            if (opts.reembed === undefined) return undefined;
             return {
               candidate_model_id: opts.reembed.candidate_model_id,
               requested_model: opts.reembed.requested_model,
@@ -604,6 +628,50 @@ describe("measure-header — fixture-invalid subsumes every way a marker stops d
     }
   });
 
+  /**
+   * A MARKER THAT EXISTS AND CANNOT BE READ IS EVIDENCE, NOT ABSENCE.
+   *
+   * Returning "no marker" for a legacy or damaged one was called a safe degrade; it is the opposite.
+   * The table's existence proves this copy was prepared, and being unable to say what the preparation
+   * did is precisely the case the collapse rule sends to `fixture-invalid`. Degrading to the pin
+   * attributes a same-width rewrite to a model that no longer describes the vectors.
+   */
+  it("classifies a marker table that is present but UNREADABLE as fixture-invalid, not as no marker", () => {
+    for (const [label, opts] of [
+      ["legacy shape", { pin: "m", observationDim: 384, reembedLegacyShape: true }],
+      ["row absent", { pin: "m", observationDim: 384, reembedTableEmpty: true }],
+      ["bad types", { pin: "m", observationDim: 384, reembedBadTypes: true }],
+    ] as const) {
+      const space = readStoreSpace(stubReader(opts), "/tmp/legacy.db");
+      expect(space.attribution.state, label).toBe("fixture-invalid");
+      expect((space.attribution as { reason: string }).reason)
+        .toMatch(/provenance marker exists but cannot be verified/);
+      // The unreadable marker is NOT surfaced as if it were data.
+      expect(space.reembed).toBeNull();
+      expect(scoredSpaceIdentity(space, "observations").trustable).toBe(false);
+      expect(() => requireTrustableSpace(space)).toThrow(/Refusing to measure/);
+    }
+  });
+
+  it("names each unreadable variant's own cause, and does not dereference the marker it could not read", () => {
+    const legacy = captured(() =>
+      printStoreHeader(stubReader({ pin: "m", observationDim: 384, reembedLegacyShape: true }), "/tmp/legacy.db"));
+    expect(legacy).toMatch(/older build whose marker lacks fields/);
+    expect(legacy).toMatch(/prepared toward: unknown \(the marker could not be read\)/);
+    expect(captured(() =>
+      printStoreHeader(stubReader({ pin: "m", observationDim: 384, reembedTableEmpty: true }), "/tmp/e.db")))
+      .toMatch(/exists but holds no marker row/);
+    expect(captured(() =>
+      printStoreHeader(stubReader({ pin: "m", observationDim: 384, reembedBadTypes: true }), "/tmp/b.db")))
+      .toMatch(/missing required values or holds the wrong types/);
+  });
+
+  it("an ABSENT table is still an ordinary pinned store — the distinction the collapse turns on", () => {
+    const space = readStoreSpace(stubReader({ pin: "Xenova/bge-m3:cls:q8", observationDim: 1024, conceptDim: 1024 }), "/tmp/plain.db");
+    expect(space.attribution.state).toBe("pin");
+    expect(() => requireTrustableSpace(space)).not.toThrow();
+  });
+
   it("a CLEAN fixture still passes, and says the contract is what keeps it sound", () => {
     const space = readStoreSpace(stubReader(BASE), "/tmp/clean.db");
     expect(space.attribution.state).toBe("candidate");
@@ -672,5 +740,42 @@ describe("measure-header — requireTrustableSpace aborts rather than decorating
   it("accepts null — a script that builds its own in-memory store has nothing to refuse", () => {
     const out = captured(() => expect(() => requireTrustableSpace(null)).not.toThrow());
     expect(out).toBe("");
+  });
+
+  /**
+   * THE REFUSAL TURNS ON WHETHER STORED VECTORS ARE CONSUMED, not on the store being imperfect.
+   *
+   * measure-normalization-ceiling embeds both sides from text and never reads a stored vector; so do
+   * observation-recall and search-recall when MODEL replaces every candidate. Aborting those refuses
+   * a valid measurement over a store state that cannot reach it — and teaches people to keep
+   * MEASURE_ALLOW_MIXED switched on, which is how an escape hatch stops meaning anything.
+   */
+  it("a run that does NOT consume stored vectors proceeds on an untrustable store, with no env var", () => {
+    for (const opts of [INVALID, MIGRATING, INTERRUPTED]) {
+      const space = readStoreSpace(stubReader(opts), "/tmp/x.db");
+      const out = captured(() => expect(() => requireTrustableSpace(space, false)).not.toThrow());
+      // Both facts, in one note: the store is unattributable AND these results are still valid.
+      expect(out).toMatch(/this store's own space is unattributable/);
+      expect(out).toMatch(/does not read its stored vectors/);
+      expect(out).toMatch(/RESULTS are wholly in that model's space and are valid/);
+    }
+  });
+
+  it("the SAME store still aborts for a run that does consume them", () => {
+    for (const opts of [INVALID, MIGRATING, INTERRUPTED]) {
+      const space = readStoreSpace(stubReader(opts), "/tmp/x.db");
+      expect(() => requireTrustableSpace(space, true)).toThrow(/Refusing to measure/);
+    }
+  });
+
+  it("consuming is the DEFAULT — a call site that says nothing gets the strict behaviour", () => {
+    const space = readStoreSpace(stubReader(INVALID), "/tmp/x.db");
+    expect(() => requireTrustableSpace(space)).toThrow(/Refusing to measure/);
+  });
+
+  it("a clean store stays silent either way — the note is for the untrustable case only", () => {
+    const space = readStoreSpace(stubReader(BASE), "/tmp/x.db");
+    expect(captured(() => requireTrustableSpace(space, false))).toBe("");
+    expect(captured(() => requireTrustableSpace(space, true))).toBe("");
   });
 });

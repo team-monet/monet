@@ -280,38 +280,75 @@ function sampleDimension(db: HeaderReader, table: "concepts" | "observations"): 
   }
 }
 
-/** The marker, or null on any store that was not prepared by reembed-store.ts (the common case). */
-function readReembedProvenance(db: HeaderReader): ReembedProvenance | null {
+/**
+ * THREE OUTCOMES, NOT TWO — and the distinction is the whole of it.
+ *
+ *   absent        no `reembed_provenance` TABLE. This copy was never prepared, the pin is the only
+ *                 identity there is, and that is the ordinary case for every real store.
+ *   unverifiable  the table EXISTS but its contents cannot be read as a marker: no row, a legacy
+ *                 shape missing columns a later build added, or a row whose fields are the wrong
+ *                 type. The table's existence is EVIDENCE a preparation happened here.
+ *   present       a readable marker, to be put through the five checks.
+ *
+ * An earlier draft returned "no marker" for all of `unverifiable` too, calling it a safe degrade. It
+ * is the opposite of safe, and it contradicts the collapse rule this module was shrunk around: a
+ * copy that was demonstrably re-embedded gets attributed to the stale pin, and on a same-width swap
+ * nothing else disagrees. Evidence that a preparation happened, plus an inability to say what it
+ * did, is exactly the definition of a fixture that must be rebuilt rather than trusted.
+ */
+type MarkerRead =
+  | { kind: "absent" }
+  | { kind: "unverifiable"; reason: string }
+  | { kind: "present"; marker: ReembedProvenance };
+
+function readReembedProvenance(db: HeaderReader): MarkerRead {
+  // PROBE THE TABLE FIRST, naming no column a later build might have added. This separates "never
+  // prepared" from "prepared by a build whose marker shape this one cannot read" — the two answers
+  // the single try/catch used to merge.
   try {
-    const row = db.prepare(
-      // A marker written by an older build lacks `rows_max_at`, so this SELECT throws and the catch
-      // below reports "no marker" — the copy degrades to an ordinary pinned store rather than being
-      // half-read. That is the same safe degrade the column additions before it relied on.
+    db.prepare(`SELECT 1 FROM reembed_provenance LIMIT 1`).get();
+  } catch {
+    return { kind: "absent" };
+  }
+
+  let row: Record<string, unknown> | undefined;
+  try {
+    row = db.prepare(
       `SELECT candidate_model_id, requested_model, pooling, dtype, measured_dim, populations,
               started_at, completed_at, rows_max_at
          FROM reembed_provenance WHERE singleton = 1`,
-    ).get() as {
-      candidate_model_id: string | null; requested_model: string; pooling: string | null;
-      dtype: string | null; measured_dim: number; populations: string;
-      started_at: number; completed_at: number | null; rows_max_at: number | null;
-    } | undefined;
-    if (row === undefined) return null;
-    return {
-      candidateModelId: row.candidate_model_id,
+    ).get() as Record<string, unknown> | undefined;
+  } catch {
+    // A legacy marker lacks a column this SELECT names. The table is still proof of a preparation.
+    return { kind: "unverifiable", reason: "written by an older build whose marker lacks fields this one requires" };
+  }
+  if (row === undefined) {
+    return { kind: "unverifiable", reason: "the provenance table exists but holds no marker row" };
+  }
+  // TYPES, not just presence: a NULL in a column this module treats as required would otherwise
+  // sail through as a marker describing nothing.
+  if (
+    typeof row.requested_model !== "string" ||
+    typeof row.measured_dim !== "number" ||
+    typeof row.populations !== "string" ||
+    typeof row.started_at !== "number"
+  ) {
+    return { kind: "unverifiable", reason: "the marker row is missing required values or holds the wrong types" };
+  }
+  return {
+    kind: "present",
+    marker: {
+      candidateModelId: typeof row.candidate_model_id === "string" ? row.candidate_model_id : null,
       requestedModel: row.requested_model,
-      pooling: row.pooling,
-      dtype: row.dtype,
+      pooling: typeof row.pooling === "string" ? row.pooling : null,
+      dtype: typeof row.dtype === "string" ? row.dtype : null,
       measuredDim: row.measured_dim,
       populations: row.populations,
-      rowsMaxAt: row.rows_max_at,
+      rowsMaxAt: typeof row.rows_max_at === "number" ? row.rows_max_at : null,
       startedAt: row.started_at,
-      completedAt: row.completed_at,
-    };
-  } catch {
-    // No such table is the NORMAL case — every store not prepared by reembed-store.ts. Absence is
-    // not a fault to report, it just means the pin is the only identity available.
-    return null;
-  }
+      completedAt: typeof row.completed_at === "number" ? row.completed_at : null,
+    },
+  };
 }
 
 /**
@@ -375,7 +412,7 @@ const iso = (ms: number): string => new Date(ms).toISOString();
  * no partial credit: a fixture is valid or it is rebuilt.
  */
 function resolveAttribution(
-  reembed: ReembedProvenance | null,
+  markerRead: MarkerRead,
   migrationInterrupted: boolean | null,
   pinReadable: boolean,
   pinnedAt: number | null,
@@ -383,7 +420,13 @@ function resolveAttribution(
   observationDim: number | null,
 ): SpaceAttribution {
   if (migrationInterrupted === true) return { state: "official-migration-interrupted" };
-  if (reembed === null) return { state: "pin" };
+  if (markerRead.kind === "absent") return { state: "pin" };
+  // A marker that exists and cannot be read is evidence of a preparation whose effect is unknown —
+  // the same verdict as any other unverifiable check, for the same reason.
+  if (markerRead.kind === "unverifiable") {
+    return { state: "fixture-invalid", reason: `provenance marker exists but cannot be verified (${markerRead.reason}) — rebuild the copy` };
+  }
+  const reembed = markerRead.marker;
   if (reembed.completedAt === null) return { state: "fixture-interrupted" };
 
   const invalid = (reason: string): SpaceAttribution => ({ state: "fixture-invalid", reason });
@@ -449,7 +492,7 @@ export function readStoreSpace(db: HeaderReader, dbPath: string): StoreSpace {
   }
   const conceptDim = sampleDimension(db, "concepts");
   const observationDim = sampleDimension(db, "observations");
-  const reembed = readReembedProvenance(db);
+  const markerRead = readReembedProvenance(db);
   const migrationInterrupted = readMigrationInterrupted(db);
   const latestRowWriteAt = readLatestRowWrite(db);
   return {
@@ -460,12 +503,15 @@ export function readStoreSpace(db: HeaderReader, dbPath: string): StoreSpace {
     observationDim,
     dim: observationDim ?? conceptDim,
     dimSplit: conceptDim !== null && observationDim !== null && conceptDim !== observationDim,
-    reembed,
+    // `reembed` stays the READABLE marker only. An unverifiable one is deliberately not surfaced
+    // here as if it were data — its whole content is "something happened and we cannot say what",
+    // which the attribution carries instead.
+    reembed: markerRead.kind === "present" ? markerRead.marker : null,
     pinnedAt,
     migrationInterrupted,
     latestRowWriteAt,
     attribution: resolveAttribution(
-      reembed, migrationInterrupted, pinReadable, pinnedAt, latestRowWriteAt, observationDim,
+      markerRead, migrationInterrupted, pinReadable, pinnedAt, latestRowWriteAt, observationDim,
     ),
   };
 }
@@ -524,7 +570,10 @@ export function printStoreHeader(db: HeaderReader, dbPath: string): StoreSpace {
       console.log(
         `!! STOP: ${REBUILD}.\n` +
         `!!   reason: ${a.reason}\n` +
-        `!!   prepared toward: ${r!.candidateModelId ?? r!.requestedModel}, ${r!.measuredDim}-dim\n` +
+        // `r` is null exactly when the marker itself was the unreadable thing — then the reason
+        // above is the whole story and there is no candidate to name. Saying "unknown" beats
+        // dereferencing a marker this state exists because we could not read.
+        `!!   prepared toward: ${r === null ? "unknown (the marker could not be read)" : `${r.candidateModelId ?? r.requestedModel}, ${r.measuredDim}-dim`}\n` +
         `!! The fixture contract is PREPARE -> MEASURE -> DISCARD. Anything that touches the copy\n` +
         `!! between those two points voids it, and not every such touch leaves a trace (see the\n` +
         `!! module header on segments). A number taken here cannot be attributed to any one model.`,
@@ -582,15 +631,46 @@ const ALLOW_MIXED_ENV = "MEASURE_ALLOW_MIXED";
  * refuse. It is accepted rather than rejected so that every measure-* script can call this in the
  * same place, whatever kind of store it uses.
  *
+ * `consumesStoredVectors` is what the refusal actually turns on — see below. Every measure-* script
+ * declares it at the call site, where the answer is known, since this function cannot infer it.
+ * The classification across the twelve:
+ *
+ *   ALWAYS true (score stored vectors; five import no embedder at all)
+ *     measure-attach-thresholds, measure-fork-and-edge-bands, measure-gate,
+ *     measure-nomination-signals, measure-threshold-headroom,
+ *     measure-nomination-size-bias (junk probes are fresh, but every CANDIDATE is a stored vector,
+ *       and its leave-one-out half is stored-vs-stored throughout)
+ *   CONDITIONAL on MODEL (set => every candidate is re-embedded before scoring)
+ *     measure-observation-recall, measure-search-recall
+ *   ALWAYS false (both sides embedded from text; no stored vector is ever read)
+ *     measure-normalization-ceiling
+ *   N/A — no store to read (pass null)
+ *     measure-recall-floor, measure-recall-perf, measure-resolution-bands
+ *
  * The escape hatch exists because deliberately measuring a mixed store is a legitimate thing to do
  * ONCE you know it is mixed — and it is named in the error, so taking it is a decision rather than
  * a discovery.
  */
-export function requireTrustableSpace(space: StoreSpace | null): void {
+export function requireTrustableSpace(space: StoreSpace | null, consumesStoredVectors = true): void {
   if (space === null) return;
   const a = space.attribution;
   if (a.state === "candidate" || a.state === "pin") return;
   const detail = a.state === "fixture-invalid" ? `${REBUILD} (${a.reason})` : a.state;
+  // A RUN THAT NEVER READS A STORED VECTOR CANNOT BE CORRUPTED BY MIXED ONES. Two facts, both true
+  // at once, and the note says both rather than picking whichever is more alarming: the STORE's own
+  // space is unattributable, and this run's RESULTS are nonetheless wholly in the loaded model's
+  // space, because every vector it scores was produced here from text. Aborting these would refuse
+  // a measurement that is fine on a store whose state is irrelevant to it — and would push people
+  // toward MEASURE_ALLOW_MIXED as routine, which is how an escape hatch stops meaning anything.
+  if (!consumesStoredVectors) {
+    console.log(
+      `   (NOTE: this store's own space is unattributable — ${detail}.\n` +
+      `   This run does not read its stored vectors: every scored vector below is embedded here from\n` +
+      `   text by the loaded model, so the RESULTS are wholly in that model's space and are valid.\n` +
+      `   What the STORE holds is unknown; what this measurement is OF is not.)`,
+    );
+    return;
+  }
   if (process.env[ALLOW_MIXED_ENV] === "1") {
     console.log(
       `!! ${ALLOW_MIXED_ENV}=1 — proceeding against a store this header refuses to attribute\n` +

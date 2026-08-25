@@ -77,7 +77,9 @@ const q = (xs: number[], p: number) => (xs.length === 0 ? NaN : [...xs].sort((a,
 async function main() {
   const db = new Database(DB, { readonly: true });
   const storeSpace = printStoreHeader(db, DB);
-  // ABORT before any measurement work: an unattributable store must not produce a figure at all.
+  // consumesStoredVectors=TRUE. The junk probes are freshly embedded, but every CANDIDATE they
+  // score against is a stored vector, and the leave-one-out half below is stored-vs-stored on
+  // both sides — so a mixed store corrupts both halves of this script.
   requireTrustableSpace(storeSpace);
 
   // The nomination scan runs inside ONE circle. Measure the largest, which is where the blobs are.

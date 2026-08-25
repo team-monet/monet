@@ -31,8 +31,11 @@ import { printEmbedderHeader, printStoreHeader, requireTrustableSpace } from "./
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
 const storeSpace = printStoreHeader(db, DB);
-// ABORT before any measurement work: an unattributable store must not produce a figure at all.
-requireTrustableSpace(storeSpace);
+// CONDITIONAL on MODEL, and decided here because that is the only input: with MODEL set, main()
+// re-embeds `whole` and `segs` for every observation before anything is scored, so no stored vector
+// survives into the measurement and a mixed store is irrelevant to it. With MODEL unset, the
+// candidates ARE the stored vectors and an unattributable store must abort before any work.
+requireTrustableSpace(storeSpace, process.env.MODEL === undefined);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;

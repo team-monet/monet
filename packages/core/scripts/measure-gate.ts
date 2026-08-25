@@ -54,7 +54,8 @@ const DELTAS = (process.env.DELTAS ?? "0,0.01,0.02,0.03,0.05,0.08,0.12,0.20")
 
 const db = new Database(DB, { readonly: true });
 const storeSpace = printStoreHeader(db, DB);
-// ABORT before any measurement work: an unattributable store must not produce a figure at all.
+// consumesStoredVectors=TRUE (the default): every figure below is scored from vectors read out
+// of this store, so an unattributable one must abort before any measurement work happens.
 requireTrustableSpace(storeSpace);
 const circle = process.env.CIRCLE ?? (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' AND status!='retired' GROUP BY circle ORDER BY n DESC LIMIT 1`,

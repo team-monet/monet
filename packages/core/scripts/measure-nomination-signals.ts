@@ -34,7 +34,8 @@ import { printStoreHeader, requireTrustableSpace } from "./measure-header";
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
 const storeSpace = printStoreHeader(db, DB);
-// ABORT before any measurement work: an unattributable store must not produce a figure at all.
+// consumesStoredVectors=TRUE (the default): every figure below is scored from vectors read out
+// of this store, so an unattributable one must abort before any measurement work happens.
 requireTrustableSpace(storeSpace);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,

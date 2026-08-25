@@ -63,7 +63,8 @@ const db = new Database(DB, { readonly: true });
 // a census: it separates 384 from 1024 on a uniform store and cannot see a store whose widths are
 // mixed within a table — `monet doctor` owns that.
 const storeSpace = printStoreHeader(db, DB);
-// ABORT before any measurement work: an unattributable store must not produce a figure at all.
+// consumesStoredVectors=TRUE (the default): every figure below is scored from vectors read out
+// of this store, so an unattributable one must abort before any measurement work happens.
 requireTrustableSpace(storeSpace);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,

@@ -102,8 +102,10 @@ const pctl = (xs: number[], p: number) => xs[Math.min(xs.length - 1, Math.floor(
 async function main() {
   const db = new Database(DB, { readonly: true });
   const storeSpace = printStoreHeader(db, DB);
-  // ABORT before any measurement work: an unattributable store must not produce a figure at all.
-  requireTrustableSpace(storeSpace);
+  // consumesStoredVectors=FALSE: the query below selects `o.content` and no embedding column, the
+  // handle is closed before the model loads, and every vector scored is produced here from text. A
+  // mixed store cannot reach these numbers, so an unattributable one is reported and not refused.
+  requireTrustableSpace(storeSpace, false);
   const circle = (db.prepare(
     `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
   ).get() as { circle: string }).circle;

@@ -39,8 +39,11 @@ import { printEmbedderHeader, printStoreHeader, requireTrustableSpace } from "./
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
 const storeSpace = printStoreHeader(db, DB);
-// ABORT before any measurement work: an unattributable store must not produce a figure at all.
-requireTrustableSpace(storeSpace);
+// CONDITIONAL on MODEL. Gated HERE rather than beside the swap because the first `run(...)` in
+// main() — the "full observation" shape — scores `o.whole` directly, which is the STORED vector
+// whenever no swap replaced it. With MODEL set the swap loop rewrites every `whole`/`segs` before
+// that call, so nothing stored is scored; with MODEL unset the very first measurement consumes them.
+requireTrustableSpace(storeSpace, process.env.MODEL === undefined);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
