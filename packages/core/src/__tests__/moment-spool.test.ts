@@ -248,3 +248,56 @@ describe("reading the spool", () => {
     ).toBeNull();
   });
 });
+
+/*
+ * WHY THE APPEND LOOPS ON `writeSync`'s RETURN, stated as a test of the HAZARD rather than of the
+ * loop, because only one of those two is honestly testable here.
+ *
+ * That `fs.writeSync` does not loop is already MEASURED in this repo and does not need re-measuring:
+ * `startup-diagnosis.ts`'s `writeFully` records asking for 1 MiB against a bounded pipe and getting
+ * 8192 back (Codex round 1, PR #79).
+ *
+ * WHAT IS NOT TESTED, SAID PLAINLY: no test here drives a real short write. A short write needs a
+ * bounded sink, and `appendMomentRecord` opens its own regular file by path, where a 20 KB append
+ * does not short-write on any filesystem this suite runs on. A "large record round-trips whole"
+ * test was written first and then DELETED for exactly that reason — it passed identically with the
+ * loop removed, which makes it a green that cannot fail rather than evidence.
+ *
+ * What IS testable, and is the whole reason the loop earns its place, is the consequence a fragment
+ * has in THIS file: the spool is newline-framed and every append opens `"a"`, so a fragment carries
+ * no trailing newline and the next append lands its whole line directly behind it. The reader then
+ * takes the two as ONE line and loses BOTH — the record that was short AND a record that wrote
+ * perfectly. That is a property of the framing, it is deterministic, and it is asserted below.
+ */
+describe("a fragment in the spool eats the record written after it", () => {
+  it("loses the NEIGHBOUR too, which is the damage the append's write loop exists to prevent", () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const run = startMomentRun(path, "core");
+    // Exactly what a short write leaves behind: a partial line, no trailing newline.
+    appendFileSync(path, `{"v":${MOMENT_SPOOL_FORMAT},"runId":"${run.runId}","seq":1,"kind":"ask","mom`);
+    run.seq = 2;
+    // A perfectly good record, appended behind it by the ordinary path.
+    appendMomentRecord(run, { kind: "ask", momentId: mintMomentId(), askedAt: "t" });
+
+    const read = readMomentSpool(path, 0);
+    // The run-start survives; the fragment and the GOOD record behind it are read as one bad line.
+    expect(read.records).toHaveLength(1);
+    expect(read.records[0]).toMatchObject({ seq: 0, kind: "run-start" });
+    expect(read.malformedLines).toBe(1);
+    // Both seq 1 and seq 2 are now holes, though only seq 1 ever failed to write.
+    expect(read.records.some((r) => r.seq === 2)).toBe(false);
+  });
+
+  it("keeps the neighbour when the line before it is whole — the same two appends, undamaged", () => {
+    // The control the test above needs to mean anything: identical shape, no fragment, both land.
+    const path = join(mkTmp(), "moments.jsonl");
+    const run = startMomentRun(path, "core");
+    appendMomentRecord(run, { kind: "ask", momentId: mintMomentId(), askedAt: "t" });
+    appendMomentRecord(run, { kind: "ask", momentId: mintMomentId(), askedAt: "t" });
+
+    const read = readMomentSpool(path, 0);
+    expect(read.malformedLines).toBe(0);
+    expect(read.records.map((r) => r.seq)).toEqual([0, 1, 2]);
+    expect(readFileSync(path, "utf8").endsWith("}\n")).toBe(true);
+  });
+});

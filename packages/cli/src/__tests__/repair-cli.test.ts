@@ -43,7 +43,7 @@ function inspection(overrides: Partial<StoredEmbedderStateInspection> = {}): Sto
       nativeConcepts: knownPopulation(),
     },
     migration: { status: "none" },
-    nonLatin: { status: "known", tolerance: 0.2, observationCount: 0, conceptCount: 0, sampleIds: [] },
+    nonLatin: { status: "known", tolerance: 0.2, liveObservationCount: 0, supersededObservationCount: 0, conceptCount: 0, sampleIds: [] },
     assessment: "safe",
     ...overrides,
   };
@@ -960,6 +960,55 @@ describe("repair completes on an English-only target without self-deadlocking", 
     expect(result.backup).toBeNull();
     expect(inspectStoredEmbedderState(dbPath).pin).toMatchObject({ modelId: "hashing:dim=256:tok=1" });
     expect(exits).toEqual([1]);
+  });
+
+  it("does NOT refuse over SUPERSEDED-ONLY non-Latin content — that move can strand nothing", async () => {
+    /*
+     * BOTH HARMS THIS REFUSAL NAMES ARE RETRIEVAL HARMS: the rows "become unreachable by their own
+     * content, and still surface in unrelated results". Retrieval selects on `superseded_by IS NULL
+     * AND superseded_at IS NULL` (retrieval.ts), so a superseded row is already unreachable and
+     * already absent from every result set — the migration changes neither. The remedy the message
+     * prescribes settles the scope the same way: "re-express them in English first" is not an
+     * operation on a superseded row.
+     *
+     * The count this path read included superseded rows, so a store whose non-English content had
+     * ALL been superseded refused a migration that could lose nothing, and the only way past was
+     * `--accept-non-latin-loss` — accepting a loss that was never on offer, which teaches the flag
+     * to mean nothing. Measured store-wide at 22 rows flagged against 0 live.
+     *
+     * The fixture is the real shape of that state rather than a contrived one: the Korean original
+     * superseded, and the concept body already re-expressed in English — exactly what an operator
+     * who followed the refusal's own instructions leaves behind.
+     */
+    const dir = mkdtempSync(join(tmpdir(), "monet-english-only-superseded-"));
+    dirs.push(dir);
+    const dbPath = join(dir, "monet.db");
+    const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+    const stored = await seed.store(KOREAN, { resolution: "forceNew" });
+    const db = (seed as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
+    db.prepare(`UPDATE observations SET superseded_at = 1 WHERE id = ?`).run(stored.observationId);
+    db.prepare(`UPDATE concepts SET body = ? WHERE id = ?`)
+      .run("the gather surface was removed and search kept", stored.conceptId);
+    seed.close();
+
+    // The scan still SEES the row — this is not a filter that hid it — it just does not count it live.
+    const scanned = inspectStoredEmbedderState(dbPath).nonLatin;
+    expect(scanned.status).toBe("known");
+    if (scanned.status !== "known") return;
+    expect(scanned.supersededObservationCount).toBe(1);
+    expect(scanned.liveObservationCount).toBe(0);
+    expect(scanned.conceptCount).toBe(0);
+
+    const exits: number[] = [];
+    const output = await run(
+      ["repair", "--target", ENGLISH_ONLY_TARGET, "--apply", "--yes", "--json"],
+      englishOnlyDeps(dbPath, exits),
+    );
+    const result = JSON.parse(output.stdout);
+
+    expect(result).toMatchObject({ ok: true, applied: true });
+    expect(inspectStoredEmbedderState(dbPath).pin).toMatchObject({ modelId: ENGLISH_ONLY_TARGET });
+    expect(exits).toEqual([]);
   });
 
   it("refuses from UNDER OWNERSHIP when the rows appear after preflight — the recheck's own reason to exist", async () => {
