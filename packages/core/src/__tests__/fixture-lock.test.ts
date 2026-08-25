@@ -340,6 +340,32 @@ describe("reembed-store — what happens inside the lock, and what deliberately 
     expect(source()).toMatch(/if \(!published\.published\)/);
   });
 
+  it("normalizes the copy's sync triggers UNDER the lock and BEFORE the rewrites", () => {
+    // The trigger counter is what detects a later engine write. It only counts while the triggers
+    // are on, and it must be on before this run's own writes so the baseline contains them.
+    const [acquire, normalize, firstRewrite] = indexOfAll(source(), [
+      "acquireExclusiveWriteLock(",
+      "UPDATE sync_meta SET applying_remote = 0",
+      "updSeg.run(",
+    ]);
+    expect(acquire).toBeLessThan(normalize);
+    expect(normalize).toBeLessThan(firstRewrite);
+  });
+
+  it("refuses to prepare anything inside a .monet directory", () => {
+    // The normalization writes sync_meta, not just vectors, so "point it at a copy" needed to stop
+    // being prose. The guard is a heuristic and the comment beside it says so.
+    const src = source();
+    expect(src).toMatch(/\/\(\^\|\\\/\)\\\.monet\\\/\/\.test\(DB\)/);
+    expect(src).toMatch(/Refusing to prepare/);
+  });
+
+  it("records the normalization in the marker rather than still claiming sync_meta is untouched", () => {
+    const src = source();
+    expect(src).toMatch(/sync_meta\.applying_remote normalized to 0/);
+    expect(src).not.toMatch(/concepts and sync_meta UNTOUCHED/);
+  });
+
   it("opens the marker with a run token, so the publish has something to verify ownership against", () => {
     const src = source();
     expect(src).toMatch(/const RUN_TOKEN = randomUUID\(\);/);

@@ -44,6 +44,8 @@ function stubReader(opts: {
   syncMetaMissing?: boolean;
   /** `sync_meta.embedder_pinned_at`. A value later than a marker's completion supersedes it. */
   pinnedAt?: number | null;
+  /** `sync_meta.applying_remote`. 1 = sync triggers gated OFF, so updated_at is not maintained. */
+  applyingRemote?: number | null;
   /** Rows in the engine's `embedder_migration` sentinel => an official migration is unfinished. */
   migrationRows?: number;
   /** Omit the table entirely (old schema) rather than reporting zero rows. */
@@ -123,7 +125,13 @@ function stubReader(opts: {
             if (opts.syncMetaMissing) throw new Error("no such table: sync_meta");
             // Default pin time sits BEFORE any marker below, so a fixture is clean unless a test
             // deliberately moves it. `null` models a store carrying no pin timestamp at all.
-            return { m: opts.pin ?? null, at: opts.pinnedAt === undefined ? 1754000000000 : opts.pinnedAt };
+            return {
+              m: opts.pin ?? null,
+              at: opts.pinnedAt === undefined ? 1754000000000 : opts.pinnedAt,
+              // 0 by default: the state the current reembed-store normalizes a copy to. A test
+              // sets 1 to model a latched copy, where updated_at is not maintained at all.
+              ar: opts.applyingRemote === undefined ? 0 : opts.applyingRemote,
+            };
           }
           // An unfiltered scan can land on a stale source row; a filtered one cannot.
           if (opts.sourceDim !== undefined && !nativeOnly(sql)) return { e: vec(opts.sourceDim) };
@@ -650,6 +658,52 @@ describe("measure-header — fixture-invalid subsumes every way a marker stops d
     expect(captured(() => printStoreHeader(
       stubReader({ pin: null, pinnedAt: null, conceptDim: 1024, observationDim: 1024 }), "/tmp/bare.db")))
       .toContain("store space: pin=(no pin)");
+  });
+
+  /**
+   * THE LATCHED-COPY ESCAPE — the residual flagged in round 7, now closed structurally.
+   *
+   * `applying_remote` gates every sync trigger, and the live store has it latched at 1, so every
+   * `.backup` of it inherits a copy whose triggers are OFF. With them off `updated_at` is not
+   * maintained: a post-preparation UPDATE keeps the row's old stamp, and a same-second INSERT lands
+   * on the truncated `unixepoch() * 1000` default. Both sit AT OR BELOW the recorded baseline and
+   * slip past the strict `>` comparison — pinned-space rows joining the candidate population with
+   * nothing left to detect them. No timestamp rule can fix that, because no timestamp is written.
+   */
+  it("ESCAPE, reproduced: on a latched copy a later write does NOT exceed the baseline", () => {
+    const PREPARED_BASELINE = 1755000000000; // the stub's default rows_max_at
+    // A post-preparation UPDATE on a latched copy leaves the old timestamp untouched, so the newest
+    // row still reads at the baseline — the `>` check sees nothing.
+    expect(PREPARED_BASELINE > PREPARED_BASELINE).toBe(false);
+    const latched = { ...BASE, applyingRemote: 1, latestRowWriteAt: PREPARED_BASELINE };
+    // The baseline check alone therefore passes. What refuses it is the trigger-state check.
+    const reason = reasonOf(latched);
+    expect(reason).toMatch(/sync triggers are disabled \(applying_remote=1\)/);
+    expect(reason).toMatch(/writes after preparation are undetectable/);
+    expect(reason).toMatch(/rebuild with the current reembed-store/);
+  });
+
+  it("a marker present on a copy whose triggers are unreadable is refused the same way", () => {
+    expect(reasonOf({ ...BASE, applyingRemote: null })).toMatch(/applying_remote=unreadable/);
+  });
+
+  it("a NORMALIZED copy — what the current reembed-store leaves behind — is accepted", () => {
+    const space = readStoreSpace(stubReader({ ...BASE, applyingRemote: 0 }), "/tmp/normalized.db");
+    expect(space.applyingRemote).toBe(0);
+    expect(space.attribution.state).toBe("candidate");
+    expect(() => requireTrustableSpace(space)).not.toThrow();
+  });
+
+  it("MARKER-SCOPED: a latched store with NO marker is completely unaffected", () => {
+    // A store making no fixture claim has nothing this check could falsify, so the live store and
+    // every ordinary backup of it keep behaving exactly as before.
+    const space = readStoreSpace(
+      stubReader({ pin: "Xenova/bge-m3:cls:q8", conceptDim: 1024, observationDim: 1024, applyingRemote: 1 }),
+      "/tmp/latched-no-marker.db",
+    );
+    expect(space.applyingRemote).toBe(1);
+    expect(space.attribution.state).toBe("pin");
+    expect(() => requireTrustableSpace(space)).not.toThrow();
   });
 
   it("a marker with no run_token is a legacy shape — the build that wrote it had the publish race", () => {

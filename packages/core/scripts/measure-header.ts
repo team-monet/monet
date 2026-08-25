@@ -161,6 +161,12 @@ export interface StoreSpace {
    */
   pinnedAt: number | null;
   /**
+   * `sync_meta.applying_remote`. 0 means this copy's sync triggers are LIVE and therefore
+   * maintaining `updated_at`; 1 means they are gated off and no write leaves a trace. Null when
+   * `sync_meta` could not be read at all.
+   */
+  applyingRemote: number | null;
+  /**
    * True when the engine's `embedder_migration` sentinel has a row: an OFFICIAL migration is running
    * or died. Null when the table could not be read at all (an old schema), which is not the same as
    * knowing there is none.
@@ -391,16 +397,29 @@ function readMigrationInterrupted(db: HeaderReader): boolean | null {
  *
  * WHICH COLUMNS CAN BE BELIEVED. `created_at` is a SCHEMA DEFAULT (`DEFAULT (unixepoch() * 1000)`,
  * engine.ts) and the local ingest path omits the column, so SQLite stamps it on every insert
- * unconditionally. `updated_at` shares that default but is MAINTAINED by the sync triggers, which
- * are gated `WHEN ... (SELECT applying_remote FROM sync_meta ...) = 0` — and `applying_remote` can
- * sit latched at 1 (findings §3.2), in which case the trigger never fires and `updated_at` stays at
- * its insert value. MAX over both is therefore safe in the direction that matters: it can only
- * UNDER-report a mutation, never invent one.
+ * unconditionally — but at SECOND granularity, since `unixepoch()` returns whole seconds.
+ * `updated_at` shares that default and is then MAINTAINED by the sync triggers, whose bodies stamp
+ * it from `MAX(last_mutation_at + 1, <now>)` — a monotonic counter, so a later write always lands
+ * strictly above an earlier reading of it, to the millisecond.
  *
- * Two other known under-reports, stated rather than papered over: a grafted row carries the ORIGIN's
- * `created_at`, so a recent sync of old evidence dates as old; and `observation_segments` has no
+ * THAT COUNTER ONLY RUNS WHILE THE TRIGGERS DO, and this used to be an accepted gap. The triggers
+ * are gated `WHEN ... (SELECT applying_remote FROM sync_meta ...) = 0`; the live store has that
+ * latched at 1 (findings §3.2), every `.backup` inherits it, and with the triggers off `updated_at`
+ * is not maintained at all — a later UPDATE keeps the old stamp and a same-second INSERT lands on
+ * the truncated default, so both slip past a `>` comparison against the baseline. An earlier draft
+ * of this comment recorded that as "can only UNDER-report a mutation", which was true and not good
+ * enough: under-reporting is exactly how a pinned-space row joins the candidate population unseen.
+ *
+ * IT IS NOW CLOSED, structurally rather than by a better timestamp rule: reembed-store.ts normalizes
+ * `applying_remote` to 0 on the copy it prepares, and resolveAttribution refuses any copy carrying a
+ * marker whose triggers are not live. A fixture either has the counter running or is not a fixture.
+ *
+ * Two under-reports remain, stated rather than papered over: a grafted row carries the ORIGIN's
+ * `created_at` and its INSERT trigger is gated `WHEN NEW.sync_writer IS NULL` (the graft path sets
+ * it), so a row arriving by SYNC is dated old and uncounted; and `observation_segments` has no
  * timestamps at all (it inherits liveness from its observation and is written in the same
- * transaction), so the observation row's stamp stands in for its segments.
+ * transaction), so the observation row's stamp stands in for its segments. Neither is expected on a
+ * scratch measurement copy, and the PREPARE -> MEASURE -> DISCARD contract is what covers them.
  */
 function readLatestRowWrite(db: HeaderReader): number | null {
   try {
@@ -428,6 +447,7 @@ function resolveAttribution(
   migrationInterrupted: boolean | null,
   pinReadable: boolean,
   pinnedAt: number | null,
+  applyingRemote: number | null,
   latestRowWriteAt: number | null,
   conceptDim: number | null,
   observationDim: number | null,
@@ -489,6 +509,24 @@ function resolveAttribution(
       `a migration, adopt or backfill has rewritten or re-declared the space since`,
     );
   }
+  // THE BASELINE ONLY MEANS SOMETHING WHILE THE TRIGGERS ARE ON. `applying_remote` gates every sync
+  // trigger, and with them gated off `updated_at` is not maintained at all: a later UPDATE leaves
+  // the old stamp in place and a same-second INSERT lands on the truncated `unixepoch() * 1000`
+  // default, so both sit at or below the recorded baseline and slip past the `>` comparison. The
+  // live store has this latched at 1 (findings §3.2) and every `.backup` of it inherits that, which
+  // is exactly the population these fixtures are built from. The current reembed-store normalizes it
+  // to 0 under the lock; a copy that still reads 1 was prepared by an older build or re-latched
+  // since, and its trust window cannot be verified either way.
+  //
+  // MARKER-SCOPED ON PURPOSE: a store with no marker makes no claim this could falsify, and is left
+  // exactly as it was.
+  if (applyingRemote !== 0) {
+    return invalid(
+      "this copy's sync triggers are disabled (applying_remote=" +
+      `${applyingRemote === null ? "unreadable" : applyingRemote}), so writes after preparation are ` +
+      "undetectable — rebuild with the current reembed-store",
+    );
+  }
   if (latestRowWriteAt === null) {
     return invalid("no observation timestamp could be read, so engine writes after the preparation cannot be ruled out");
   }
@@ -519,12 +557,14 @@ export function readStoreSpace(db: HeaderReader, dbPath: string): StoreSpace {
   let pin: string | null = null;
   let pinReadable = true;
   let pinnedAt: number | null = null;
+  let applyingRemote: number | null = null;
   try {
     const row = db.prepare(
-      `SELECT embedder_model_id AS m, embedder_pinned_at AS at FROM sync_meta`,
-    ).get() as { m: string | null; at: number | null } | undefined;
+      `SELECT embedder_model_id AS m, embedder_pinned_at AS at, applying_remote AS ar FROM sync_meta`,
+    ).get() as { m: string | null; at: number | null; ar: number | null } | undefined;
     pin = row?.m ?? null;
     pinnedAt = row?.at ?? null;
+    applyingRemote = row?.ar ?? null;
   } catch {
     pinReadable = false;
   }
@@ -546,10 +586,12 @@ export function readStoreSpace(db: HeaderReader, dbPath: string): StoreSpace {
     // which the attribution carries instead.
     reembed: markerRead.kind === "present" ? markerRead.marker : null,
     pinnedAt,
+    applyingRemote,
     migrationInterrupted,
     latestRowWriteAt,
     attribution: resolveAttribution(
-      markerRead, migrationInterrupted, pinReadable, pinnedAt, latestRowWriteAt, conceptDim, observationDim,
+      markerRead, migrationInterrupted, pinReadable, pinnedAt, applyingRemote, latestRowWriteAt,
+      conceptDim, observationDim,
     ),
   };
 }

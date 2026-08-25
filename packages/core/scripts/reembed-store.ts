@@ -24,6 +24,30 @@ import { OnnxEmbeddingProvider } from "../src/embedding-onnx";
 
 const DB = process.env.MONET_DB!;
 const MODEL = process.env.MODEL!;
+
+/*
+ * "POINT IT AT A COPY" WAS ONLY EVER PROSE. This script rewrites every observation and segment
+ * vector and now also normalizes `sync_meta.applying_remote` — the second of which is a sync-visible
+ * setting, not just a vector. Both are catastrophic on a real store and neither was guarded by
+ * anything but the sentence in the header comment above.
+ *
+ * The refusal is a path check, which is a heuristic and says so: it catches the standard location
+ * (`~/.monet/...`) and nothing else. It is a guardrail against the obvious slip, not a proof of
+ * scratch-ness — the contract that this is a disposable copy still rests on the operator.
+ */
+if (DB === undefined || DB.trim() === "") {
+  console.error("MONET_DB is required: point it at a scratch COPY of the store, never the live one.");
+  process.exit(1);
+}
+if (/(^|\/)\.monet\//.test(DB)) {
+  console.error(
+    `Refusing to prepare '${DB}': it is inside a .monet directory, which is where the LIVE store ` +
+    `lives. This script rewrites every vector and enables the copy's sync triggers — both are ` +
+    `destructive. Back the store up first (sqlite3 <store> \".backup '/tmp/copy.db'\") and point ` +
+    `MONET_DB at the copy.`,
+  );
+  process.exit(1);
+}
 /*
  * POOLING and DTYPE are part of the candidate SPACE, not decoration on the model id: a checkpoint
  * pooled the way it was not trained, or loaded at a quantized precision, produces vectors a measured
@@ -67,9 +91,9 @@ async function main(): Promise<void> {
    * ONE ROW, REPLACED ON RE-RUN: the last preparation is the state of the file, and a history of
    * superseded preparations would just be another thing to read wrong.
    *
-   * THIS SCRIPT ONLY EVER TOUCHES THE COPY IT WAS POINTED AT. It opens MONET_DB read-write and is
-   * documented from its first line as a fixture builder for a COPY — the live store is not involved
-   * here, and pointing this at one was already destructive before this table existed.
+   * THIS SCRIPT ONLY EVER TOUCHES THE COPY IT WAS POINTED AT — now enforced rather than asserted:
+   * see the `.monet/` refusal at the top of the file, added when the preparation started writing
+   * `sync_meta` as well as vectors.
    */
   db.exec(`
     CREATE TABLE IF NOT EXISTS reembed_provenance (
@@ -106,7 +130,10 @@ async function main(): Promise<void> {
     POOLING ?? null,
     DTYPE ?? null,
     warmup.length,
-    "observations+segments where kind != 'source'; concepts and sync_meta UNTOUCHED",
+    // What this preparation did to the copy, in the copy. It used to end "concepts and sync_meta
+    // UNTOUCHED" — no longer true once the run normalizes applying_remote, so the record says so.
+    "observations+segments where kind != 'source'; concept vectors and the embedder pin UNTOUCHED; " +
+      "sync_meta.applying_remote normalized to 0 so this copy's sync triggers detect later writes",
     Date.now(),
     RUN_TOKEN,
   );
@@ -129,6 +156,38 @@ async function main(): Promise<void> {
    * rewritten.
    */
   acquireExclusiveWriteLock(db, "re-embedding this copy");
+
+  /*
+   * NORMALIZE THE COPY'S SYNC TRIGGERS — the structural close of a gap no timestamp rule could.
+   *
+   * `applying_remote` gates every sync trigger (`WHEN ... (SELECT applying_remote FROM sync_meta) = 0`,
+   * engine.ts). The live store has it LATCHED AT 1 (findings §3.2), so every `.backup` copy inherits
+   * a store whose triggers are OFF — and with them off, `updated_at` is not maintained at all. A
+   * post-preparation UPDATE then leaves the row's old timestamp in place, and a same-second INSERT
+   * lands on the truncated `unixepoch() * 1000` default. Both sit at or below the recorded baseline,
+   * so both escape the `>` comparison, and pinned-space rows mix into the candidate population with
+   * nothing anywhere to notice.
+   *
+   * Another timestamp heuristic cannot fix that — the timestamps are simply not being written. What
+   * fixes it is turning the writer back on. The preparation owns this copy (it is scratch by the
+   * contract enforced above), enabling triggers on a throwaway file has no sync consequence, and
+   * once on, the trigger body's `MAX(last_mutation_at + 1, <now>)` is a MONOTONIC counter: every
+   * later engine write — UPDATE via sync_observations_update, INSERT via sync_observations_insert,
+   * both of which stamp `updated_at` from that counter — lands strictly above any baseline read
+   * before it, to the millisecond, regardless of clock granularity.
+   *
+   * `sync_meta` carries no trigger of its own (engine.ts installs them on concepts, observations,
+   * circle_aliases, contradictions, first_block and sessions), so this write does not self-fire.
+   * It happens BEFORE the rewrites so that this run's own writes are trigger-stamped too, which is
+   * exactly what makes the baseline below contain them.
+   *
+   * ONE RESIDUAL, STATED RATHER THAN GLOSSED: the INSERT trigger is gated `WHEN NEW.sync_writer IS
+   * NULL`, and the graft path supplies `sync_writer` explicitly. A row arriving by SYNC therefore
+   * still escapes the counter. Sync into a scratch measurement copy is not a thing that happens by
+   * design, but it is not impossible, and the PREPARE -> MEASURE -> DISCARD contract remains the
+   * outer guarantee.
+   */
+  db.prepare(`UPDATE sync_meta SET applying_remote = 0 WHERE singleton = 1`).run();
 
   // NATIVE-ONLY ON BOTH POPULATIONS. The observation query has always filtered `kind != 'source'`;
   // the segment query did not, so a prepped copy came out in a THIRD state nobody described — source
