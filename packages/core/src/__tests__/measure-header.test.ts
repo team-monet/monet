@@ -672,6 +672,49 @@ describe("measure-header — fixture-invalid subsumes every way a marker stops d
     expect(() => requireTrustableSpace(space)).not.toThrow();
   });
 
+  /**
+   * NO MARKER IS NOT THE SAME AS NO PREPARATION.
+   *
+   * reembed-store existed before the provenance table did, and a copy it prepared carries no marker
+   * at all. If that run swapped in a model of a different width, the file now holds pinned concepts
+   * at one dimension and rewritten observations at another — and the marker-absent path read that as
+   * an ordinary pinned store and let every stored-vector measurement through. The sampler already
+   * disproves the pin here without any marker to consult; nothing else in the module was listening.
+   */
+  it("an UNMARKED store whose populations disagree on width is refused, not read as pinned", () => {
+    const unmarkedSplit = { pin: "Xenova/bge-small-en-v1.5", conceptDim: 384, observationDim: 1024 };
+    const space = readStoreSpace(stubReader(unmarkedSplit), "/tmp/legacy-prep.db");
+    expect(space.reembed).toBeNull();      // genuinely no marker
+    expect(space.dimSplit).toBe(true);     // and the widths say the pin cannot describe both
+    expect(space.attribution.state).toBe("fixture-invalid");
+    expect((space.attribution as { reason: string }).reason)
+      .toMatch(/populations are in different spaces \(concepts 384-dim, observations 1024-dim\)/);
+    expect((space.attribution as { reason: string }).reason)
+      .toMatch(/no provenance marker explains which is which/);
+
+    for (const population of ["observations", "concepts"] as const) {
+      expect(scoredSpaceIdentity(space, population).trustable).toBe(false);
+    }
+    expect(() => requireTrustableSpace(space)).toThrow(/Refusing to measure/);
+    // consumesStoredVectors semantics are untouched: a run that re-embeds everything still proceeds.
+    const note = captured(() => expect(() => requireTrustableSpace(space, false)).not.toThrow());
+    expect(note).toMatch(/RESULTS are wholly in that model's space and are valid/);
+  });
+
+  it("only the SPLIT triggers it — a uniform unmarked store at any width stays pinned", () => {
+    for (const dims of [{ conceptDim: 384, observationDim: 384 }, { conceptDim: 1024, observationDim: 1024 }]) {
+      const space = readStoreSpace(stubReader({ pin: "m", ...dims }), "/tmp/uniform.db");
+      expect(space.attribution.state).toBe("pin");
+      expect(() => requireTrustableSpace(space)).not.toThrow();
+    }
+    // A store where only ONE population holds vectors cannot disagree with itself.
+    for (const dims of [{ observationDim: 1024 }, { conceptDim: 384 }]) {
+      const space = readStoreSpace(stubReader({ pin: "m", ...dims }), "/tmp/one-sided.db");
+      expect(space.dimSplit).toBe(false);
+      expect(space.attribution.state).toBe("pin");
+    }
+  });
+
   it("a CLEAN fixture still passes, and says the contract is what keeps it sound", () => {
     const space = readStoreSpace(stubReader(BASE), "/tmp/clean.db");
     expect(space.attribution.state).toBe("candidate");

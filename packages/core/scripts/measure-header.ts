@@ -417,10 +417,31 @@ function resolveAttribution(
   pinReadable: boolean,
   pinnedAt: number | null,
   latestRowWriteAt: number | null,
+  conceptDim: number | null,
   observationDim: number | null,
 ): SpaceAttribution {
   if (migrationInterrupted === true) return { state: "official-migration-interrupted" };
-  if (markerRead.kind === "absent") return { state: "pin" };
+  if (markerRead.kind === "absent") {
+    // NO MARKER IS NOT THE SAME AS NO PREPARATION. A copy prepared by a reembed-store from before
+    // the provenance table existed carries no marker at all — and if that run swapped in a model of
+    // a different width, the store now holds pinned concepts at one dimension and rewritten
+    // observations at another. The pin cannot describe both, and the widths say so out loud: this
+    // is the one case where the SAMPLER already disproves the pin without any marker to consult.
+    // Reading it as an ordinary pinned store attributes stored-vector measurements to a model the
+    // evidence in the same file contradicts.
+    if (conceptDim !== null && observationDim !== null && conceptDim !== observationDim) {
+      return {
+        state: "fixture-invalid",
+        reason:
+          `the store's populations are in different spaces (concepts ${conceptDim}-dim, observations ` +
+          `${observationDim}-dim) and no provenance marker explains which is which — rebuild the copy ` +
+          `with the current reembed-store`,
+      };
+    }
+    // A uniform store with no marker is the ordinary, overwhelmingly common case: the pin is the
+    // only identity there is and it is not contradicted by anything. Unchanged.
+    return { state: "pin" };
+  }
   // A marker that exists and cannot be read is evidence of a preparation whose effect is unknown —
   // the same verdict as any other unverifiable check, for the same reason.
   if (markerRead.kind === "unverifiable") {
@@ -511,7 +532,7 @@ export function readStoreSpace(db: HeaderReader, dbPath: string): StoreSpace {
     migrationInterrupted,
     latestRowWriteAt,
     attribution: resolveAttribution(
-      markerRead, migrationInterrupted, pinReadable, pinnedAt, latestRowWriteAt, observationDim,
+      markerRead, migrationInterrupted, pinReadable, pinnedAt, latestRowWriteAt, conceptDim, observationDim,
     ),
   };
 }
