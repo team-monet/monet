@@ -106,10 +106,10 @@ async function main(): Promise<void> {
   const modelId = process.env.MODEL;
   const onnx: EmbeddingProvider = modelId ? new OnnxEmbeddingProvider({ model: modelId }) : new OnnxEmbeddingProvider();
   await onnx.embed("warmup");
-  // A mismatch is only a defect on the NON-re-embedding path: when MODEL is set every vector below
-  // is recomputed in the loaded space, which is the whole point of the flag. printEmbedderHeader
-  // warns either way and says so — the swap is legitimate, the silent mismatch is not.
-  printEmbedderHeader(storeSpace, onnx);
+  // MODEL set => the loop below replaces `whole` and `segs` on every observation, so nothing stored
+  // is scored and the run is wholly in the loaded space. MODEL unset => the candidates keep their
+  // STORED vectors and only the cue is embedded fresh, which is the path a pin mismatch corrupts.
+  printEmbedderHeader(storeSpace, onnx, modelId !== undefined ? "replaces-stored-vectors" : "against-stored-vectors");
   console.log("");
   if (modelId !== undefined) {
     let done = 0;

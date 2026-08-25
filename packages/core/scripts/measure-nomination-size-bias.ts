@@ -109,9 +109,10 @@ async function main() {
   const onnx: EmbeddingProvider = new OnnxEmbeddingProvider();
   await onnx.embed("warmup");
   const th = onnx.recommendedThresholds;
-  // This script embeds JUNK probes with the loaded model and scores them against the store's
-  // STORED vectors, so a model that is not the store's pin makes every cosine below cross-space.
-  printEmbedderHeader(storeSpace, onnx);
+  // AGAINST STORED VECTORS, unconditionally: `byConcept` above is built from `o.embedding` read out
+  // of the DB and is never re-embedded, while each JUNK probe is embedded fresh by the loaded model.
+  // There is no MODEL swap on this script, so a pin mismatch here is always the corrupting kind.
+  printEmbedderHeader(storeSpace, onnx, "against-stored-vectors");
   console.log(`thresholds=${JSON.stringify(th)}\n`);
 
   // Per size bin: the distribution of best-observation cosine under OFF-TOPIC text.

@@ -120,10 +120,10 @@ async function main() {
   const th = onnx.recommendedThresholds;
 
   console.log(`circle=${circle}   ${rows.length} observations, ${new Set(rows.map((r) => r.cid)).size} concepts`);
-  // This script re-embeds the observations' TEXT rather than reading their stored vectors, so a
-  // mismatch is not fatal here — but it changes what the run is a measurement OF, which is exactly
-  // the fact that went unrecorded and turned two shipped derivation comments into false labels.
-  printEmbedderHeader(storeSpace, onnx);
+  // BOTH SIDES ARE EMBEDDED FROM TEXT here: the query above selects `o.content` and no embedding
+  // column, and the handle is closed before the model loads. No stored vector is ever read, so the
+  // results are wholly in the loaded space — the store supplies the corpus, not the vectors.
+  printEmbedderHeader(storeSpace, onnx, "replaces-stored-vectors");
   console.log(`tauAttach=${th?.tauAttach}  cross-pair budget=${MAX_CROSS}\n`);
 
   // Which (i, j) pairs to score — decided ONCE so every variant is measured on identical pairs.

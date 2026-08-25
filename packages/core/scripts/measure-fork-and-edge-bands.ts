@@ -47,9 +47,10 @@ const AMBIG_CANDIDATES = (process.env.TAU_AMBIGS ?? "0.40,0.50,0.55,0.60,0.65,0.
 
 const db = new Database(DB, { readonly: true });
 // This script's own db=/pin= header was the only one of the twelve that recorded the space at all;
-// it now goes through the shared printer so every measure-* run reports it in one format, and so
-// the dimension — the half that would have caught the bge-small/bge-m3 mislabelling on its own —
-// travels with the pin.
+// it now goes through the shared printer so every measure-* run reports it in one format, and so a
+// sampled dimension travels beside the pin. The dimension is one row per population (LIMIT 1), not
+// a census: it separates 384 from 1024 on a uniform store and cannot see a store whose widths are
+// mixed within a table — `monet doctor` owns that.
 printStoreHeader(db, DB);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,

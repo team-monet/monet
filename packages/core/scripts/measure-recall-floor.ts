@@ -32,7 +32,7 @@
  */
 import { MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider, cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
-import { printSyntheticStoreHeader } from "./measure-header";
+import { printProviderIdentity, printSyntheticStoreHeader } from "./measure-header";
 import { NATIVE_SCORE_FLOOR, nativeScoreFloorOf } from "../src/retrieval";
 import { STARTER_SUITE, BACKGROUND } from "../src/eval/scenarios";
 import type { StoragePort } from "../src/storage";
@@ -142,6 +142,9 @@ async function measure(label: string, embedder: EmbeddingProvider): Promise<void
     const f = (x: number): string => x.toFixed(4);
 
     console.log(`\n===== ${label} — ${queries.length} probe queries, ${JUNK_QUERIES.length} junk queries =====`);
+    // The prose label says which provider CLASS this is; the identity line says which SPACE, which is
+    // the fact a floor derived here has to be read against. There is no store pin to supply it.
+    printProviderIdentity(label, embedder);
     console.log(`GOLD      min=${f(g[0])} p05=${f(pct(g, 5))} p25=${f(pct(g, 25))} median=${f(pct(g, 50))} max=${f(g[g.length - 1])}  n=${g.length}`);
     console.log(`NON-GOLD  median=${f(pct(n, 50))} p90=${f(pct(n, 90))} p99=${f(pct(n, 99))}  n=${n.length}`);
     console.log(`JUNK      p50=${f(pct(j, 50))} p95=${f(pct(j, 95))} p99=${f(pct(j, 99))} max=${f(j[j.length - 1])}  n=${j.length}`);

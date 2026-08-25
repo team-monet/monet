@@ -69,7 +69,7 @@
  */
 import { AmbiguousNominationError, MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider, cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
-import { printSyntheticStoreHeader } from "./measure-header";
+import { printProviderIdentity, printSyntheticStoreHeader } from "./measure-header";
 import { resolveIncoming, type ResolutionMode, type ResolutionNomination } from "../src/resolution";
 import { STARTER_SUITE, BACKGROUND, type Seed } from "../src/eval/scenarios";
 import type { StoragePort } from "../src/storage";
@@ -260,6 +260,9 @@ async function measure(
     const total = incoming.length;
 
     console.log(`\n===== ${label} =====`);
+    // Four measurements run under three providers here, after one synthetic store header. The label
+    // names the scenario and the provider class; this names the SPACE the bands below were seen in.
+    printProviderIdentity(label, embedder);
     console.log(`thresholds  tauAttach=${thresholds.tauAttach}  tauAmbiguous=${thresholds.tauAmbiguous}`);
     console.log(`store       ${memberScores.length} observations / ${conceptCount} concepts (${(memberScores.length / conceptCount).toFixed(2)} observations per concept) after ${total} measured writes`);
     console.log(`\n1. SCORE DISTRIBUTIONS (paired, one sample per ingest that had any candidate)`);
