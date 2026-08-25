@@ -12,7 +12,7 @@ describe("HashingEmbeddingProvider Unicode tokenization (item 9 fallback tokeniz
     for (const text of ["こんにちは世界", "Привет мир", "안녕하세요 세계"]) {
       const v = embedder.embed(text);
       const magnitude = Math.sqrt(Array.from(v).reduce((sum, x) => sum + x * x, 0));
-      // normalize() divides by (mag || 1) — an all-zero vector (the old ASCII-only bug) would
+      // normalizeVector() divides by (mag || 1) — an all-zero vector (the old ASCII-only bug) would
       // stay all-zero and report magnitude 0, not 1.
       expect(magnitude).toBeCloseTo(1, 5);
     }

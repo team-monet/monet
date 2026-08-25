@@ -337,10 +337,24 @@ export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
     // Evidence says "same concept". Ask identity whether that concept is still coherent.
     if (centroidScore >= tauAmbiguous) {
       // SIMILAR ENOUGH IS NOT THE SAME QUESTION AS SURE IT IS THIS ONE (#86). tauAttach answered
-      // the first; nothing had ever asked the second, and the second is the one that separates —
-      // precision of attaches is flat at ~74% across the whole tauAttach range, while the winner's
-      // margin over the runner-up puts misfiles' median (0.0335) below correct decisions' p10
-      // (0.0346). Under this bar the winner is wrong ~64% of the time.
+      // the first; nothing had ever asked the second, and the second is the one that separates: the
+      // winner's margin over the runner-up puts misfiles' median (0.0335) below correct decisions'
+      // p10 (0.0346). Under this bar the winner is wrong ~64% of the time.
+      //
+      // THIS USED TO OPEN WITH "precision of attaches is flat at ~74% across the whole tauAttach
+      // range" — RETIRED 2026-08-25, and it was never a second measurement, only this file's copy of
+      // the sentence in embedding.ts's tauMargin doc. That sweep is a `Xenova/bge-small-en-v1.5`
+      // 384-dim run (measure-attach-thresholds.ts reads stored vectors and imports no embedder;
+      // monet-hq did not migrate to bge-m3 until 2026-08-24), where it reproduces at 73.9% -> 76.9%.
+      // Re-run on the bge-m3 store 2026-08-25, same script, n=788, precision RISES across the same
+      // 0.50 -> 0.75 sweep: 76.3% -> 86.2%. See embedding.ts's tauMargin block for the full grid.
+      //
+      // Nothing about THIS branch turns on that. The flatness was only ever an argument about why
+      // raising tauAttach is a poor substitute for the margin gate; the gate's own case — tauAttach
+      // asks "similar enough", the margin asks "sure it is THIS one" — is a statement about which
+      // question is being answered, and holds in either space. The margin figures above come from
+      // the tauMargin derivation (measure-gate.ts), a different script measuring a different
+      // quantity, and are left as they were.
       //
       // So the decision is NOT taken. It is handed back with the candidates, and the caller either
       // names one (attachTo) or asserts distinctness (forceNew). Writing first and letting the

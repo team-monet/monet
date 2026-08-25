@@ -45,6 +45,7 @@
  */
 import { MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider } from "../src/embedding";
+import { printSyntheticStoreHeader } from "./measure-header";
 import type { StoragePort } from "../src/storage";
 
 const CIRCLE = "perf";
@@ -86,8 +87,14 @@ function summarize(samples: number[]): string {
 
 async function main(): Promise<void> {
   let seq = 0;
+  const embedder = new HashingEmbeddingProvider();
+  // No store to name: the fixture is built here, in memory, by the one provider below. These are
+  // TIMINGS rather than cosines, so the space governs the shape of the scan and not the numbers'
+  // meaning — but a timing on 256-dim hashing vectors is not a timing on 1024-dim semantic ones,
+  // which is reason enough for the run to say which it was.
+  printSyntheticStoreHeader(`${CONCEPTS} concepts x ${OBS_PER_CONCEPT + 1} observations, embedder=${embedder.modelId}`);
   const core = new MonetCore(":memory:", {
-    embedder: new HashingEmbeddingProvider(), tauAttach: 1.1, tauAmbiguous: 1.1, // dedup off => exact shape
+    embedder, tauAttach: 1.1, tauAmbiguous: 1.1, // dedup off => exact shape
     idGen: () => `c${(seq++).toString().padStart(6, "0")}`,
   });
   try {

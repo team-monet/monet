@@ -52,6 +52,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
+import { printEmbedderHeader, printStoreHeader } from "./measure-header";
 
 const DB = process.env.PROBE_DB!;
 const JUNK = [
@@ -75,12 +76,13 @@ const q = (xs: number[], p: number) => (xs.length === 0 ? NaN : [...xs].sort((a,
 
 async function main() {
   const db = new Database(DB, { readonly: true });
+  const storeSpace = printStoreHeader(db, DB);
 
   // The nomination scan runs inside ONE circle. Measure the largest, which is where the blobs are.
   const circle = (db.prepare(
     `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
   ).get() as { circle: string; n: number });
-  console.log(`store=${DB}\ncircle=${circle.circle} (${circle.n} non-source concepts)\n`);
+  console.log(`circle=${circle.circle} (${circle.n} non-source concepts)\n`);
 
   // Exactly the rows scoreNativeConceptsByObservation reads: live, non-source.
   const rows = db.prepare(
@@ -107,7 +109,10 @@ async function main() {
   const onnx: EmbeddingProvider = new OnnxEmbeddingProvider();
   await onnx.embed("warmup");
   const th = onnx.recommendedThresholds;
-  console.log(`embedder=${(onnx as any).modelId}  thresholds=${JSON.stringify(th)}\n`);
+  // This script embeds JUNK probes with the loaded model and scores them against the store's
+  // STORED vectors, so a model that is not the store's pin makes every cosine below cross-space.
+  printEmbedderHeader(storeSpace, onnx);
+  console.log(`thresholds=${JSON.stringify(th)}\n`);
 
   // Per size bin: the distribution of best-observation cosine under OFF-TOPIC text.
   const perBin = new Map<string, number[]>(ORDER.map((b) => [b, []]));

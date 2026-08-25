@@ -28,7 +28,12 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
+import { printStoreHeader } from "./measure-header";
 
+// PROBE_DB, not MONET_DB — of the five scripts that import no embedder this is the only one reading
+// a different env var (nomination-size-bias and normalization-ceiling read PROBE_DB too, but they
+// load embedders), so the header below prints the path it ACTUALLY resolved rather than the
+// variable a reader assumes.
 const DB = process.env.PROBE_DB!;
 const TAU_ATTACH = Number(process.env.TAU_ATTACH ?? 0.72);
 const TAU_AMBIGUOUS = Number(process.env.TAU_AMBIGUOUS ?? 0.5);
@@ -38,6 +43,7 @@ const pct = (xs: number[], p: number) => xs[Math.min(xs.length - 1, Math.floor(p
 const share = (xs: number[], t: number) => ((xs.filter((x) => x >= t).length / xs.length) * 100).toFixed(1);
 
 const db = new Database(DB, { readonly: true });
+printStoreHeader(db, DB);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;

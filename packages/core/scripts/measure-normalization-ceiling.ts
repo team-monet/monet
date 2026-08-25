@@ -36,6 +36,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, type EmbeddingProvider } from "../src/embedding";
+import { printEmbedderHeader, printStoreHeader } from "./measure-header";
 
 const DB = process.env.PROBE_DB!;
 /** Cross-concept pairs sampled on a fixed stride (no clock, no RNG). Same budget for every variant
@@ -100,6 +101,7 @@ const pctl = (xs: number[], p: number) => xs[Math.min(xs.length - 1, Math.floor(
 
 async function main() {
   const db = new Database(DB, { readonly: true });
+  const storeSpace = printStoreHeader(db, DB);
   const circle = (db.prepare(
     `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
   ).get() as { circle: string }).circle;
@@ -118,7 +120,11 @@ async function main() {
   const th = onnx.recommendedThresholds;
 
   console.log(`circle=${circle}   ${rows.length} observations, ${new Set(rows.map((r) => r.cid)).size} concepts`);
-  console.log(`embedder=${(onnx as any).modelId}  tauAttach=${th?.tauAttach}  cross-pair budget=${MAX_CROSS}\n`);
+  // This script re-embeds the observations' TEXT rather than reading their stored vectors, so a
+  // mismatch is not fatal here — but it changes what the run is a measurement OF, which is exactly
+  // the fact that went unrecorded and turned two shipped derivation comments into false labels.
+  printEmbedderHeader(storeSpace, onnx);
+  console.log(`tauAttach=${th?.tauAttach}  cross-pair budget=${MAX_CROSS}\n`);
 
   // Which (i, j) pairs to score — decided ONCE so every variant is measured on identical pairs.
   const samePairs: Array<[number, number]> = [];

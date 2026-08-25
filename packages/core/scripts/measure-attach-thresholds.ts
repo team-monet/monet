@@ -33,12 +33,14 @@
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
 import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/lexical-overlap";
+import { printStoreHeader } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const CANDIDATES = (process.env.TAUS ?? "0.50,0.55,0.58,0.60,0.62,0.65,0.68,0.70,0.72,0.75")
   .split(",").map((s) => Number(s.trim()));
 
 const db = new Database(DB, { readonly: true });
+printStoreHeader(db, DB);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;

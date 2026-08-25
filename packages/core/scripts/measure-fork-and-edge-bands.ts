@@ -36,6 +36,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
+import { printStoreHeader } from "./measure-header";
 
 const DB = process.env.MONET_DB ?? `${process.env.HOME}/.monet/monet.db`;
 const EDGE_CANDIDATES = (process.env.EDGE_MINS ?? "0.40,0.45,0.50,0.55,0.60,0.65,0.70")
@@ -45,11 +46,15 @@ const AMBIG_CANDIDATES = (process.env.TAU_AMBIGS ?? "0.40,0.50,0.55,0.60,0.65,0.
   .split(",").map((s) => Number(s.trim()));
 
 const db = new Database(DB, { readonly: true });
-const pin = (db.prepare(`SELECT embedder_model_id AS m FROM sync_meta`).get() as { m: string } | undefined)?.m;
+// This script's own db=/pin= header was the only one of the twelve that recorded the space at all;
+// it now goes through the shared printer so every measure-* run reports it in one format, and so
+// the dimension — the half that would have caught the bge-small/bge-m3 mislabelling on its own —
+// travels with the pin.
+printStoreHeader(db, DB);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
-console.log(`db=${DB}\npin=${pin ?? "(none)"}  circle=${circle}  tauAttach=${TAU_ATTACH}\n`);
+console.log(`circle=${circle}  tauAttach=${TAU_ATTACH}\n`);
 
 const pct = (n: number, d: number): string => `${((100 * n) / Math.max(d, 1)).toFixed(1)}%`;
 const quantile = (sorted: number[], q: number): number =>

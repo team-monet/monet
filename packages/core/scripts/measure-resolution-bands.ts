@@ -69,6 +69,7 @@
  */
 import { AmbiguousNominationError, MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider, cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
+import { printSyntheticStoreHeader } from "./measure-header";
 import { resolveIncoming, type ResolutionMode, type ResolutionNomination } from "../src/resolution";
 import { STARTER_SUITE, BACKGROUND, type Seed } from "../src/eval/scenarios";
 import type { StoragePort } from "../src/storage";
@@ -352,6 +353,9 @@ const consolidated = async (core: MonetCore): Promise<Seed[]> => {
 };
 
 async function main(): Promise<void> {
+  // No store to name: every `measure(...)` below builds its own :memory: MonetCore, so the space is
+  // the provider each run is labelled with rather than a persisted pin.
+  printSyntheticStoreHeader("one :memory: MonetCore seeded per measurement");
   const lexical = "HashingEmbeddingProvider (lexical — what CI runs)";
   await measure(`A. natural ingest — ${lexical}`, new HashingEmbeddingProvider(), naturalIngest);
   await measure(`B. consolidated store — ${lexical}`, new HashingEmbeddingProvider(), consolidated);

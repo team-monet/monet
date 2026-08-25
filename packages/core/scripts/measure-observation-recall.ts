@@ -26,9 +26,11 @@
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
 import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/lexical-overlap";
+import { printEmbedderHeader, printStoreHeader } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
+const storeSpace = printStoreHeader(db, DB);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
@@ -104,7 +106,11 @@ async function main(): Promise<void> {
   const modelId = process.env.MODEL;
   const onnx: EmbeddingProvider = modelId ? new OnnxEmbeddingProvider({ model: modelId }) : new OnnxEmbeddingProvider();
   await onnx.embed("warmup");
-  console.log(`embedder=${onnx.modelId ?? "(unnamed)"}  dim=${onnx.dim}\n`);
+  // A mismatch is only a defect on the NON-re-embedding path: when MODEL is set every vector below
+  // is recomputed in the loaded space, which is the whole point of the flag. printEmbedderHeader
+  // warns either way and says so — the swap is legitimate, the silent mismatch is not.
+  printEmbedderHeader(storeSpace, onnx);
+  console.log("");
   if (modelId !== undefined) {
     let done = 0;
     for (const o of observations) {

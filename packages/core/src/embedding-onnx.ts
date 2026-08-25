@@ -521,6 +521,22 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
      * CREATE. At tauAttach 0.70 with no margin gate the second population is absorbed 87.9% of the
      * time; the first misfiles 26.1% raw, ~17% after blinded adjudication of 60 disagreements.
      *
+     * NOT DERIVED IN THE SPACE THIS PROFILE GOVERNS — recorded 2026-08-25, and the reason this
+     * whole file names a space beside every other number. measure-gate.ts imports no embedder: it
+     * reads whatever vectors the store it is pointed at already holds. This constant landed in
+     * a472af7 on 2026-08-23 13:32 UTC, and monet-hq was pinned to bge-m3 on 2026-08-24 09:51 UTC —
+     * roughly twenty hours LATER. So the sweep below ran on `Xenova/bge-small-en-v1.5` 384-dim
+     * vectors, and 0.12 governs a bge-m3 profile it has never been measured in. Its neighbours in
+     * this same profile do not share the defect: tauAttach, reliableSegmentTokens and edgeSimMin
+     * each name the corpus AND were measured on stores whose vectors are in this space.
+     *
+     * The value is LEFT AT 0.12 rather than removed or guessed at. Re-derivation in bge-m3 space is
+     * tracked separately and is not what this note does; until it happens, read every figure below
+     * as a bge-small measurement. Note also that the derivation ran against a centroid the script
+     * built WITHOUT normalizing (fixed 2026-08-25, scripts/measure-gate.ts), so its centroid
+     * confirmation gate was consulted on deflated scores — a second reason a re-derivation will not
+     * simply reproduce these numbers.
+     *
      * Swept together, unrecoverable merges (wrong home + absorbed new topic) run 38.9% at d=0,
      * 26.4% at 0.02, 15.1% at 0.05, 9.1% at 0.08, 5.6% at 0.12. Past 0.12 the asks dominate without
      * buying much: 0.20 reaches 2.8% but files only 22.4% of placeable memories correctly.

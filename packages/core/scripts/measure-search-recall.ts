@@ -34,9 +34,11 @@
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
 import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/lexical-overlap";
+import { printEmbedderHeader, printStoreHeader } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
+const storeSpace = printStoreHeader(db, DB);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;
@@ -155,6 +157,7 @@ async function main(): Promise<void> {
     const { OnnxEmbeddingProvider: Swap } = await import("../src/embedding-onnx");
     const alt: EmbeddingProvider = new Swap({ model: swapModel });
     await alt.embed("warmup");
+    printEmbedderHeader(storeSpace, alt);
     console.log(`re-embedding with ${swapModel}...`);
     for (const o of observations) {
       o.whole = await alt.embed(o.content);
@@ -169,7 +172,12 @@ async function main(): Promise<void> {
 
   const { OnnxEmbeddingProvider } = await import("../src/embedding-onnx");
   const onnx: EmbeddingProvider = swapped ?? new OnnxEmbeddingProvider();
-  if (swapped === null) await onnx.embed("warmup");
+  // Loaded here rather than at startup — the "full observation" shape above needs no model at all —
+  // so the space it embeds cues in is reported here, at the point it becomes real.
+  if (swapped === null) {
+    await onnx.embed("warmup");
+    printEmbedderHeader(storeSpace, onnx);
+  }
   const cache = new Map<string, Float32Array>();
   await run("opening sentence", async (o) => {
     const text = opening(o.content);
