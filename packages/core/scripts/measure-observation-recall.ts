@@ -31,11 +31,16 @@ import { printEmbedderHeader, printStoreHeader, requireTrustableSpace } from "./
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
 const storeSpace = printStoreHeader(db, DB);
-// CONDITIONAL on MODEL, and decided here because that is the only input: with MODEL set, main()
-// re-embeds `whole` and `segs` for every observation before anything is scored, so no stored vector
-// survives into the measurement and a mixed store is irrelevant to it. With MODEL unset, the
-// candidates ARE the stored vectors and an unattributable store must abort before any work.
-requireTrustableSpace(storeSpace, process.env.MODEL === undefined);
+// UNCONDITIONAL, INCLUDING THE MODEL PATH. Setting MODEL replaces every scored VALUE, but it does
+// not replace the POPULATION: `observations` above is already filtered to rows with a nonzero stored
+// whole vector AND at least one stored segment, and the re-embed loop iterates that filtered list.
+// Membership is decided by stored state before any model loads. That matters because an interrupted
+// official migration DELETES the segments of every observation it rewrote (engine.ts,
+// migrateEmbeddings: "DROP THIS OBSERVATION'S SEGMENTS") — so on such a store this filter silently
+// drops exactly the migrated rows, and a MODEL run would measure only the untouched remainder while
+// printing a corpus-wide n. A selection bias reported as coverage is the defect class this whole
+// header exists to prevent, so this script refuses rather than exempting itself.
+requireTrustableSpace(storeSpace);
 const circle = (db.prepare(
   `SELECT circle, COUNT(*) n FROM concepts WHERE kind!='source' GROUP BY circle ORDER BY n DESC LIMIT 1`,
 ).get() as { circle: string }).circle;

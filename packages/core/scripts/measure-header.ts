@@ -660,13 +660,21 @@ const ALLOW_MIXED_ENV = "MEASURE_ALLOW_MIXED";
  *     measure-attach-thresholds, measure-fork-and-edge-bands, measure-gate,
  *     measure-nomination-signals, measure-threshold-headroom,
  *     measure-nomination-size-bias (junk probes are fresh, but every CANDIDATE is a stored vector,
- *       and its leave-one-out half is stored-vs-stored throughout)
- *   CONDITIONAL on MODEL (set => every candidate is re-embedded before scoring)
- *     measure-observation-recall, measure-search-recall
+ *       and its leave-one-out half is stored-vs-stored throughout),
+ *     measure-observation-recall, measure-search-recall (MODEL replaces every scored VALUE but not
+ *       the POPULATION — both filter to rows with a nonzero stored whole vector and at least one
+ *       stored segment BEFORE any model loads, so membership is stored state either way; see the
+ *       comment at either call site for why an interrupted migration makes that a silent bias)
  *   ALWAYS false (both sides embedded from text; no stored vector is ever read)
- *     measure-normalization-ceiling
+ *     measure-normalization-ceiling — its population query selects `o.concept_id, o.content` and no
+ *       embedding column, and the file does not import isZeroVector at all
  *   N/A — no store to read (pass null)
  *     measure-recall-floor, measure-recall-perf, measure-resolution-bands
+ *
+ * NOTHING IS CURRENTLY CONDITIONAL. The parameter stays because "does this run read stored vectors"
+ * is a real property a future script may have, not because anything exercises it today — "it
+ * re-embeds everything" was tried as an exemption for the two recall scripts and turned out to be
+ * false of their population SELECTION even where it was true of their scored values.
  *
  * The escape hatch exists because deliberately measuring a mixed store is a legitimate thing to do
  * ONCE you know it is mixed — and it is named in the error, so taking it is a decision rather than

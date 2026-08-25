@@ -20,6 +20,7 @@
  * `prepare(...).get()` shape, and driving them with SQL would test better-sqlite3.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   printEmbedderHeader, printStoreHeader, printStoredOnlySection, readStoreSpace,
   requireTrustableSpace, scoredSpaceIdentity,
@@ -820,5 +821,72 @@ describe("measure-header — requireTrustableSpace aborts rather than decorating
     const space = readStoreSpace(stubReader(BASE), "/tmp/x.db");
     expect(captured(() => requireTrustableSpace(space, false))).toBe("");
     expect(captured(() => requireTrustableSpace(space, true))).toBe("");
+  });
+});
+
+/**
+ * WHICH SCRIPT CLAIMS WHICH EXEMPTION — asserted on the SOURCE, because that is where the claim
+ * lives and nothing else could catch it moving.
+ *
+ * The exemption is a per-script assertion about what a run consumes, made at its call site. The
+ * function-level tests above prove the flag behaves; they cannot prove a script passes the right
+ * one. That gap is not hypothetical: the two recall scripts carried
+ * `consumesStoredVectors = MODEL === undefined` on the theory that re-embedding every candidate
+ * makes the store's state irrelevant. It does not — see the call-site comments — and no test failed
+ * when that was wrong, because no test read the call sites.
+ *
+ * STRUCTURAL, in the codebase's own idiom (gates.test.ts uses the same technique where the real
+ * condition is disproportionate to set up): driving each script for real would need twelve stores
+ * and, for four of them, a 570 MB model download.
+ */
+describe("measure-* scripts — the stored-vector exemption is claimed only where it holds", () => {
+  const scriptsDir = new URL("../../scripts/", import.meta.url);
+  const sourceOf = (name: string): string => readFileSync(new URL(name, scriptsDir), "utf8");
+  const callOf = (name: string): string => {
+    const m = sourceOf(name).match(/requireTrustableSpace\(([^)]*)\)/);
+    expect(m, `${name} must call requireTrustableSpace`).not.toBeNull();
+    return m![1].trim();
+  };
+
+  // Every script that scores vectors READ FROM the store. The two recall scripts belong here even
+  // under MODEL: it replaces the values they score, not the population they select.
+  const STRICT = [
+    "measure-attach-thresholds.ts", "measure-fork-and-edge-bands.ts", "measure-gate.ts",
+    "measure-nomination-signals.ts", "measure-threshold-headroom.ts", "measure-nomination-size-bias.ts",
+    "measure-observation-recall.ts", "measure-search-recall.ts",
+  ];
+
+  it.each(STRICT)("%s refuses unconditionally — no second argument, no MODEL condition", (name) => {
+    expect(callOf(name)).toBe("storeSpace");
+  });
+
+  it.each(["measure-observation-recall.ts", "measure-search-recall.ts"])(
+    "%s does not reason about MODEL when deciding whether to refuse", (name) => {
+      // The specific regression: a conditional keyed on MODEL exempts the run whose population
+      // selection is the thing an interrupted migration corrupts.
+      expect(callOf(name)).not.toMatch(/MODEL/);
+    },
+  );
+
+  it("measure-normalization-ceiling.ts is the ONLY exempt script, and its population proves it", () => {
+    expect(callOf("measure-normalization-ceiling.ts")).toBe("storeSpace, false");
+    const src = sourceOf("measure-normalization-ceiling.ts");
+    // The exemption rests on two facts, both checkable here: it selects content and no vector, and
+    // it has no notion of a zero vector to filter a population by.
+    expect(src).toMatch(/SELECT o\.concept_id AS cid, o\.content AS content/);
+    expect(src).not.toMatch(/isZeroVector/);
+  });
+
+  it("the three :memory: scripts pass null — they read no store at all", () => {
+    for (const name of ["measure-recall-floor.ts", "measure-recall-perf.ts", "measure-resolution-bands.ts"]) {
+      expect(callOf(name)).toBe("null");
+    }
+  });
+
+  it("all twelve gate, and only the twelve classifications above exist", () => {
+    const all = [...STRICT, "measure-normalization-ceiling.ts",
+      "measure-recall-floor.ts", "measure-recall-perf.ts", "measure-resolution-bands.ts"];
+    expect(all).toHaveLength(12);
+    for (const name of all) expect(sourceOf(name)).toContain("requireTrustableSpace(");
   });
 });
