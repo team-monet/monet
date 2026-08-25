@@ -59,20 +59,6 @@ async function main(): Promise<void> {
       + `[pooling=${POOLING ?? "profile default"}, dtype=${DTYPE ?? "profile default"}, dim=${warmup.length}]`,
   );
 
-  const updSeg = db.prepare(`UPDATE observation_segments SET embedding = ? WHERE observation_id = ? AND segment_index = ?`);
-  let i = 0;
-  for (const s of segs) {
-    const v = embToJson(await provider.embed(s.content));
-    db.transaction(() => updSeg.run(v, s.observation_id, s.segment_index))();
-    if (++i % 500 === 0) console.log(`  segments ${i}/${segs.length}`);
-  }
-  const updObs = db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`);
-  i = 0;
-  for (const o of obs) {
-    const v = embToJson(await provider.embed(o.content));
-    db.transaction(() => updObs.run(v, o.id))();
-    if (++i % 500 === 0) console.log(`  observations ${i}/${obs.length}`);
-  }
   /*
    * PROVENANCE, WRITTEN INTO THE COPY — the durable half of the note above.
    *
@@ -83,6 +69,15 @@ async function main(): Promise<void> {
    * file. `sync_meta` still names the old pin, the concept vectors are still in the old space, and a
    * header sampling widths reports a tidy, uniform, WRONG answer. The only fix is for the run to say
    * so in the copy, which is what this row is.
+   *
+   * TWO-PHASE, AND OPENED BEFORE THE FIRST VECTOR MOVES. Publishing only on success is what the
+   * first version did, and it made an interruption invisible in the worst possible way: a rerun that
+   * dies partway leaves the PREVIOUS run's row standing over a store that is now half one space and
+   * half another, and the row reads as authoritative. Same-width swaps evade even the dimension
+   * check, so nothing anywhere would notice. The engine's own `embedder_migration` table solves this
+   * with a sentinel — present means interrupted, absent means completed (findings §1) — and this is
+   * that idea shaped for a row that must SURVIVE completion: `completed_at` NULL means the
+   * preparation is still running or died, and the vectors are a mix that no identity describes.
    *
    * ONE ROW, REPLACED ON RE-RUN: the last preparation is the state of the file, and a history of
    * superseded preparations would just be another thing to read wrong.
@@ -100,20 +95,23 @@ async function main(): Promise<void> {
       dtype TEXT,
       measured_dim INTEGER NOT NULL,
       populations TEXT NOT NULL,
-      rewritten_at INTEGER NOT NULL
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER
     );
   `);
   db.prepare(
     `INSERT INTO reembed_provenance
-       (singleton, candidate_model_id, requested_model, pooling, dtype, measured_dim, populations, rewritten_at)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+       (singleton, candidate_model_id, requested_model, pooling, dtype, measured_dim, populations,
+        started_at, completed_at)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, NULL)
      ON CONFLICT(singleton) DO UPDATE SET
        candidate_model_id = excluded.candidate_model_id, requested_model = excluded.requested_model,
        pooling = excluded.pooling, dtype = excluded.dtype, measured_dim = excluded.measured_dim,
-       populations = excluded.populations, rewritten_at = excluded.rewritten_at`,
+       populations = excluded.populations, started_at = excluded.started_at,
+       completed_at = NULL`, // the previous run's completion never carries over onto this one
   ).run(
     // NULL, not a fabricated id, when the checkpoint is off-profile: modelId is undefined exactly
-    // when nothing names this space, and `requested_model` below still records what was asked for.
+    // when nothing names this space, and `requested_model` still records what was asked for.
     provider.modelId ?? null,
     MODEL,
     POOLING ?? null,
@@ -122,6 +120,25 @@ async function main(): Promise<void> {
     "observations+segments where kind != 'source'; concepts and sync_meta UNTOUCHED",
     Date.now(),
   );
+
+  const updSeg = db.prepare(`UPDATE observation_segments SET embedding = ? WHERE observation_id = ? AND segment_index = ?`);
+  let i = 0;
+  for (const s of segs) {
+    const v = embToJson(await provider.embed(s.content));
+    db.transaction(() => updSeg.run(v, s.observation_id, s.segment_index))();
+    if (++i % 500 === 0) console.log(`  segments ${i}/${segs.length}`);
+  }
+  const updObs = db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`);
+  i = 0;
+  for (const o of obs) {
+    const v = embToJson(await provider.embed(o.content));
+    db.transaction(() => updObs.run(v, o.id))();
+    if (++i % 500 === 0) console.log(`  observations ${i}/${obs.length}`);
+  }
+  // PHASE 2 — publish. Only now is the copy fully in the candidate space, so only now may the row
+  // claim to describe it. Anything that kills the process before this line leaves completed_at NULL,
+  // which is the state measure-header.ts refuses to attribute rather than guessing at.
+  db.prepare(`UPDATE reembed_provenance SET completed_at = ? WHERE singleton = 1`).run(Date.now());
 
   db.close();
   console.log(`done — provenance recorded in reembed_provenance (concepts and the pin are unchanged)`);

@@ -44,6 +44,8 @@ function stubReader(opts: {
   reembed?: {
     candidate_model_id: string | null; requested_model: string; pooling?: string | null;
     dtype?: string | null; measured_dim: number;
+    /** Omitted => completed. `null` => the preparation was interrupted and never published. */
+    completed_at?: number | null;
   };
 }) {
   const vec = (n: number): string => JSON.stringify(new Array(n).fill(0.1));
@@ -63,7 +65,8 @@ function stubReader(opts: {
               dtype: opts.reembed.dtype ?? null,
               measured_dim: opts.reembed.measured_dim,
               populations: "observations+segments where kind != 'source'; concepts and sync_meta UNTOUCHED",
-              rewritten_at: 1756000000000,
+              started_at: 1756000000000,
+              completed_at: opts.reembed.completed_at === undefined ? 1756000060000 : opts.reembed.completed_at,
             };
           }
           if (sql.includes("sync_meta")) {
@@ -226,7 +229,7 @@ describe("measure-header — declared width vs measured width", () => {
     const out = captured(() => printStoredOnlySection(space));
     expect(out).toMatch(/stored-vector section/);
     expect(out).toContain("Xenova/bge-m3:cls:q8");
-    expect(out).toMatch(/applies to the earlier section, not to this one/);
+    expect(out).toMatch(/applies elsewhere, not to this section/);
   });
 });
 
@@ -255,8 +258,8 @@ describe("measure-header — candidate provenance on a same-width re-embed", () 
 
     const out = captured(() => printStoreHeader(stubReader(SWAP), "/tmp/swap.db"));
     expect(out).toMatch(/prepared by scripts\/reembed-store\.ts/);
-    expect(out).toContain("scored side (observations + segments) -> Xenova/bge-base-en-v1.5");
-    expect(out).toContain("concepts + sync_meta                  -> Xenova/bge-small-en-v1.5");
+    expect(out).toContain("observations + segments -> Xenova/bge-base-en-v1.5");
+    expect(out).toContain("concepts + sync_meta    -> Xenova/bge-small-en-v1.5");
   });
 
   it("clears a run whose loaded model IS the candidate — the pin alone would have called it a mismatch", () => {
@@ -294,6 +297,30 @@ describe("measure-header — candidate provenance on a same-width re-embed", () 
     expect(out).toMatch(/marker records a 384-dim rewrite but the observations sampled/);
   });
 
+  it("attributes the CONCEPT population to the pin and the OBSERVATION population to the candidate, on one store", () => {
+    // measure-fork-and-edge-bands.ts is the script that does both: segments for tauAmbiguous,
+    // concept pairs for edgeSimMin. reembed-store.ts rewrote only the first.
+    const space = readStoreSpace(stubReader(SWAP), "/tmp/swap.db");
+    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({
+      id: "Xenova/bge-base-en-v1.5", source: "reembed-marker",
+    });
+    expect(scoredSpaceIdentity(space, "concepts")).toMatchObject({
+      id: "Xenova/bge-small-en-v1.5", source: "pin",
+    });
+
+    const obsSection = captured(() => printStoredOnlySection(space, "observations"));
+    expect(obsSection).toContain("observation and segment vectors");
+    expect(obsSection).toContain("Xenova/bge-base-en-v1.5");
+
+    const conceptSection = captured(() => printStoredOnlySection(space, "concepts"));
+    expect(conceptSection).toContain("concepts.embedding");
+    expect(conceptSection).toContain("Xenova/bge-small-en-v1.5");
+    expect(conceptSection).toMatch(/did NOT rewrite these vectors/);
+    expect(conceptSection).toMatch(/PINNED space/);
+    // The two sections must not be given the same answer.
+    expect(conceptSection).not.toContain("bge-base");
+  });
+
   it("MARKER ABSENT: behaviour is exactly what it was — the pin is the identity", () => {
     const plain = { pin: "Xenova/bge-m3:cls:q8", conceptDim: 1024, observationDim: 1024 };
     const space = readStoreSpace(stubReader(plain), "/tmp/plain.db");
@@ -308,5 +335,77 @@ describe("measure-header — candidate provenance on a same-width re-embed", () 
     const mismatch = captured(() =>
       printEmbedderHeader(space, { modelId: "Xenova/bge-small-en-v1.5", dim: 384 }, "against-stored-vectors", 384));
     expect(mismatch).toMatch(/does NOT match the store pin 'Xenova\/bge-m3:cls:q8'/);
+    // Concepts resolve to the same pin when nothing rewrote anything — no spurious divergence.
+    expect(scoredSpaceIdentity(space, "concepts")).toMatchObject({ id: "Xenova/bge-m3:cls:q8", source: "pin" });
+  });
+});
+
+/**
+ * AN INTERRUPTED PREPARATION — the state the first marker could not represent.
+ *
+ * reembed-store.ts publishes provenance only when the rewrite finishes. Before this, a rerun that
+ * died partway left the PREVIOUS run's row standing over a half-rewritten store, reading as
+ * authoritative; on a same-width swap nothing else in the file disagreed with it. The marker is now
+ * opened before the first vector moves and completed after the last, so `completed_at IS NULL` is
+ * the store saying "I am two spaces at once" — which is not a space, and must not be attributed.
+ */
+describe("measure-header — interrupted preparation", () => {
+  const INTERRUPTED = {
+    pin: "Xenova/bge-small-en-v1.5",
+    conceptDim: 384,
+    observationDim: 384,
+    reembed: {
+      candidate_model_id: "Xenova/bge-base-en-v1.5", requested_model: "Xenova/bge-base-en-v1.5",
+      measured_dim: 384, completed_at: null,
+    },
+  };
+
+  it("reports the space as NOT TRUSTABLE rather than naming either side", () => {
+    const space = readStoreSpace(stubReader(INTERRUPTED), "/tmp/half.db");
+    expect(space.reembed?.completedAt).toBeNull();
+    const identity = scoredSpaceIdentity(space);
+    expect(identity.trustable).toBe(false);
+    expect(identity.known).toBe(false);
+    expect(identity.id).toBeNull();
+    expect(identity.source).toBe("reembed-interrupted");
+    // The concept side is poisoned too — a half-rewritten observations table is not something the
+    // "concepts were untouched" reasoning can be read beside.
+    expect(scoredSpaceIdentity(space, "concepts").trustable).toBe(false);
+  });
+
+  it("emits the interrupted/mixed STOP, and NOT the ordinary split NOTE", () => {
+    const out = captured(() => printStoreHeader(stubReader(INTERRUPTED), "/tmp/half.db"));
+    expect(out).toMatch(/STOP: scripts\/reembed-store\.ts began preparing this copy and never finished/);
+    expect(out).toMatch(/MIX of that candidate's space and the pinned/);
+    expect(out).toMatch(/no completion recorded/);
+    // The completed-copy NOTE would imply a clean two-population split, which this is not.
+    expect(out).not.toMatch(/NOTE: this copy was prepared/);
+  });
+
+  it("keeps the interrupted state DISTINCT from the stale-width warning", () => {
+    // Same store, but the rows are also a different width than the marker claims. The interrupted
+    // state subsumes it: a half-rewritten table legitimately holds both widths, so reporting a
+    // stale marker on top would describe the symptom as if it were a second, separate fault.
+    const out = captured(() => printStoreHeader(stubReader({ ...INTERRUPTED, observationDim: 1024 }), "/tmp/half.db"));
+    expect(out).toMatch(/STOP:/);
+    expect(out).not.toMatch(/marker records a .*-dim rewrite but the observations sampled/);
+  });
+
+  it("refuses to attribute a loaded embedder instead of declaring a match or a mismatch", () => {
+    const space = readStoreSpace(stubReader(INTERRUPTED), "/tmp/half.db");
+    // Loading the very candidate the preparation was heading toward still gets no clearance.
+    const out = captured(() =>
+      printEmbedderHeader(space, { modelId: "Xenova/bge-base-en-v1.5", dim: 384 }, "against-stored-vectors", 384));
+    expect(out).toMatch(/REFUSING TO ATTRIBUTE/);
+    expect(out).toMatch(/not a question with an answer/);
+    expect(out).not.toMatch(/does NOT match/);
+  });
+
+  it("stays quiet for a run that re-embeds everything — it never reads the mixed rows", () => {
+    const space = readStoreSpace(stubReader(INTERRUPTED), "/tmp/half.db");
+    const out = captured(() =>
+      printEmbedderHeader(space, { modelId: "Xenova/bge-base-en-v1.5", dim: 384 }, "replaces-stored-vectors", 384));
+    expect(out).not.toMatch(/REFUSING/);
+    expect(out).not.toMatch(/WARNING/);
   });
 });
