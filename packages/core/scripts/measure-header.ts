@@ -40,6 +40,28 @@ export type ScoringSide =
   /** Every scored vector is re-embedded by the loaded model first; the store supplies only text. */
   | "replaces-stored-vectors";
 
+/**
+ * What scripts/reembed-store.ts recorded about a copy it prepared, when it prepared one.
+ *
+ * The row exists precisely because width cannot answer this. A same-width candidate swap — another
+ * 384-dim model, or the same checkpoint at a different pooling or dtype — rewrites every observation
+ * and segment vector and leaves the file otherwise identical: same pin, same row counts, same
+ * sampled dimension, no split. Without this row a header reports uniform agreement with a pin that
+ * no longer describes the vectors these scripts score.
+ */
+export interface ReembedProvenance {
+  /** The candidate's own id; NULL when the checkpoint is off-profile and nothing names its space. */
+  candidateModelId: string | null;
+  /** What was asked for — always known, even when no id names the resulting space. */
+  requestedModel: string;
+  pooling: string | null;
+  dtype: string | null;
+  /** The width that run actually produced, measured from a real vector. */
+  measuredDim: number;
+  populations: string;
+  rewrittenAt: number;
+}
+
 export interface StoreSpace {
   /** The path the script actually resolved, whatever env var it read to get there. */
   dbPath: string;
@@ -59,6 +81,44 @@ export interface StoreSpace {
   dim: number | null;
   /** True when the two populations are BOTH known and DISAGREE — a partial re-embed or a half-migration. */
   dimSplit: boolean;
+  /** scripts/reembed-store.ts's marker, when this copy was prepared by it; null otherwise. */
+  reembed: ReembedProvenance | null;
+}
+
+/**
+ * WHICH IDENTITY GOVERNS THE VECTORS THESE SCRIPTS SCORE.
+ *
+ * Not always the pin. Every consumer here scores the observation/segment population, and that is
+ * exactly the population reembed-store.ts rewrites while leaving `sync_meta` alone — so on a
+ * prepped copy the pin names the CONCEPT side and the marker names the scored side.
+ *
+ * Returns `id: null` with `known: false` for an off-profile candidate: the run happened, the space
+ * changed, and nothing names it. That is a third answer, and collapsing it into either "matches" or
+ * "does not match" is the kind of guess this module exists to refuse.
+ */
+export function scoredSpaceIdentity(space: StoreSpace): {
+  id: string | null;
+  known: boolean;
+  source: "reembed-marker" | "pin";
+  label: string;
+} {
+  const r = space.reembed;
+  if (r !== null) {
+    const detail = [r.pooling ? `pooling=${r.pooling}` : null, r.dtype ? `dtype=${r.dtype}` : null]
+      .filter((x) => x !== null).join(", ");
+    const suffix = detail === "" ? "" : ` [${detail}]`;
+    if (r.candidateModelId !== null) {
+      return { id: r.candidateModelId, known: true, source: "reembed-marker", label: `${r.candidateModelId}${suffix}` };
+    }
+    return {
+      id: null, known: false, source: "reembed-marker",
+      label: `${r.requestedModel} (off-profile: no id names this space)${suffix}`,
+    };
+  }
+  if (space.pinReadable && space.pin !== null) {
+    return { id: space.pin, known: true, source: "pin", label: space.pin };
+  }
+  return { id: null, known: false, source: "pin", label: space.pinReadable ? "(no pin)" : "(unavailable)" };
 }
 
 /**
@@ -93,6 +153,33 @@ function sampleDimension(db: HeaderReader, table: "concepts" | "observations"): 
   }
 }
 
+/** The marker, or null on any store that was not prepared by reembed-store.ts (the common case). */
+function readReembedProvenance(db: HeaderReader): ReembedProvenance | null {
+  try {
+    const row = db.prepare(
+      `SELECT candidate_model_id, requested_model, pooling, dtype, measured_dim, populations, rewritten_at
+         FROM reembed_provenance WHERE singleton = 1`,
+    ).get() as {
+      candidate_model_id: string | null; requested_model: string; pooling: string | null;
+      dtype: string | null; measured_dim: number; populations: string; rewritten_at: number;
+    } | undefined;
+    if (row === undefined) return null;
+    return {
+      candidateModelId: row.candidate_model_id,
+      requestedModel: row.requested_model,
+      pooling: row.pooling,
+      dtype: row.dtype,
+      measuredDim: row.measured_dim,
+      populations: row.populations,
+      rewrittenAt: row.rewritten_at,
+    };
+  } catch {
+    // No such table is the NORMAL case — every store not prepared by reembed-store.ts. Absence is
+    // not a fault to report, it just means the pin is the only identity available.
+    return null;
+  }
+}
+
 export function readStoreSpace(db: HeaderReader, dbPath: string): StoreSpace {
   let pin: string | null = null;
   let pinReadable = true;
@@ -111,6 +198,7 @@ export function readStoreSpace(db: HeaderReader, dbPath: string): StoreSpace {
     observationDim,
     dim: observationDim ?? conceptDim,
     dimSplit: conceptDim !== null && observationDim !== null && conceptDim !== observationDim,
+    reembed: readReembedProvenance(db),
   };
 }
 
@@ -132,6 +220,29 @@ export function printStoreHeader(db: HeaderReader, dbPath: string): StoreSpace {
   const pin = space.pinReadable ? (space.pin ?? "(no pin)") : "(unavailable)";
   console.log(`db=${dbPath}`);
   console.log(`store space: pin=${pin}  dim=${describeDim(space)}`);
+  if (space.reembed !== null) {
+    const r = space.reembed;
+    const scored = scoredSpaceIdentity(space);
+    // THE SPLIT THE PIN CANNOT SHOW. Announced whether or not the widths differ — a same-width swap
+    // is the case with no other symptom, and is the reason this marker exists at all.
+    console.log(
+      `!! NOTE: this copy was prepared by scripts/reembed-store.ts, so its two populations are in\n` +
+      `!! DIFFERENT spaces and the pin above describes only one of them:\n` +
+      `!!   scored side (observations + segments) -> ${scored.label}, ${r.measuredDim}-dim measured\n` +
+      `!!   concepts + sync_meta                  -> ${pin} (untouched by that rewrite)\n` +
+      `!!   rewrote: ${r.populations}\n` +
+      `!!   prepared: ${new Date(r.rewrittenAt).toISOString()}\n` +
+      `!! Every measurement below that reads stored vectors is in the SCORED side's space, not the\n` +
+      `!! pin's. Attribute its output accordingly.`,
+    );
+    if (space.observationDim !== null && space.observationDim !== r.measuredDim) {
+      console.log(
+        `!! WARNING: the marker records a ${r.measuredDim}-dim rewrite but the observations sampled\n` +
+        `!! ${space.observationDim}-dim. Something rewrote these vectors AFTER that preparation, so the\n` +
+        `!! marker names a space the rows are no longer in. Trust neither until the copy is rebuilt.`,
+      );
+    }
+  }
   if (space.dimSplit) {
     console.log(
       `!! NOTE: this store holds TWO embedding spaces — concepts at ${space.conceptDim}-dim, observations\n` +
@@ -207,11 +318,11 @@ export function printProviderIdentity(
  * below are in, and it is the store's own regardless of what model the process loaded.
  */
 export function printStoredOnlySection(space: StoreSpace | null): void {
-  const pin = space === null || !space.pinReadable ? "(unavailable)" : (space.pin ?? "(no pin)");
+  const label = space === null ? "(unavailable)" : scoredSpaceIdentity(space).label;
   console.log(
     `\n-- stored-vector section: both sides of every comparison below are read from the store, with\n` +
-    `-- no embedding performed, so this is the store's own space (pin=${pin}) whatever model is\n` +
-    `-- loaded. Any loaded-embedder warning above applies to the earlier section, not to this one.`,
+    `-- no embedding performed, so this is the stored vectors' own space (${label}) whatever model\n` +
+    `-- is loaded. Any loaded-embedder warning above applies to the earlier section, not to this one.`,
   );
 }
 
@@ -260,21 +371,35 @@ export function printEmbedderHeader(
     );
   }
 
-  // IDENTITY — needs a pin.
-  if (space === null || !space.pinReadable || space.pin === null) return;
-  if (space.pin === modelId) return;
+  // IDENTITY — compared against the SCORED side, which is the pin only when no candidate rewrite
+  // has happened. On a reembed-prepped copy the pin describes the concepts, and comparing against it
+  // would flag a correctly-matched candidate run as a mismatch (and pass the genuinely wrong one).
+  if (space === null) return;
+  const scored = scoredSpaceIdentity(space);
+  const via = scored.source === "reembed-marker" ? "the candidate this copy was re-embedded with" : "the store pin";
+  if (!scored.known) {
+    if (scored.source === "reembed-marker" && scoring === "against-stored-vectors") {
+      console.log(
+        `!! WARNING: this copy was re-embedded with '${scored.label}', which carries no model id, so\n` +
+        `!! whether the loaded '${modelId}' is the SAME space cannot be established here — only that the\n` +
+        `!! stored vectors are not the pin's. Rebuild the copy with a profiled checkpoint to compare.`,
+      );
+    }
+    return; // an unpinned, unprepared store has no identity to compare against at all
+  }
+  if (scored.id === modelId) return;
   if (scoring === "against-stored-vectors") {
     console.log(
-      `!! WARNING: loaded embedder '${modelId}' does NOT match the store pin '${space.pin}'.\n` +
-      `!! Probes are embedded by the loaded model and compared against vectors written by the pinned\n` +
+      `!! WARNING: loaded embedder '${modelId}' does NOT match ${via} '${scored.label}'.\n` +
+      `!! Probes are embedded by the loaded model and compared against vectors written by that other\n` +
       `!! one, so every figure below is a cross-space comparison. Fix the MODEL env var, or read the\n` +
       `!! output as a deliberate swap experiment — it is not a measurement of either space alone.`,
     );
   } else {
     console.log(
-      `   (candidate-model run: '${modelId}' differs from the store pin '${space.pin}', but every scored\n` +
+      `   (candidate-model run: '${modelId}' differs from ${via} '${scored.label}', but every scored\n` +
       `   vector below is re-embedded by the loaded model, so the results are wholly in '${modelId}'\n` +
-      `   space. The pin names what the STORE holds, which this run does not measure.)`,
+      `   space. That other id names what the STORE holds, which this run does not measure.)`,
     );
   }
 }

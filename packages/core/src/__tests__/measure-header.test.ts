@@ -20,9 +20,11 @@
  * `prepare(...).get()` shape, and driving them with SQL would test better-sqlite3.
  */
 import { describe, it, expect, vi } from "vitest";
-import { printEmbedderHeader, printStoreHeader, printStoredOnlySection, readStoreSpace } from "../../scripts/measure-header";
+import {
+  printEmbedderHeader, printStoreHeader, printStoredOnlySection, readStoreSpace, scoredSpaceIdentity,
+} from "../../scripts/measure-header";
 
-type Row = { e: string } | { m: string | null } | undefined;
+type Row = { e: string } | { m: string | null } | Record<string, unknown> | undefined;
 
 /**
  * A store stub: `concepts`/`observations` widths, and a pin that may be absent or unreadable.
@@ -38,6 +40,11 @@ function stubReader(opts: {
   sourceDim?: number;
   pin?: string | null;
   syncMetaMissing?: boolean;
+  /** Present => the copy carries scripts/reembed-store.ts's marker. Absent => no such table. */
+  reembed?: {
+    candidate_model_id: string | null; requested_model: string; pooling?: string | null;
+    dtype?: string | null; measured_dim: number;
+  };
 }) {
   const vec = (n: number): string => JSON.stringify(new Array(n).fill(0.1));
   const nativeOnly = (sql: string): boolean => sql.includes("kind != 'source'");
@@ -45,6 +52,20 @@ function stubReader(opts: {
     prepare(sql: string) {
       return {
         get(): Row {
+          if (sql.includes("reembed_provenance")) {
+            // The normal case is that this table does not exist at all, and the reader must treat
+            // that as "no candidate rewrite", not as a fault.
+            if (opts.reembed === undefined) throw new Error("no such table: reembed_provenance");
+            return {
+              candidate_model_id: opts.reembed.candidate_model_id,
+              requested_model: opts.reembed.requested_model,
+              pooling: opts.reembed.pooling ?? null,
+              dtype: opts.reembed.dtype ?? null,
+              measured_dim: opts.reembed.measured_dim,
+              populations: "observations+segments where kind != 'source'; concepts and sync_meta UNTOUCHED",
+              rewritten_at: 1756000000000,
+            };
+          }
           if (sql.includes("sync_meta")) {
             if (opts.syncMetaMissing) throw new Error("no such table: sync_meta");
             return { m: opts.pin ?? null };
@@ -200,11 +221,92 @@ describe("measure-header — declared width vs measured width", () => {
     expect(out).toContain("384 (declared by the profile; no vector measured yet)");
   });
 
-  it("marks a stored-only section as the store's own space, whatever model is loaded", () => {
+  it("marks a stored-only section as the stored vectors' own space, whatever model is loaded", () => {
     const space = readStoreSpace(stubReader({ observationDim: 1024, pin: "Xenova/bge-m3:cls:q8" }), "/tmp/x.db");
     const out = captured(() => printStoredOnlySection(space));
     expect(out).toMatch(/stored-vector section/);
-    expect(out).toContain("pin=Xenova/bge-m3:cls:q8");
+    expect(out).toContain("Xenova/bge-m3:cls:q8");
     expect(out).toMatch(/applies to the earlier section, not to this one/);
+  });
+});
+
+/**
+ * THE SAME-WIDTH CANDIDATE SWAP — the state no width check can see.
+ *
+ * scripts/reembed-store.ts can rewrite every observation and segment vector with a different
+ * 384-dim model, or with the SAME checkpoint at a different pooling or dtype, and leave the file
+ * otherwise identical: same pin, same row counts, same sampled dimension, no split. Its own header
+ * names this exact hazard — "same file name, same row counts, same pin". The marker it now writes
+ * into the copy is the only thing that can distinguish the two files.
+ */
+describe("measure-header — candidate provenance on a same-width re-embed", () => {
+  const SWAP = {
+    pin: "Xenova/bge-small-en-v1.5",
+    conceptDim: 384,
+    observationDim: 384, // SAME width — the whole point
+    reembed: { candidate_model_id: "Xenova/bge-base-en-v1.5", requested_model: "Xenova/bge-base-en-v1.5", measured_dim: 384 },
+  };
+
+  it("names the CANDIDATE for the scored side and does not report agreement with the stale pin", () => {
+    const space = readStoreSpace(stubReader(SWAP), "/tmp/swap.db");
+    expect(space.dimSplit).toBe(false);        // width sees nothing, by construction
+    expect(space.reembed?.candidateModelId).toBe("Xenova/bge-base-en-v1.5");
+    expect(scoredSpaceIdentity(space)).toMatchObject({ id: "Xenova/bge-base-en-v1.5", source: "reembed-marker" });
+
+    const out = captured(() => printStoreHeader(stubReader(SWAP), "/tmp/swap.db"));
+    expect(out).toMatch(/prepared by scripts\/reembed-store\.ts/);
+    expect(out).toContain("scored side (observations + segments) -> Xenova/bge-base-en-v1.5");
+    expect(out).toContain("concepts + sync_meta                  -> Xenova/bge-small-en-v1.5");
+  });
+
+  it("clears a run whose loaded model IS the candidate — the pin alone would have called it a mismatch", () => {
+    const space = readStoreSpace(stubReader(SWAP), "/tmp/swap.db");
+    const out = captured(() =>
+      printEmbedderHeader(space, { modelId: "Xenova/bge-base-en-v1.5", dim: 384 }, "against-stored-vectors", 384));
+    expect(out).not.toMatch(/WARNING/);
+  });
+
+  it("flags a run loaded with the PIN's model — which the stale pin would have waved through", () => {
+    const space = readStoreSpace(stubReader(SWAP), "/tmp/swap.db");
+    const out = captured(() =>
+      printEmbedderHeader(space, { modelId: "Xenova/bge-small-en-v1.5", dim: 384 }, "against-stored-vectors", 384));
+    expect(out).toMatch(/WARNING: loaded embedder 'Xenova\/bge-small-en-v1\.5' does NOT match/);
+    expect(out).toContain("the candidate this copy was re-embedded with");
+  });
+
+  it("says the space cannot be compared for an OFF-PROFILE candidate rather than guessing either way", () => {
+    const offProfile = {
+      ...SWAP,
+      reembed: { candidate_model_id: null, requested_model: "some/local-checkpoint", measured_dim: 384, pooling: "cls", dtype: "q8" },
+    };
+    const space = readStoreSpace(stubReader(offProfile), "/tmp/swap.db");
+    expect(scoredSpaceIdentity(space)).toMatchObject({ known: false, source: "reembed-marker" });
+    const out = captured(() =>
+      printEmbedderHeader(space, { modelId: "Xenova/bge-small-en-v1.5", dim: 384 }, "against-stored-vectors", 384));
+    expect(out).toMatch(/cannot be established here/);
+    // Pooling and dtype are part of the space, so they travel with the label.
+    expect(out).toContain("pooling=cls, dtype=q8");
+  });
+
+  it("warns when the marker's recorded width disagrees with the rows — something rewrote them after", () => {
+    const stale = { ...SWAP, observationDim: 1024 };
+    const out = captured(() => printStoreHeader(stubReader(stale), "/tmp/swap.db"));
+    expect(out).toMatch(/marker records a 384-dim rewrite but the observations sampled/);
+  });
+
+  it("MARKER ABSENT: behaviour is exactly what it was — the pin is the identity", () => {
+    const plain = { pin: "Xenova/bge-m3:cls:q8", conceptDim: 1024, observationDim: 1024 };
+    const space = readStoreSpace(stubReader(plain), "/tmp/plain.db");
+    expect(space.reembed).toBeNull();
+    expect(scoredSpaceIdentity(space)).toMatchObject({ id: "Xenova/bge-m3:cls:q8", source: "pin" });
+    const header = captured(() => printStoreHeader(stubReader(plain), "/tmp/plain.db"));
+    expect(header).toContain("store space: pin=Xenova/bge-m3:cls:q8  dim=1024 (concepts + observations)");
+    expect(header).not.toMatch(/NOTE/);
+    const match = captured(() =>
+      printEmbedderHeader(space, { modelId: "Xenova/bge-m3:cls:q8", dim: 1024 }, "against-stored-vectors", 1024));
+    expect(match).not.toMatch(/WARNING/);
+    const mismatch = captured(() =>
+      printEmbedderHeader(space, { modelId: "Xenova/bge-small-en-v1.5", dim: 384 }, "against-stored-vectors", 384));
+    expect(mismatch).toMatch(/does NOT match the store pin 'Xenova\/bge-m3:cls:q8'/);
   });
 });

@@ -36,8 +36,16 @@ async function main(): Promise<void> {
   const provider = new OnnxEmbeddingProvider({ model: MODEL, dim: Number(process.env.DIM) || undefined, pooling: POOLING, dtype: DTYPE });
   const warmup = await provider.embed("warmup");
 
-  const segs = db.prepare(`SELECT observation_id, segment_index, content FROM observation_segments`)
-    .all() as Array<{ observation_id: string; segment_index: number; content: string }>;
+  // NATIVE-ONLY ON BOTH POPULATIONS. The observation query has always filtered `kind != 'source'`;
+  // the segment query did not, so a prepped copy came out in a THIRD state nobody described — source
+  // observations on the old model, their own segments on the new one. Aligning them means the
+  // provenance marker below can state what was rewritten in one sentence and have it be true.
+  const segs = db.prepare(
+    `SELECT s.observation_id AS observation_id, s.segment_index AS segment_index, s.content AS content
+       FROM observation_segments s
+       JOIN observations o ON o.id = s.observation_id
+      WHERE o.kind != 'source'`,
+  ).all() as Array<{ observation_id: string; segment_index: number; content: string }>;
   const obs = db.prepare(`SELECT id, content FROM observations WHERE kind != 'source'`)
     .all() as Array<{ id: string; content: string }>;
   // THE EFFECTIVE SPACE, not the requested model (Codex review, PR #178). A copy written with
@@ -65,7 +73,57 @@ async function main(): Promise<void> {
     db.transaction(() => updObs.run(v, o.id))();
     if (++i % 500 === 0) console.log(`  observations ${i}/${obs.length}`);
   }
+  /*
+   * PROVENANCE, WRITTEN INTO THE COPY — the durable half of the note above.
+   *
+   * That note fixed the LOG so a run says which space it produced. A log scrolls away; the .db file
+   * is what a calibration script opens days later, and it carries no trace of this run at all. Width
+   * cannot supply one: swapping one 384-dim model for another, or re-running the SAME model at a
+   * different pooling or dtype, rewrites every vector and changes NO observable property of the
+   * file. `sync_meta` still names the old pin, the concept vectors are still in the old space, and a
+   * header sampling widths reports a tidy, uniform, WRONG answer. The only fix is for the run to say
+   * so in the copy, which is what this row is.
+   *
+   * ONE ROW, REPLACED ON RE-RUN: the last preparation is the state of the file, and a history of
+   * superseded preparations would just be another thing to read wrong.
+   *
+   * THIS SCRIPT ONLY EVER TOUCHES THE COPY IT WAS POINTED AT. It opens MONET_DB read-write and is
+   * documented from its first line as a fixture builder for a COPY — the live store is not involved
+   * here, and pointing this at one was already destructive before this table existed.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS reembed_provenance (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      candidate_model_id TEXT,
+      requested_model TEXT NOT NULL,
+      pooling TEXT,
+      dtype TEXT,
+      measured_dim INTEGER NOT NULL,
+      populations TEXT NOT NULL,
+      rewritten_at INTEGER NOT NULL
+    );
+  `);
+  db.prepare(
+    `INSERT INTO reembed_provenance
+       (singleton, candidate_model_id, requested_model, pooling, dtype, measured_dim, populations, rewritten_at)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(singleton) DO UPDATE SET
+       candidate_model_id = excluded.candidate_model_id, requested_model = excluded.requested_model,
+       pooling = excluded.pooling, dtype = excluded.dtype, measured_dim = excluded.measured_dim,
+       populations = excluded.populations, rewritten_at = excluded.rewritten_at`,
+  ).run(
+    // NULL, not a fabricated id, when the checkpoint is off-profile: modelId is undefined exactly
+    // when nothing names this space, and `requested_model` below still records what was asked for.
+    provider.modelId ?? null,
+    MODEL,
+    POOLING ?? null,
+    DTYPE ?? null,
+    warmup.length,
+    "observations+segments where kind != 'source'; concepts and sync_meta UNTOUCHED",
+    Date.now(),
+  );
+
   db.close();
-  console.log(`done`);
+  console.log(`done — provenance recorded in reembed_provenance (concepts and the pin are unchanged)`);
 }
 void main();
