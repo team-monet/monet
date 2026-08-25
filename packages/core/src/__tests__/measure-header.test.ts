@@ -55,6 +55,8 @@ function stubReader(opts: {
     dtype?: string | null; measured_dim: number;
     /** Omitted => completed. `null` => the preparation was interrupted and never published. */
     completed_at?: number | null;
+    /** The row-write baseline the preparation observed. Omitted => the stub's default clean value. */
+    rows_max_at?: number | null;
   };
 }) {
   const vec = (n: number): string => JSON.stringify(new Array(n).fill(0.1));
@@ -75,7 +77,10 @@ function stubReader(opts: {
               measured_dim: opts.reembed.measured_dim,
               populations: "observations+segments where kind != 'source'; concepts and sync_meta UNTOUCHED",
               started_at: 1756000000000,
-              completed_at: opts.reembed.completed_at === undefined ? 1756000060000 : opts.reembed.completed_at,
+              completed_at: opts.reembed.completed_at === undefined ? 1756000060750 : opts.reembed.completed_at,
+              // Default baseline == the stub's default current row max, i.e. nothing has been
+              // written since the preparation. Tests move one side or the other to break that.
+              rows_max_at: opts.reembed.rows_max_at === undefined ? 1755000000000 : opts.reembed.rows_max_at,
             };
           }
           if (sql.includes("embedder_migration")) {
@@ -497,7 +502,7 @@ describe("measure-header — interrupted OFFICIAL migration", () => {
  * is not.
  */
 describe("measure-header — fixture-invalid subsumes every way a marker stops describing the copy", () => {
-  const PREPARED_AT = 1756000060000; // the stub's completed_at
+  const PREPARED_AT = 1756000060750; // the stub's completed_at — note the MILLISECONDS
   const STARTED_AT = 1756000000000;  // the stub's started_at
   const BASE = {
     pin: "Xenova/bge-small-en-v1.5",
@@ -523,18 +528,52 @@ describe("measure-header — fixture-invalid subsumes every way a marker stops d
       .toBe("candidate");
   });
 
-  it("INCLUSIVE SECOND: a row written in the same second as completion invalidates", () => {
-    // `created_at` is `unixepoch() * 1000` — whole seconds — while completed_at carries milliseconds.
-    // A row from the same second stamps BELOW completed_at, so a `>` test would call this clean.
-    const sameSecond = 1756000060000; // floor(PREPARED_AT) exactly
-    expect(reasonOf({ ...BASE, latestRowWriteAt: sameSecond })).toMatch(/at or after the preparation completed/);
-    // One second earlier is genuinely before it.
-    expect(readStoreSpace(stubReader({ ...BASE, latestRowWriteAt: sameSecond - 1000 }), "/tmp/f.db").attribution.state)
-      .toBe("candidate");
+  /**
+   * A FRESHLY PREPARED FIXTURE ON A HEALTHY STORE MUST BE VALID.
+   *
+   * On a copy with `applying_remote = 0` — the normal, non-latched state — reembed-store's own
+   * `UPDATE observations SET embedding = ...` fires `sync_observations_update`, whose body advances
+   * `sync_meta.last_mutation_at` to wall-clock now and stamps `updated_at` from it. Every row the
+   * preparation touched therefore carries a timestamp from milliseconds before `completed_at`.
+   * Comparing that against a clock-derived cutoff invalidated the fixture the instant it was built.
+   *
+   * The baseline is read AFTER those writes, so it contains them, and only a LATER write exceeds it.
+   */
+  it("HEALTHY STORE: a fresh preparation whose own trigger-advanced writes land in the completion second is VALID", () => {
+    // Rows stamped 200ms before completion (the trigger firing on the preparation's own UPDATEs),
+    // and the baseline observed right after them — the shape reembed-store actually produces.
+    const triggerAdvanced = PREPARED_AT - 200;
+    const fresh = {
+      ...BASE,
+      latestRowWriteAt: triggerAdvanced,
+      reembed: { ...BASE.reembed, rows_max_at: triggerAdvanced },
+    };
+    const space = readStoreSpace(stubReader(fresh), "/tmp/fresh.db");
+    expect(space.attribution.state).toBe("candidate");
+    expect(scoredSpaceIdentity(space, "observations")).toMatchObject({ trustable: true });
+    expect(() => requireTrustableSpace(space)).not.toThrow();
+  });
+
+  it("catches an engine write that lands AFTER the baseline, even by one millisecond", () => {
+    // The sync trigger's `MAX(last_mutation_at + 1, now)` is monotonic, so the next engine write
+    // stamps strictly above the baseline even inside the same second.
+    const triggerAdvanced = PREPARED_AT - 200;
+    const written = {
+      ...BASE,
+      latestRowWriteAt: triggerAdvanced + 1,
+      reembed: { ...BASE.reembed, rows_max_at: triggerAdvanced },
+    };
+    expect(reasonOf(written)).toMatch(/an observation has been written since the preparation/);
+    expect(reasonOf(written)).toMatch(/baseline recorded at preparation/);
   });
 
   it("still catches a plainly later write", () => {
-    expect(reasonOf({ ...BASE, latestRowWriteAt: PREPARED_AT + 5_000 })).toMatch(/the engine has written to this copy since/);
+    expect(reasonOf({ ...BASE, latestRowWriteAt: PREPARED_AT + 5_000 })).toMatch(/has been written since the preparation/);
+  });
+
+  it("a marker with no recorded baseline cannot be verified", () => {
+    expect(reasonOf({ ...BASE, reembed: { ...BASE.reembed, rows_max_at: null } }))
+      .toMatch(/records no row-write baseline/);
   });
 
   it("UNREADABILITY invalidates too — an unchecked signal is not a passed one", () => {
@@ -547,7 +586,7 @@ describe("measure-header — fixture-invalid subsumes every way a marker stops d
   it("gives every one of them the SAME instruction and the same state", () => {
     for (const opts of [
       { ...BASE, pinnedAt: PREPARED_AT + 1 },
-      { ...BASE, latestRowWriteAt: PREPARED_AT },
+      { ...BASE, latestRowWriteAt: PREPARED_AT }, // written after the baseline
       { ...BASE, latestRowWriteAt: null },
       { ...BASE, observationDim: 1024 },
     ]) {

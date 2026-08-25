@@ -76,6 +76,13 @@ export interface ReembedProvenance {
   /** The width that run actually produced, measured from a real vector. */
   measuredDim: number;
   populations: string;
+  /**
+   * The newest observation row timestamp AS THE PREPARATION LEFT IT — read after its own writes, so
+   * it already contains them. The header invalidates on a current max that EXCEEDS this, which is
+   * why the preparation's own trigger-advanced `updated_at` values cannot invalidate the fixture
+   * they belong to. Null only on a marker written before this column existed.
+   */
+  rowsMaxAt: number | null;
   startedAt: number;
   /**
    * When the rewrite finished. NULL means it did NOT — the process is still running or it died
@@ -277,13 +284,16 @@ function sampleDimension(db: HeaderReader, table: "concepts" | "observations"): 
 function readReembedProvenance(db: HeaderReader): ReembedProvenance | null {
   try {
     const row = db.prepare(
+      // A marker written by an older build lacks `rows_max_at`, so this SELECT throws and the catch
+      // below reports "no marker" — the copy degrades to an ordinary pinned store rather than being
+      // half-read. That is the same safe degrade the column additions before it relied on.
       `SELECT candidate_model_id, requested_model, pooling, dtype, measured_dim, populations,
-              started_at, completed_at
+              started_at, completed_at, rows_max_at
          FROM reembed_provenance WHERE singleton = 1`,
     ).get() as {
       candidate_model_id: string | null; requested_model: string; pooling: string | null;
       dtype: string | null; measured_dim: number; populations: string;
-      started_at: number; completed_at: number | null;
+      started_at: number; completed_at: number | null; rows_max_at: number | null;
     } | undefined;
     if (row === undefined) return null;
     return {
@@ -293,6 +303,7 @@ function readReembedProvenance(db: HeaderReader): ReembedProvenance | null {
       dtype: row.dtype,
       measuredDim: row.measured_dim,
       populations: row.populations,
+      rowsMaxAt: row.rows_max_at,
       startedAt: row.started_at,
       completedAt: row.completed_at,
     };
@@ -356,17 +367,6 @@ function readLatestRowWrite(db: HeaderReader): number | null {
 const iso = (ms: number): string => new Date(ms).toISOString();
 
 /**
- * SECOND-GRANULARITY IS WHY THIS FLOORS. Every engine timestamp on these rows comes from
- * `DEFAULT (unixepoch() * 1000)` (engine.ts) — `unixepoch()` returns whole SECONDS, so `created_at`
- * is always a multiple of 1000. `completed_at` is a `Date.now()` with milliseconds. A row written in
- * the SAME second as the preparation completed therefore carries a stamp strictly BELOW it, and a
- * `>` comparison declares the fixture clean on the one write most likely to be concurrent with it.
- * Flooring the cutoff to its second and comparing `>=` closes that hole. It rounds toward calling a
- * fixture invalid, which is the only direction this check may err in.
- */
-const floorToSecond = (ms: number): number => Math.floor(ms / 1000) * 1000;
-
-/**
  * Resolve the ONE state.
  *
  * The two STOP states come first because they have their own remedies. Everything after them is a
@@ -411,11 +411,19 @@ function resolveAttribution(
   if (latestRowWriteAt === null) {
     return invalid("no observation timestamp could be read, so engine writes after the preparation cannot be ruled out");
   }
-  const cutoff = floorToSecond(reembed.completedAt);
-  if (latestRowWriteAt >= cutoff) {
+  if (reembed.rowsMaxAt === null) {
+    return invalid("the marker records no row-write baseline, so engine writes after the preparation cannot be ruled out");
+  }
+  // OBSERVED VALUE vs OBSERVED VALUE, and STRICTLY greater. The baseline was read after the
+  // preparation's own writes, so it already contains them — including the `updated_at` values its
+  // own UPDATEs caused `sync_observations_update` to advance to wall-clock-now on a healthy copy.
+  // An earlier draft compared that against a floored `completed_at` instead and declared every
+  // freshly built fixture stale; nothing caught it because every store copy on this machine
+  // inherits `applying_remote = 1`, which switches those triggers off entirely.
+  if (latestRowWriteAt > reembed.rowsMaxAt) {
     return invalid(
-      `an observation carries a timestamp at or after the preparation completed ` +
-      `(newest row ${iso(latestRowWriteAt)}, cutoff ${iso(cutoff)}) — the engine has written to this copy since`,
+      `an observation has been written since the preparation ` +
+      `(newest row ${iso(latestRowWriteAt)}, baseline recorded at preparation ${iso(reembed.rowsMaxAt)})`,
     );
   }
   if (observationDim !== null && observationDim !== reembed.measuredDim) {
@@ -737,18 +745,18 @@ export function printEmbedderHeader(
   // line from quietly following it with a verdict that implies otherwise.
   if (!scored.trustable) {
     if (scoring === "against-stored-vectors") {
-      // Name the CAUSE — the four untrustable states need four different remedies, and "rebuild the
-      // copy" is wrong advice for a store whose own migration is half-finished.
-      const cause = {
-        "engine-migration-interrupted":
-          "an INTERRUPTED OFFICIAL MIGRATION (see the STOP above) — finish or abandon it with 'monet doctor'",
-        "reembed-interrupted":
-          "an INTERRUPTED fixture preparation (see the STOP above) — rebuild the copy",
-        "marker-partial":
-          "a copy that was re-embedded and then WRITTEN TO AGAIN (see the WARNING above) — rebuild the copy",
-        "marker-unverifiable":
-          "a copy whose provenance could not be dated (see the WARNING above) — rebuild the copy",
-      }[scored.source as "engine-migration-interrupted" | "reembed-interrupted" | "marker-partial" | "marker-unverifiable"];
+      // Name the CAUSE — the three untrustable states need different remedies, and "rebuild the
+      // copy" is wrong advice for a store whose own migration is half-finished. Keyed off the
+      // CURRENT state set; the collapse to `fixture-invalid` left this mapping naming two retired
+      // states, so the one case that most needs a diagnosis printed "come from undefined".
+      const cause = space.attribution.state === "fixture-invalid"
+        ? `${REBUILD}\n!! (${space.attribution.reason})`
+        : {
+          "engine-migration-interrupted":
+            "an INTERRUPTED OFFICIAL MIGRATION (see the STOP above) — finish or abandon it with 'monet doctor'",
+          "reembed-interrupted":
+            "an INTERRUPTED fixture preparation (see the STOP above) — rebuild the copy",
+        }[scored.source as "engine-migration-interrupted" | "reembed-interrupted"];
       console.log(
         `!! REFUSING TO ATTRIBUTE: the stored vectors this run scores against come from\n` +
         `!! ${cause}.\n` +

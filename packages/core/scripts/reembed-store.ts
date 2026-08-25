@@ -96,7 +96,8 @@ async function main(): Promise<void> {
       measured_dim INTEGER NOT NULL,
       populations TEXT NOT NULL,
       started_at INTEGER NOT NULL,
-      completed_at INTEGER
+      completed_at INTEGER,
+      rows_max_at INTEGER
     );
   `);
   db.prepare(
@@ -135,10 +136,33 @@ async function main(): Promise<void> {
     db.transaction(() => updObs.run(v, o.id))();
     if (++i % 500 === 0) console.log(`  observations ${i}/${obs.length}`);
   }
-  // PHASE 2 — publish. Only now is the copy fully in the candidate space, so only now may the row
-  // claim to describe it. Anything that kills the process before this line leaves completed_at NULL,
-  // which is the state measure-header.ts refuses to attribute rather than guessing at.
-  db.prepare(`UPDATE reembed_provenance SET completed_at = ? WHERE singleton = 1`).run(Date.now());
+  /*
+   * PHASE 2 — publish, WITH THE OBSERVED ROW-WRITE BASELINE.
+   *
+   * `rows_max_at` is the newest row timestamp AS IT STANDS RIGHT NOW, read after this run's own
+   * writes have landed. The header later invalidates the fixture when the current max EXCEEDS this
+   * value, which is a comparison of one observed number against another — no clock, no precision
+   * assumption, no arithmetic relating two different time sources.
+   *
+   * IT HAS TO BE OBSERVED, because THIS SCRIPT'S OWN WRITES MOVE IT. On a healthy copy
+   * (`applying_remote = 0`) the `UPDATE observations SET embedding = ...` above fires
+   * `sync_observations_update`, whose body advances `sync_meta.last_mutation_at` to now and then
+   * stamps `updated_at` from it — so every row this run touched carries a timestamp from moments
+   * ago. Comparing that against a wall-clock cutoff taken here declares the fixture stale the
+   * instant it is built. Recording the baseline instead subtracts this run's own footprint exactly:
+   * what it wrote is in the number, so only what someone ELSE writes can exceed it.
+   *
+   * The trigger is also what makes a LATER engine write detectable to the millisecond. Its
+   * `MAX(last_mutation_at + 1, <now>)` is monotonic by construction, so the next engine insert or
+   * update stamps strictly above this baseline even inside the same second — which a second-
+   * granularity `created_at` alone could not promise.
+   */
+  const rowsMaxAt = (db.prepare(
+    `SELECT MAX(MAX(created_at), MAX(updated_at)) AS t FROM observations WHERE kind != 'source'`,
+  ).get() as { t: number | null }).t;
+  db.prepare(
+    `UPDATE reembed_provenance SET completed_at = ?, rows_max_at = ? WHERE singleton = 1`,
+  ).run(Date.now(), rowsMaxAt);
 
   db.close();
   console.log(`done — provenance recorded in reembed_provenance (concepts and the pin are unchanged)`);
