@@ -19,6 +19,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireExclusiveWriteLock, publishFixtureMarker, releaseExclusiveWriteLock } from "../../scripts/fixture-lock";
+import { beginStoreReadSnapshot, endStoreReadSnapshot } from "../../scripts/measure-header";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -297,6 +298,179 @@ describe("fixture-lock — a run publishes only onto the marker it opened", () =
 });
 
 /**
+ * THE READER SIDE — a measurement straddling a preparation's commit.
+ *
+ * Round 11 deliberately left READERS unblocked: the preparation excludes writers only. That is the
+ * right call and it leaves this open. Every measure-* script reads in several separate autocommit
+ * statements — header probes, circle pick, then the populations — so a preparation that commits
+ * between any two of them hands the reader a store that never existed at one instant. Worst shape:
+ * the header ran BEFORE the marker was committed, so it saw no marker, the gate passed, and the
+ * mixture gets labelled with the OLD pin.
+ *
+ * A deferred read transaction takes a WAL snapshot at the first read and holds it, so the commit
+ * lands entirely before the reader's view or entirely after it. Never half.
+ */
+describe("measure-header — one read snapshot for the header and the data it describes", () => {
+  /** A store with two populations, so a mixed read is visible as such. */
+  const makeStore = (): { path: string } => {
+    const dir = mkdtempSync(join(tmpdir(), "read-snapshot-"));
+    dirs.push(dir);
+    const path = join(dir, "copy.db");
+    const setup = new Database(path);
+    setup.pragma("journal_mode = WAL");
+    setup.exec("CREATE TABLE observations (id INTEGER PRIMARY KEY, embedding TEXT)");
+    setup.exec("CREATE TABLE observation_segments (observation_id INTEGER PRIMARY KEY, embedding TEXT)");
+    setup.prepare("INSERT INTO observations VALUES (1, 'OLD-whole')").run();
+    setup.prepare("INSERT INTO observation_segments VALUES (1, 'OLD-seg')").run();
+    setup.close();
+    return { path };
+  };
+
+  /** Exactly what a preparation commits: the marker appears and both populations move, atomically. */
+  const preparationCommits = (path: string): void => {
+    const w = new Database(path);
+    w.prepare("BEGIN IMMEDIATE").run();
+    w.exec("CREATE TABLE IF NOT EXISTS reembed_provenance (singleton INTEGER PRIMARY KEY)");
+    w.prepare("INSERT OR REPLACE INTO reembed_provenance VALUES (1)").run();
+    w.prepare("UPDATE observations SET embedding = 'NEW-whole' WHERE id = 1").run();
+    w.prepare("UPDATE observation_segments SET embedding = 'NEW-seg' WHERE observation_id = 1").run();
+    w.prepare("COMMIT").run();
+    w.close();
+  };
+
+  const markerVisible = (db: Database.Database): boolean => {
+    try { db.prepare("SELECT 1 FROM reembed_provenance LIMIT 1").get(); return true; } catch { return false; }
+  };
+  const whole = (db: Database.Database): string =>
+    (db.prepare("SELECT embedding AS e FROM observations WHERE id = 1").get() as { e: string }).e;
+  const seg = (db: Database.Database): string =>
+    (db.prepare("SELECT embedding AS e FROM observation_segments WHERE observation_id = 1").get() as { e: string }).e;
+
+  it("PREMISE: without a snapshot, a commit between two reads yields a MIXED result", () => {
+    // If this ever stops holding, the test below proves nothing.
+    const { path } = makeStore();
+    const r = new Database(path, { readonly: true });
+    try {
+      expect(markerVisible(r)).toBe(false);   // the header sees no marker — the gate would pass
+      const w1 = whole(r);                    // first population read
+      preparationCommits(path);               // the preparation commits in the gap
+      const s1 = seg(r);                      // second population read
+      expect({ w1, s1 }).toEqual({ w1: "OLD-whole", s1: "NEW-seg" });
+    } finally {
+      r.close();
+    }
+  });
+
+  it("holds ONE view across the header read and every population read", () => {
+    const { path } = makeStore();
+    const r = new Database(path, { readonly: true });
+    try {
+      beginStoreReadSnapshot(r);
+      expect(markerVisible(r)).toBe(false);   // header: pre-preparation, and that stays true
+      const w1 = whole(r);
+      preparationCommits(path);
+      const s1 = seg(r);
+      // Pure pre-preparation state — correctly attributable to the pin the header just read.
+      expect({ w1, s1 }).toEqual({ w1: "OLD-whole", s1: "OLD-seg" });
+      expect(r.inTransaction).toBe(true);
+    } finally {
+      endStoreReadSnapshot(r);
+      r.close();
+    }
+  });
+
+  it("a reader that starts AFTER the commit sees the marker, and the gate can act on it", () => {
+    // The other side of the either/or: never half, but a later reader is not frozen out of the truth.
+    const { path } = makeStore();
+    preparationCommits(path);
+    const r = new Database(path, { readonly: true });
+    try {
+      beginStoreReadSnapshot(r);
+      expect(markerVisible(r)).toBe(true);
+      expect({ w: whole(r), s: seg(r) }).toEqual({ w: "NEW-whole", s: "NEW-seg" });
+    } finally {
+      endStoreReadSnapshot(r);
+      r.close();
+    }
+  });
+
+  it("takes no write lock — the preparation is not blocked by a measurement reading", () => {
+    // Round 11's readers-allowed decision, preserved: this is DEFERRED, not IMMEDIATE.
+    const { path } = makeStore();
+    const r = new Database(path, { readonly: true });
+    try {
+      beginStoreReadSnapshot(r);
+      whole(r); // take the snapshot
+      const w = new Database(path, { timeout: 200 });
+      try {
+        expect(() => w.prepare("UPDATE observations SET embedding = 'x' WHERE id = 1").run()).not.toThrow();
+      } finally {
+        w.close();
+      }
+    } finally {
+      endStoreReadSnapshot(r);
+      r.close();
+    }
+  });
+
+  it("ending is idempotent, so a script can release unconditionally", () => {
+    const { path } = makeStore();
+    const r = new Database(path, { readonly: true });
+    try {
+      beginStoreReadSnapshot(r);
+      whole(r);
+      endStoreReadSnapshot(r);
+      expect(r.inTransaction).toBe(false);
+      expect(() => endStoreReadSnapshot(r)).not.toThrow();
+    } finally {
+      r.close();
+    }
+  });
+});
+
+/**
+ * Every store-reading measure-* script must open the snapshot before its header read and close it
+ * when its reads are done — asserted on the sources, since driving twelve scripts for real would
+ * need twelve stores and four model downloads.
+ */
+describe("measure-* scripts — each opens one read snapshot around its reads", () => {
+  const scriptsDir = new URL("../../scripts/", import.meta.url);
+  const src = (name: string): string => readFileSync(new URL(name, scriptsDir), "utf8");
+
+  // The nine that read a store. The other three build their own :memory: store in-process, so there
+  // is no second connection and no commit to straddle — the race cannot arise.
+  const STORE_READING = [
+    "measure-attach-thresholds.ts", "measure-fork-and-edge-bands.ts", "measure-gate.ts",
+    "measure-nomination-signals.ts", "measure-nomination-size-bias.ts", "measure-normalization-ceiling.ts",
+    "measure-observation-recall.ts", "measure-search-recall.ts", "measure-threshold-headroom.ts",
+  ];
+
+  it.each(STORE_READING)("%s begins the snapshot BEFORE its header read and ends it after", (name) => {
+    const s = src(name);
+    const begin = s.indexOf("beginStoreReadSnapshot(db)");
+    const header = s.indexOf("printStoreHeader(db, DB)");
+    const end = s.indexOf("endStoreReadSnapshot(db)");
+    expect(begin, "must open a read snapshot").toBeGreaterThan(-1);
+    expect(end, "must release it").toBeGreaterThan(-1);
+    expect(begin).toBeLessThan(header);
+    expect(header).toBeLessThan(end);
+  });
+
+  it("the :memory: three take no snapshot — they read no store", () => {
+    for (const name of ["measure-recall-floor.ts", "measure-recall-perf.ts", "measure-resolution-bands.ts"]) {
+      expect(src(name)).not.toContain("beginStoreReadSnapshot");
+    }
+  });
+
+  it("nomination-size-bias releases BEFORE it loads a model, not at db.close()", () => {
+    // It is the one store-reading script that embeds after reading; a snapshot held across that
+    // would pin the WAL for the whole run.
+    const s = src("measure-nomination-size-bias.ts");
+    expect(s.indexOf("endStoreReadSnapshot(db)")).toBeLessThan(s.indexOf('await import("../src/embedding-onnx")'));
+  });
+});
+
+/**
  * The ORDER inside reembed-store.ts is load-bearing and invisible to any unit test of the lock
  * itself, so it is asserted on the source — the same technique the measure-* classification uses.
  */
@@ -352,12 +526,27 @@ describe("reembed-store — what happens inside the lock, and what deliberately 
     expect(normalize).toBeLessThan(firstRewrite);
   });
 
-  it("refuses to prepare anything inside a .monet directory", () => {
+  it("refuses to prepare anything inside a .monet directory, on EITHER path separator", () => {
     // The normalization writes sync_meta, not just vectors, so "point it at a copy" needed to stop
-    // being prose. The guard is a heuristic and the comment beside it says so.
+    // being prose. The guard is a heuristic and the comment beside it says so — but a heuristic that
+    // only knows `/` waves through the Windows form of the exact path it exists to stop.
     const src = source();
-    expect(src).toMatch(/\/\(\^\|\\\/\)\\\.monet\\\/\/\.test\(DB\)/);
     expect(src).toMatch(/Refusing to prepare/);
+    // The predicate as the script applies it, lifted verbatim so the test exercises the real thing.
+    const refuses = (p: string): boolean => /(^|\/)\.monet\//.test(p.replace(/\\/g, "/").toLowerCase());
+    expect(src).toContain('/(^|\\/)\\.monet\\//.test(DB.replace(/\\\\/g, "/").toLowerCase())');
+
+    expect(refuses("/Users/me/.monet/monet.db")).toBe(true);
+    expect(refuses("C:\\Users\\me\\.monet\\monet.db")).toBe(true);   // the P1
+    expect(refuses("C:\\Users\\me\\.MONET\\monet.db")).toBe(true);   // Windows paths fold case
+    expect(refuses(".monet/monet.db")).toBe(true);                   // relative, at the root
+    expect(refuses("\\\\server\\share\\.monet\\monet.db")).toBe(true); // UNC
+
+    // And it must not swallow legitimate scratch copies.
+    expect(refuses("/tmp/copy.db")).toBe(false);
+    expect(refuses("C:\\temp\\copy.db")).toBe(false);
+    expect(refuses("/tmp/monet-fixture/copy.db")).toBe(false);       // "monet" without the dot
+    expect(refuses("/tmp/dotmonet/copy.db")).toBe(false);
   });
 
   it("records the normalization in the marker rather than still claiming sync_meta is untouched", () => {

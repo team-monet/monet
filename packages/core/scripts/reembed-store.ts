@@ -34,12 +34,18 @@ const MODEL = process.env.MODEL!;
  * The refusal is a path check, which is a heuristic and says so: it catches the standard location
  * (`~/.monet/...`) and nothing else. It is a guardrail against the obvious slip, not a proof of
  * scratch-ness — the contract that this is a disposable copy still rests on the operator.
+ *
+ * BOTH SEPARATORS, AND CASE-FOLDED. A guard that only knows `/` waves through
+ * `C:\Users\me\.monet\monet.db` — the very path it exists to stop, on the one platform where the
+ * operator is least likely to notice. Windows paths are also case-insensitive, so `.MONET\` must
+ * match too. Backslashes are folded to forward slashes and the whole path lowercased before the
+ * test, which costs nothing and removes the platform from the question.
  */
 if (DB === undefined || DB.trim() === "") {
   console.error("MONET_DB is required: point it at a scratch COPY of the store, never the live one.");
   process.exit(1);
 }
-if (/(^|\/)\.monet\//.test(DB)) {
+if (/(^|\/)\.monet\//.test(DB.replace(/\\/g, "/").toLowerCase())) {
   console.error(
     `Refusing to prepare '${DB}': it is inside a .monet directory, which is where the LIVE store ` +
     `lives. This script rewrites every vector and enables the copy's sync triggers — both are ` +

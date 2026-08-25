@@ -52,7 +52,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
-import { printEmbedderHeader, printStoreHeader, printStoredOnlySection, requireTrustableSpace } from "./measure-header";
+import { printEmbedderHeader, printStoreHeader, printStoredOnlySection, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 const DB = process.env.PROBE_DB!;
 const JUNK = [
@@ -76,6 +76,10 @@ const q = (xs: number[], p: number) => (xs.length === 0 ? NaN : [...xs].sort((a,
 
 async function main() {
   const db = new Database(DB, { readonly: true });
+  // ONE VIEW for the header and the data it describes: without this, a preparation
+  // committing between these reads yields a mixture no single space explains. See
+  // beginStoreReadSnapshot.
+  beginStoreReadSnapshot(db);
   const storeSpace = printStoreHeader(db, DB);
   // consumesStoredVectors=TRUE. The junk probes are freshly embedded, but every CANDIDATE they
   // score against is a stored vector, and the leave-one-out half below is stored-vs-stored on
@@ -95,6 +99,9 @@ async function main() {
       WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
         AND o.kind != 'source' AND c.circle = ? AND c.kind != 'source'`,
   ).all(circle.circle) as Array<{ cid: string; emb: string }>;
+  // Reads are done. Released HERE and not at db.close(): an ONNX model loads below and the run
+  // embeds for minutes, and a read snapshot held across that would pin the WAL for no purpose.
+  endStoreReadSnapshot(db);
 
   const byConcept = new Map<string, Float32Array[]>();
   for (const r of rows) {

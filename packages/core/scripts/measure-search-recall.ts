@@ -34,10 +34,14 @@
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
 import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/lexical-overlap";
-import { printEmbedderHeader, printStoreHeader, requireTrustableSpace } from "./measure-header";
+import { printEmbedderHeader, printStoreHeader, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const db = new Database(DB, { readonly: true });
+// ONE VIEW for the header and the data it describes: without this, a preparation
+// committing between these reads yields a mixture no single space explains. See
+// beginStoreReadSnapshot.
+beginStoreReadSnapshot(db);
 const storeSpace = printStoreHeader(db, DB);
 // UNCONDITIONAL, INCLUDING THE MODEL PATH — same reason as measure-observation-recall.ts. The swap
 // loop rewrites every `whole`/`segs` VALUE, but `observations` above was already filtered to rows
@@ -65,6 +69,8 @@ const segRows = db.prepare(
     WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
       AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?`,
 ).all(circle) as Array<{ oid: string; emb: string; content: string }>;
+// Reads are done — release the snapshot before the handle closes.
+endStoreReadSnapshot(db);
 db.close();
 
 const segTextByObs = new Map<string, string[]>();

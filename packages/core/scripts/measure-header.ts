@@ -50,6 +50,48 @@ interface HeaderReader {
   prepare(sql: string): { get(...params: unknown[]): unknown };
 }
 
+interface SnapshotDatabase {
+  prepare(sql: string): { run(...params: unknown[]): unknown };
+  readonly inTransaction: boolean;
+}
+
+/**
+ * ONE VIEW OF THE STORE FOR THE HEADER AND THE DATA IT DESCRIBES.
+ *
+ * Every measure-* script reads in several separate statements: the header's pin/marker/dimension
+ * probes, then the circle pick, then the population queries. In autocommit each of those is its own
+ * snapshot, so a preparation running alongside can COMMIT between any two of them. The reader then
+ * sees a store that never existed at one instant — measured (probed on a WAL file, two connections):
+ *
+ *     without a read transaction:  whole=OLD-whole  seg=NEW-seg   <- MIXED
+ *     with one held across both:   whole=OLD-whole  seg=OLD-seg   <- consistent
+ *
+ * A mixed read is the worst shape available here, because the header saw no marker — it was not
+ * committed yet — so the gate passes and the mixture gets labelled with the OLD pin. Old whole
+ * vectors scored against new segment vectors, reported as one space.
+ *
+ * A DEFERRED `BEGIN` fixes it by taking a WAL snapshot at the first read and holding it: the
+ * preparation's commit lands entirely before the reader's view (marker visible, gate refuses or
+ * attributes correctly) or entirely after it (pure pre-preparation state, correctly the pin's).
+ * Never half.
+ *
+ * DEFERRED, NOT IMMEDIATE — this is the reader side of round 11's decision. The preparation excludes
+ * writers and deliberately leaves readers alone; a read transaction takes no write lock and blocks
+ * nobody, so the two coexist.
+ *
+ * SCOPED TO THE READ PHASE ONLY. The scripts do their reads up front and several close the handle
+ * before the model loads; holding a transaction across an embed loop would pin the WAL for minutes
+ * to no purpose. End it as soon as the last population read is done.
+ */
+export function beginStoreReadSnapshot(db: SnapshotDatabase): void {
+  db.prepare("BEGIN").run();
+}
+
+/** Release the read snapshot. Safe to call when none is open, so a script can end unconditionally. */
+export function endStoreReadSnapshot(db: SnapshotDatabase): void {
+  if (db.inTransaction) db.prepare("COMMIT").run();
+}
+
 /** Which population a script's cosines actually meet — the fact that decides what a mismatch means. */
 export type ScoringSide =
   /** Freshly-embedded probes are compared against vectors READ FROM THE STORE. */

@@ -33,13 +33,17 @@
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
 import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "../src/lexical-overlap";
-import { printStoreHeader, requireTrustableSpace } from "./measure-header";
+import { printStoreHeader, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 const DB = process.env.MONET_DB!;
 const CANDIDATES = (process.env.TAUS ?? "0.50,0.55,0.58,0.60,0.62,0.65,0.68,0.70,0.72,0.75")
   .split(",").map((s) => Number(s.trim()));
 
 const db = new Database(DB, { readonly: true });
+// ONE VIEW for the header and the data it describes: without this, a preparation
+// committing between these reads yields a mixture no single space explains. See
+// beginStoreReadSnapshot.
+beginStoreReadSnapshot(db);
 const storeSpace = printStoreHeader(db, DB);
 // consumesStoredVectors=TRUE (the default): every figure below is scored from vectors read out
 // of this store, so an unattributable one must abort before any measurement work happens.
@@ -64,6 +68,8 @@ const contentRows = db.prepare(
     WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
       AND o.kind != 'source' AND c.kind != 'source' AND c.circle = ?`,
 ).all(circle) as Array<{ oid: string; content: string }>;
+// Reads are done — release the snapshot before the handle closes.
+endStoreReadSnapshot(db);
 db.close();
 
 interface Obs { oid: string; cid: string; vecs: Float32Array[]; toks: Set<string> }

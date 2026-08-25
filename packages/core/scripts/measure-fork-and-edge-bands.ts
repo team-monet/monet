@@ -36,7 +36,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
-import { printStoreHeader, printStoredOnlySection, requireTrustableSpace } from "./measure-header";
+import { printStoreHeader, printStoredOnlySection, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 /*
  * NO DEFAULT. This script used to fall back to `~/.monet/monet.db` when MONET_DB was unset — the
@@ -62,6 +62,10 @@ const db = new Database(DB, { readonly: true });
 // sampled dimension travels beside the pin. The dimension is one row per population (LIMIT 1), not
 // a census: it separates 384 from 1024 on a uniform store and cannot see a store whose widths are
 // mixed within a table — `monet doctor` owns that.
+// ONE VIEW for the header and the data it describes: without this, a preparation
+// committing between these reads yields a mixture no single space explains. See
+// beginStoreReadSnapshot.
+beginStoreReadSnapshot(db);
 const storeSpace = printStoreHeader(db, DB);
 // consumesStoredVectors=TRUE (the default): every figure below is scored from vectors read out
 // of this store, so an unattributable one must abort before any measurement work happens.
@@ -147,6 +151,10 @@ for (const row of db.prepare(
   const v = jsonToEmb(row.e);
   if (!isZeroVector(v)) concepts.push({ id: row.id, v });
 }
+
+// Both populations are loaded — segments above, concepts here. This script imports no embedder,
+// so the snapshot spans only reads and the arithmetic between them.
+endStoreReadSnapshot(db);
 
 const pairScores: number[] = [];
 const degrees = new Map<number, Map<string, number>>(EDGE_CANDIDATES.map((t) => [t, new Map()]));

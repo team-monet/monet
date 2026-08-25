@@ -36,7 +36,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, type EmbeddingProvider } from "../src/embedding";
-import { printEmbedderHeader, printStoreHeader, requireTrustableSpace } from "./measure-header";
+import { printEmbedderHeader, printStoreHeader, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 const DB = process.env.PROBE_DB!;
 /** Cross-concept pairs sampled on a fixed stride (no clock, no RNG). Same budget for every variant
@@ -101,6 +101,10 @@ const pctl = (xs: number[], p: number) => xs[Math.min(xs.length - 1, Math.floor(
 
 async function main() {
   const db = new Database(DB, { readonly: true });
+  // ONE VIEW for the header and the data it describes: without this, a preparation
+  // committing between these reads yields a mixture no single space explains. See
+  // beginStoreReadSnapshot.
+  beginStoreReadSnapshot(db);
   const storeSpace = printStoreHeader(db, DB);
   // consumesStoredVectors=FALSE: the query below selects `o.content` and no embedding column, the
   // handle is closed before the model loads, and every vector scored is produced here from text. A
@@ -116,6 +120,8 @@ async function main() {
         AND o.kind != 'source' AND c.circle = ? AND c.kind != 'source'
       ORDER BY o.id`,
   ).all(circle) as Array<{ cid: string; content: string }>;
+  // Reads are done — release the snapshot before the handle closes.
+  endStoreReadSnapshot(db);
   db.close();
 
   const { OnnxEmbeddingProvider } = await import("../src/embedding-onnx");

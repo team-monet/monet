@@ -28,7 +28,7 @@
  */
 import Database from "better-sqlite3";
 import { cosine, isZeroVector, jsonToEmb } from "../src/embedding";
-import { printStoreHeader, requireTrustableSpace } from "./measure-header";
+import { printStoreHeader, requireTrustableSpace, beginStoreReadSnapshot, endStoreReadSnapshot } from "./measure-header";
 
 // PROBE_DB, not MONET_DB — of the five scripts that import no embedder this is the only one reading
 // a different env var (nomination-size-bias and normalization-ceiling read PROBE_DB too, but they
@@ -43,6 +43,10 @@ const pct = (xs: number[], p: number) => xs[Math.min(xs.length - 1, Math.floor(p
 const share = (xs: number[], t: number) => ((xs.filter((x) => x >= t).length / xs.length) * 100).toFixed(1);
 
 const db = new Database(DB, { readonly: true });
+// ONE VIEW for the header and the data it describes: without this, a preparation
+// committing between these reads yields a mixture no single space explains. See
+// beginStoreReadSnapshot.
+beginStoreReadSnapshot(db);
 const storeSpace = printStoreHeader(db, DB);
 // consumesStoredVectors=TRUE (the default): every figure below is scored from vectors read out
 // of this store, so an unattributable one must abort before any measurement work happens.
@@ -73,6 +77,8 @@ const rows = db.prepare(
         WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
           AND o.kind != 'source' AND c.circle = ? AND c.kind != 'source'`,
 ).all(circle) as Array<{ cid: string; oid: string; emb: string }>;
+// Reads are done; the pair sweep below is pure arithmetic over what was just loaded.
+endStoreReadSnapshot(db);
 
 // Group by OBSERVATION: the pair populations are observation pairs either way, so that a segmented
 // and an unsegmented run are comparing the same things and only the evidence granularity differs.
