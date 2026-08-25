@@ -17,6 +17,7 @@
  * govern it, before anyone commits to a pin. Point it at a copy.
  */
 import Database from "better-sqlite3";
+import { acquireExclusiveWriteLock, releaseExclusiveWriteLock } from "./fixture-lock";
 import { embToJson } from "../src/embedding";
 import { OnnxEmbeddingProvider } from "../src/embedding-onnx";
 
@@ -35,29 +36,6 @@ async function main(): Promise<void> {
   const db = new Database(DB);
   const provider = new OnnxEmbeddingProvider({ model: MODEL, dim: Number(process.env.DIM) || undefined, pooling: POOLING, dtype: DTYPE });
   const warmup = await provider.embed("warmup");
-
-  // NATIVE-ONLY ON BOTH POPULATIONS. The observation query has always filtered `kind != 'source'`;
-  // the segment query did not, so a prepped copy came out in a THIRD state nobody described — source
-  // observations on the old model, their own segments on the new one. Aligning them means the
-  // provenance marker below can state what was rewritten in one sentence and have it be true.
-  const segs = db.prepare(
-    `SELECT s.observation_id AS observation_id, s.segment_index AS segment_index, s.content AS content
-       FROM observation_segments s
-       JOIN observations o ON o.id = s.observation_id
-      WHERE o.kind != 'source'`,
-  ).all() as Array<{ observation_id: string; segment_index: number; content: string }>;
-  const obs = db.prepare(`SELECT id, content FROM observations WHERE kind != 'source'`)
-    .all() as Array<{ id: string; content: string }>;
-  // THE EFFECTIVE SPACE, not the requested model (Codex review, PR #178). A copy written with
-  // POOLING=cls DTYPE=q8 and one written with the defaults differ in every vector and in nothing
-  // else: same file name, same row counts, same pin, and — before this line — the same log. These
-  // copies are what the calibration scripts read, so an ambiguous provenance line is how a
-  // measurement gets attributed to a space that did not produce it.
-  console.log(
-    `re-embedding ${obs.length} observations and ${segs.length} segments as `
-      + `${provider.modelId ?? `${MODEL} (off-profile: no id names this space)`} `
-      + `[pooling=${POOLING ?? "profile default"}, dtype=${DTYPE ?? "profile default"}, dim=${warmup.length}]`,
-  );
 
   /*
    * PROVENANCE, WRITTEN INTO THE COPY — the durable half of the note above.
@@ -122,18 +100,62 @@ async function main(): Promise<void> {
     Date.now(),
   );
 
+  /*
+   * EVERYTHING FROM HERE TO THE COMMIT HAPPENS UNDER ONE WRITE LOCK — see scripts/fixture-lock.ts
+   * for the contract and why BEGIN IMMEDIATE rather than locking_mode=EXCLUSIVE.
+   *
+   * THE OPENING MARKER IS DELIBERATELY OUTSIDE IT, committed just above. If it were inside, a
+   * process killed mid-run would roll it back along with the rewrites and the copy would read as an
+   * ordinary un-prepared store — losing the one signal the two-phase marker exists to give. Outside,
+   * an interrupted run leaves `completed_at` NULL and the header says so.
+   *
+   * THE POPULATION SNAPSHOT IS INSIDE IT, and that is the whole reason the lock starts here rather
+   * than after the SELECTs. Reading the row lists before taking the lock leaves a window in which
+   * another writer can INSERT an observation: the snapshot would not contain it, so this run would
+   * never rewrite it, and the baseline below would absorb its timestamp — a row in the old space,
+   * inside a fixture certified as entirely in the new one, with nothing left to detect it. Taking
+   * the lock first means every row that exists is in the snapshot and every row in the snapshot is
+   * rewritten.
+   */
+  acquireExclusiveWriteLock(db, "re-embedding this copy");
+
+  // NATIVE-ONLY ON BOTH POPULATIONS. The observation query has always filtered `kind != 'source'`;
+  // the segment query did not, so a prepped copy came out in a THIRD state nobody described — source
+  // observations on the old model, their own segments on the new one. Aligning them means the
+  // provenance marker above can state what was rewritten in one sentence and have it be true.
+  const segs = db.prepare(
+    `SELECT s.observation_id AS observation_id, s.segment_index AS segment_index, s.content AS content
+       FROM observation_segments s
+       JOIN observations o ON o.id = s.observation_id
+      WHERE o.kind != 'source'`,
+  ).all() as Array<{ observation_id: string; segment_index: number; content: string }>;
+  const obs = db.prepare(`SELECT id, content FROM observations WHERE kind != 'source'`)
+    .all() as Array<{ id: string; content: string }>;
+  // THE EFFECTIVE SPACE, not the requested model (Codex review, PR #178). A copy written with
+  // POOLING=cls DTYPE=q8 and one written with the defaults differ in every vector and in nothing
+  // else: same file name, same row counts, same pin, and — before this line — the same log. These
+  // copies are what the calibration scripts read, so an ambiguous provenance line is how a
+  // measurement gets attributed to a space that did not produce it.
+  console.log(
+    `re-embedding ${obs.length} observations and ${segs.length} segments as `
+      + `${provider.modelId ?? `${MODEL} (off-profile: no id names this space)`} `
+      + `[pooling=${POOLING ?? "profile default"}, dtype=${DTYPE ?? "profile default"}, dim=${warmup.length}]`,
+  );
+
+  // No per-row `db.transaction(...)` any more: the enclosing lock IS the transaction, and wrapping
+  // each row would only add a savepoint per write.
   const updSeg = db.prepare(`UPDATE observation_segments SET embedding = ? WHERE observation_id = ? AND segment_index = ?`);
   let i = 0;
   for (const s of segs) {
     const v = embToJson(await provider.embed(s.content));
-    db.transaction(() => updSeg.run(v, s.observation_id, s.segment_index))();
+    updSeg.run(v, s.observation_id, s.segment_index);
     if (++i % 500 === 0) console.log(`  segments ${i}/${segs.length}`);
   }
   const updObs = db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`);
   i = 0;
   for (const o of obs) {
     const v = embToJson(await provider.embed(o.content));
-    db.transaction(() => updObs.run(v, o.id))();
+    updObs.run(v, o.id);
     if (++i % 500 === 0) console.log(`  observations ${i}/${obs.length}`);
   }
   /*
@@ -163,6 +185,11 @@ async function main(): Promise<void> {
   db.prepare(
     `UPDATE reembed_provenance SET completed_at = ?, rows_max_at = ? WHERE singleton = 1`,
   ).run(Date.now(), rowsMaxAt);
+
+  // STILL UNDER THE LOCK for both of the two statements above, which is what makes the baseline
+  // mean anything: no writer could have committed between the last rewrite, the MAX that reads it,
+  // and the marker that records it. Releasing publishes all of it at once.
+  releaseExclusiveWriteLock(db);
 
   db.close();
   console.log(`done — provenance recorded in reembed_provenance (concepts and the pin are unchanged)`);
