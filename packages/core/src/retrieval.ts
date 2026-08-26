@@ -6,9 +6,11 @@
  * THE UNIT SPLIT (recall design call 2026-07-26). Observations are the unit of RETRIEVAL;
  * concepts are the unit of DELIVERY.
  *
- * The defect this closes: a many-observation concept's `concepts.embedding` is a running-mean
- * centroid (blend(), embedding.ts) over everything ever attached to it, so it embeds to a blurred
- * mixture — pointing at no one query in particular. Measured on the live store (2026-07-25),
+ * The defect this closes: a many-observation concept's `concepts.embedding` is a CENTROID over
+ * everything ever attached to it (`centroidOf`, embedding.ts — a running `blend()` when this was
+ * written), so it embeds to a blurred mixture — pointing at no one query in particular. The blur is
+ * a property of averaging, not of how the average was accumulated, so making that centroid the true
+ * mean did not touch this argument. Measured on the live store (2026-07-25),
  * cosine against that centroid correlates r = -0.584 with log(body length) on ON-TOPIC queries
  * and r = -0.522 OFF-topic: length moved the score regardless of relevance, which means the
  * store's richest, most-consolidated concepts were its LEAST findable — consolidation's virtue

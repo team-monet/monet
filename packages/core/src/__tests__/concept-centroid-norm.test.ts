@@ -3,10 +3,11 @@
  *
  * `cosine()` (embedding.ts) is a bare dot product whose contract is "both vectors are
  * L2-normalized", and every other path that writes `concepts.embedding` honours it: `create` stores
- * the provider's own output, `attach` goes through `blend`, `mergeConceptInto` through
- * `blendWeighted` — all three normalize. `recomputeNativeConceptProjection` did not: it wrote a
- * plain arithmetic mean of the live observation vectors, because `normalize` was module-private and
- * the engine could not reach it.
+ * the provider's own output, and `attach` / `detach` / `mergeConceptInto` all normalize (through
+ * `blend` and `blendWeighted` when this was written; through `centroidOf` since they converged on
+ * the true mean). `recomputeNativeConceptProjection` did not: it wrote a plain arithmetic mean of
+ * the live observation vectors, because `normalize` was module-private and the engine could not
+ * reach it.
  *
  * The consequence is not a wrong direction but a SHORT one, and every centroid read is a dot
  * product that scales with length: `nominateByObservation`'s `centroidScore` (engine.ts) against
@@ -26,7 +27,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore } from "../engine";
-import { HashingEmbeddingProvider, embToJson, isZeroVector, jsonToEmb, normalizeVector } from "../embedding";
+import { HashingEmbeddingProvider, blend, embToJson, isZeroVector, jsonToEmb, normalizeVector } from "../embedding";
 import { BetterSqlitePort, type Statement, type StoragePort } from "../storage";
 
 const CIRCLE = "centroid-norm";
@@ -213,12 +214,19 @@ describe("recomputeNativeConceptProjection — the stored centroid is L2-normali
  *   SHORT CENTROIDS — what the block above fixed going forward, unrepaired on any store whose
  *   concepts were last recomputed by a pre-#90 build.
  *
- *   BLEND DRIFT — `attach()` folds each observation in with a RUNNING `blend()`, which re-inflates
- *   the accumulated direction to full integer weight at every step as if all priors agreed. The
- *   stored centroid therefore depends on the ORDER the evidence arrived in and drifts off the true
- *   normalized mean. Crucially it stays UNIT-LENGTH while drifting, which is why the norm-only
- *   repair could not have caught it — the PREMISE test below asserts exactly that, so the wider
- *   pass is justified by the fixture rather than by assertion.
+ *   BLEND DRIFT — `attach()` USED TO fold each observation in with a RUNNING `blend()`, which
+ *   re-inflates the accumulated direction to full integer weight at every step as if all priors
+ *   agreed. The stored centroid therefore depended on the ORDER the evidence arrived in and drifted
+ *   off the true normalized mean. Crucially it stayed UNIT-LENGTH while drifting, which is why the
+ *   norm-only repair could not have caught it — the PREMISE test below asserts exactly that, so the
+ *   wider pass is justified by the fixture rather than by assertion.
+ *
+ * THE LIVE WRITER NO LONGER PRODUCES EITHER DEFECT, and that is what `buildDrifted` below now has
+ * to work around rather than rely on. `attach()` writes the true mean (see concept-centroid-mean
+ * .test.ts for that half), so drift is PLANTED here — the old `blend()` replayed over the same
+ * stored vectors in the same arrival order. This pass is not made redundant by the writer change:
+ * it repairs what OLDER BUILDS persisted, and a settled concept that is never attached to again is
+ * never recomputed either.
  *
  * HOW THE PRE-PASS STATE IS REACHED: a genuine legacy store has no `centroids_reprojected` column
  * at all and `migrate()`'s guarded ALTER backfills it to 0. These tests set the gate back to 0,
@@ -253,9 +261,21 @@ function openFileCore(path: string, port?: StoragePort): MonetCore {
 const gateOf = (db: StoragePort): number =>
   (db.prepare(`SELECT centroids_reprojected AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number }).value;
 
+/** Mirrors engine.ts's `CENTROID_REPROJECTION_VERSION`. The sentinel is a VERSION, not a boolean:
+ *  v1.8.0 stamped 1 while `blend()` was still the attach writer, so stores stamped by that build
+ *  carry re-drifted centroids and must run the pass once more. Kept as a literal here rather than
+ *  imported, so a change to the engine's constant shows up as a failing assertion to be read and
+ *  agreed with rather than silently tracked. */
+const REPROJECTION_VERSION = 2;
+
 /** Put the store back in the state migrate()'s ALTER leaves a genuine pre-pass store in. */
 const reopenPending = (db: StoragePort): void => {
   db.prepare(`UPDATE sync_meta SET centroids_reprojected = 0 WHERE singleton = 1`).run();
+};
+
+/** The state a v1.8.0 store is in: the one-time pass already ran and stamped the old boolean 1. */
+const stampLegacyReprojected = (db: StoragePort): void => {
+  db.prepare(`UPDATE sync_meta SET centroids_reprojected = 1 WHERE singleton = 1`).run();
 };
 
 const setConceptVector = (db: StoragePort, conceptId: string, v: Float32Array): void => {
@@ -298,10 +318,34 @@ const cos = (a: Float32Array, b: Float32Array): number => {
 const trueMean = (db: StoragePort, conceptId: string): Float32Array =>
   normalizeVector(rawMean(liveObservationVectors(db, conceptId)));
 
-/** Build one concept carrying `order.length` observations, attached in that arrival order. */
+/**
+ * Build one concept carrying `order.length` observations attached in that arrival order, and leave
+ * in `concepts.embedding` the centroid A PRE-FIX BUILD WOULD HAVE PERSISTED for it.
+ *
+ * THE PLANT IS NOT A SHORTCUT, it is the only way this fixture can exist any more. `attach()` now
+ * writes the true mean of the concept's live evidence, so a concept built through the public API
+ * comes out ALREADY CONVERGED and this whole pass would have nothing to repair — every test below
+ * would be a green that could not fail. The population this one-time pass exists for is stores
+ * written by OLDER builds, and reproducing what those builds left in the column is the fixture.
+ *
+ * Faithful rather than approximate: the same `blend()` the engine used to call, replayed over the
+ * same STORED observation vectors, in the same arrival order, with the same running count (1, 2, 3
+ * …) `attach` passed as `concept.support_count`. That is byte-for-byte the state a pre-fix engine
+ * would have left.
+ */
 async function buildDrifted(core: MonetCore, order: number[]): Promise<string> {
   const first = await core.store(TEXTS[order[0]!]!, { circle: CIRCLE });
-  for (const i of order.slice(1)) await core.store(TEXTS[i]!, { circle: CIRCLE, attachTo: first.conceptId });
+  const arrivalObsIds = [first.observationId];
+  for (const i of order.slice(1)) {
+    const attached = await core.store(TEXTS[i]!, { circle: CIRCLE, attachTo: first.conceptId });
+    arrivalObsIds.push(attached.observationId);
+  }
+  const db = dbOf(core);
+  const vectorOf = (id: string): Float32Array =>
+    jsonToEmb((db.prepare(`SELECT embedding FROM observations WHERE id = ?`).get(id) as { embedding: string }).embedding);
+  let drifted = vectorOf(arrivalObsIds[0]!);
+  for (let n = 1; n < arrivalObsIds.length; n++) drifted = blend(drifted, vectorOf(arrivalObsIds[n]!), n);
+  setConceptVector(db, first.conceptId, drifted);
   return first.conceptId;
 }
 
@@ -331,7 +375,7 @@ function countingPort(inner: StoragePort, sqlNeedle: string): { port: StoragePor
 }
 
 describe("repairDriftedConceptCentroids — the one-time convergence pass", () => {
-  it("PREMISE: attach() leaves a UNIT-LENGTH but DRIFTED centroid, so a norm-only pass would find nothing", async () => {
+  it("PREMISE: the pre-fix blend writer left a UNIT-LENGTH but DRIFTED centroid, so a norm-only pass would find nothing", async () => {
     const path = tempStore();
     const core = openFileCore(path);
     try {
@@ -386,7 +430,7 @@ describe("repairDriftedConceptCentroids — the one-time convergence pass", () =
       // makes a later real recompute a no-op, which is what "converged" has to mean.
       expect(Array.from(stored)).toEqual(expected);
       expect(l2(stored)).toBeCloseTo(1, 5);
-      expect(gateOf(dbOf(reopened))).toBe(1);
+      expect(gateOf(dbOf(reopened))).toBe(REPROJECTION_VERSION);
     } finally {
       reopened.close();
     }
@@ -553,7 +597,7 @@ describe("repairDriftedConceptCentroids — the one-time convergence pass", () =
     }
     {
       const core = openFileCore(path);
-      expect(gateOf(dbOf(core))).toBe(1);
+      expect(gateOf(dbOf(core))).toBe(REPROJECTION_VERSION);
       core.close();
     }
 
@@ -570,12 +614,69 @@ describe("repairDriftedConceptCentroids — the one-time convergence pass", () =
 
     const reopened = openFileCore(path);
     try {
-      expect(gateOf(dbOf(reopened))).toBe(1);
+      expect(gateOf(dbOf(reopened))).toBe(REPROJECTION_VERSION);
       // A pass that re-ran would silently fix this. The gate means it must survive, which is what
       // "one-time" actually asserts.
       expect(Array.from(conceptVector(dbOf(reopened), conceptId))).toEqual(planted);
     } finally {
       reopened.close();
+    }
+  });
+
+  /**
+   * THE GATE IS A VERSION, BECAUSE ONE SHOT WAS NOT ENOUGH (Codex #95, P2).
+   *
+   * v1.8.0 shipped this pass — which stamps the sentinel — while `attach()` was STILL the running
+   * `blend()` writer. Verified against the tag rather than assumed: the pass's commit is an ancestor
+   * of v1.8.0, and v1.8.0's `attach` reads `blend(jsonToEmb(concept.embedding), emb,
+   * concept.support_count)`. So a v1.8.0 store converged its backlog, stamped 1, and then re-drifted
+   * on its very next attach — and the boolean gate read "already done" forever after. The true-mean
+   * writers do not rescue it either: they only correct a concept on its NEXT attachment, and a
+   * settled concept has none.
+   *
+   * The state below is exactly that store: drifted centroid, sentinel at the old value 1.
+   */
+  it("RE-RUNS for a store stamped by v1.8.0, whose centroids re-drifted after that pass", async () => {
+    const path = tempStore();
+    let conceptId = "";
+    let expectedMean: number[] = [];
+    {
+      const core = openFileCore(path);
+      conceptId = await buildDrifted(core, [0, 1, 2, 3, 4]);
+      const db = dbOf(core);
+      // The fixture really is drifted, or the re-run below would have nothing to prove.
+      expect(cos(conceptVector(db, conceptId), trueMean(db, conceptId))).toBeLessThan(0.999);
+      expectedMean = Array.from(trueMean(db, conceptId));
+      stampLegacyReprojected(db);
+      core.close();
+    }
+
+    const reopened = openFileCore(path);
+    try {
+      // Converged on the true mean, byte for byte — the pass ran despite the old stamp.
+      expect(Array.from(conceptVector(dbOf(reopened), conceptId))).toEqual(expectedMean);
+      expect(gateOf(dbOf(reopened))).toBe(REPROJECTION_VERSION);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("stamps the CURRENT version on a fresh store, and a second open does not re-run", async () => {
+    const path = tempStore();
+    {
+      // A brand-new store starts at the schema default 0 and is converged by the first open.
+      const core = openFileCore(path);
+      expect(gateOf(dbOf(core))).toBe(REPROJECTION_VERSION);
+      core.close();
+    }
+    // Second open: already at the current version, so the pass must not write anything at all.
+    const counted = countingPort(new BetterSqlitePort(path), `UPDATE concepts SET embedding = ?`);
+    const second = openFileCore(path, counted.port);
+    try {
+      expect(counted.runs()).toBe(0);
+      expect(gateOf(dbOf(second))).toBe(REPROJECTION_VERSION);
+    } finally {
+      second.close();
     }
   });
 
@@ -664,7 +765,7 @@ describe("repairDriftedConceptCentroids — the one-time convergence pass", () =
     const secondMs = performance.now() - startedSecond;
     try {
       expect(second.runs()).toBe(0);
-      expect(gateOf(dbOf(b))).toBe(1);
+      expect(gateOf(dbOf(b))).toBe(REPROJECTION_VERSION);
       // Reported, not asserted — whole-constructor wall time, pass included.
       console.log(`[cost] 900 concepts / 2700 observations — first pass ${firstMs.toFixed(0)}ms (${firstWrites} writes), converged re-run ${secondMs.toFixed(0)}ms (0 writes)`);
     } finally {
@@ -718,7 +819,7 @@ describe("repairDriftedConceptCentroids — the one-time convergence pass", () =
       // the sentinel is still spent. Corruption is diagnostics' population to report, not this
       // pass's to repair, so there is nothing here to come back for.
       expect(Array.from(conceptVector(db, healthyId))).toEqual(healthyExpected);
-      expect(gateOf(db)).toBe(1);
+      expect(gateOf(db)).toBe(REPROJECTION_VERSION);
     } finally {
       reopened.close();
     }
@@ -753,7 +854,7 @@ describe("repairDriftedConceptCentroids — the one-time convergence pass", () =
       // Pre-fix the mean of [0.1,0,0.3], [0.2,0.4,0.4] and [0.5,0.1,0.2] was normalized and stored —
       // a centroid derived partly from a value that was never measured.
       expect(conceptEmbeddingJson(db, conceptId)).toBe(before);
-      expect(gateOf(db)).toBe(1);
+      expect(gateOf(db)).toBe(REPROJECTION_VERSION);
     } finally {
       reopened.close();
     }
@@ -802,7 +903,7 @@ describe("repairDriftedConceptCentroids — the one-time convergence pass", () =
     try {
       const db = dbOf(clean);
       expect(Array.from(conceptVector(db, conceptId))).toEqual(expected);
-      expect(gateOf(db)).toBe(1);
+      expect(gateOf(db)).toBe(REPROJECTION_VERSION);
     } finally {
       clean.close();
     }

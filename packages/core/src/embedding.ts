@@ -105,6 +105,39 @@ export interface EmbeddingThresholds {
    */
   tauMargin?: number;
   /**
+   * UPPER BOUND ON THE MARGIN GATE'S BAND: a centroid cosine at or above this takes the attach
+   * WITHOUT consulting the margin. Defined only where it has been measured; omitted means no upper
+   * bound at all and the margin gate runs on every above-tau nomination, exactly as before.
+   *
+   * WHAT IT ANSWERS THAT tauMargin CANNOT. The margin asks "am I sure it is THIS one" by comparing
+   * the winner to the runner-up — a question about SEPARATION, which goes quiet the moment two
+   * candidates are genuinely close. But the identity half of the decision has a second, independent
+   * witness the gate never consults once it has decided to ask: the winner's own centroid score,
+   * i.e. how well the incoming evidence agrees with everything that concept already holds. A
+   * near-tie between a coherent home and some neighbour is not the same situation as a near-tie
+   * between two neighbours neither of which the evidence sits inside, and the margin alone cannot
+   * tell them apart. This says: above a high enough centroid, coherence is already confirmed and the
+   * separation question stops being worth a round-trip.
+   *
+   * WHY AN UPPER BOUND RATHER THAN A LOWER tauMargin. Lowering the margin buys the same ask-rate
+   * reduction by discarding the separation test everywhere, including where it is doing its work.
+   * This discards it only where a second signal already answers the question, so the asks it removes
+   * are the ones with an independent reason to be safe.
+   *
+   * IT ASSUMES THE STORED CENTROID IS THE TRUE MEAN OF THE CONCEPT'S LIVE EVIDENCE. That is what
+   * "coherence is already confirmed" rests on, and it was not true of every store until the centroid
+   * writers converged on `centroidOf` and the 1.8.0 one-time reprojection repaired the backlog. A
+   * value derived against drifted centroids would be calibrated against a deflated quantity — see
+   * the profile's own note for what that did to the derivation. RE-DERIVE IF THE CENTROID DEFINITION
+   * EVER CHANGES AGAIN.
+   *
+   * PER-MODEL, like every other number here: it is a raw cosine against a concept centroid and
+   * cosine scales differ by space. The derivation, the numbers, and the honest magnitude live with
+   * the profile that carries it (MODEL_PROFILES, embedding-onnx.ts). A borrowed value would bypass
+   * the margin gate in a space nobody measured it in, which is strictly worse than not having it.
+   */
+  tauConfident?: number;
+  /**
    * Lower bound of the `related` edge band, `edgeSimMin <= cos < tauAttach`. Per-model because it
    * is a raw cosine and cosine scales differ by space; omitted means the engine's embedder-class
    * fallback, which is a guess about the class rather than a measurement of the model.
@@ -371,7 +404,57 @@ export function isZeroVector(v: Float32Array): boolean {
   return true;
 }
 
-/** Running-mean blend of a concept's vector with a new supporting observation. */
+/**
+ * THE CONCEPT CENTROID: the L2-normalized arithmetic mean of a concept's live evidence vectors.
+ * ONE definition, shared by every writer of `concepts.embedding` that has evidence in hand —
+ * `recomputeNativeConceptProjection`, `attach`, `detach`'s two rebuilds and `mergeConceptInto`
+ * (engine.ts) — so that the vector any one of them writes is the vector a later recompute would
+ * write for the same set, and no two of them can disagree about what the column means.
+ *
+ * IT REPLACED A RUNNING BLEND, and the difference is not cosmetic. Folding each observation in with
+ * `blend()` re-inflates the accumulated direction to full integer weight at every step, as if every
+ * prior member had agreed perfectly with it; the result depends on the ORDER the evidence arrived
+ * in and drifts off the mean of the same set (measured through the engine: five observations in two
+ * arrival orders, cos 0.9968). A mean has neither property — it is order-free and path-free by
+ * construction — which is why this, and not the blend, is what "the concept's vector" means.
+ *
+ * ORDER STILL MATTERS TO THE LAST ULP, and callers owe that. Float addition is not associative, so
+ * the summation order fixes the low bits; every engine caller sums its evidence in `ORDER BY id
+ * ASC`, which is what makes attach's write and a later recompute BYTE-identical rather than merely
+ * close. A caller summing the same set in another order gets the same centroid to ~7 digits and a
+ * different one to `toEqual`.
+ *
+ * `vector[d] ?? 0` on a short member, matching the recompute this was extracted from: a width
+ * mismatch is a store-level defect the width assertions exist to catch, and silently reading past
+ * the end of one member is not this function's error to raise.
+ *
+ * A ZERO VECTOR STAYS ZERO — the mean of placeholders is the zero placeholder, and `normalizeVector`
+ * divides by `mag || 1` rather than manufacturing a measurement out of "not measured".
+ *
+ * Callers must not pass an empty set: the mean of nothing is not a vector, and a width would have to
+ * be invented to return one. Every caller has its own answer for "no live evidence" (the recompute
+ * writes an explicit `embedder.dim` placeholder; the merge keeps the vector it already had), and
+ * those answers differ, so this function refuses rather than picking one for them.
+ */
+export function centroidOf(vectors: readonly Float32Array[]): Float32Array {
+  if (vectors.length === 0) throw new Error("centroidOf: no vectors to average");
+  const out = new Float32Array(vectors[0]!.length);
+  for (let d = 0; d < out.length; d++) {
+    let sum = 0;
+    for (const vector of vectors) sum += vector[d] ?? 0;
+    out[d] = sum / vectors.length;
+  }
+  return normalizeVector(out);
+}
+
+/**
+ * Running-mean blend of a concept's vector with a new supporting observation.
+ *
+ * NO LONGER A CENTROID WRITER. Every `concepts.embedding` path that used to call this — `attach`,
+ * `detach`'s two rebuilds — now goes through `centroidOf` above, because this one is
+ * path-dependent (see that comment). Retained as an exported vector primitive; nothing in the
+ * engine calls it.
+ */
 export function blend(current: Float32Array, next: Float32Array, currentCount: number): Float32Array {
   const out = new Float32Array(current.length);
   for (let i = 0; i < out.length; i++) {
