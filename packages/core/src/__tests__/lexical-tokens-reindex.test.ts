@@ -681,6 +681,42 @@ describe("combining and variation marks inside a CJK run", () => {
     expect(lexicalCoverage(marked)).toBeCloseTo(1, 10);
   });
 
+  it("keeps a Hangul run whole across a SPACING tone mark (Mc, not Mn)", () => {
+    // U+302E/U+302F are `Mc` — spacing combining marks — and `scx=Hangul`. A mark class of
+    // `[\p{Mn}\p{Me}]` excluded them and split the run, which is why the class is all of `\p{M}`.
+    for (const mark of ["\u302E", "\u302F"]) {
+      const marked = `한${mark}국`;
+      expect(marked.normalize("NFC")).toBe(marked); // premise: NFC leaves it alone
+      expect([...marked].length).toBe(3);
+      expect(/\p{Mc}/u.test(mark)).toBe(true);      // premise: spacing, not non-spacing
+      expect(/\p{Mn}/u.test(mark)).toBe(false);
+      expect(lexicalTokens(marked), mark).toEqual(lexicalTokens("한국"));
+      expect(lexicalCoverage(marked)).toBeCloseTo(1, 10);
+    }
+  });
+
+  it("keeps a Han run whole across an ideographic tone mark (Mc)", () => {
+    for (const mark of ["\u{16FF0}", "\u{16FF1}"]) {
+      const marked = `漢${mark}字`;
+      expect(marked.normalize("NFC")).toBe(marked);
+      expect([...marked].length).toBe(3);
+      expect(/\p{Mc}/u.test(mark)).toBe(true);
+      expect(lexicalTokens(marked), mark).toEqual(lexicalTokens("漢字"));
+      expect(lexicalCoverage(marked)).toBeCloseTo(1, 10);
+    }
+  });
+
+  it("admits no mark into the coverage denominator, whatever the class widens to", () => {
+    // The safety argument for blanket `\p{M}`: general categories are mutually exclusive, so a mark
+    // is never a letter or a number and can never be counted as readable text. Spot-checked here
+    // across all three mark categories; verified exhaustively over every code point when the class
+    // was widened.
+    for (const mark of ["\u0301", "\u302E", "\u20DD", "\u093E", "\u{16FF0}", "\u3099"]) {
+      expect(/\p{M}/u.test(mark), mark).toBe(true);
+      expect(/[\p{L}\p{N}]/u.test(mark), mark).toBe(false);
+    }
+  });
+
   it("does not let a stray mark open a run of its own", () => {
     // A mark may only extend a run that a real CJK character already started.
     expect(lexicalTokens("abc ゚ def").size).toBe(2); // `abc`, `def` — the mark yields nothing

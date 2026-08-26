@@ -98,11 +98,27 @@ const CJK_CHAR = "(?=[\\p{L}\\p{N}])[\\p{scx=Han}\\p{scx=Hangul}\\p{scx=Hiragana
  * A run must still START with a real CJK character, so a stray mark after Latin or punctuation opens
  * nothing. Marks are `[\p{L}\p{N}]`-negative, so they were never in `lexicalCoverage`'s denominator
  * and must not reach its numerator either — `scanLexical` counts base characters only.
+ *
+ * ALL OF `\p{M}`, NOT JUST `\p{Mn}\p{Me}` (Codex P2, PR #97 round 7). Combining marks are not all
+ * non-spacing: the Hangul tone marks `U+302E`/`U+302F` and the ideographic tone marks
+ * `U+16FF0`/`U+16FF1` are category `Mc`, and all four are script-attached to the very scripts this
+ * class exists for — `scx=Hangul` and `scx=Han` respectively. Excluding `Mc` split `한` + U+302E +
+ * `국` into two one-character runs and emitted nothing, the same defect the `Mn` cases had.
+ *
+ * BLANKET `\p{M}` IS SAFE, and the reason is a property of Unicode rather than a survey of what
+ * happens to be adjacent to CJK in practice. General categories are MUTUALLY EXCLUSIVE, so no mark
+ * is ever a letter or a number: verified exhaustively over all 0x110000 code points, 0 of the 2543
+ * `\p{M}` characters are also `[\p{L}\p{N}]`. Marks therefore cannot reach the coverage
+ * denominator no matter how many of them this class admits, and the counting invariant is untouched
+ * by construction. Widening past `Mn`/`Me` adds 471 `Mc` characters; 4 are the CJK tone marks above
+ * and the rest are Indic and South-East Asian spacing vowel signs, which can only be absorbed when
+ * they sit DIRECTLY AFTER a CJK base — text that is already malformed, where the outcome is bounded
+ * to dropping the mark and treating the two CJK characters either side of it as adjacent.
  */
-const CJK_MARK = "[\\p{Mn}\\p{Me}]";
+const CJK_MARK = "\\p{M}";
 
 /** One mark, for stripping a matched run down to its base characters. */
-const CJK_MARK_ONE = /[\p{Mn}\p{Me}]/u;
+const CJK_MARK_ONE = /\p{M}/u;
 
 /**
  * ONE PASS, BOTH CLASSES. Alternation rather than two independent scans, so every character of the
