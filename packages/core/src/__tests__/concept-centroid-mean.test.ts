@@ -38,7 +38,7 @@
 import { describe, it, expect } from "vitest";
 import { MonetCore } from "../engine";
 import { HashingEmbeddingProvider, blend, blendWeighted, jsonToEmb, normalizeVector } from "../embedding";
-import type { StoragePort } from "../storage";
+import { BetterSqlitePort, type Statement, type StoragePort } from "../storage";
 
 const CIRCLE = "centroid-mean";
 
@@ -274,6 +274,131 @@ describe("detach() rebuilds both sides as true means", () => {
       expect(Array.from(conceptVector(db, dest))).toEqual(Array.from(trueMean(db, dest)));
       expect(liveObservationVectors(db, source)).toHaveLength(1);
       expect(Array.from(conceptVector(db, source))).toEqual(Array.from(trueMean(db, source)));
+    } finally {
+      core.close();
+    }
+  });
+});
+
+/**
+ * THE REATTACH LOOP COMPUTES THE DESTINATION CENTROID ONCE (Codex #95, P2).
+ *
+ * `detach(destConceptId)` bulk-repoints all k moved observations onto the destination in step 3 and
+ * only then calls `attach` once per row in step 5. Because the rows are already repointed, every
+ * one of those attaches sees the COMPLETE final union in `liveConceptEvidence` — and nothing in the
+ * loop mutates `observations`, so all k of them computed the identical vector. O(k·n·d) for one
+ * answer, with the per-attach cost dominated by JSON.parse of n stored vectors.
+ *
+ * COUNTED THROUGH A STORAGE PORT, not a seam in the engine. The live-evidence SELECT is
+ * distinctive enough to recognise by its SQL, so the proof needs no production hook at all — the
+ * same reason concept-centroid-norm.test.ts counts centroid writes that way.
+ */
+function countingAllPort(inner: StoragePort, sqlNeedle: string): { port: StoragePort; alls: () => number } {
+  let alls = 0;
+  const port: StoragePort = {
+    prepare(sql: string): Statement {
+      const stmt = inner.prepare(sql);
+      if (!sql.includes(sqlNeedle)) return stmt;
+      return {
+        run: (...p: unknown[]) => stmt.run(...p),
+        get: (...p: unknown[]) => stmt.get(...p),
+        all: (...p: unknown[]) => { alls += 1; return stmt.all(...p); },
+      };
+    },
+    exec: (sql) => inner.exec(sql),
+    pragma: (source, options) => inner.pragma(source, options),
+    transaction: (fn) => inner.transaction(fn),
+    immediateTransaction: (fn) => inner.immediateTransaction(fn),
+    inTransaction: inner.inTransaction ? () => inner.inTransaction!() : undefined,
+    acquireExclusiveOwnership: () => inner.acquireExclusiveOwnership(),
+    releaseExclusiveOwnership: () => inner.releaseExclusiveOwnership(),
+    close: () => inner.close(),
+  };
+  return { port, alls: () => alls };
+}
+
+/** The exact SQL `liveConceptEvidence` issues — every centroid built from stored evidence runs it. */
+const LIVE_EVIDENCE_SQL = "superseded_at IS NULL ORDER BY id ASC";
+
+describe("detach's reattach loop builds the destination centroid once", () => {
+  const TEXTS6 = [...TEXTS, "The billing reconciler runs nightly and emits a variance report."];
+
+  /** A source of `k + 1` observations and a destination of two, sharing one counting port. */
+  async function fixture(k: number): Promise<{
+    core: MonetCore; db: StoragePort; source: string; dest: string; moving: string[]; alls: () => number;
+  }> {
+    const counted = countingAllPort(new BetterSqlitePort(":memory:"), LIVE_EVIDENCE_SQL);
+    let seq = 0;
+    const core = new MonetCore(counted.port, {
+      embedder: new HashingEmbeddingProvider(), tauAttach: 1.1, tauAmbiguous: 1.1,
+      idGen: () => `c${(seq++).toString().padStart(4, "0")}`,
+    });
+    const first = await core.store(TEXTS6[0]!, { circle: CIRCLE });
+    const moving: string[] = [];
+    for (let i = 1; i <= k; i++) {
+      const r = await core.store(`${TEXTS6[i % TEXTS6.length]!} (variant ${i})`, { circle: CIRCLE, attachTo: first.conceptId });
+      moving.push(r.observationId);
+    }
+    const dest = await core.store(TEXTS6[4]!, { circle: CIRCLE });
+    await core.store(TEXTS6[5]!, { circle: CIRCLE, attachTo: dest.conceptId });
+    return { core, db: dbOf(core), source: first.conceptId, dest: dest.conceptId, moving, alls: counted.alls };
+  }
+
+  it("runs the live-evidence read a CONSTANT number of times, not once per moved row", async () => {
+    // Two detaches of different k against the same shape. Before the fix the count rose with k
+    // (one read per attach); after it, the loop's contribution is a single hoisted read and the
+    // delta between the two k's collapses to zero. Comparing two k values rather than pinning one
+    // absolute number keeps this honest about the reads detach makes for its OWN reasons.
+    const small = await fixture(3);
+    const large = await fixture(6);
+    try {
+      const beforeSmall = small.alls();
+      await small.core.detach(small.source, small.moving, { destConceptId: small.dest, circle: CIRCLE });
+      const deltaSmall = small.alls() - beforeSmall;
+
+      const beforeLarge = large.alls();
+      await large.core.detach(large.source, large.moving, { destConceptId: large.dest, circle: CIRCLE });
+      const deltaLarge = large.alls() - beforeLarge;
+
+      console.log(`[reattach] live-evidence reads during detach: k=3 -> ${deltaSmall}, k=6 -> ${deltaLarge}`);
+      // The whole claim: doubling the moved rows does not buy a single extra centroid read.
+      expect(deltaLarge).toBe(deltaSmall);
+    } finally {
+      small.core.close();
+      large.core.close();
+    }
+  });
+
+  it("lands the destination on the union's true mean with k >= 3 moved rows", async () => {
+    const { core, db, source, dest, moving } = await fixture(4);
+    try {
+      await core.detach(source, moving, { destConceptId: dest, circle: CIRCLE });
+      expect(liveObservationVectors(db, dest)).toHaveLength(6); // 2 held + 4 moved
+      // The hoisted vector must BE the answer the loop used to converge on, byte for byte.
+      expect(Array.from(conceptVector(db, dest))).toEqual(Array.from(trueMean(db, dest)));
+    } finally {
+      core.close();
+    }
+  });
+
+  it("excludes a TERMINALLY SUPERSEDED moved row — the one case where this is not a faithful hoist", async () => {
+    // `attach`'s pending-row branch reads "absent from live evidence" as "not repointed yet", so a
+    // dead moved row used to have its vector merged in — and because only the LAST iteration's write
+    // survived, whether that happened depended on which row came last. Measured before the fix on
+    // this exact shape: the destination landed at cos 0.958286 from its own live-evidence mean.
+    // Hoisting the computation removes the leak rather than reproducing it: a centroid is the mean
+    // of LIVE evidence, and that is the one definition this column has.
+    const { core, db, source, dest, moving } = await fixture(3);
+    try {
+      core.supersedeObservation(moving[moving.length - 1]!, null); // terminal: superseded_at set, superseded_by NULL
+      await core.detach(source, moving, { destConceptId: dest, circle: CIRCLE });
+
+      const live = liveObservationVectors(db, dest);
+      expect(live).toHaveLength(4); // 2 held + 3 moved − 1 dead — the dead row IS on the destination
+      expect((db.prepare(
+        `SELECT COUNT(*) AS n FROM observations WHERE concept_id = ? AND superseded_at IS NOT NULL`,
+      ).get(dest) as { n: number }).n).toBe(1);
+      expect(Array.from(conceptVector(db, dest))).toEqual(Array.from(trueMean(db, dest)));
     } finally {
       core.close();
     }

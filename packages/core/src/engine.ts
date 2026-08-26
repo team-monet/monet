@@ -8064,9 +8064,37 @@ export class MonetCore {
         // duplicate of another moved row. Accepted: attach() still sets dirty=1 on every call
         // regardless, so the destination is left pending synthesis and the next synthesis pass
         // regenerates the body from the full observation ledger, picking the text up correctly.
+        //
+        // THE DESTINATION CENTROID IS COMPUTED ONCE, NOT ONCE PER MOVED ROW (Codex #95, P2). Step 3
+        // above already repointed every moved observation onto destConceptId, so from the FIRST
+        // iteration `attach`'s own `liveConceptEvidence(destConceptId)` returns the complete final
+        // union — and since nothing in this loop touches `observations` (attach writes only
+        // `concepts`), every iteration recomputed the identical vector. That is O(k·n·d) inside one
+        // transaction to produce one answer, and the per-attach cost is dominated by JSON.parse of n
+        // stored vectors, so the waste grows with the destination's size as well as with k.
+        //
+        // AND IT IS COMPUTED OVER LIVE EVIDENCE, which is a DELIBERATE CORRECTION rather than a
+        // faithful hoist of what the loop used to write. `attach`'s pending-row branch reads "not in
+        // live evidence" as "not repointed yet" and merges `emb` in — right for storeInternal, wrong
+        // for a TERMINALLY superseded moved row, which liveConceptEvidence excludes on purpose. So
+        // the old loop's iterations did NOT all agree once a dead row was in the set, and the stored
+        // centroid was whichever the LAST iteration happened to produce: measured on a 3-row detach
+        // whose last row was terminally superseded, the destination landed at cos 0.958286 from its
+        // own live-evidence mean, with a dead observation's vector inside it. Writing dead evidence
+        // into a centroid contradicts the one definition this column now has, so this computes the
+        // live mean and the leak is gone. Where every moved row is live — the ordinary case — this
+        // is byte-identical to what the final iteration wrote before.
+        //
+        // `undefined` when the destination has no live evidence at all (an empty destination and
+        // every moved row dead): there is no mean to take, so each attach falls back to its own
+        // assembly exactly as before rather than this branch inventing a vector or throwing.
+        const destEvidence = this.liveConceptEvidence(destConceptId);
+        const destCentroid = destEvidence.length > 0
+          ? centroidOf(destEvidence.map((o) => jsonToEmb(o.embedding)))
+          : undefined;
         for (const obs of detachingRows) {
           const currentDest = this.getRow(destConceptId)!;
-          this.attach(currentDest, obs.content, jsonToEmb(obs.embedding), null, obs.id);
+          this.attach(currentDest, obs.content, jsonToEmb(obs.embedding), null, obs.id, destCentroid);
         }
       }
 
@@ -14946,6 +14974,43 @@ export class MonetCore {
     ).all(conceptId) as Array<{ id: string; embedding: string; session_id: string | null; created_at: number }>;
   }
 
+  /**
+   * The centroid `attach` writes: the true mean of `conceptId`'s live evidence, with `emb` merged in
+   * AT ITS ID-SORTED POSITION when the row carrying it is not already among that evidence.
+   *
+   * Extracted from `attach` so the one caller that can supply the answer itself — `detach`'s
+   * reattach loop, which repoints every moved row BEFORE attaching any of them — has something to
+   * bypass rather than something to duplicate. See `attach`'s `precomputedCentroid` parameter.
+   *
+   * WHAT "not already among that evidence" COVERS, and it is two different situations that this
+   * predicate deliberately does not distinguish: the ordinary store path, where the row exists but
+   * `concept_id` is not set yet (storeInternal repoints it after this call), and a moved row that is
+   * SUPERSEDED, which `liveConceptEvidence` excludes on purpose. Merging `emb` in is right for the
+   * first and wrong for the second — a superseded observation is dead evidence and has no business
+   * in a centroid. The second case is unreachable from `storeInternal` (a brand-new observation is
+   * never born superseded) and is handled at the one place it can occur, in `detach`'s loop, which
+   * now bypasses this entirely.
+   */
+  private centroidIncludingPendingObservation(
+    conceptId: string,
+    emb: Float32Array,
+    observationId?: string,
+  ): Float32Array {
+    const evidence = this.liveConceptEvidence(conceptId);
+    const vectors: Float32Array[] = [];
+    let pending: Float32Array | null =
+      observationId !== undefined && evidence.some((row) => row.id === observationId) ? null : emb;
+    for (const row of evidence) {
+      if (pending !== null && observationId !== undefined && observationId < row.id) {
+        vectors.push(pending);
+        pending = null;
+      }
+      vectors.push(jsonToEmb(row.embedding));
+    }
+    if (pending !== null) vectors.push(pending);
+    return centroidOf(vectors);
+  }
+
   private recomputeNativeConceptProjection(conceptId: string, relayAt: number): void {
     this.assertPinSatisfied(); // embedder-pin ADR, FIX AC — the empty-observation branch below writes a this.embedder.dim-sized vector with no embed() call to gate it otherwise
     const concept = this.getRow(conceptId);
@@ -17190,7 +17255,25 @@ export class MonetCore {
    * why it can no longer mean "the" current observation). No attachTo creates a brand-new file
    * concept (the first chunk of a never-before-seen file) with placeholder content.
    */
-  private attach(concept: ConceptRow, content: string, emb: Float32Array, sessionId?: string | null, observationId?: string): ConceptRow {
+  /**
+   * `precomputedCentroid` — THE CENTROID THIS CALL SHOULD WRITE, when the caller already knows it.
+   *
+   * Exists for exactly one caller, `detach`'s reattach loop, and for a reason that is a property of
+   * that loop rather than a micro-optimization. It bulk-repoints ALL k moved observations onto the
+   * destination BEFORE attaching any of them, so from the first iteration onward this method's own
+   * `liveConceptEvidence` already returns the complete final union — and computes the identical
+   * centroid k times inside one transaction, O(k·n·d) to produce one vector. Nothing in the loop
+   * mutates `observations` (attach writes only `concepts`), so k−1 of those are pure waste.
+   *
+   * The caller owes the same quantity this method would have computed, over the same live evidence
+   * in the same `ORDER BY id ASC`; `detach` builds it from the same `liveConceptEvidence` +
+   * `centroidOf` pair, so the two cannot drift apart. Passing it in rather than deferring the write
+   * to after the loop is deliberate: `getRow(destConceptId)` is re-read on every iteration, and a
+   * deferred write would leave that row carrying a stale vector for k−1 of them. Nothing reads
+   * `concept.embedding` in here TODAY — the true-mean change removed that read — but "the row is
+   * consistent at every point in the transaction" is a cheaper invariant to keep than to re-derive.
+   */
+  private attach(concept: ConceptRow, content: string, emb: Float32Array, sessionId?: string | null, observationId?: string, precomputedCentroid?: Float32Array): ConceptRow {
     if (concept.status === "retired") throw new Error("cannot attach to a retired concept");
     const trimmed = content.trim();
     // Compare whole evidence, not rendered body lines: a multi-line observation must remain one
@@ -17237,19 +17320,10 @@ export class MonetCore {
     //
     // support_count is deliberately untouched by this: it is an attach counter, not a live-evidence
     // count, and reconciling the two is a separate semantic change nothing here asked for.
-    const evidence = this.liveConceptEvidence(concept.id);
-    const vectors: Float32Array[] = [];
-    let pending: Float32Array | null =
-      observationId !== undefined && evidence.some((row) => row.id === observationId) ? null : emb;
-    for (const row of evidence) {
-      if (pending !== null && observationId !== undefined && observationId < row.id) {
-        vectors.push(pending);
-        pending = null;
-      }
-      vectors.push(jsonToEmb(row.embedding));
-    }
-    if (pending !== null) vectors.push(pending);
-    const blended = centroidOf(vectors);
+    //
+    // The assembly itself lives in centroidIncludingPendingObservation so `detach`'s reattach loop
+    // can supply the answer instead of paying for it once per moved row — see the parameter.
+    const blended = precomputedCentroid ?? this.centroidIncludingPendingObservation(concept.id, emb, observationId);
 
     // Cross-session = sessionId provided AND differs from the concept's last_confirmed_session_id.
     // Same-session = sessionId provided AND matches. null = detach reattach (old evidence, no confirm).
