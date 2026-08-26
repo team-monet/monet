@@ -83,6 +83,38 @@ function expected(embedder: SpaceEmbedder, text: string): number[] {
   return Array.from(embedder.embed(text));
 }
 
+/**
+ * The normalized mean of a concept's live observation vectors — what `concepts.embedding` holds for
+ * an ACTIVE native concept once a migration finishes (Codex #95, P1). `reembedConcept` can only
+ * write `embed(body)`, because it runs before the observation phase has moved the evidence into the
+ * target space; the migration then rebuilds the centroid from that evidence.
+ *
+ * Computed here in float32, mirroring `centroidOf` + `normalizeVector` rather than importing them,
+ * so the expectation is independent of the code under test — and so this file still compiles against
+ * a tree without the fix, making the red-before run a real assertion failure.
+ *
+ * A concept with NO live evidence, a `kind = 'source'` concept, and a RETIRED one all keep the body
+ * embedding instead — see the migration's own comment for why each is excluded.
+ */
+function liveCentroid(db: RawDb, conceptId: string): number[] {
+  const rows = db.prepare(
+    `SELECT embedding FROM observations
+      WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL ORDER BY id ASC`,
+  ).all(conceptId) as Array<{ embedding: string }>;
+  const vectors = rows.map((row) => new Float32Array(JSON.parse(row.embedding) as number[]));
+  const out = new Float32Array(vectors[0]!.length);
+  for (let d = 0; d < out.length; d++) {
+    let sum = 0;
+    for (const v of vectors) sum += v[d] ?? 0;
+    out[d] = sum / vectors.length;
+  }
+  let mag = 0;
+  for (let i = 0; i < out.length; i++) mag += out[i]! * out[i]!;
+  mag = Math.sqrt(mag) || 1;
+  for (let i = 0; i < out.length; i++) out[i] /= mag;
+  return Array.from(out);
+}
+
 function withTempDb(run: (dbPath: string) => void | Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "monet-migrate-embeddings-"));
   const dbPath = join(dir, "monet.db");
@@ -245,10 +277,16 @@ describe("MonetCore.migrateEmbeddings", () => {
         const conceptBodies = new Map(
           (db.prepare(`SELECT id, body FROM concepts ORDER BY id`).all() as Array<{ id: string; body: string }>).map((row) => [row.id, row.body]),
         );
-        for (const id of [fixture.activeA, fixture.activeB, fixture.retired]) {
-          expect(vector(db, "concepts", id)).toEqual(expected(target, conceptBodies.get(id)!));
+        // ACTIVE concepts end on the centroid of their migrated evidence, not on `embed(body)`:
+        // the body vector is only what `reembedConcept` could write before the observation phase ran.
+        for (const id of [fixture.activeA, fixture.activeB]) {
+          expect(vector(db, "concepts", id)).toEqual(liveCentroid(db, id));
+          expect(vector(db, "concepts", id)).not.toEqual(expected(target, conceptBodies.get(id)!));
           expect(JSON.stringify(vector(db, "concepts", id))).not.toBe(oldConceptVectors.get(id));
         }
+        // RETIRED keeps the body embedding — it is not centroid-maintained by any writer.
+        expect(vector(db, "concepts", fixture.retired)).toEqual(expected(target, conceptBodies.get(fixture.retired)!));
+        expect(JSON.stringify(vector(db, "concepts", fixture.retired))).not.toBe(oldConceptVectors.get(fixture.retired));
         expect(vector(db, "concepts", fixture.workstream)).toEqual(expected(target, fixture.workstreamText));
         expect(JSON.stringify(vector(db, "concepts", fixture.workstream))).not.toBe(oldConceptVectors.get(fixture.workstream));
 
@@ -279,6 +317,76 @@ describe("MonetCore.migrateEmbeddings", () => {
         ];
         const observed = progress.map((event) => phaseOrder.indexOf(event.phase));
         expect(observed).toEqual([...observed].sort((a, b) => a - b));
+      } finally {
+        core.close();
+      }
+    });
+  });
+
+  /**
+   * A MIGRATION MUST LEAVE THE CENTROID, NOT THE BODY EMBEDDING (Codex #95, P1).
+   *
+   * The native-concepts phase runs `reembedConcept`, which writes `embed(row.body)` — all it can do,
+   * since it runs BEFORE the observation phase moves the evidence into the target space. Nothing
+   * afterwards used to put the centroid back: the observation phase writes only
+   * `observations.embedding`, `reembedWorkstream` touches workstreams alone, and neither the graph
+   * phase nor completion writes a concept vector. So every migrated multi-observation concept was
+   * left holding a body embedding, which `nominateByObservation` then reads as `centroidScore` and
+   * the tauConfident bypass attaches above.
+   *
+   * THREE LIVE MEMBERS, deliberately: a mean is only distinguishable from its members when the
+   * members disagree, and a one-observation concept would make `embed(body)` and the centroid
+   * trivially close enough to prove nothing.
+   */
+  it("rebuilds an active concept's centroid from the MIGRATED evidence, not from its body text", async () => {
+    await withTempDb(async (dbPath) => {
+      const oldEmbedder = new SpaceEmbedder("test:space:old", 1);
+      let conceptId = "";
+      {
+        const core = new MonetCore(dbPath, { embedder: oldEmbedder, tauAttach: 1.1, tauAmbiguous: 1.1 });
+        try {
+          const first = await core.store("Rolling deploys drain each node before restart.", { resolution: "forceNew" });
+          await core.store("Feature flags are evaluated once per request.", { attachTo: first.conceptId });
+          await core.store("The ingest queue shards by tenant id and rebalances.", { attachTo: first.conceptId });
+          conceptId = first.conceptId;
+        } finally {
+          core.close();
+        }
+      }
+
+      const target = new SpaceEmbedder("test:space:target", 2);
+      const core = new MonetCore(dbPath, { embedder: target, tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const db = dbOf(core);
+      try {
+        const oldVector = JSON.stringify(vector(db, "concepts", conceptId));
+        const report = await core.migrateEmbeddings({ targetModelId: target.modelId });
+        expect(report.failures).toEqual([]);
+
+        const live = db.prepare(
+          `SELECT id FROM observations WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL`,
+        ).all(conceptId);
+        expect(live).toHaveLength(3); // the fixture can exhibit a mean at all
+
+        const body = (db.prepare(`SELECT body FROM concepts WHERE id = ?`).get(conceptId) as { body: string }).body;
+        const stored = vector(db, "concepts", conceptId);
+
+        // It IS the centroid of the migrated evidence...
+        expect(stored).toEqual(liveCentroid(db, conceptId));
+        // ...and it is NOT what `reembedConcept` left behind. Asserted so this cannot pass on a tree
+        // where the recompute is missing.
+        expect(stored).not.toEqual(expected(target, body));
+        // Still moved out of the old space, which is the migration's own guarantee.
+        expect(JSON.stringify(stored)).not.toBe(oldVector);
+        // A centroid is unit-length; a raw SpaceEmbedder body vector is not — so the column is
+        // holding the quantity it is supposed to hold, not merely a different one.
+        const magnitude = Math.sqrt(stored.reduce((m, x) => m + x * x, 0));
+        expect(magnitude).toBeCloseTo(1, 6);
+
+        // Every member the centroid was built from is in the TARGET space (marker 2), so the
+        // rebuild consumed migrated evidence rather than leftovers from the old one.
+        for (const row of live as Array<{ id: string }>) {
+          expect(vector(db, "observations", row.id)[0]).toBe(2);
+        }
       } finally {
         core.close();
       }
@@ -439,7 +547,11 @@ describe("MonetCore.migrateEmbeddings", () => {
         expect(report.failures).toEqual([]);
         expect(migrationRow(dbOf(core))).toBeUndefined();
         expect(pinRow(dbOf(core)).embedder_model_id).toBe(target.modelId);
-        expect(vector(dbOf(core), "concepts", fixture.activeA)[0]).toBe(2);
+        // Landed in the target space: the concept now carries the centroid of its migrated evidence.
+        // (The raw `[0] === 2` space marker no longer reads directly off a concept row — the centroid
+        // is normalized — so this checks the same thing against the vector the column actually holds.)
+        expect(vector(dbOf(core), "concepts", fixture.activeA)).toEqual(liveCentroid(dbOf(core), fixture.activeA));
+        expect(vector(dbOf(core), "observations", fixture.currentObservation)[0]).toBe(2);
       } finally {
         core.close();
       }
@@ -485,9 +597,8 @@ describe("MonetCore.migrateEmbeddings", () => {
         expect(report.failures).toEqual([]);
         expect(migrationRow(dbOf(retry))).toBeUndefined();
         await expect(retry.ensureEmbedderPin()).resolves.toBeUndefined();
-        expect(vector(dbOf(retry), "concepts", fixture.activeB)).toEqual(
-          expected(fixed, "AuthService has a second active concept."),
-        );
+        // Active: the centroid of its migrated evidence (one live observation, normalized).
+        expect(vector(dbOf(retry), "concepts", fixture.activeB)).toEqual(liveCentroid(dbOf(retry), fixture.activeB));
         expect(vector(dbOf(retry), "concepts", fixture.retired)).toEqual(
           expected(fixed, "Retired native vector must still migrate."),
         );

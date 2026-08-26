@@ -377,6 +377,25 @@ const SOURCE_RETIREMENT_SCHEMA_VERSION = 13;
  * false repair nor a missed one is reachable from either side.
  */
 const CENTROID_UNIT_NORM_TOLERANCE = 1e-6;
+/**
+ * `sync_meta.centroids_reprojected` IS A VERSION, NOT A BOOLEAN (Codex #95, P2).
+ *
+ * It shipped as a one-shot flag, and one shot was not enough. v1.8.0 carried the reprojection pass
+ * — which stamps this column — while `attach()` was STILL the running `blend()` writer (verified:
+ * `git merge-base --is-ancestor` puts the pass inside v1.8.0, whose `attach` reads
+ * `blend(jsonToEmb(concept.embedding), emb, concept.support_count)`). So a v1.8.0 store converged
+ * its backlog, stamped 1, and then re-drifted on the very next attach. Upgrading such a store to the
+ * true-mean writers repairs nothing by itself: the new writer only corrects a concept on its NEXT
+ * attachment, and a settled concept has none — while the old gate read "already stamped" and
+ * returned. That re-drifted centroid is what `centroidScore` reads, and the tauConfident bypass
+ * attaches above it.
+ *
+ * Bumped to 2 so those stores run the pass exactly once more. The pass is idempotent (it writes only
+ * where the recomputed centroid differs), so re-running it on a genuinely converged store costs a
+ * scan and no writes. Any future writer-side change that can leave persisted centroids off the true
+ * mean bumps this again rather than adding a second sentinel.
+ */
+const CENTROID_REPROJECTION_VERSION = 2;
 // Rung 13: the source subsystem's retirement (#16). The ruling that dropped the subsystem is
 // what makes the purge safe — its content was always a materialized copy of files that live
 // outside the store, and nothing can re-read it once the connector is gone.
@@ -4049,8 +4068,14 @@ export class MonetCore {
    * converges the backlog; it does not change the ongoing writer. Changing `attach()` is a separate
    * decision with its own behavioural surface, and is deliberately not taken here." That decision
    * has since been taken — `attach()` writes the true mean of the concept's live evidence, and so do
-   * `detach`'s two rebuilds and `mergeConceptInto` — so the backlog this converges STAYS converged
-   * instead of re-drifting from the next write onward.
+   * `detach`'s two rebuilds and `mergeConceptInto` — so from those writers onward the backlog this
+   * converges STAYS converged instead of re-drifting from the next write.
+   *
+   * BUT ONLY FROM THOSE WRITERS ONWARD, AND THAT IS WHY THE GATE IS A VERSION (Codex #95, P2).
+   * v1.8.0 shipped this pass while `blend()` was still the attach writer, so a v1.8.0 store stamped
+   * the sentinel and then re-drifted on its next attach — and the boolean gate then read "already
+   * done" forever. `CENTROID_REPROJECTION_VERSION` (see its own comment) is what lets those stores
+   * run it once more.
    *
    * THIS PASS IS NOT MADE REDUNDANT BY THAT, which is the reason it is still here: it repairs what
    * OLDER BUILDS PERSISTED, and a settled concept that is never attached to again is never
@@ -4062,12 +4087,12 @@ export class MonetCore {
     // column means no gate, and running ungated would repeat the pass on every open.
     if (!cols.some((c) => c.name === "centroids_reprojected")) return;
     const gate = this.db.prepare(`SELECT centroids_reprojected AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number } | undefined;
-    if (gate === undefined || gate.value !== 0) return;
+    if (gate === undefined || gate.value >= CENTROID_REPROJECTION_VERSION) return;
     this.db.immediateTransaction((): void => {
       // Re-read under the write reservation: another process may have finished the pass between the
       // unlocked probe above and this transaction, and it must not run twice.
       const pending = this.db.prepare(`SELECT centroids_reprojected AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number } | undefined;
-      if (pending === undefined || pending.value !== 0) return;
+      if (pending === undefined || pending.value >= CENTROID_REPROJECTION_VERSION) return;
       const priorApplyingRemote = (this.db.prepare(`SELECT applying_remote AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number }).value;
       this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
       const update = this.db.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`);
@@ -4127,7 +4152,7 @@ export class MonetCore {
       }
 
       this.db.prepare(`UPDATE sync_meta SET applying_remote = ? WHERE singleton = 1`).run(priorApplyingRemote);
-      this.db.prepare(`UPDATE sync_meta SET centroids_reprojected = 1 WHERE singleton = 1`).run();
+      this.db.prepare(`UPDATE sync_meta SET centroids_reprojected = ? WHERE singleton = 1`).run(CENTROID_REPROJECTION_VERSION);
     })();
   }
 
@@ -9781,6 +9806,47 @@ export class MonetCore {
             throw new EmbedderMigrationFailedError(report);
           }
 
+          // THE CONCEPT ROWS ARE BODY EMBEDDINGS UNTIL HERE (Codex #95, P1). The native-concepts
+          // phase above ran `reembedConcept`, which writes `embed(row.body)` — that is all it can do,
+          // since it runs BEFORE the observation phase has moved the evidence into the new space.
+          // But `concepts.embedding` means the centroid of the concept's live evidence, and nothing
+          // between that phase and completion put the centroid back: the observation phase writes
+          // only `observations.embedding`, `reembedWorkstream` touches workstreams alone, and the
+          // graph phase and `completeEmbedderMigration` write no concept vector at all. A migrated
+          // multi-observation concept would therefore carry a body embedding until some later
+          // operation happened to recompute it — and both the related-graph scan and the tauConfident
+          // bypass read that column in the meantime.
+          //
+          // RUNS BEFORE THE GRAPH PHASE, which needs no reordering to benefit: the graph is built
+          // from a FRESH `this.eligibleNativeGraphRows()` below, not from the rows captured earlier,
+          // so it now derives from the final centroids rather than from body vectors.
+          //
+          // AFTER THE FAILURE GATE ABOVE, so the observations this averages are guaranteed to be in
+          // the new space — a recompute over a half-migrated ledger would mix two spaces in one mean.
+          //
+          // ZERO LIVE EVIDENCE KEEPS THE BODY EMBEDDING: `centroidOf` refuses an empty set, and the
+          // body vector `reembedConcept` just wrote is both in the right space and the only
+          // description of that concept there is.
+          //
+          // SOURCE AND RETIRED ARE EXCLUDED, matching every other centroid writer rather than this
+          // one deciding for itself. A source concept's vector derives from its body text via
+          // recomputeSourceConceptBody and was never centroided from observations — its per-chunk
+          // observation vectors answer a different question — and `repairDriftedConceptCentroids`
+          // leaves `kind = 'source'` untouched for exactly that reason. A retired concept is not
+          // centroid-maintained either: `recomputeNativeConceptProjection` returns early on it, and
+          // the same repair gives it norm-only treatment. Both keep the body embedding this
+          // migration already put in the new space, which is all a migration owes them.
+          try {
+            this.recomputeMigratedNativeCentroids(
+              nativeConcepts.filter((row) => row.kind !== "source" && row.status !== "retired").map((row) => row.id),
+              capability,
+            );
+          } catch (error) {
+            fail("native-concepts", "(centroid-recompute)", error);
+            this.abortEmbedderMigration();
+            throw new EmbedderMigrationFailedError(report);
+          }
+
           // Fresh, uncached proof before even computing a target graph. If live corruption exists,
           // every pre-migration related row/component remains byte-for-byte untouched.
           try {
@@ -9833,6 +9899,45 @@ export class MonetCore {
   // BLOCKING 1 review fix (cold-audit round 3): every reembed* helper below stamps
   // markEmbedderMigrationVectorsRewritten() in the SAME transaction as its own vector write(s) — see
   // reembedConcept's own comment (above) for the full reasoning.
+  /**
+   * Rebuild each migrated native concept's centroid from its now-new-space live evidence, so the
+   * migration leaves `concepts.embedding` holding the quantity that column means rather than the
+   * body embedding `reembedConcept` could only write before the evidence had moved. See the call
+   * site in `migrateEmbeddings` for why it must run there and not earlier.
+   *
+   * NOTHING BUT `concepts.embedding` IS WRITTEN, and `recomputeNativeConceptProjection` is
+   * deliberately not reused, for the same two reasons `repairDriftedConceptCentroids` gives for
+   * refusing it: its UPDATE also sets `support_count`, `confidence`, `status` and the temporal
+   * columns — reconciling `support_count` to the live count is a semantic change no finding asked
+   * for — and its empty-evidence branch is a destructive WRITE (zeroed counts, cleared confirmation
+   * timestamps, an `embedder.dim` placeholder vector) where this needs a skip.
+   *
+   * SYNCHRONOUS AND SINGLE-TRANSACTION because it embeds nothing: every vector it averages is
+   * already in the store. That is what lets the ownership re-check and the durable
+   * `markEmbedderMigrationVectorsRewritten()` stamp share one transaction with the writes, which is
+   * the discipline every reembed* helper here follows so `abandonEmbedderMigration` can never
+   * disagree with what is durable.
+   *
+   * The write is unsuppressed, exactly like `reembedConcept`'s a few lines above it — this changes
+   * the VALUE those same rows were already given in this same run, so it adds no sync surface that
+   * the native-concepts phase had not already opened.
+   */
+  private recomputeMigratedNativeCentroids(conceptIds: readonly string[], capability: object): void {
+    this.db.transaction((): void => {
+      this.assertRepairOwnershipUnchanged(capability, "recomputeMigratedNativeCentroids");
+      const update = this.db.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`);
+      let written = 0;
+      for (const conceptId of conceptIds) {
+        const evidence = this.liveConceptEvidence(conceptId);
+        if (evidence.length === 0) continue; // no evidence to average — the body embedding stands
+        const centroid = centroidOf(evidence.map((row) => jsonToEmb(row.embedding)));
+        update.run(embToJson(centroid), conceptId);
+        written += 1;
+      }
+      if (written > 0) this.markEmbedderMigrationVectorsRewritten();
+    })();
+  }
+
   private writePreparedNativeObservations(
     prepared: Array<{ id: string; content: string; embedding: Float32Array }>,
     capability: object,
