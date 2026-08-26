@@ -90,6 +90,14 @@ const liveObservationVectors = (db: StoragePort, conceptId: string): Float32Arra
       WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL ORDER BY id ASC`,
   ).all(conceptId) as Array<{ embedding: string }>).map((r) => jsonToEmb(r.embedding));
 
+/** EVERY observation vector on a concept, terminally superseded ones included — the set `detach`'s
+ *  two rebuilds used to average. Same `ORDER BY id ASC`, so the only difference from
+ *  `liveObservationVectors` is the liveness predicate and not the summation order. */
+const allObservationVectors = (db: StoragePort, conceptId: string): Float32Array[] =>
+  (db.prepare(
+    `SELECT embedding FROM observations WHERE concept_id = ? ORDER BY id ASC`,
+  ).all(conceptId) as Array<{ embedding: string }>).map((r) => jsonToEmb(r.embedding));
+
 const rawMean = (vectors: Float32Array[]): Float32Array => {
   const out = new Float32Array(vectors[0]!.length);
   for (let d = 0; d < out.length; d++) {
@@ -399,6 +407,117 @@ describe("detach's reattach loop builds the destination centroid once", () => {
         `SELECT COUNT(*) AS n FROM observations WHERE concept_id = ? AND superseded_at IS NOT NULL`,
       ).get(dest) as { n: number }).n).toBe(1);
       expect(Array.from(conceptVector(db, dest))).toEqual(Array.from(trueMean(db, dest)));
+    } finally {
+      core.close();
+    }
+  });
+});
+
+/**
+ * DETACH'S TWO REBUILDS EXCLUDE SUPERSEDED HISTORY (Codex #95, P2).
+ *
+ * The reattach-destination case above was fixed first; these are its two siblings, and they were
+ * still averaging every raw row on the concept. The tests in `detach() rebuilds both sides as true
+ * means` could not catch it: their fixtures are entirely live, so the raw-row mean and the
+ * live-evidence mean are THE SAME VECTOR there and a green proves nothing about the predicate.
+ * Every test below therefore asserts the inequality as well — the stored vector must equal the live
+ * mean AND differ from the raw-row mean — so it fails against the pre-fix rebuilds rather than
+ * passing on a fixture that cannot exhibit the difference.
+ *
+ * WHY IT IS NOT MERELY UNTIDY: `nominateByObservation` reads `centroidScore` as
+ * `cosine(emb, jsonToEmb(candidate.embedding))` — the STORED column — and resolution's tauConfident
+ * gate attaches outright above it, skipping the ambiguity ask. A centroid carrying a retired
+ * observation's direction is a vector no live evidence voted for, and it decides that gate.
+ */
+describe("detach's source and new-destination rebuilds exclude superseded history", () => {
+  /** Observation ids on a concept in the engine's own detach order. */
+  const obsIdsOf = (db: StoragePort, conceptId: string): string[] =>
+    (db.prepare(
+      `SELECT id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`,
+    ).all(conceptId) as Array<{ id: string }>).map((r) => r.id);
+
+  it("the SURVIVING SOURCE drops a terminally superseded row that stayed behind", async () => {
+    const core = newCore();
+    try {
+      const conceptId = await buildConcept(core, [0, 1, 2, 3, 4]);
+      const db = dbOf(core);
+      const obsIds = obsIdsOf(db, conceptId);
+
+      // Terminal retirement (superseded_at set, superseded_by NULL) of a row that STAYS. It has no
+      // pointer for detach's inbound cleanup to clear, so it is still dead after the split — which
+      // is exactly the population the "surviving source must keep live evidence" guard tolerates as
+      // long as SOME live row remains.
+      core.supersedeObservation(obsIds[1]!, null);
+
+      // Move the last two away; the source keeps {live, DEAD, live}.
+      await core.detach(conceptId, obsIds.slice(3), { circle: CIRCLE });
+
+      const all = allObservationVectors(db, conceptId);
+      expect(liveObservationVectors(db, conceptId)).toHaveLength(2);
+      expect(all).toHaveLength(3); // the dead row is still ON the source
+
+      const stored = conceptVector(db, conceptId);
+      const rawRowMean = normalizeVector(rawMean(all));
+      console.log(`[detach source] stored vs raw-row mean: cos ${cos(stored, rawRowMean).toFixed(6)}`);
+      expect(Array.from(stored)).toEqual(Array.from(trueMean(db, conceptId)));
+      // The pre-fix rebuild wrote this one. Asserted so the test cannot pass on the old code.
+      expect(Array.from(stored)).not.toEqual(Array.from(rawRowMean));
+    } finally {
+      core.close();
+    }
+  });
+
+  it("a NEWLY CREATED destination drops a terminally superseded moved row", async () => {
+    const core = newCore();
+    try {
+      const conceptId = await buildConcept(core, [0, 1, 2, 3, 4]);
+      const db = dbOf(core);
+      const obsIds = obsIdsOf(db, conceptId);
+      const moved = obsIds.slice(3);
+
+      // The second mover is dead on arrival: its supersession is TERMINAL, so detach's outbound
+      // cleanup (which only clears a pointer at a superseder left behind) has nothing to revive.
+      core.supersedeObservation(moved[1]!, null);
+
+      const result = await core.detach(conceptId, moved, { circle: CIRCLE });
+      expect(result.destConceptId).not.toBe(conceptId);
+
+      const all = allObservationVectors(db, result.destConceptId);
+      expect(liveObservationVectors(db, result.destConceptId)).toHaveLength(1);
+      expect(all).toHaveLength(2); // both moved rows landed; only one of them is evidence
+
+      const stored = conceptVector(db, result.destConceptId);
+      const rawRowMean = normalizeVector(rawMean(all));
+      console.log(`[detach new dest] stored vs raw-row mean: cos ${cos(stored, rawRowMean).toFixed(6)}`);
+      expect(Array.from(stored)).toEqual(Array.from(trueMean(db, result.destConceptId)));
+      expect(Array.from(stored)).not.toEqual(Array.from(rawRowMean));
+    } finally {
+      core.close();
+    }
+  });
+
+  it("a NEWLY CREATED destination with NO live evidence keeps the vector create() gave it", async () => {
+    const core = newCore();
+    try {
+      const conceptId = await buildConcept(core, [0, 1, 2, 3, 4]);
+      const db = dbOf(core);
+      const obsIds = obsIdsOf(db, conceptId);
+      const moved = obsIds.slice(3);
+
+      // BOTH movers terminally superseded: the destination is created from dead evidence alone.
+      // `centroidOf` refuses an empty set on purpose, so this is the branch that has to answer
+      // "no live evidence" for itself — it keeps what `create()` wrote from the first moved row
+      // rather than inventing a vector or throwing mid-transaction.
+      for (const id of moved) core.supersedeObservation(id, null);
+      const createdFrom = jsonToEmb((db.prepare(
+        `SELECT embedding FROM observations WHERE id = ?`,
+      ).get(moved[0]!) as { embedding: string }).embedding);
+
+      const result = await core.detach(conceptId, moved, { circle: CIRCLE });
+
+      expect(liveObservationVectors(db, result.destConceptId)).toHaveLength(0);
+      expect(allObservationVectors(db, result.destConceptId)).toHaveLength(2);
+      expect(Array.from(conceptVector(db, result.destConceptId))).toEqual(Array.from(createdFrom));
     } finally {
       core.close();
     }

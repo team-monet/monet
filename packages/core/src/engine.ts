@@ -7981,14 +7981,31 @@ export class MonetCore {
         // a concept reconstructed from a fixed set has no excuse for a path-dependent vector. Same
         // definition every other writer of this column uses now (embedding.ts's `centroidOf`).
         //
-        // THE SET IS UNCHANGED and is deliberately NOT the live-evidence predicate the other
-        // callers use: this rebuild runs over `remainingRows` as raw rows, superseded history
-        // included, because body/support_count/confidence beside it are computed the same way.
-        // Narrowing the vector alone would make the centroid disagree with the support count
-        // written in the same UPDATE — a wider change than this one, called out at the
-        // "A SURVIVING SOURCE MUST KEEP LIVE EVIDENCE" guard above for the same reason.
-        const remEmbs = remainingRows.map((o) => jsonToEmb(o.embedding));
-        const srcEmb = centroidOf(remEmbs);
+        // OVER LIVE EVIDENCE, not `remainingRows` as raw rows (Codex #95, P2). A centroid is the
+        // mean of a concept's LIVE evidence — the one definition this column has — so averaging a
+        // terminally superseded row into it writes a direction no live evidence voted for. That
+        // vector is not inert: `nominateByObservation` reads it as `centroidScore`, and resolution's
+        // tauConfident gate attaches outright above that score instead of raising the ambiguity ask.
+        // A stale centroid therefore buys a silent attach on a near-tie that would otherwise ask.
+        //
+        // THE OBJECTION THIS REPLACES — that narrowing the vector alone makes it disagree with the
+        // support_count written in the same UPDATE — is already settled the other way by `attach`,
+        // which centroids live evidence while leaving support_count as an attach counter and says so
+        // in as many words. Reconciling the two counters is still that separate semantic change;
+        // the vector does not wait on it, and `recomputeNativeConceptProjection` — the definition
+        // both of them are measured against — has always narrowed BOTH.
+        //
+        // NON-EMPTY IS GUARANTEED, so there is no empty-set branch to write here. This is the
+        // `remainingRows.length > 0` arm, and the "A SURVIVING SOURCE MUST KEEP LIVE EVIDENCE" guard
+        // above already refused the call unless a remaining row is still live once this detach's own
+        // inbound cleanup has run — which it has, in step 2, well before this line. At this point
+        // that guard's predicate and `liveConceptEvidence` select exactly the same rows.
+        //
+        // The `ORDER BY id ASC` that comes with it — rather than `remainingRows`' `created_at,
+        // rowid` — is `centroidOf`'s float-determinism contract: it makes this write byte-identical
+        // to a later recompute of the same set instead of merely close to it.
+        const srcLiveEvidence = this.liveConceptEvidence(sourceConceptId);
+        const srcEmb = centroidOf(srcLiveEvidence.map((o) => jsonToEmb(o.embedding)));
         const srcBody = remainingRows.map((o) => o.content).join("\n");
         const srcSupportCount = remainingRows.length;
         const srcConfidence = Math.max(0.3, srcRow.confidence * (remainingRows.length / totalCount));
@@ -8035,18 +8052,35 @@ export class MonetCore {
       // 5. Destination finalize.
       if (destAction === "created") {
         if (detachingRows.length > 1) {
-          // More than one observation: CENTROID all stored embeddings and join content. Same
+          // More than one observation: CENTROID the moved evidence and join content. Same
           // change, same reason as the source rebuild above — the sequential blend made a
           // brand-new concept's vector depend on the order its evidence happened to be listed in.
-          const dstEmbs = detachingRows.map((o) => jsonToEmb(o.embedding));
-          const dstEmb = centroidOf(dstEmbs);
+          //
+          // OVER LIVE EVIDENCE, for the reason the source rebuild states (Codex #95, P2). Step 3
+          // already repointed every moved row onto destConceptId and step 2 revived the ones whose
+          // superseder stayed behind, so `liveConceptEvidence` here is exactly the moved rows that
+          // are still evidence: dead on arrival is dead at the destination.
+          //
+          // NO LIVE EVIDENCE AT ALL -> KEEP THE VECTOR `create()` WROTE. Unlike the source, this
+          // case is REACHABLE — move two terminally superseded rows to a new concept and every row
+          // on the destination is dead — so it needs an answer rather than a guard. `centroidOf`
+          // refuses an empty set instead of inventing a width, and its callers' answers legitimately
+          // differ (the recompute writes an `embedder.dim` placeholder; the merge keeps the vector it
+          // had). This keeps the one it has: `create()` seeded the row from the first moved
+          // observation, which is the same answer the single-observation case below already lives
+          // with. COALESCE rather than a second UPDATE, so body and support_count are written either
+          // way and the no-evidence branch costs one NULL instead of a duplicated statement.
+          const dstLiveEvidence = this.liveConceptEvidence(destConceptId);
+          const dstEmbJson = dstLiveEvidence.length > 0
+            ? embToJson(centroidOf(dstLiveEvidence.map((o) => jsonToEmb(o.embedding))))
+            : null;
           const dstBody = detachingRows.map((o) => o.content).join("\n");
           this.db
             .prepare(
-              `UPDATE concepts SET body = ?, embedding = ?, support_count = ?,
+              `UPDATE concepts SET body = ?, embedding = COALESCE(?, embedding), support_count = ?,
                       dirty = 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
             )
-            .run(dstBody, embToJson(dstEmb), detachingRows.length, destConceptId);
+            .run(dstBody, dstEmbJson, detachingRows.length, destConceptId);
         }
         // single-observation case: create() already used its content+embedding, nothing more to do
       } else {

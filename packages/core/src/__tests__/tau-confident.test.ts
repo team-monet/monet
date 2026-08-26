@@ -32,7 +32,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { AmbiguousNominationError, MonetCore } from "../engine";
-import { HashingEmbeddingProvider, cosine, jsonToEmb } from "../embedding";
+import { HashingEmbeddingProvider, cosine, jsonToEmb, normalizeVector } from "../embedding";
 import { OnnxEmbeddingProvider, DEFAULT_MODEL } from "../embedding-onnx";
 import { resolveIncoming, type ResolutionThresholds } from "../resolution";
 import type { StoragePort } from "../storage";
@@ -221,6 +221,107 @@ describe("tauConfident — through store()", () => {
       } finally {
         core.close();
       }
+    }
+  });
+});
+
+/**
+ * WHAT THE BOUND IS READING (Codex #95, P2).
+ *
+ * `centroidScore` is `cosine(emb, jsonToEmb(candidate.embedding))` — the STORED column — so the gate
+ * above is only as honest as whatever last wrote it. `detach`'s two rebuilds used to average every
+ * raw observation row, terminally superseded history included, and a centroid carrying a retired
+ * observation's direction is a vector no live evidence voted for. Where that stale vector sits
+ * higher against an incoming probe than the concept's true live mean does, it clears a bound the
+ * live mean would not, and the near-tie that should have raised an ambiguity ask attaches silently
+ * instead. This is that end-to-end path, and it is the reason the rebuild predicate is not a
+ * cosmetic detail of detach.
+ *
+ * GEOMETRY MEASURED, THEN THE BOUND PLACED — the discipline this file already follows. Both scores
+ * are asserted either side of BOUND, so a fixture that drifted until it could no longer exhibit the
+ * difference fails here rather than passing on a case it stopped testing.
+ */
+describe("tauConfident — a stale detach centroid must not clear the bound", () => {
+  const A1 = "the ferry to the island leaves at quarter past every hour";
+  const A2 = "the ferry to the island leaves at quarter past the hour on weekends";
+  const A3_RETIRED = "the harbour master records each ferry departure in the tide book";
+  const A4_MOVED = "winter storms cancel the crossing without notice";
+  const OTHER = "the ferry to the mainland leaves at half past every hour";
+  // Leans on the RETIRED observation's vocabulary as well as the live rows', which is what separates
+  // the two candidate centroids at all.
+  const PROBE = "the ferry to the island leaves at quarter past, the harbour master records it";
+
+  /** Measured on this fixture: live mean 0.858151, raw-row mean 0.902885. The bound sits between. */
+  const BOUND = 0.88;
+
+  const rawRowMean = (vectors: Float32Array[]): Float32Array => {
+    const out = new Float32Array(vectors[0]!.length);
+    for (let d = 0; d < out.length; d++) {
+      let sum = 0;
+      for (const v of vectors) sum += v[d] ?? 0;
+      out[d] = sum / vectors.length;
+    }
+    return normalizeVector(out);
+  };
+
+  /** cosine(probe, stored concept centroid) — the exact quantity the bound is compared against.
+   *  Same body as the `through store()` suite's helper; scoped per-describe rather than hoisted, so
+   *  neither suite's fixture can quietly change the other's measurement. */
+  const storedCentroidScore = (core: MonetCore, conceptId: string, text: string): number => {
+    const emb = new HashingEmbeddingProvider().embed(text);
+    const row = dbOf(core).prepare(`SELECT embedding FROM concepts WHERE id = ?`).get(conceptId) as { embedding: string };
+    return cosine(emb, jsonToEmb(row.embedding));
+  };
+
+  const vectorsOn = (db: StoragePort, conceptId: string, liveOnly: boolean): Float32Array[] =>
+    (db.prepare(
+      `SELECT embedding FROM observations WHERE concept_id = ?
+        ${liveOnly ? "AND superseded_by IS NULL AND superseded_at IS NULL" : ""} ORDER BY id ASC`,
+    ).all(conceptId) as Array<{ embedding: string }>).map((r) => jsonToEmb(r.embedding));
+
+  it("asks, because the bound is compared against the LIVE mean and not the raw-row mean", async () => {
+    let seq = 0;
+    const core = new MonetCore(":memory:", {
+      embedder: new HashingEmbeddingProvider(),
+      tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.9, // 0.9 = the margin gate asks on anything
+      tauConfident: BOUND,
+      idGen: () => `c${(seq++).toString().padStart(4, "0")}`,
+    });
+    try {
+      const db = dbOf(core);
+      const a = await core.store(A1, { circle: CIRCLE, resolution: "forceNew" });
+      await core.store(A2, { circle: CIRCLE, attachTo: a.conceptId });
+      const retired = await core.store(A3_RETIRED, { circle: CIRCLE, attachTo: a.conceptId });
+      const moved = await core.store(A4_MOVED, { circle: CIRCLE, attachTo: a.conceptId });
+      // A second nominatable concept, so the margin is DEFINED and the gate is genuinely armed.
+      await core.store(OTHER, { circle: CIRCLE, resolution: "forceNew" });
+
+      // Terminal retirement: superseded_at set, superseded_by NULL — no pointer for detach's inbound
+      // cleanup to clear, so this row is still dead after the split and still ON the concept.
+      core.supersedeObservation(retired.observationId, null);
+      await core.detach(a.conceptId, [moved.observationId], { circle: CIRCLE });
+
+      const emb = new HashingEmbeddingProvider().embed(PROBE);
+      const all = vectorsOn(db, a.conceptId, false);
+      const live = vectorsOn(db, a.conceptId, true);
+      expect(all).toHaveLength(3);
+      expect(live).toHaveLength(2);
+
+      const storedScore = storedCentroidScore(core, a.conceptId, PROBE);
+      const staleScore = cosine(emb, rawRowMean(all));
+      console.log(`[stale centroid] stored(live) ${storedScore.toFixed(6)} vs raw-row ${staleScore.toFixed(6)}, bound ${BOUND}`);
+
+      // THE PREMISE, both halves. The raw-row mean clears the bound — so the pre-fix rebuild really
+      // did hand this store a silent attach — and the live mean does not.
+      expect(staleScore).toBeGreaterThanOrEqual(BOUND);
+      expect(storedScore).toBeLessThan(BOUND);
+      // And the stored column is the live mean, not the raw one.
+      expect(storedScore).toBeCloseTo(cosine(emb, rawRowMean(live)), 12);
+
+      // The behaviour anyone would notice: the ask survives, and the store writes nothing.
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
+    } finally {
+      core.close();
     }
   });
 });
