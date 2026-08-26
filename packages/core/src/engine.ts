@@ -3211,11 +3211,6 @@ export class MonetCore {
         -- "older than the current tokenizer" for both a fresh store and migrate()'s guarded ALTER;
         -- a fresh store pays one scan over zero rows and stamps the current version.
         lexical_tokens_version INTEGER NOT NULL DEFAULT 0,
-        -- The two counts the repair's fast-path probe compares (see reindexLexicalTokens). Not a
-        -- position and not a clock: staleness is carried by the marker rows themselves, and these
-        -- only decide whether the anti-join that reads them is worth running.
-        lexical_tokens_observation_count INTEGER NOT NULL DEFAULT -1,
-        lexical_tokens_marker_count INTEGER NOT NULL DEFAULT -1,
         clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical')),
         embedder_model_id TEXT,
         embedder_pin_source TEXT CHECK (embedder_pin_source IN ('created', 'backfilled', 'migrated')),
@@ -3443,12 +3438,6 @@ export class MonetCore {
     }
     if (!syncMetaCols.some((c) => c.name === "lexical_tokens_version")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN lexical_tokens_version INTEGER NOT NULL DEFAULT 0`);
-    }
-    if (!syncMetaCols.some((c) => c.name === "lexical_tokens_observation_count")) {
-      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN lexical_tokens_observation_count INTEGER NOT NULL DEFAULT -1`);
-    }
-    if (!syncMetaCols.some((c) => c.name === "lexical_tokens_marker_count")) {
-      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN lexical_tokens_marker_count INTEGER NOT NULL DEFAULT -1`);
     }
     if (!syncMetaCols.some((c) => c.name === "clock_mode")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))`);
@@ -4290,78 +4279,69 @@ export class MonetCore {
    * build then writes are tokenized with its older tokenizer, and healing those is the newer binary's
    * own repair's job at its next open.
    *
-   * THE PROBE, because the anti-join is not free. Two counts are stored at each repair: how many
-   * observations exist, and how many markers. From a repaired baseline every eligible observation has
-   * a marker, so ANY event that creates staleness moves one of them — a marker-ignorant rewrite
-   * deletes a marker (marker count falls), a new row from any binary raises the observation count,
-   * a hard delete lowers it. Both counts unchanged therefore means nothing can be stale, and the
-   * anti-join is skipped. This keys on the marker the rewriter necessarily destroys rather than on
-   * side-effects it might not have, so unlike a (clock, count, max-rowid) triple it has no residual
-   * escape to reason about: there is no way to lose a marker without the marker count falling.
-   * Measured on a 2554-observation store: probe 0.029 ms, anti-join 0.62 ms (~12 ms projected at
-   * 50k), full rebuild ~1.5 s.
+   * THE ANTI-JOIN RUNS ON EVERY OPEN, and comparing the identities IS the check — there is no
+   * cheaper signal standing in front of it. A probe over cardinalities lived here for one round and
+   * was removed: two counts can return to their saved values while the marked SET changes, because
+   * cancellation needs only a pairing of +1/-1 across populations that differ in whether they carry
+   * markers. Codex's case, and it is a supported one: a legacy daemon appends a non-source
+   * observation with no marker (+1 observation, +0 markers) while source retirement deletes a source
+   * observation, which intentionally never had a marker (-1 observation, +0 markers). Both counts
+   * land exactly where they were and the appended row stays mis-tokenized forever. No count-family
+   * signal escapes this without the old binary's cooperation, which is the one thing that cannot be
+   * assumed. The identity comparison has nothing to argue: a row is stale exactly when its marker is
+   * absent, and this reads that directly.
+   *
+   * THE ONLY FAST PATH IS AN EMPTY RESULT. The anti-join is a read, so it runs OUTSIDE the write
+   * transaction; nothing stale means the pass returns without ever taking a write reservation, which
+   * matters on a store several daemons hold open. Measured on a 2554-observation store: 0.75 ms
+   * against a ~44 ms open, projecting to ~15 ms at 50k. That is what the retired probe was
+   * defending, and it was not worth an argument that needed defending.
    *
    * THE POPULATION IS EVERY NON-SOURCE OBSERVATION, live or superseded, attached or not — not the
    * reader's filter (live and attached), because liveness changes after the pass has run and a
    * narrower rewrite would leave the table half in one tokenizer and half in another. `kind` is
    * filtered in TypeScript rather than in the anti-join on purpose: `WHERE kind != 'source'` costs a
    * full table scan (9.4 ms measured) because nothing indexes `kind`, while the anti-join without it
-   * is index-only on both sides (0.62 ms).
+   * is index-only on both sides (0.75 ms).
    */
   private reindexLexicalTokens(): void {
-    // A custom StoragePort, or a store this build never migrated, may not carry the sentinels. No
+    // A custom StoragePort, or a store this build never migrated, may not carry the sentinel. No
     // column means no gate, and running ungated would repeat this on every open.
     const cols = this.db.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
-    for (const needed of ["lexical_tokens_version", "lexical_tokens_observation_count", "lexical_tokens_marker_count"]) {
-      if (!cols.some((c) => c.name === needed)) return;
-    }
+    if (!cols.some((c) => c.name === "lexical_tokens_version")) return;
     const gate = this.db.prepare(
-      `SELECT lexical_tokens_version AS version, lexical_tokens_observation_count AS observations,
-              lexical_tokens_marker_count AS markers
-         FROM sync_meta WHERE singleton = 1`,
-    ).get() as { version: number; observations: number; markers: number } | undefined;
+      `SELECT lexical_tokens_version AS version FROM sync_meta WHERE singleton = 1`,
+    ).get() as { version: number } | undefined;
     if (gate === undefined) return;
     if (gate.version > LEXICAL_TOKENS_VERSION) return; // a newer build owns this index; see above
 
     const marker = lexicalTokensMarker(LEXICAL_TOKENS_VERSION);
-    const counts = (): { observations: number; markers: number } => ({
-      // COUNT(*) with no WHERE so SQLite answers from a covering index (0.0015 ms) instead of
-      // scanning the table for `kind` (9.4 ms). Counting source rows too only over-triggers.
-      observations: (this.db.prepare(`SELECT COUNT(*) AS n FROM observations`).get() as { n: number }).n,
-      markers: (this.db.prepare(`SELECT COUNT(*) AS n FROM observation_tokens WHERE token = ?`).get(marker) as { n: number }).n,
-    });
-
-    const seen = counts();
-    if (gate.version === LEXICAL_TOKENS_VERSION
-      && seen.observations === gate.observations && seen.markers === gate.markers) return;
+    /*
+     * THE STALE SET, index-only on both sides: the left leg walks the observations primary-key
+     * index, the right leg searches `idx_observation_tokens_token` for exactly the marker rows.
+     * `kind` is deliberately absent — filtering it here costs a full table scan (9.4 ms measured
+     * against 0.75 ms without, because nothing indexes `kind`) — so source rows come back and are
+     * dropped in the loop below.
+     *
+     * Read FIRST, outside any transaction. An empty result is the whole fast path, and reaching it
+     * without a write reservation is what keeps a multi-daemon store from serialising on every open.
+     */
+    const staleQuery = `SELECT id FROM observations
+                         EXCEPT
+                        SELECT observation_id FROM observation_tokens WHERE token = ?`;
+    if ((this.db.prepare(staleQuery).all(marker) as Array<{ id: string }>).length === 0
+      && gate.version === LEXICAL_TOKENS_VERSION) return;
 
     this.db.immediateTransaction((): void => {
-      // Re-read under the write reservation: another process may have finished between the unlocked
-      // probe above and this transaction, and the pass must not run twice.
+      // Re-read under the write reservation: another process may have repaired the store between the
+      // unlocked read above and this transaction, and the work must not be done twice.
       const pending = this.db.prepare(
-        `SELECT lexical_tokens_version AS version, lexical_tokens_observation_count AS observations,
-                lexical_tokens_marker_count AS markers
-           FROM sync_meta WHERE singleton = 1`,
-      ).get() as { version: number; observations: number; markers: number } | undefined;
+        `SELECT lexical_tokens_version AS version FROM sync_meta WHERE singleton = 1`,
+      ).get() as { version: number } | undefined;
       if (pending === undefined) return;
       if (pending.version > LEXICAL_TOKENS_VERSION) return; // re-checked under the lock; see above
-      const now = counts();
-      if (pending.version === LEXICAL_TOKENS_VERSION
-        && now.observations === pending.observations && now.markers === pending.markers) return;
 
-      /*
-       * THE STALE SET, index-only on both sides: the left leg walks the observations primary-key
-       * index, the right leg searches `idx_observation_tokens_token` for exactly the marker rows.
-       * `kind` is deliberately absent — see the header for what filtering it here would cost — so
-       * source rows come back here and are dropped in the loop below.
-       */
-      const stale = this.db.prepare(
-        `SELECT id FROM observations
-          EXCEPT
-         SELECT observation_id FROM observation_tokens WHERE token = ?`,
-      ).all(marker) as Array<{ id: string }>;
-
-      for (const row of stale) {
+      for (const row of this.db.prepare(staleQuery).all(marker) as Array<{ id: string }>) {
         const observation = this.db.prepare(
           `SELECT content AS content, kind AS kind FROM observations WHERE id = ?`,
         ).get(row.id) as { content: string; kind: string } | undefined;
@@ -4369,19 +4349,12 @@ export class MonetCore {
         this.writeObservationTokens(row.id, observation.content);
       }
 
-      /*
-       * COUNTED AFTER THE WORK, INSIDE THIS TRANSACTION. Storing the probe's own earlier reading
-       * would record a baseline that never existed — the repair itself changes the marker count —
-       * and storing it outside would let a crash leave counts that claim a repair which did not
-       * commit. Recounting here costs two indexed reads and makes the stored pair exactly describe
-       * the state this transaction is about to commit.
-       */
-      const settled = counts();
-      this.db.prepare(
-        `UPDATE sync_meta
-            SET lexical_tokens_version = ?, lexical_tokens_observation_count = ?, lexical_tokens_marker_count = ?
-          WHERE singleton = 1`,
-      ).run(LEXICAL_TOKENS_VERSION, settled.observations, settled.markers);
+      // The sentinel records which build owns the index. It is not a staleness signal — the markers
+      // are — so it is simply brought up to date alongside the rows this transaction just wrote.
+      if (pending.version !== LEXICAL_TOKENS_VERSION) {
+        this.db.prepare(`UPDATE sync_meta SET lexical_tokens_version = ? WHERE singleton = 1`)
+          .run(LEXICAL_TOKENS_VERSION);
+      }
     })();
   }
 
@@ -4456,8 +4429,6 @@ export class MonetCore {
     addColumn("sync_meta", "closure_migrated", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "centroids_reprojected", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "lexical_tokens_version", "INTEGER NOT NULL DEFAULT 0");
-    addColumn("sync_meta", "lexical_tokens_observation_count", "INTEGER NOT NULL DEFAULT -1");
-    addColumn("sync_meta", "lexical_tokens_marker_count", "INTEGER NOT NULL DEFAULT -1");
     addColumn("sync_meta", "clock_mode", "TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))");
     addColumn("concept_tombstones", "updated_at", "INTEGER");
     addColumn("concept_restorations", "updated_at", "INTEGER");

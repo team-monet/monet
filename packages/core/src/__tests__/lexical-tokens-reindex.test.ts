@@ -92,13 +92,6 @@ const hasMarker = (core: MonetCore, observationId: string): boolean =>
   dbOf(core).prepare(`SELECT 1 FROM observation_tokens WHERE observation_id = ? AND token = ?`)
     .get(observationId, MARKER) !== undefined;
 
-/** The two counts the fast-path probe compares. */
-const probe = (core: MonetCore): { observations: number; markers: number } =>
-  dbOf(core).prepare(
-    `SELECT lexical_tokens_observation_count AS observations, lexical_tokens_marker_count AS markers
-       FROM sync_meta WHERE singleton = 1`,
-  ).get() as { observations: number; markers: number };
-
 /** Put the store back into the state an upgrade across #38 produces: Latin-only rows, no sentinel. */
 function downgradeToLegacy(core: MonetCore): void {
   const db = dbOf(core);
@@ -353,7 +346,7 @@ describe("the posting-version marker — any marker-ignorant writer is healed at
     core.close();
   }));
 
-  it("rewrites nothing when both probe counts are unchanged", withStore(async (dbPath) => {
+  it("rewrites nothing when the anti-join comes back empty", withStore(async (dbPath) => {
     // THE FAST PATH. `observation_tokens` is a rowid table, so a DELETE+INSERT cycle renumbers its
     // rows — comparing rowids detects a rewrite that comparing (observation_id, token) pairs would
     // miss entirely.
@@ -365,14 +358,56 @@ describe("the posting-version marker — any marker-ignorant writer is healed at
 
     core = open(dbPath);
     const before = dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all();
-    const probeBefore = probe(core);
     expect(before.length).toBeGreaterThan(0);
     core.close();
 
     core = open(dbPath);
     expect(dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all())
       .toEqual(before);                       // byte-identical, rowids included: nothing rewritten
-    expect(probe(core)).toEqual(probeBefore);
+    core.close();
+  }));
+
+  it("heals a legacy append even when a concurrent source deletion cancels it out", withStore(async (dbPath) => {
+    /*
+     * THE CASE THAT RETIRED THE CARDINALITY PROBE (Codex P2, PR #97 round 5). Two supported writers
+     * move the store between opens in opposite directions across populations that differ in whether
+     * they carry markers:
+     *
+     *   a legacy daemon appends a non-source observation   -> observations +1, markers +0
+     *   source retirement deletes a source observation     -> observations -1, markers +0
+     *
+     * Both cardinalities land exactly where they were, so a probe comparing saved counts sees an
+     * unchanged store and skips the check — and the appended row stays indexed by the old tokenizer
+     * forever. Comparing identities cannot be cancelled this way: the row's marker is absent, and
+     * that is read directly.
+     */
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    const db = dbOf(core);
+    const donor = db.prepare(`SELECT embedding, circle FROM observations LIMIT 1`).get() as { embedding: string; circle: string };
+    db.prepare(
+      `INSERT INTO observations (id, content, embedding, kind, circle, author_agent_id, created_at, updated_at, sync_revision, sync_writer)
+       VALUES ('doomed-source', ?, ?, 'source', ?, 'x', 1, 1, 1, 'x')`,
+    ).run(KO, donor.embedding, donor.circle);
+    core.close();
+    settle(dbPath); // counts recorded with the source row present and marker-less
+
+    core = open(dbPath);
+    const observationsBefore = (dbOf(core).prepare(`SELECT COUNT(*) AS n FROM observations`).get() as { n: number }).n;
+    const markersBefore = (dbOf(core).prepare(`SELECT COUNT(*) AS n FROM observation_tokens WHERE token = ?`).get(MARKER) as { n: number }).n;
+
+    legacyWriterInserts(core, "legacy-cancelled", KO_WITH_ID);          // +1 observation, +0 markers
+    dbOf(core).prepare(`DELETE FROM observations WHERE id = 'doomed-source'`).run(); // -1, +0
+
+    // PREMISE: both cardinalities are exactly where they started, so a count probe would see nothing.
+    expect((dbOf(core).prepare(`SELECT COUNT(*) AS n FROM observations`).get() as { n: number }).n).toBe(observationsBefore);
+    expect((dbOf(core).prepare(`SELECT COUNT(*) AS n FROM observation_tokens WHERE token = ?`).get(MARKER) as { n: number }).n).toBe(markersBefore);
+    expect(hasMarker(core, "legacy-cancelled")).toBe(false);
+    core.close();
+
+    core = open(dbPath);
+    expect(postingsFor(core, "legacy-cancelled")).toEqual(lexicalTokens(KO_WITH_ID));
+    expect(hasMarker(core, "legacy-cancelled")).toBe(true);
     core.close();
   }));
 
@@ -501,7 +536,6 @@ describe("an older binary on a newer store touches nothing", () => {
     // repair if the version guard were missing.
     legacyWriterInserts(core, "written-under-v3", KO_WITH_ID);
     const postingsBefore = db.prepare(`SELECT observation_id, token FROM observation_tokens ORDER BY observation_id, token`).all();
-    const probeBefore = probe(core);
     expect(version(core)).toBe(3);
     core.close();
 
@@ -509,7 +543,6 @@ describe("an older binary on a newer store touches nothing", () => {
     // tokenizer and stamp itself in.
     core = open(dbPath);
     expect(version(core)).toBe(3);                       // NOT downgraded
-    expect(probe(core)).toEqual(probeBefore);            // probe counts unmoved
     expect(dbOf(core).prepare(`SELECT observation_id, token FROM observation_tokens ORDER BY observation_id, token`).all())
       .toEqual(postingsBefore);                          // not one posting rewritten
     core.close();
@@ -537,7 +570,7 @@ describe("a pre-v8 store, without the sync-closure columns, still opens", () => 
     for (const column of ["updated_at", "sync_revision", "sync_writer"]) {
       dbOf(core).exec(`ALTER TABLE observations DROP COLUMN ${column}`);
     }
-    for (const column of ["lexical_tokens_version", "lexical_tokens_observation_count", "lexical_tokens_marker_count"]) {
+    for (const column of ["lexical_tokens_version"]) {
       dbOf(core).exec(`ALTER TABLE sync_meta DROP COLUMN ${column}`);
     }
     dbOf(core).exec(`DELETE FROM observation_tokens`);
