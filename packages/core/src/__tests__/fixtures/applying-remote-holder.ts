@@ -18,10 +18,11 @@
  *   waits  `b-read`       until the other process has read its own prior, or holdMs elapses
  *   writes `a-done`       once the engine is fully constructed and its window has closed
  *
- * The holdMs timeout is what the POST-FIX run needs: with the window wrapped in a transaction the
- * other process cannot reach its read at all until this one commits, so `b-read` never arrives and
- * the wait must end on its own. It is deliberately shorter than the 5000ms busy timeout so the
- * blocked process waits rather than failing.
+ * The holdMs timeout is what the POST-FIX run needs, and it is now the ONLY way the wait ends:
+ * with the window wrapped in a transaction the other process cannot reach it until this one
+ * commits, and migrate() no longer reads the flag at all (it closes its window at a literal 0
+ * rather than at whatever it found), so `b-read` is never written by anyone. It is deliberately
+ * shorter than the 5000ms busy timeout so the blocked process waits rather than failing.
  */
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
