@@ -31,61 +31,249 @@
  */
 
 /**
- * Words worth matching on. Three characters minimum after the first, which drops the articles and
- * operators that carry no discriminative load, and keeps identifiers (`tauAttach`, `source_chunks`)
- * whole — those are the highest-signal tokens in a technical corpus and splitting them on case or
- * underscore would scatter exactly the evidence this arm exists to catch.
+ * Words worth matching on, in TWO classes — because one regex cannot serve both scripts (#38).
+ *
+ * LATIN/DIGIT. Three characters minimum after the first, which drops the articles and operators that
+ * carry no discriminative load, and keeps identifiers (`tauAttach`, `source_chunks`) whole — those
+ * are the highest-signal tokens in a technical corpus and splitting them on case or underscore would
+ * scatter exactly the evidence this arm exists to catch.
+ *
+ * CJK, CHARACTER BIGRAMS OVER A RUN. `[a-z0-9]` matches nothing in Han, Hangul, Hiragana or
+ * Katakana, so before #38 the whole arm was blind to those scripts: a Korean probe yielded zero
+ * tokens, `applyLexicalArm` short-circuited, and `lexicalCoverage` read 0.0 — which also held the
+ * write-side ambiguity gate shut (see LEXICAL_COVERAGE_MIN). Bigrams rather than whole runs because
+ * these scripts do not delimit words: Korean spaces at the *eojeol* (word+particle) boundary and
+ * Chinese and Japanese do not space at all, so a run is a phrase and matching whole runs would only
+ * match identical phrasing. Bigrams are the standard CJK fallback for exactly this reason — they
+ * need no dictionary, no morphological analyser and no model, which keeps this arm what its header
+ * says it is: pure, synchronous, and dependency-free.
+ *
+ * A ONE-CHARACTER RUN IS DROPPED, NOT EMITTED AS A UNIGRAM — the same rule the Latin class already
+ * applies to `a` and `to`, reached the same way. Single Hangul syllables between spaces are almost
+ * all grammatical (이/그/수/것/때), and single Han characters in Korean and Japanese prose are
+ * mostly counters and particles. MEASURED, not assumed: see the CJK_GRAM block below for the
+ * corpus run that decided it against the emit-as-unigram alternative.
  */
-const TOKEN = /[a-z0-9][a-z0-9_-]{2,}/gu;
+const LATIN_TOKEN = "[a-z0-9][a-z0-9_-]{2,}";
 
 /**
- * The share of a text's letters and digits that `TOKEN` above actually consumes — "how much of this
- * can the lexical arm read", answered by the tokenizer itself.
+ * One CJK character: in Han, Hangul, Hiragana or Katakana AND a letter or digit.
+ *
+ * SCRIPT EXTENSIONS (`scx`), not `sc`, so the marks these scripts share with Common travel with the
+ * run they belong to — the prolonged sound mark `ー` (U+30FC) and the iteration mark `々` (U+3005)
+ * are `Script=Common` and would otherwise split `データー` and `人々` in half.
+ *
+ * INTERSECTED WITH `[\p{L}\p{N}]` by the lookahead, and that is load-bearing rather than tidy:
+ * `lexicalCoverage`'s denominator counts letters and digits, so a run admitting CJK punctuation
+ * would put characters in the numerator that the denominator never counted. Punctuation also ends a
+ * run, which is what keeps a bigram from spanning `。` and joining two sentences.
+ */
+const CJK_CHAR = "(?=[\\p{L}\\p{N}])[\\p{scx=Han}\\p{scx=Hangul}\\p{scx=Hiragana}\\p{scx=Katakana}]";
+
+/**
+ * ONE PASS, BOTH CLASSES. Alternation rather than two independent scans, so every character of the
+ * text is claimed by at most one branch and `scanLexical` below can count coverage off the same walk
+ * that emits the tokens. Two scans would let the two measures drift apart, which is the failure the
+ * counting invariant in `lexicalCoverage` exists to prevent.
+ */
+const LEXICAL_SCAN = new RegExp(`(?<latin>${LATIN_TOKEN})|(?<cjk>(?:${CJK_CHAR})+)`, "gu");
+
+/** Letters and digits — `lexicalCoverage`'s denominator, and the class `CJK_CHAR` intersects with. */
+const ALNUM = /[\p{L}\p{N}]/gu;
+
+/**
+ * The gram width for CJK, and the minimum run length that yields anything at all: a run shorter than
+ * this is read by nothing and therefore counts as nothing.
+ *
+ * MEASURED, AND THE MEASUREMENT IS MIXED — read this before treating the CJK branch as settled.
+ * Space `Xenova/bge-m3:cls:q8` 1024-dim, corpus `cjk-corpus-2026-08-26` (1285 live observations,
+ * 161 concepts, 75.3% CJK-heavy), 2026-08-26, leave-one-out concept recall at LEXICAL_BOOST 1.0.
+ * `segment -> segment+lexical` R@1 on CJK-heavy queries, this tokenizer against the retired one:
+ *
+ *   query shape          n     retired    this    R@5 (retired -> this)
+ *   full observation   967      +7.2pp   +5.3pp    88.6% -> 90.6%
+ *   opening sentence   830      +5.3pp   +6.7pp    70.8% -> 78.4%
+ *
+ * THE FULL-OBSERVATION CELL IS A REGRESSION AGAINST THE RETIRED TOKENIZER (63.4% -> 61.4%, net -19
+ * of 967, McNemar p=0.113) and it has one mechanism: `lexicalOverlap` normalises by the PROBE's
+ * total IDF mass, so the ~7 high-IDF Latin identifiers a Korean technical observation carries stop
+ * being the whole denominator once ~115 CJK bigrams join it, and a candidate sharing the identifier
+ * earns a smaller overlap than before. Split by how much Latin the CJK-heavy probe carries, the two
+ * effects separate cleanly (full observation, delta against segment-only):
+ *
+ *   Latin tokens >= 3    n=771    retired +9.7pp    this +6.2pp
+ *   Latin tokens 1-2     n=133    retired -3.8pp    this +0.8pp
+ *   Latin tokens == 0    n= 63    retired +0.0pp    this +3.2pp
+ *
+ * So the pooled anchor is carried by a subgroup where the retired tokenizer already worked, and this
+ * branch strictly wins on the population #38 exists for — where the retired arm was inert (+0.0pp)
+ * or actively harmful (-3.8pp). Both readings are true; neither alone is the number.
+ *
+ * WIDTH AND LONE-RUN RULE, against the alternatives swept on the same corpus (CJK-heavy R@1,
+ * full observation / opening sentence, and the share of CJK-heavy observations clearing
+ * LEXICAL_COVERAGE_MIN, which is what decides whether the write gate can evaluate at all):
+ *
+ *   bigrams, lone run dropped   61.4% / 49.2%   99.4% over the bar   <- this
+ *   bigrams, lone run unigram   60.7% /    -    99.9%
+ *   trigrams                    61.8% / 48.0%    0.0%
+ *   4-grams                     61.3% /    -     0.0%
+ *   unigrams only               62.6% /    -    99.9%
+ *   bigrams + trigrams          60.5% /    -    99.4%
+ *   bigrams, runs >= 3 only     61.2% / 48.2%   99.4%
+ *   bigrams, run tail trimmed   62.6% / 50.8%   33.6%
+ *
+ * Nothing beats the retired tokenizer on the full-observation cell. Unigrams come closest by
+ * contributing almost nothing — their document frequency is so high that `tokenIdf` clamps them —
+ * and they LOSE on the Latin-token-free population (-1.6pp), which is the one #38 names. Trigrams
+ * and 4-grams score comparably on reading but leave 0% of CJK-heavy observations over the coverage
+ * bar, because they emit nothing at all from the two-character runs Korean is full of, so they close
+ * the read half of #38 while leaving the write half exactly as broken as before. Trimming a run's
+ * last character (a crude Korean stem/particle split) reads best of all but costs two thirds of the
+ * write gate, and this corpus is Korean-only, so it cannot certify a Korean morphological heuristic
+ * for Han or Kana at all. Bigrams with the lone run dropped are what remains: the rule with no
+ * language-specific assumption in it, winning the read half on short queries and the write half
+ * outright.
+ *
+ * RAISING LEXICAL_BOOST DOES NOT RECOVER THE FULL-OBSERVATION CELL — swept 0.15 to 2.0, CJK-heavy
+ * R@1 rises monotonically to 62.9% at 2.0 and still does not reach the retired tokenizer's 63.4% at
+ * 1.0, while Latin degrades above 0.5. The dilution explains the direction; the blend weight is not
+ * the lever that undoes it.
+ *
+ * WHAT THIS CORPUS CANNOT SAY. It is Korean. Han and Kana appear only incidentally, so the width and
+ * the lone-run rule are certified for Hangul and inferred for the rest — a Chinese or Japanese
+ * corpus would have runs an order of magnitude longer (no inter-word spacing) and might well choose
+ * differently.
+ */
+const CJK_GRAM = 2;
+
+/**
+ * The single walk both public functions read: the tokens a text yields, and how many of its letters
+ * and digits those tokens actually read.
+ *
+ * COUNTED THE SAME WAY ON BOTH SIDES (Codex P2, PR #87 round 5, generalised for #38). The rule is
+ * that a character counts as covered exactly when some EMITTED token contains it, counted once
+ * however many tokens that is. Two ways to break it, one per class:
+ *
+ *   LATIN — `m[0].length` includes the `-` and `_` a token may carry, while the denominator counts
+ *   letters and digits only, so `api____________________` reported more covered characters than it
+ *   has readable ones and could push a mostly-CJK probe to full coverage on three ASCII letters.
+ *
+ *   CJK — bigrams OVERLAP, so a run of n characters emits n-1 tokens totalling 2(n-1) characters.
+ *   Summing token lengths would report 1.33x coverage on a three-character run and let `Math.min`
+ *   quietly absorb the error, which is the same defect wearing the other script's clothes. The run
+ *   contributes n, because each of its n characters is read, once.
+ */
+function scanLexical(lower: string): { tokens: string[]; covered: number } {
+  const tokens: string[] = [];
+  let covered = 0;
+  for (const m of lower.matchAll(LEXICAL_SCAN)) {
+    const latin = m.groups?.latin;
+    if (latin !== undefined) {
+      tokens.push(latin);
+      covered += (latin.match(ALNUM) ?? []).length;
+      continue;
+    }
+    // Code points, not UTF-16 units: CJK Extension B and beyond are astral, and a bigram cut at a
+    // surrogate boundary is a token no other text can ever match.
+    const run = [...(m.groups?.cjk ?? "")];
+    if (run.length < CJK_GRAM) continue; // read by nothing, so covered by nothing
+    for (let i = 0; i + CJK_GRAM <= run.length; i++) tokens.push(run.slice(i, i + CJK_GRAM).join(""));
+    covered += run.length;
+  }
+  return { tokens, covered };
+}
+
+/**
+ * The share of a text's letters and digits that the tokenizer above actually consumes — "how much of
+ * this can the lexical arm read", answered by the tokenizer itself.
  *
  * WHY NOT nonLatinLetterShare (Codex P1, PR #87 round 4). That function detects SCRIPT, and says so
  * in its own header: French, Vietnamese and Turkish score 0 there and are still largely invisible to
- * TOKEN, whose class is `[a-z0-9_-]`. Anything accented is dropped or fragmented. Using the script
- * guard to decide lexical comparability answered a neighbouring question — the third time this
- * branch reached for an adjacent quantity, which is why the measure now lives beside the regex it
- * measures rather than being borrowed from a module that documents its own unsuitability.
+ * the tokenizer, whose Latin class is `[a-z0-9_-]`. Anything accented is dropped or fragmented.
+ * Using the script guard to decide lexical comparability answered a neighbouring question — the
+ * third time this branch reached for an adjacent quantity, which is why the measure now lives beside
+ * the regex it measures rather than being borrowed from a module that documents its own
+ * unsuitability. #38 widened the tokenizer, not this argument: a script guard would now be wrong in
+ * a second direction as well, since it cannot see that CJK has become readable.
  */
 /**
- * Below this share of a text readable by TOKEN, a rank gap is not the quantity a lexically-blended
- * threshold was calibrated against, and any such threshold must stand down (see tauMargin).
+ * Below this share of a text readable by the tokenizer, a rank gap is not the quantity a
+ * lexically-blended threshold was calibrated against, and any such threshold must stand down (see
+ * tauMargin).
  *
- * MEASURED, NOT PICKED. On the corpus tauMargin was derived from — monet-hq, n=1011 live
- * observations, in the `Xenova/bge-small-en-v1.5` 384-dim space that store held BEFORE its
- * 2026-08-24 migration to bge-m3 (naming the space, not just the corpus, is the point: see the
- * LEXICAL_BOOST block below for what a corpus-only label cost) — coverage runs min 0.845, p01
- * 0.902, p05 0.920, p50 0.955 — so every observation that produced the threshold clears this bar
- * with room. The cases it has to exclude sit far below:
- * Korean scores 0.000, Korean carrying an ASCII identifier 0.200, and accented French 0.571. The
- * band between 0.571 and 0.845 is empty on both sides, and this sits inside it.
+ * THE VALUE DID NOT MOVE ACROSS #38. ITS JUSTIFICATION DID, ENTIRELY. What follows is the
+ * re-derivation; the argument it replaces is quoted below it, retired rather than deleted, because
+ * the reason a constant was chosen is the thing that goes stale when the space around it changes.
  *
- * That emptiness is why the value is a floor rather than a tuned point: anywhere in that band admits
- * 100% of the derivation population and refuses all three contrast cases, so nothing here is being
- * traded off. Re-measure it on any corpus this threshold is re-derived against.
+ * RE-DERIVED 2026-08-26 — space `Xenova/bge-m3:cls:q8` 1024-dim, corpus `cjk-corpus-2026-08-26`
+ * (1285 live observations over 161 concepts, 75.3% CJK-heavy, 83.8% carrying any CJK), tokenizer as
+ * of this file's #38 CJK branch. Coverage by script class, `cjkShare` of the observation:
+ *
+ *                          n     min    p01    p05    p50    p99   >= 0.8
+ *   CJK-heavy (>0.5)     967   0.750  0.819  0.865  0.932  0.989   99.4%
+ *     of which >0.8      343   0.827  0.863  0.888  0.946  0.990  100.0%
+ *   mixed (0.2-0.5]       95   0.748  0.748  0.794  0.928  1.000   94.7%
+ *   Latin (<=0.2)        223   0.856  0.863  0.893  0.940  0.979  100.0%
+ *   ALL                 1285   0.748  0.812  0.863  0.933  0.989   99.1%
+ *
+ * THE POPULATIONS DID NOT SEPARATE — THEY CONVERGED, and that is what settles the per-script
+ * question this constant raised. CJK-heavy text now lands where Latin text lands (medians 0.932 vs
+ * 0.940), so one global constant serves both and no script-aware variant is needed. Before #38 the
+ * same three classes read 0.205 / 0.540 / 0.938 at the median and 0.0% / 0.0% / 98.7% over the bar.
+ *
+ * LATIN IS UNTOUCHED, BY CONSTRUCTION AND BY MEASUREMENT. All 208 observations with NO CJK at all
+ * score identical coverage and identical token counts before and after — the CJK branch cannot fire
+ * on them. The Latin CLASS moves (min 0.761 -> 0.856) only because `cjkShare <= 0.2` admits a little
+ * CJK, and that little is now read.
+ *
+ * WHAT 0.8 NOW COSTS, because it is no longer free. It refuses 11 of 1285 observations (0.9%), 6 of
+ * them CJK-heavy (0.6% of that class). That is the trade-off the retired argument did not have to
+ * make, and the number to weigh against any proposal to move it.
+ *
+ * WHERE A FUTURE RE-DERIVATION WOULD GO. The empty band moved rather than vanishing: [0.571, 0.845)
+ * held nothing on the English derivation population and holds 42 observations (3.3%) here, while
+ * [0.571, 0.748) is empty on BOTH — above accented French (0.458-0.571 measured, still refused) and
+ * below this corpus's minimum. A value in that band would admit 100% of every population measured so
+ * far and still refuse the contrast cases, which is the same FORM of argument that originally chose
+ * 0.8. It is not taken here because 0.8 already meets what #38 asked of it and moving a global
+ * constant that governs English writes wants an English measurement demanding it, which there is
+ * not.
+ *
+ * ── RETIRED 2026-08-26 (#38). True of the tokenizer that shipped before the CJK branch, and false
+ * of this one — its Korean and Korean-plus-identifier contrast cases are now READ, at 1.000 and
+ * 1.000, and its empty band is no longer empty:
+ *
+ *   "MEASURED, NOT PICKED. On the corpus tauMargin was derived from — monet-hq, n=1011 live
+ *    observations, in the `Xenova/bge-small-en-v1.5` 384-dim space that store held BEFORE its
+ *    2026-08-24 migration to bge-m3 (naming the space, not just the corpus, is the point: see the
+ *    LEXICAL_BOOST block below for what a corpus-only label cost) — coverage runs min 0.845, p01
+ *    0.902, p05 0.920, p50 0.955 — so every observation that produced the threshold clears this bar
+ *    with room. The cases it has to exclude sit far below: Korean scores 0.000, Korean carrying an
+ *    ASCII identifier 0.200, and accented French 0.571. The band between 0.571 and 0.845 is empty on
+ *    both sides, and this sits inside it.
+ *
+ *    That emptiness is why the value is a floor rather than a tuned point: anywhere in that band
+ *    admits 100% of the derivation population and refuses all three contrast cases, so nothing here
+ *    is being traded off. Re-measure it on any corpus this threshold is re-derived against."
+ *
+ * The one instruction in it that survives unchanged is its last sentence, and this block is what
+ * following it produced.
  */
 export const LEXICAL_COVERAGE_MIN = 0.8;
 
 export function lexicalCoverage(text: string): number {
   const lower = text.toLowerCase();
-  const alnum = lower.match(/[\p{L}\p{N}]/gu);
+  const alnum = lower.match(ALNUM);
   if (alnum === null || alnum.length === 0) return 1; // nothing to read: vacuously comparable
-  // COUNTED THE SAME WAY ON BOTH SIDES (Codex P2, PR #87 round 5). `m[0].length` includes the `-`
-  // and `_` a token may carry, while the denominator counts letters and digits only — so a token
-  // like `api____________________` reported more covered characters than it has readable ones and
-  // could push a mostly-CJK probe to full coverage on three ASCII letters. The numerator now counts
-  // what the denominator counts.
-  let covered = 0;
-  for (const m of lower.matchAll(TOKEN)) covered += (m[0].match(/[\p{L}\p{N}]/gu) ?? []).length;
-  return Math.min(1, covered / alnum.length);
+  // The numerator comes from the same walk that emits the tokens — see scanLexical's header for the
+  // invariant it exists to hold, and the two ways (one per script class) it has been broken.
+  return Math.min(1, scanLexical(lower).covered / alnum.length);
 }
 
 /** The token set of one text. A SET, not a bag: this measures whether a term is shared, not how
  *  often it is repeated, so a long observation cannot outscore a short one by restating itself. */
 export function lexicalTokens(text: string): Set<string> {
-  return new Set(text.toLowerCase().match(TOKEN) ?? []);
+  return new Set(scanLexical(text.toLowerCase()).tokens);
 }
 
 /**

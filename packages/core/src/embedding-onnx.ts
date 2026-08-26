@@ -561,11 +561,18 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
      * tauAttach 0.80 reaches 16.3% but files only 52.2%.
      *
      * UNVALIDATED FOR CJK, and this corpus cannot validate it: monet-hq holds ZERO CJK-heavy
-     * observations (every durable artifact here is English by project convention). lexicalTokens'
-     * TOKEN regex scores a near-identical Korean pair at overlap 0.0 where its English equivalent
-     * scores 0.714, so a CJK `rank` IS its cosine while a Latin one is cosine * (1 + overlap) and
-     * can run up to twice as large. Those are not the same quantity and 0.12 was measured on only
-     * one of them. #38 is the prerequisite for any store that holds CJK content.
+     * observations (every durable artifact here is English by project convention), so 0.12 was
+     * measured on Latin ranks and on nothing else.
+     *
+     * WHAT #38 CHANGED HERE, AND WHAT IT DID NOT (2026-08-26). The reason this note used to give was
+     * that the two ranks are not even the same QUANTITY — "lexicalTokens' TOKEN regex scores a
+     * near-identical Korean pair at overlap 0.0 where its English equivalent scores 0.714, so a CJK
+     * `rank` IS its cosine while a Latin one is cosine * (1 + overlap) and can run up to twice as
+     * large" — and that sentence is retired: the tokenizer now reads CJK, so a Korean rank is a
+     * blended rank like any other and the shape mismatch is gone. The conclusion is not retired.
+     * 0.12 is still a number derived on English margins, and margins in the CJK space have not been
+     * measured; the corpus that could measure them (`cjk-corpus-2026-08-26`) exists now, and doing so
+     * is its own piece of work, deliberately not folded into #38.
      */
     /*
      * CONFIDENCE CEILING 0.81 — the UPPER bound on the band the margin gate above governs. A
