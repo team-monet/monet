@@ -3735,8 +3735,8 @@ export class MonetCore {
     //
     // Column-guard pattern: PRAGMA table_info, then ALTER only if missing (SQLite has no IF NOT EXISTS).
     //
-    // ONE TRANSACTION AROUND READ-SET-WORK-RESTORE, not a bare try/finally. The suppression flag is
-    // a read-modify-write on a row every process sharing this store also writes, and the old shape
+    // ONE TRANSACTION AROUND SET-WORK-CLEAR, not a bare try/finally. The suppression flag used to be
+    // a read-modify-write on a row every process sharing this store also writes, and that shape
     // — read prior, set 1, work, restore the READ prior in a `finally` — made the transient 1
     // observable to anyone else mid-migration. That is a PERMANENT LATCH, no crash required. With
     // A and B both opening the same store (three processes observed on one store in the field):
@@ -3756,9 +3756,9 @@ export class MonetCore {
     //
     // `immediateTransaction` (storage.ts: better-sqlite3's own `db.transaction(fn).immediate`, the
     // wrapper this file's graftRows comment documents and probes) takes SQLite's write reservation
-    // BEFORE the read, so the read-set-work-restore is one atomic unit: a concurrent migrate()
-    // serializes on the write lock instead of interleaving, and its read therefore sees the
-    // COMMITTED prior, never the transient. Two properties the try/finally could not give:
+    // BEFORE the first statement, so set-work-clear is one atomic unit: a concurrent migrate()
+    // serializes on the write lock instead of interleaving, and can only ever see the COMMITTED
+    // value, never the transient. Two properties the try/finally could not give:
     //   - The transient is never visible outside this transaction — under WAL another connection
     //     reads the last committed value, so there is no window in which 1 can be adopted at all.
     //   - A crash or throw ROLLS BACK, which is strictly better than the old `finally`: the old one
@@ -3774,8 +3774,17 @@ export class MonetCore {
     //
     // The `finally` is gone deliberately — restoring in a `finally` is what would re-open the hole
     // if the body ever threw, since the restore would then commit on its own outside the rollback.
+    //
+    // THE WINDOW CLOSES AT 0, NEVER AT "whatever was found" — this open HEALS a store it finds
+    // latched. INVARIANT: every legitimate holder of applying_remote = 1 sets AND clears it inside
+    // ONE immediateTransaction (this block; repairDriftedConceptCentroids; the sync apply path's
+    // set/clear pair), and BEGIN IMMEDIATE excludes concurrent writer transactions, so no other
+    // connection can ever observe a legitimate 1. A COMMITTED 1 read here is therefore definitionally
+    // a LEAK — a pre-atomic build's process killed mid-window — and there is no live owner whose
+    // suppression this open could be stealing. Preserving it is what made the leak permanent:
+    // suppressed sync-clock triggers for the store's whole remaining life, and every later open
+    // reading 1 as its own "prior" and writing it straight back.
     this.db.immediateTransaction((): void => {
-      const priorApplyingRemote = (this.db.prepare(`SELECT applying_remote AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number }).value;
       this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
       const conceptCols2 = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
       if (!conceptCols2.some((c) => c.name === "last_confirmed_at")) {
@@ -3800,7 +3809,7 @@ export class MonetCore {
     // The WHERE-NULL predicate makes it a no-op for State C and D (no rows to update).
     // Excludes kind='workstream' — those rows are NULL by design.
       this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL AND kind != 'workstream'`);
-      this.db.prepare(`UPDATE sync_meta SET applying_remote = ? WHERE singleton = 1`).run(priorApplyingRemote);
+      this.db.prepare(`UPDATE sync_meta SET applying_remote = 0 WHERE singleton = 1`).run();
     })();
     // Version gate: bump to TEMPORAL_SCHEMA_VERSION once the graph backfill slot has been consumed.
     // Guards the graph-schema-version invariant; the temporal backfill itself is now independent
@@ -4060,8 +4069,8 @@ export class MonetCore {
    * is in `conceptSemanticChange`, so an unsuppressed pass would fire `sync_concepts_update` on
    * every row it touched: one sync-clock tick and one `sync_revision`/`updated_at` bump per concept,
    * then an export pushing all of it at peers who are about to run this same pass themselves. Same
-   * read-set-work-restore-inside-one-`immediateTransaction` discipline the temporal block in
-   * `migrate()` documents, for the same reason: a transient 1 that escapes can latch permanently.
+   * set-work-clear-inside-one-`immediateTransaction` discipline the temporal block in `migrate()`
+   * documents, for the same reason: a transient 1 that escapes can latch permanently.
    *
    * WHAT ONE-TIME ONCE COST, and no longer does. This paragraph used to read: "`attach()`'s running
    * blend is still the live write path, so drift begins accumulating again on the next attach. This
@@ -4082,6 +4091,15 @@ export class MonetCore {
    * recomputed either. The writer change fixes the future; only this fixes the past.
    */
   private repairDriftedConceptCentroids(): void {
+    // DEFER WITHOUT SPENDING THE GATE while an embedder migration is in flight. A store with a live
+    // migration sentinel holds vectors from TWO embedding spaces at once, and the width guard below
+    // cannot separate them: a same-model pooling change (bge-m3 mean vs cls) leaves both spaces at
+    // identical width, and concepts are rewritten one transaction at a time, so an interrupted run
+    // leaves mixed-space evidence under one concept. Averaging that is not a repair. The return is
+    // deliberately BEFORE the sentinel is read or consumed — the gate has to survive to an open that
+    // can be trusted, because a resumed migration re-embeds each concept from its BODY and never
+    // revisits the evidence mean, so a gate spent here would skip the convergence permanently.
+    if (this.readEmbedderMigration() !== undefined) return;
     const cols = this.db.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
     // A custom StoragePort or a store this build never migrated may not carry the sentinel. No
     // column means no gate, and running ungated would repeat the pass on every open.
@@ -4093,7 +4111,8 @@ export class MonetCore {
       // unlocked probe above and this transaction, and it must not run twice.
       const pending = this.db.prepare(`SELECT centroids_reprojected AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number } | undefined;
       if (pending === undefined || pending.value >= CENTROID_REPROJECTION_VERSION) return;
-      const priorApplyingRemote = (this.db.prepare(`SELECT applying_remote AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number }).value;
+      // Set/clear, never read-modify-write — same invariant migrate()'s window states: a committed 1
+      // has no live owner, so closing at 0 can only heal a leak, never cut a real apply short.
       this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
       const update = this.db.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`);
 
@@ -4103,6 +4122,7 @@ export class MonetCore {
       // different order would give a centroid that is merely close to what a later real recompute
       // writes instead of identical to it.
       const liveVectors = new Map<string, Float32Array[]>();
+      const corruptEvidence = new Set<string>();
       for (const row of this.db.prepare(
         `SELECT o.concept_id AS conceptId, o.embedding AS embedding
            FROM observations o JOIN concepts c ON c.id = o.concept_id
@@ -4110,11 +4130,15 @@ export class MonetCore {
             AND o.embedding IS NOT NULL AND c.kind != 'source' AND c.status != 'retired'
           ORDER BY o.concept_id, o.id`,
       ).all() as Array<{ conceptId: string; embedding: string }>) {
-        let vector: Float32Array;
-        try {
-          vector = jsonToEmb(row.embedding);
-        } catch {
-          continue; // diagnostics' `malformed` population has its own reporting path
+        // STRICT, because the lenient parser hides exactly the corruption the width guard below
+        // cannot: `jsonToEmb` is `Float32Array.from(JSON.parse(s))`, which turns `[null]` into `[0]`
+        // and `[0.1, null, 0.3]` into a SAME-WIDTH partially zeroed vector. Only syntactically
+        // invalid JSON ever threw. parseFiniteEmbeddingJson is the strict persisted-vector parser
+        // diagnosis and enforcement already share.
+        const vector = parseFiniteEmbeddingJson(row.embedding);
+        if (vector === null) {
+          corruptEvidence.add(row.conceptId); // diagnostics' `malformed` population reports it
+          continue;
         }
         const bucket = liveVectors.get(row.conceptId);
         if (bucket === undefined) liveVectors.set(row.conceptId, [vector]);
@@ -4124,6 +4148,11 @@ export class MonetCore {
       for (const row of this.db.prepare(
         `SELECT id, embedding FROM concepts WHERE kind != 'source' AND embedding IS NOT NULL`,
       ).all() as Array<{ id: string; embedding: string }>) {
+        // ONE malformed row disqualifies the WHOLE concept, and the row is left exactly as found —
+        // not even norm-repaired. This pass repairs DRIFT; it does not recover corruption, and
+        // re-centering a concept on whichever evidence happened to parse would launder the loss into
+        // a centroid that looks measured. Reporting the malformed population is diagnostics' job.
+        if (corruptEvidence.has(row.id)) continue;
         const vectors = liveVectors.get(row.id);
         if (vectors === undefined || vectors.length === 0) {
           this.normalizeStoredCentroidInPlace(row.id, row.embedding, update);
@@ -4151,7 +4180,7 @@ export class MonetCore {
         if (next !== row.embedding) update.run(next, row.id); // idempotent: a converged store writes nothing
       }
 
-      this.db.prepare(`UPDATE sync_meta SET applying_remote = ? WHERE singleton = 1`).run(priorApplyingRemote);
+      this.db.prepare(`UPDATE sync_meta SET applying_remote = 0 WHERE singleton = 1`).run();
       this.db.prepare(`UPDATE sync_meta SET centroids_reprojected = ? WHERE singleton = 1`).run(CENTROID_REPROJECTION_VERSION);
     })();
   }

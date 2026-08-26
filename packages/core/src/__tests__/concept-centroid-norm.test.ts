@@ -282,6 +282,31 @@ const setConceptVector = (db: StoragePort, conceptId: string, v: Float32Array): 
   db.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`).run(embToJson(v), conceptId);
 };
 
+/** The raw stored TEXT, not a parsed vector — "untouched" has to be asserted byte-for-byte, because
+ *  a parse-and-compare would hide exactly the coercions this pass must stop performing. */
+const conceptEmbeddingJson = (db: StoragePort, conceptId: string): string =>
+  (db.prepare(`SELECT embedding FROM concepts WHERE id = ?`).get(conceptId) as { embedding: string }).embedding;
+
+const liveObservationIds = (db: StoragePort, conceptId: string): string[] =>
+  (db.prepare(
+    `SELECT id FROM observations
+      WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL ORDER BY id ASC`,
+  ).all(conceptId) as Array<{ id: string }>).map((r) => r.id);
+
+/** Fabricates the interrupted-migration sentinel directly — same INSERT beginEmbedderMigration
+ *  makes (see embedder-pin.test.ts's writeMigrationSentinel), without a real ONNX-shaped run. */
+const writeMigrationSentinel = (db: StoragePort, targetModelId: string): void => {
+  db.prepare(
+    `INSERT INTO embedder_migration
+       (singleton, target_model_id, started_at, prior_model_id, prior_pin_source, prior_pinned_at, prior_pin_captured, vectors_rewritten)
+     VALUES (1, ?, ?, NULL, NULL, NULL, 0, 0)`,
+  ).run(targetModelId, Date.now());
+};
+
+const clearMigrationSentinel = (db: StoragePort): void => {
+  db.prepare(`DELETE FROM embedder_migration WHERE singleton = 1`).run();
+};
+
 const cos = (a: Float32Array, b: Float32Array): number => {
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i]! * b[i]!;
@@ -747,4 +772,140 @@ describe("repairDriftedConceptCentroids — the one-time convergence pass", () =
       b.close();
     }
   }, 60_000);
+
+  /**
+   * MALFORMED EVIDENCE DISQUALIFIES ITS CONCEPT — the width guard above cannot see it.
+   *
+   * The pass used to parse evidence with `jsonToEmb`, which is `Float32Array.from(JSON.parse(s))`
+   * and therefore SILENTLY COERCES: `[null]` becomes `[0]`, `[0.1, null, 0.3]` becomes a same-width
+   * vector with a zeroed component. Only syntactically invalid JSON ever threw. Width equality
+   * catches neither shape — not a single-observation concept (nothing to disagree with), and not a
+   * partially corrupt row of the right length. The corrupt value went straight into the mean and was
+   * persisted as the concept's centroid.
+   */
+  it("leaves a concept whose ONLY evidence is malformed exactly as found, and still repairs its healthy sibling", async () => {
+    const path = tempStore();
+    let corruptId = "";
+    let healthyId = "";
+    let corruptBefore = "";
+    let healthyExpected: number[] = [];
+    {
+      const core = openFileCore(path);
+      const db = dbOf(core);
+      corruptId = (await core.store(TEXTS[3]!, { circle: CIRCLE })).conceptId;
+      healthyId = await buildDrifted(core, [0, 1, 2]);
+
+      // THE FIXTURE MUST BE ABLE TO EXHIBIT IT: one live observation means no width disagreement for
+      // the guard to find, and the store's real vectors are far wider than the `[0]` the coercion
+      // produces — so a pass that parses leniently rewrites a full-width centroid to a 1-wide zero.
+      const ids = liveObservationIds(db, corruptId);
+      expect(ids.length).toBe(1);
+      expect(conceptVector(db, corruptId).length).toBeGreaterThan(1);
+      setObservationVector(db, ids[0]!, "[null]");
+
+      healthyExpected = Array.from(trueMean(db, healthyId));
+      expect(cos(conceptVector(db, healthyId), trueMean(db, healthyId))).toBeLessThan(0.999);
+      corruptBefore = conceptEmbeddingJson(db, corruptId);
+      reopenPending(db);
+      core.close();
+    }
+
+    const reopened = openFileCore(path);
+    try {
+      const db = dbOf(reopened);
+      // Pre-fix this row read `[0]`: the mean of one coerced vector, normalized to itself, written.
+      expect(conceptEmbeddingJson(db, corruptId)).toBe(corruptBefore);
+      // Skipping one concept must not abandon the pass — the rest of the store still converges, and
+      // the sentinel is still spent. Corruption is diagnostics' population to report, not this
+      // pass's to repair, so there is nothing here to come back for.
+      expect(Array.from(conceptVector(db, healthyId))).toEqual(healthyExpected);
+      expect(gateOf(db)).toBe(REPROJECTION_VERSION);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("leaves a concept alone when ONE same-width evidence row is partially malformed", async () => {
+    const path = tempStore();
+    let conceptId = "";
+    let before = "";
+    {
+      const core = openFileCore(path);
+      const db = dbOf(core);
+      conceptId = await buildDrifted(core, [0, 1, 2]);
+      const ids = liveObservationIds(db, conceptId);
+      expect(ids.length).toBe(3);
+
+      // Three vectors of IDENTICAL width, one of them holding a null. `Float32Array.from` turns that
+      // null into a 0 without complaint, so every width check the pass makes agrees, and the corrupt
+      // row is averaged in as if it were a measurement of zero on that dimension.
+      setObservationVector(db, ids[0]!, "[0.1,null,0.3]");
+      setObservationVector(db, ids[1]!, "[0.2,0.4,0.4]");
+      setObservationVector(db, ids[2]!, "[0.5,0.1,0.2]");
+      setConceptVector(db, conceptId, normalizeVector(Float32Array.from([0.3, 0.2, 0.3])));
+      before = conceptEmbeddingJson(db, conceptId);
+      reopenPending(db);
+      core.close();
+    }
+
+    const reopened = openFileCore(path);
+    try {
+      const db = dbOf(reopened);
+      // Pre-fix the mean of [0.1,0,0.3], [0.2,0.4,0.4] and [0.5,0.1,0.2] was normalized and stored —
+      // a centroid derived partly from a value that was never measured.
+      expect(conceptEmbeddingJson(db, conceptId)).toBe(before);
+      expect(gateOf(db)).toBe(REPROJECTION_VERSION);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  /**
+   * DEFERRED, NOT SPENT, WHILE AN EMBEDDER MIGRATION IS IN FLIGHT.
+   *
+   * A store with a live `embedder_migration` sentinel holds vectors from two embedding spaces at
+   * once — concepts are rewritten one transaction at a time — and a same-model pooling change
+   * (bge-m3 mean vs cls) leaves both spaces at IDENTICAL width, so the width guard cannot separate
+   * them. Averaging that evidence produces a centroid belonging to neither space. The gate must
+   * survive to a trustable open: a resumed migration re-embeds each concept from its BODY and never
+   * revisits the evidence mean, so a sentinel spent here skips the convergence permanently. Same
+   * treatment `backfillGraph` already gets for the same hazard.
+   */
+  it("defers while an embedder migration is pending — the centroid is untouched AND the gate is NOT spent", async () => {
+    const path = tempStore();
+    let conceptId = "";
+    let before = "";
+    {
+      const core = openFileCore(path);
+      const db = dbOf(core);
+      conceptId = await buildDrifted(core, [0, 1, 2]);
+      expect(cos(conceptVector(db, conceptId), trueMean(db, conceptId))).toBeLessThan(0.999); // real drift to repair
+      before = conceptEmbeddingJson(db, conceptId);
+      reopenPending(db);
+      writeMigrationSentinel(db, "onnx:some-other-model");
+      core.close();
+    }
+
+    let expected: number[] = [];
+    {
+      const deferred = openFileCore(path);
+      const db = dbOf(deferred);
+      expect(conceptEmbeddingJson(db, conceptId)).toBe(before);
+      // THE HALF THAT MATTERS. Pre-fix the pass ran here and stamped, so the gate was gone before
+      // the migration ever finished and no later open could converge this store.
+      expect(gateOf(db)).toBe(0);
+      expected = Array.from(trueMean(db, conceptId));
+      clearMigrationSentinel(db);
+      deferred.close();
+    }
+
+    const clean = openFileCore(path);
+    try {
+      const db = dbOf(clean);
+      expect(Array.from(conceptVector(db, conceptId))).toEqual(expected);
+      expect(gateOf(db)).toBe(REPROJECTION_VERSION);
+    } finally {
+      clean.close();
+    }
+  });
 });
