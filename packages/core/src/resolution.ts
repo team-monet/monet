@@ -6,9 +6,12 @@
  * unit split, and this is its store-side twin.)
  *
  * THE SPLIT, APPLIED TO RESOLUTION. The recall slice established that a concept's
- * `concepts.embedding` is a running-mean centroid (blend(), embedding.ts) over everything ever
- * attached, so a many-observation concept embeds to a blurred mixture pointing at no one input in
- * particular. Retrieval fixed that by ranking on observation vectors. Resolution had the SAME
+ * `concepts.embedding` is a CENTROID over everything ever attached (`centroidOf`, embedding.ts — a
+ * running `blend()` when that slice was written), so a many-observation concept embeds to a blurred
+ * mixture pointing at no one input in particular. The blur comes from averaging, not from the way
+ * the average was accumulated, so making that centroid the true mean left this reasoning — and the
+ * blur attractor and silent split below — exactly as they were. Retrieval fixed the recall half by
+ * ranking on observation vectors. Resolution had the SAME
  * disease — "which concept does this incoming observation belong to?" was decided entirely by
  * cosine against those centroids — and the design's answer is a hybrid, not a second wholesale
  * swap:
@@ -212,6 +215,14 @@ export interface ResolutionThresholds {
    * Derivation and the CJK limit live with the profile that carries it (embedding-onnx.ts).
    */
   tauMargin?: number;
+  /**
+   * Upper bound on the band the margin gate governs: at or above this centroid cosine the attach is
+   * taken without consulting the margin. Omitted disables the bound — the margin gate runs on every
+   * above-tau nomination, which is what a profile nobody measured this in gets rather than a
+   * borrowed number, the same default rule tauMargin follows. Derivation lives with the profile
+   * (embedding-onnx.ts); what the bound MEANS is at EmbeddingThresholds.tauConfident.
+   */
+  tauConfident?: number;
 }
 
 /**
@@ -325,7 +336,7 @@ export interface ResolutionDecision {
  */
 export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
   const { nomination } = input;
-  const { tauAttach, tauAmbiguous, tauMargin } = input.thresholds;
+  const { tauAttach, tauAmbiguous, tauMargin, tauConfident } = input.thresholds;
 
   // Nothing in the circle's evidence matched at all. The centroid still cannot ATTACH anything —
   // it has no nomination power (defect 1) — but it can still PAIR: see createOrPair below.
@@ -364,6 +375,29 @@ export function resolveIncoming(input: ResolutionInput): ResolutionDecision {
       // candidates silently converts every ambiguous store into a fork, which is the high-tauAttach
       // outcome this gate exists to avoid. Blocking the write is what forces the decision.
       //
+      // THE BAND HAS AN UPPER BOUND NOW (tauConfident). The margin gate answers "am I sure it is
+      // THIS one" by comparing the winner to the runner-up, and that comparison is the ONLY thing it
+      // looks at — so a near-tie makes it ask regardless of how well the incoming evidence agrees
+      // with the winner's own accumulated evidence. But `centroidScore` is a second, independent
+      // witness on the same identity question, and this branch has already read it once, three lines
+      // up, to establish coherence at all (`>= tauAmbiguous`). Above a high enough centroid the
+      // coherence is not merely present but emphatic, and asking a human to separate the winner from
+      // a runner-up it already agrees with this strongly spends a round-trip on a question the
+      // evidence has answered.
+      //
+      // ORDER MATTERS AND IS DELIBERATE: this runs AFTER the tauAmbiguous check, never instead of
+      // it. A high centroid cannot rescue a fork signal — evidence-near/centroid-far still forks —
+      // because that branch is about a BIMODAL concept, and nothing here is allowed to turn the
+      // absence of coherence into an attach. This only removes the SEPARATION question, and only
+      // where coherence is already confirmed with room to spare.
+      //
+      // `>=`, matching every other band boundary in this file: a score sitting exactly on
+      // tauConfident attaches. `tauConfident === undefined` is a profile nobody measured this in —
+      // no upper bound, the margin gate runs as before, which is the same honest default tauMargin
+      // itself takes rather than borrowing a number from another space.
+      if (tauConfident !== undefined && centroidScore >= tauConfident) {
+        return { action: "attached", mode: "attach", attachToConceptId: conceptId, score: obsScore };
+      }
       // `margin === undefined` is a circle with one nominatable concept: nothing to choose between,
       // so the tauAttach verdict stands. `tauMargin === undefined` is an embedder nobody measured
       // this in — the gate is off rather than borrowing a number from another space.

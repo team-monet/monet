@@ -567,7 +567,60 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
      * can run up to twice as large. Those are not the same quantity and 0.12 was measured on only
      * one of them. #38 is the prerequisite for any store that holds CJK content.
      */
-    thresholds: { tauAttach: 0.70, tauAmbiguous: 0.5, tauMargin: 0.12, edgeSimMin: 0.60 },
+    /*
+     * CONFIDENCE CEILING 0.81 — the UPPER bound on the band the margin gate above governs. A
+     * nomination whose centroid cosine reaches this attaches without the margin being consulted at
+     * all; what the bound means and why it is a separate question from tauMargin is at
+     * EmbeddingThresholds.tauConfident (embedding.ts). Only the number and its provenance are here.
+     *
+     * DERIVED IN THE SPACE IT GOVERNS, which is the thing its neighbour tauMargin cannot say: a
+     * legality-aware, engine-driven replay of the live `monet-hq` store in bge-m3 space — the same
+     * harness that re-derived tauMargin's own figures on 2026-08-26, driving the engine rather than
+     * restating it. The metric swept is the exchange rate: correct decisions given up per misfile
+     * caught, as the ceiling moves.
+     *
+     * THE EVIDENCE CHAIN, three runs, because the first two were measuring the wrong thing and
+     * saying so is the record:
+     *
+     *   2026-08-25  naive replay              peak 2.92 @ 0.80   CV pooled 2.30   spread 0.013
+     *   2026-08-26  + legality awareness      peak 3.36          CV pooled 3.00   spread 0.009
+     *   2026-08-26  + stored centroid = true mean                CV pooled 4.00   spread 0.005
+     *                                         fitted [0.805 .. 0.813]  ->  0.81
+     *
+     * Each correction SHARPENED the optimum rather than moving it somewhere else: the peak rises and
+     * the cross-validated spread tightens threefold, which is what a real operating point looks like
+     * and is the opposite of what tauMargin's sweep found (a monotone curve with no interior
+     * optimum — see the block above, which says plainly that no measurement will pick that one).
+     * Against a baseline that wastes 1.38-1.40 correct decisions per misfile caught, an ask removed
+     * here is bought back at better than 4:1.
+     *
+     * THE THIRD ROW IS WHY THIS IS A DURABLE NUMBER AND THE EARLIER TWO WERE NOT. It was measured
+     * with the stored centroid equal to the true mean of the concept's live evidence. Before the
+     * centroid writers converged on `centroidOf` — attach folded each observation in with a running
+     * blend, so a settled concept's stored vector had drifted BELOW its own evidence's mean — a
+     * ceiling fitted against those vectors would have been fitted against a deflated quantity, and
+     * would have drifted with them. The engine now maintains that equality on every write, and the
+     * 1.8.0 one-time reprojection repaired the backlog. RE-DERIVE IF THE CENTROID DEFINITION EVER
+     * CHANGES AGAIN — this value is calibrated to what a centroid IS, not only to the space it is in.
+     *
+     * THE MAGNITUDE, HONESTLY, because a gate that reads like a fix would be oversold. Ask rate
+     * 33.8% -> ~27%; misfile catch 80% -> ~70%. That is roughly one write in fifteen that no longer
+     * stops to ask, bought by letting through roughly one misfile in ten that the margin used to
+     * catch. It is a REFINEMENT OF THE ASK BAND. It is not a fix for the 76% concept-placement
+     * accuracy, it does not move tauAttach or tauMargin, and nothing about it should be read as
+     * making the substrate more accurate — only as making it interrupt less for the same accuracy.
+     *
+     * EVERY FIGURE ABOVE IS AN UPPER BOUND, and the reason is the ground truth. "Correct" here means
+     * the store's own existing placement of the withheld observation, so a replay agreeing with a
+     * misfiled concept scores as correct. A blinded audit put the store itself right 66.7% of the
+     * time. Read the exchange rates as ceilings on the real ones, not as estimates of them.
+     *
+     * DOES NOT TRAVEL. Per-embedder like everything else in this table, and doubly so: this is a raw
+     * cosine against a concept CENTROID, so it is calibrated to the space AND to what that space's
+     * centroids look like. Another model gets no ceiling until someone sweeps it there — the honest
+     * default, the same one tauMargin takes.
+     */
+    thresholds: { tauAttach: 0.70, tauAmbiguous: 0.5, tauMargin: 0.12, tauConfident: 0.81, edgeSimMin: 0.60 },
     /*
      * CARD-EMISSION FLOOR 0.40, from scripts/measure-recall-floor.ts on the same STARTER_SUITE corpus
      * every other floor here came from — 20 probe queries, 9 junk queries, observation granularity.

@@ -100,8 +100,13 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
     // from its own two-corpus sweeps (MODEL_PROFILES, embedding-onnx.ts); the 0.78 this replaces was
     // bge-small-en-v1.5's, measured on a corpus this default no longer serves. NOTE tauAmbiguous is
     // 0.5 in EVERY profile, and the bge-m3 sweep found out WHY on both of its corpora: no fork scores
-    // below it, so it is inert rather than tuned (#174).
-    expect(embedder.recommendedThresholds).toEqual({ tauAttach: 0.70, tauAmbiguous: 0.5, tauMargin: 0.12, edgeSimMin: 0.60 });
+    // below it, so it is inert rather than tuned (#174). tauConfident 0.81 joined the set later, and
+    // is the one band here derived in bge-m3 space AGAINST TRUE-MEAN CENTROIDS — it is calibrated to
+    // what a centroid is, not only to the space, so it must be re-derived if that ever changes again
+    // (see its own block in embedding-onnx.ts).
+    expect(embedder.recommendedThresholds).toEqual({
+      tauAttach: 0.70, tauAmbiguous: 0.5, tauMargin: 0.12, tauConfident: 0.81, edgeSimMin: 0.60,
+    });
   });
 
   // SKIPPED — STALE FIXTURE, not a stale number (monet-core#170). This fixture was hand-sized to

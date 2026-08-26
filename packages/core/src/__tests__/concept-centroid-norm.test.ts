@@ -3,10 +3,11 @@
  *
  * `cosine()` (embedding.ts) is a bare dot product whose contract is "both vectors are
  * L2-normalized", and every other path that writes `concepts.embedding` honours it: `create` stores
- * the provider's own output, `attach` goes through `blend`, `mergeConceptInto` through
- * `blendWeighted` — all three normalize. `recomputeNativeConceptProjection` did not: it wrote a
- * plain arithmetic mean of the live observation vectors, because `normalize` was module-private and
- * the engine could not reach it.
+ * the provider's own output, and `attach` / `detach` / `mergeConceptInto` all normalize (through
+ * `blend` and `blendWeighted` when this was written; through `centroidOf` since they converged on
+ * the true mean). `recomputeNativeConceptProjection` did not: it wrote a plain arithmetic mean of
+ * the live observation vectors, because `normalize` was module-private and the engine could not
+ * reach it.
  *
  * The consequence is not a wrong direction but a SHORT one, and every centroid read is a dot
  * product that scales with length: `nominateByObservation`'s `centroidScore` (engine.ts) against
@@ -26,7 +27,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore } from "../engine";
-import { HashingEmbeddingProvider, embToJson, isZeroVector, jsonToEmb, normalizeVector } from "../embedding";
+import { HashingEmbeddingProvider, blend, embToJson, isZeroVector, jsonToEmb, normalizeVector } from "../embedding";
 import { BetterSqlitePort, type Statement, type StoragePort } from "../storage";
 
 const CIRCLE = "centroid-norm";
@@ -213,12 +214,19 @@ describe("recomputeNativeConceptProjection — the stored centroid is L2-normali
  *   SHORT CENTROIDS — what the block above fixed going forward, unrepaired on any store whose
  *   concepts were last recomputed by a pre-#90 build.
  *
- *   BLEND DRIFT — `attach()` folds each observation in with a RUNNING `blend()`, which re-inflates
- *   the accumulated direction to full integer weight at every step as if all priors agreed. The
- *   stored centroid therefore depends on the ORDER the evidence arrived in and drifts off the true
- *   normalized mean. Crucially it stays UNIT-LENGTH while drifting, which is why the norm-only
- *   repair could not have caught it — the PREMISE test below asserts exactly that, so the wider
- *   pass is justified by the fixture rather than by assertion.
+ *   BLEND DRIFT — `attach()` USED TO fold each observation in with a RUNNING `blend()`, which
+ *   re-inflates the accumulated direction to full integer weight at every step as if all priors
+ *   agreed. The stored centroid therefore depended on the ORDER the evidence arrived in and drifted
+ *   off the true normalized mean. Crucially it stayed UNIT-LENGTH while drifting, which is why the
+ *   norm-only repair could not have caught it — the PREMISE test below asserts exactly that, so the
+ *   wider pass is justified by the fixture rather than by assertion.
+ *
+ * THE LIVE WRITER NO LONGER PRODUCES EITHER DEFECT, and that is what `buildDrifted` below now has
+ * to work around rather than rely on. `attach()` writes the true mean (see concept-centroid-mean
+ * .test.ts for that half), so drift is PLANTED here — the old `blend()` replayed over the same
+ * stored vectors in the same arrival order. This pass is not made redundant by the writer change:
+ * it repairs what OLDER BUILDS persisted, and a settled concept that is never attached to again is
+ * never recomputed either.
  *
  * HOW THE PRE-PASS STATE IS REACHED: a genuine legacy store has no `centroids_reprojected` column
  * at all and `migrate()`'s guarded ALTER backfills it to 0. These tests set the gate back to 0,
@@ -273,10 +281,34 @@ const cos = (a: Float32Array, b: Float32Array): number => {
 const trueMean = (db: StoragePort, conceptId: string): Float32Array =>
   normalizeVector(rawMean(liveObservationVectors(db, conceptId)));
 
-/** Build one concept carrying `order.length` observations, attached in that arrival order. */
+/**
+ * Build one concept carrying `order.length` observations attached in that arrival order, and leave
+ * in `concepts.embedding` the centroid A PRE-FIX BUILD WOULD HAVE PERSISTED for it.
+ *
+ * THE PLANT IS NOT A SHORTCUT, it is the only way this fixture can exist any more. `attach()` now
+ * writes the true mean of the concept's live evidence, so a concept built through the public API
+ * comes out ALREADY CONVERGED and this whole pass would have nothing to repair — every test below
+ * would be a green that could not fail. The population this one-time pass exists for is stores
+ * written by OLDER builds, and reproducing what those builds left in the column is the fixture.
+ *
+ * Faithful rather than approximate: the same `blend()` the engine used to call, replayed over the
+ * same STORED observation vectors, in the same arrival order, with the same running count (1, 2, 3
+ * …) `attach` passed as `concept.support_count`. That is byte-for-byte the state a pre-fix engine
+ * would have left.
+ */
 async function buildDrifted(core: MonetCore, order: number[]): Promise<string> {
   const first = await core.store(TEXTS[order[0]!]!, { circle: CIRCLE });
-  for (const i of order.slice(1)) await core.store(TEXTS[i]!, { circle: CIRCLE, attachTo: first.conceptId });
+  const arrivalObsIds = [first.observationId];
+  for (const i of order.slice(1)) {
+    const attached = await core.store(TEXTS[i]!, { circle: CIRCLE, attachTo: first.conceptId });
+    arrivalObsIds.push(attached.observationId);
+  }
+  const db = dbOf(core);
+  const vectorOf = (id: string): Float32Array =>
+    jsonToEmb((db.prepare(`SELECT embedding FROM observations WHERE id = ?`).get(id) as { embedding: string }).embedding);
+  let drifted = vectorOf(arrivalObsIds[0]!);
+  for (let n = 1; n < arrivalObsIds.length; n++) drifted = blend(drifted, vectorOf(arrivalObsIds[n]!), n);
+  setConceptVector(db, first.conceptId, drifted);
   return first.conceptId;
 }
 
@@ -306,7 +338,7 @@ function countingPort(inner: StoragePort, sqlNeedle: string): { port: StoragePor
 }
 
 describe("repairDriftedConceptCentroids — the one-time convergence pass", () => {
-  it("PREMISE: attach() leaves a UNIT-LENGTH but DRIFTED centroid, so a norm-only pass would find nothing", async () => {
+  it("PREMISE: the pre-fix blend writer left a UNIT-LENGTH but DRIFTED centroid, so a norm-only pass would find nothing", async () => {
     const path = tempStore();
     const core = openFileCore(path);
     try {

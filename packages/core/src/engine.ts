@@ -42,7 +42,7 @@ import {
   EmbedderOutputNonFiniteError,
   validateEmbeddingProviderOutput,
   cosine,
-  blend,
+  centroidOf,
   blendWeighted,
   embToJson,
   jsonToEmb,
@@ -2393,6 +2393,14 @@ export interface MonetCoreOptions {
    * an unmeasured embedder has to say so — and say what value, in that embedder's own rank space.
    */
   tauMargin?: number;
+  /**
+   * Override the margin gate's UPPER BOUND: at or above this centroid cosine an above-tau
+   * nomination attaches without consulting the margin. Same no-fallback rule as tauMargin above and
+   * for the same reason — a caller who wants coherence to override separation in a space nobody
+   * measured it in has to name the number in that space's own cosine scale. See
+   * EmbeddingThresholds.tauConfident for what the bound means.
+   */
+  tauConfident?: number;
   agentId?: string;
   /** Stable per-store sync identity override (primarily for deterministic tests). Persisted on first open. */
   syncDeviceId?: string;
@@ -2570,6 +2578,13 @@ export class MonetCore {
    */
   private tauMargin?: number;
   /**
+   * NO FALLBACK, for the same reason as tauMargin directly above — this one decides when the margin
+   * gate is SKIPPED, and a borrowed number would take writes silently in a space it was never
+   * derived in. Undefined means no upper bound: the margin gate governs the whole above-tau band, as
+   * it did before this existed.
+   */
+  private tauConfident?: number;
+  /**
    * The RAW tauAttach/tauAmbiguous/edgeSimMin opts as passed to the constructor (undefined where
    * not explicitly set) — captured once, verbatim, so applyEmbedderDerivedThresholds can re-apply
    * the constructor's documented precedence (explicit opt → embedder's recommendedThresholds →
@@ -2578,7 +2593,7 @@ export class MonetCore {
    * honored on re-derivation — there would be no way to tell "explicitly 0.55" from "defaulted to
    * 0.55 because the original embedder happened to recommend it".
    */
-  private explicitThresholdOpts: Pick<MonetCoreOptions, "tauAttach" | "tauAmbiguous" | "tauMargin" | "edgeSimMin">;
+  private explicitThresholdOpts: Pick<MonetCoreOptions, "tauAttach" | "tauAmbiguous" | "tauMargin" | "tauConfident" | "edgeSimMin">;
   /**
    * Constructor-time pin guard (embedder-pin ADR, review hardening): armed at the end of the
    * constructor when this store already has a recorded pin that does NOT match the
@@ -2659,7 +2674,7 @@ export class MonetCore {
     // applyEmbedderDerivedThresholds). tauAttach/tauAmbiguous/edgeSimMin are set as a side effect of
     // that call below, not assigned directly here, so there is exactly one place that implements
     // the precedence rule.
-    this.explicitThresholdOpts = { tauAttach: opts.tauAttach, tauAmbiguous: opts.tauAmbiguous, tauMargin: opts.tauMargin, edgeSimMin: opts.edgeSimMin };
+    this.explicitThresholdOpts = { tauAttach: opts.tauAttach, tauAmbiguous: opts.tauAmbiguous, tauMargin: opts.tauMargin, tauConfident: opts.tauConfident, edgeSimMin: opts.edgeSimMin };
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
     this.momentSpoolPath = opts.momentSpoolPath ?? null;
@@ -3941,14 +3956,17 @@ export class MonetCore {
    *   centroid deflates every read of it. #90 made that path normalize; it did not repair what
    *   earlier builds had already persisted, and a settled concept may never be recomputed again.
    *
-   *   BLEND DRIFT. `attach()` folds each new observation in with a RUNNING `blend()`, which
+   *   BLEND DRIFT. `attach()` USED TO fold each new observation in with a RUNNING `blend()`, which
    *   re-inflates the accumulated direction to full integer weight at every step as if every prior
-   *   member had agreed perfectly. The stored centroid therefore depends on the ORDER the
-   *   observations arrived in, and drifts away from the true normalized mean of the same evidence.
+   *   member had agreed perfectly. The stored centroid therefore depended on the ORDER the
+   *   observations arrived in, and drifted away from the true normalized mean of the same evidence.
    *   Reproduced through the real engine: the same five observations attached in two different
-   *   orders give two different centroids (cos 0.9968). Cauchy-Schwarz makes the direction of the
+   *   orders gave two different centroids (cos 0.9968). Cauchy-Schwarz makes the direction of the
    *   error one-way — drift can only lower a concept's self-similarity to its own evidence — and on
-   *   the live store the multi-member population's median cosine to its true mean is 0.9030.
+   *   the live store the multi-member population's median cosine to its true mean was 0.9030.
+   *   `attach()` now writes the true mean itself (see its own comment), so this class no longer
+   *   accumulates; this pass remains what converges the backlog those earlier builds persisted, and
+   *   every store written before that change still needs it.
    *
    * Recomputing the centroid from the live evidence fixes both at once: the result is the true
    * normalized mean, which is short-free by construction and order-free by construction.
@@ -4026,10 +4044,17 @@ export class MonetCore {
    * read-set-work-restore-inside-one-`immediateTransaction` discipline the temporal block in
    * `migrate()` documents, for the same reason: a transient 1 that escapes can latch permanently.
    *
-   * WHAT ONE-TIME COSTS, stated rather than hidden: `attach()`'s running blend is still the live
-   * write path, so drift begins accumulating again on the next attach. This converges the backlog;
-   * it does not change the ongoing writer. Changing `attach()` is a separate decision with its own
-   * behavioural surface, and is deliberately not taken here.
+   * WHAT ONE-TIME ONCE COST, and no longer does. This paragraph used to read: "`attach()`'s running
+   * blend is still the live write path, so drift begins accumulating again on the next attach. This
+   * converges the backlog; it does not change the ongoing writer. Changing `attach()` is a separate
+   * decision with its own behavioural surface, and is deliberately not taken here." That decision
+   * has since been taken — `attach()` writes the true mean of the concept's live evidence, and so do
+   * `detach`'s two rebuilds and `mergeConceptInto` — so the backlog this converges STAYS converged
+   * instead of re-drifting from the next write onward.
+   *
+   * THIS PASS IS NOT MADE REDUNDANT BY THAT, which is the reason it is still here: it repairs what
+   * OLDER BUILDS PERSISTED, and a settled concept that is never attached to again is never
+   * recomputed either. The writer change fixes the future; only this fixes the past.
    */
   private repairDriftedConceptCentroids(): void {
     const cols = this.db.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
@@ -4792,7 +4817,10 @@ export class MonetCore {
             ? { conceptId: liveMatches[0].match.id, centroidScore: liveMatches[0].score }
             : null,
           kind: opts.kind,
-          thresholds: { tauAttach: this.tauAttach, tauAmbiguous: this.tauAmbiguous, tauMargin: this.tauMargin },
+          thresholds: {
+            tauAttach: this.tauAttach, tauAmbiguous: this.tauAmbiguous,
+            tauMargin: this.tauMargin, tauConfident: this.tauConfident,
+          },
         });
         // HELD, NOT RAISED YET (Codex P2, PR #87). The margin said the winner is not distinguishable
         // from the runner-up, but the five refusals below can still say it was never a legal landing
@@ -7946,11 +7974,21 @@ export class MonetCore {
         this.hardDeleteNativeConcept(sourceConceptId);
         sourceDeleted = true;
       } else {
+        // SUM-THEN-NORMALIZE over the surviving evidence, not a sequential blend down the list.
+        // The running blend this replaced re-inflated the accumulated direction to full weight at
+        // every step, so the rebuilt source vector depended on the order `srcObsRows` came back in
+        // (`ORDER BY created_at, rowid`) and sat off the mean of the very rows it was rebuilt from —
+        // a concept reconstructed from a fixed set has no excuse for a path-dependent vector. Same
+        // definition every other writer of this column uses now (embedding.ts's `centroidOf`).
+        //
+        // THE SET IS UNCHANGED and is deliberately NOT the live-evidence predicate the other
+        // callers use: this rebuild runs over `remainingRows` as raw rows, superseded history
+        // included, because body/support_count/confidence beside it are computed the same way.
+        // Narrowing the vector alone would make the centroid disagree with the support count
+        // written in the same UPDATE — a wider change than this one, called out at the
+        // "A SURVIVING SOURCE MUST KEEP LIVE EVIDENCE" guard above for the same reason.
         const remEmbs = remainingRows.map((o) => jsonToEmb(o.embedding));
-        let srcEmb = remEmbs[0]!;
-        for (let i = 1; i < remEmbs.length; i++) {
-          srcEmb = blend(srcEmb, remEmbs[i]!, i);
-        }
+        const srcEmb = centroidOf(remEmbs);
         const srcBody = remainingRows.map((o) => o.content).join("\n");
         const srcSupportCount = remainingRows.length;
         const srcConfidence = Math.max(0.3, srcRow.confidence * (remainingRows.length / totalCount));
@@ -7997,12 +8035,11 @@ export class MonetCore {
       // 5. Destination finalize.
       if (destAction === "created") {
         if (detachingRows.length > 1) {
-          // More than one observation: blend all stored embeddings and join content.
+          // More than one observation: CENTROID all stored embeddings and join content. Same
+          // change, same reason as the source rebuild above — the sequential blend made a
+          // brand-new concept's vector depend on the order its evidence happened to be listed in.
           const dstEmbs = detachingRows.map((o) => jsonToEmb(o.embedding));
-          let dstEmb = dstEmbs[0]!;
-          for (let i = 1; i < dstEmbs.length; i++) {
-            dstEmb = blend(dstEmb, dstEmbs[i]!, i);
-          }
+          const dstEmb = centroidOf(dstEmbs);
           const dstBody = detachingRows.map((o) => o.content).join("\n");
           this.db
             .prepare(
@@ -9335,6 +9372,12 @@ export class MonetCore {
     // Deliberately without the `?? <number>` tail the two above carry: see the field's own
     // declaration for why an unmeasured embedder gets no gate rather than a borrowed one.
     this.tauMargin = this.explicitThresholdOpts.tauMargin ?? embedder.recommendedThresholds?.tauMargin;
+    // Same precedence, same missing `?? <number>` tail, same reason: an embedder nobody measured
+    // this in gets no upper bound on the margin gate's band rather than one borrowed from another
+    // cosine scale. It is also PER-EMBEDDER for a second reason tauMargin does not have — it is
+    // compared against a concept CENTROID score, so it is calibrated not only to the space but to
+    // what that space's centroids look like (see EmbeddingThresholds.tauConfident's durability note).
+    this.tauConfident = this.explicitThresholdOpts.tauConfident ?? embedder.recommendedThresholds?.tauConfident;
     /*
      * A `related` edge needs more overlap than a semantic model implies. The MEASURED per-model
      * value wins; the class split below is the fallback for a model nobody has swept, and it is a
@@ -14879,14 +14922,35 @@ export class MonetCore {
     return repaired;
   }
 
+  /**
+   * A concept's LIVE evidence rows, in the one order every centroid writer sums them in.
+   *
+   * EXTRACTED SO THE PREDICATE AND THE ORDER HAVE ONE HOME. Four writers now build a concept
+   * centroid from stored evidence — this file's `recomputeNativeConceptProjection`, `attach`,
+   * `mergeConceptInto`, and (over its own two subsets) `detach` — and the centroid they write is
+   * only interchangeable if they agree on WHICH rows count and in WHICH order they are added.
+   * `superseded_by IS NULL AND superseded_at IS NULL` is the "live" predicate (both columns:
+   * keep-current retires a correction TERMINALLY with `superseded_at` set and `superseded_by`
+   * NULL), and `ORDER BY id ASC` is the float-determinism contract `centroidOf` documents — with
+   * it, attach's write and a later recompute of the same set are byte-identical, not merely close.
+   *
+   * `session_id` / `created_at` are read for the recompute's confidence and temporal arithmetic and
+   * are dead weight to the other callers. Kept on the shared query anyway: two columns per row is
+   * nothing beside the vector JSON, and a second near-identical SELECT is exactly how the predicate
+   * drifts apart again.
+   */
+  private liveConceptEvidence(conceptId: string): Array<{ id: string; embedding: string; session_id: string | null; created_at: number }> {
+    return this.db.prepare(
+      `SELECT id, embedding, session_id, created_at FROM observations
+        WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL ORDER BY id ASC`,
+    ).all(conceptId) as Array<{ id: string; embedding: string; session_id: string | null; created_at: number }>;
+  }
+
   private recomputeNativeConceptProjection(conceptId: string, relayAt: number): void {
     this.assertPinSatisfied(); // embedder-pin ADR, FIX AC — the empty-observation branch below writes a this.embedder.dim-sized vector with no embed() call to gate it otherwise
     const concept = this.getRow(conceptId);
     if (!concept || concept.status === "retired") return;
-    const observations = this.db.prepare(
-      `SELECT id, embedding, session_id, created_at FROM observations
-        WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL ORDER BY id ASC`,
-    ).all(conceptId) as Array<{ id: string; embedding: string; session_id: string | null; created_at: number }>;
+    const observations = this.liveConceptEvidence(conceptId);
     const contradictionStats = this.db.prepare(
       `SELECT SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count,
               SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved_count,
@@ -14908,24 +14972,18 @@ export class MonetCore {
       return;
     }
 
-    const vectors = observations.map((o) => jsonToEmb(o.embedding));
-    const centroid = new Float32Array(vectors[0]!.length);
-    for (let d = 0; d < centroid.length; d++) {
-      let sum = 0;
-      for (const vector of vectors) sum += vector[d] ?? 0;
-      centroid[d] = sum / vectors.length;
-    }
-    // NORMALIZE, like every other writer of this column. An arithmetic mean of unit vectors is
-    // SHORT whenever its members disagree — two at 60° average to 0.87 — and `cosine()` is a bare
-    // dot product, so a short centroid deflates every read of it: nominateByObservation's
-    // `centroidScore` against tauAmbiguous, and rankByCentroid's edge-neighbour scan. The direction
-    // is right and the length is not, which is the failure mode that reads as a confident low score
-    // rather than as an error. `create` (the provider's own output), `attach` (blend) and
-    // mergeConceptInto (blendWeighted) all normalize; this path was the only one that could not,
-    // because the normalizer was module-private in embedding.ts until it was exported for this.
+    // THE mean-and-normalize, now shared rather than written out here (embedding.ts's `centroidOf`).
+    // The normalization is what #90 added: an arithmetic mean of unit vectors is SHORT whenever its
+    // members disagree — two at 60° average to 0.87 — and `cosine()` is a bare dot product, so a
+    // short centroid deflates every read of it: nominateByObservation's `centroidScore` against
+    // tauAmbiguous, and rankByCentroid's edge-neighbour scan. The direction is right and the length
+    // is not, which is the failure mode that reads as a confident low score rather than as an error.
     // A concept whose every live observation is still a zero PLACEHOLDER stays zero — see
     // normalizeVector's `mag || 1` — so isZeroVector keeps meaning "not measured" here.
-    normalizeVector(centroid);
+    //
+    // The loop moved to embedding.ts when `attach` stopped running a blend and started writing this
+    // same quantity: two copies of a mean is how the column ends up meaning two things.
+    const centroid = centroidOf(observations.map((o) => jsonToEmb(o.embedding)));
     const sessions = new Set(observations.map((o) => o.session_id).filter((id): id is string => !!id));
     const evidenceConfidence = Math.min(1, 0.6 + Math.max(0, sessions.size - 1) * 0.1 + (contradictionStats.resolved_count ?? 0) * 0.2);
     const confidence = hasOpen ? Math.min(0.5, evidenceConfidence) : evidenceConfidence;
@@ -16765,12 +16823,57 @@ export class MonetCore {
     // 2) Carry contradictions onto the target BEFORE recomputing status (their observations followed
     //    in step 1) — so a disputed source doesn't get silently restored to active by the merge.
     this.db.prepare(`UPDATE contradictions SET concept_id = ? WHERE concept_id = ?`).run(target.id, src.id);
-    // 3) Fold body + support + vector + source_refs into the target (never re-embed; blend the two
-    //    centroids WEIGHTED by support so a heavily-supported source isn't treated as one sample).
+    // 3) Fold body + support + vector + source_refs into the target (never re-embed).
     const lines = splitLines(target.body);
     for (const l of splitLines(src.body)) if (!lines.includes(l)) lines.push(l);
     const supportCount = target.support_count + src.support_count;
-    const blended = blendWeighted(jsonToEmb(target.embedding), target.support_count, jsonToEmb(src.embedding), src.support_count);
+    // THE UNION'S OWN CENTROID, because step 1 above already made the union real. The source's
+    // observations are the target's as of that UPDATE, so `liveConceptEvidence(target.id)` here
+    // returns exactly the evidence the merged concept will hold, in the order a later recompute
+    // will read it — the true mean is available for free and needs no second definition.
+    //
+    // WHAT THIS REPLACED, and why it was a third definition rather than a variant of the other two:
+    // `blendWeighted(targetVec, targetSupport, srcVec, srcSupport)` averages TWO ALREADY-AVERAGED
+    // vectors. That is the union mean only when each side's support_count equals its live evidence
+    // count AND each stored vector is already that side's true mean — and it is the second
+    // condition that fails, because normalizing each side before averaging discards exactly the
+    // length information a mean of means would need — a short mean (members disagreeing) and a long
+    // one (members agreeing) are rescaled to the same length before the weights are applied, so the
+    // weights no longer say what they were meant to say.
+    //
+    // QUANTIFIED RATHER THAN ASSERTED, on the five-text `HashingEmbeddingProvider` fixture the
+    // centroid tests use (256-dim lexical space; the gap is a property of averaging normalized means
+    // and does not travel as a NUMBER to bge-m3, only as a shape). Splitting those five observations
+    // across two concepts, converging each side, then merging:
+    //
+    //   3+2  cos(blendWeighted, unionMean) = 0.998770
+    //   2+3                                 0.999552
+    //   4+1                                 0.996043
+    //   1+4                                 0.996041
+    //
+    // Far above float noise, and one-directional: among unit vectors the normalized mean is the one
+    // MAXIMIZING summed cosine to the members, so every other choice — the weighted blend included —
+    // can only lower the merged concept's self-similarity to its own evidence. Same one-way error the
+    // attach blend had. The lopsided splits are the worse ones, which is the merge shape that
+    // actually occurs (a big concept absorbing a small one).
+    //
+    // WHY NOT CALL `recomputeNativeConceptProjection` INSTEAD, which is the obvious reuse: its
+    // UPDATE also writes support_count, confidence, status and both last_confirmed_* columns, and
+    // this method computes MERGED values for every one of them a few lines below (additive support,
+    // `openContraCount` status, MAX temporal carry). Reusing it would clobber the merge's own
+    // arithmetic with a recompute's. Same finding, same shape, as repairDriftedConceptCentroids's
+    // reason 2 for not reusing it either.
+    //
+    // NO LIVE EVIDENCE IN THE UNION -> KEEP THE WEIGHTED BLEND. Both sides are active (the two
+    // assertions at the top) but a concept can be active with every observation terminally
+    // superseded, and the mean of nothing is not a vector. The recompute answers that case by
+    // writing an `embedder.dim` placeholder over the centroid; a merge must not, because it would
+    // erase a direction on the survivor to record the absence of evidence on both sides. So this
+    // one keeps the vector arithmetic it had — stated here rather than left as a silent branch.
+    const unionEvidence = this.liveConceptEvidence(target.id);
+    const blended = unionEvidence.length > 0
+      ? centroidOf(unionEvidence.map((o) => jsonToEmb(o.embedding)))
+      : blendWeighted(jsonToEmb(target.embedding), target.support_count, jsonToEmb(src.embedding), src.support_count);
     // Union return-to-source pointers — source-keyed idempotency reads concept-level
     // source_refs, so a dedup-merge must not drop the moved concept's refs.
     const refs = [
@@ -17100,7 +17203,53 @@ export class MonetCore {
       : [concept.body, trimmed].filter(Boolean).join("\n");
     const version = concept.version + 1;
     const supportCount = concept.support_count + 1;
-    const blended = blend(jsonToEmb(concept.embedding), emb, concept.support_count);
+    // THE TRUE MEAN OF THE CONCEPT'S LIVE EVIDENCE, INCLUDING THIS OBSERVATION — not a running
+    // blend of the stored vector with the incoming one.
+    //
+    // WHAT THE BLEND WAS DOING. `blend(stored, emb, support_count)` re-inflates the accumulated
+    // direction to full integer weight at every step, as if every prior member had agreed with it
+    // perfectly. The stored centroid therefore depended on the ORDER the evidence arrived in and
+    // drifted off the mean of the same evidence: reproduced through this engine, the same five
+    // observations attached in two orders gave two different centroids (cos 0.9968), and on the
+    // live monet-hq store the multi-member population's median cosine to its own true mean was
+    // 0.9030. Cauchy-Schwarz makes the error one-way — drift can only LOWER a concept's
+    // self-similarity to its own evidence — so the deflation landed on exactly the identity half of
+    // the attach decision (`centroidScore` against tauAmbiguous), on the concepts with the most
+    // evidence.
+    //
+    // WHY THE MEAN IS "RIGHT" HERE RATHER THAN MERELY DIFFERENT: it is the definition every OTHER
+    // writer of this column already converged on. `recomputeNativeConceptProjection` (since #90),
+    // `detach`'s two rebuilds, `mergeConceptInto` and `repairNativeProjections` all write the
+    // normalized mean of live evidence; the 1.8.0 one-time reprojection converged the persisted
+    // backlog onto it. attach was the last writer holding a second definition, and the one that
+    // re-introduced drift on the next write after that pass — see repairDriftedConceptCentroids's
+    // "WHAT ONE-TIME COSTS", which named this as the separate decision it was deliberately not
+    // taking. This is that decision.
+    //
+    // THE PENDING ROW IS MERGED IN AT ITS ID-SORTED POSITION, not appended. storeInternal INSERTs
+    // the observation before calling here and only repoints `concept_id` after, so the live-evidence
+    // query cannot see it yet and it has to be supplied; detach's reattach path bulk-repoints first,
+    // so there the query DOES return it and `emb` must not be counted twice. Both are handled by id.
+    // Placing it where `ORDER BY id ASC` will put it once the row lands is what makes this write
+    // byte-identical to the recompute that may follow it — float addition is not associative, so an
+    // appended pending row would leave the two agreeing to ~7 digits and differing in the last ulp,
+    // and "converged" in this codebase means a later recompute finds NOTHING to change.
+    //
+    // support_count is deliberately untouched by this: it is an attach counter, not a live-evidence
+    // count, and reconciling the two is a separate semantic change nothing here asked for.
+    const evidence = this.liveConceptEvidence(concept.id);
+    const vectors: Float32Array[] = [];
+    let pending: Float32Array | null =
+      observationId !== undefined && evidence.some((row) => row.id === observationId) ? null : emb;
+    for (const row of evidence) {
+      if (pending !== null && observationId !== undefined && observationId < row.id) {
+        vectors.push(pending);
+        pending = null;
+      }
+      vectors.push(jsonToEmb(row.embedding));
+    }
+    if (pending !== null) vectors.push(pending);
+    const blended = centroidOf(vectors);
 
     // Cross-session = sessionId provided AND differs from the concept's last_confirmed_session_id.
     // Same-session = sessionId provided AND matches. null = detach reattach (old evidence, no confirm).
