@@ -162,6 +162,10 @@ const CJK_GRAM = 2;
  *   Summing token lengths would report 1.33x coverage on a three-character run and let `Math.min`
  *   quietly absorb the error, which is the same defect wearing the other script's clothes. The run
  *   contributes n, because each of its n characters is read, once.
+ *
+ * Takes text ALREADY prepared by `prepare` below — normalised and lowercased. That is not a caller
+ * convenience: `lexicalCoverage`'s denominator has to be counted over the very same string this
+ * walks, and NFC changes how many code points a text has.
  */
 function scanLexical(lower: string): { tokens: string[]; covered: number } {
   const tokens: string[] = [];
@@ -182,6 +186,36 @@ function scanLexical(lower: string): { tokens: string[]; covered: number } {
   }
   return { tokens, covered };
 }
+
+/**
+ * THE ONE ENTRY BOTH READERS GO THROUGH. Normalise, then lowercase — in that order, and once.
+ *
+ * NFC BECAUSE CANONICALLY EQUIVALENT TEXT MUST TOKENIZE IDENTICALLY (Codex P2, PR #97). Unicode
+ * lets the same character be stored two ways, and the CJK class is far more exposed to it than the
+ * Latin class ever was, because the decomposed form inserts a COMBINING MARK in the middle of a run:
+ *
+ *   `がき` composed (U+304C U+304D) is one two-character run and emits the bigram `がき`; decomposed
+ *   (か U+3099 き) the combining dakuten is not in the CJK class, so it SPLITS the run into two
+ *   one-character runs, each dropped by the lone-run rule — the text emits nothing at all.
+ *
+ *   Hangul is the same defect with a different shape: conjoining Jamo (ᄒ ᅡ ᆫ) are `scx=Hangul` and
+ *   so are precomposed syllables (한), but a three-Jamo syllable is three characters where the
+ *   syllable is one, so the two forms produce bigrams that can never match each other.
+ *
+ * Both forms occur in the wild — macOS filesystem APIs hand back NFD, most editors and git blobs
+ * hold NFC — so a probe and the document it should match could disagree purely on encoding. NFC is
+ * the composing direction, so it is the one that keeps a run whole.
+ *
+ * NORMALISE BEFORE LOWERCASING because composition is defined on the original characters; the
+ * reverse order can leave a composed form unreachable. CJK has no case, so the second step is a
+ * no-op for the class this fixes and the existing behaviour for the Latin one.
+ *
+ * NO LEGACY MISMATCH SURVIVES THIS. Postings written before #38 were produced without normalisation,
+ * so a store could hold NFD-derived tokens that this now never emits — but `reindexLexicalTokens`
+ * (engine.ts) regenerates every posting row from stored text at the first open that carries this
+ * code, so both sides of every comparison come from this function or neither does.
+ */
+const prepare = (text: string): string => text.normalize("NFC").toLowerCase();
 
 /**
  * The share of a text's letters and digits that the tokenizer above actually consumes — "how much of
@@ -262,7 +296,10 @@ function scanLexical(lower: string): { tokens: string[]; covered: number } {
 export const LEXICAL_COVERAGE_MIN = 0.8;
 
 export function lexicalCoverage(text: string): number {
-  const lower = text.toLowerCase();
+  // Prepared ONCE, and the denominator counted over that same string. Counting `alnum` on the raw
+  // text while the numerator walks the normalised one would reopen the counting invariant from the
+  // other end: NFD `が` is two code points to the denominator and one to the tokenizer.
+  const lower = prepare(text);
   const alnum = lower.match(ALNUM);
   if (alnum === null || alnum.length === 0) return 1; // nothing to read: vacuously comparable
   // The numerator comes from the same walk that emits the tokens — see scanLexical's header for the
@@ -273,7 +310,7 @@ export function lexicalCoverage(text: string): number {
 /** The token set of one text. A SET, not a bag: this measures whether a term is shared, not how
  *  often it is repeated, so a long observation cannot outscore a short one by restating itself. */
 export function lexicalTokens(text: string): Set<string> {
-  return new Set(scanLexical(text.toLowerCase()).tokens);
+  return new Set(scanLexical(prepare(text)).tokens);
 }
 
 /**

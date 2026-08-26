@@ -396,6 +396,40 @@ const CENTROID_UNIT_NORM_TOLERANCE = 1e-6;
  * mean bumps this again rather than adding a second sentinel.
  */
 const CENTROID_REPROJECTION_VERSION = 2;
+/**
+ * `sync_meta.lexical_tokens_version` — WHICH TOKENIZER PRODUCED EVERY ROW IN `observation_tokens`.
+ *
+ * The postings are a DERIVED index over `observations.content`, so they are only as good as the
+ * tokenizer that wrote them, and a tokenizer change silently invalidates every row already there.
+ * #38 gave the lexical arm a CJK class (lexical-overlap.ts), which makes that concrete rather than
+ * theoretical: a store upgraded across #38 holds Latin-only postings while the arm now reads Korean.
+ *
+ * WHY THAT IS A CORRECTNESS BUG AND NOT JUST STALE RECALL (Codex P2, PR #97). `lexicalCoverage` is
+ * computed from the INCOMING text, so it jumps to ~1.0 for a Korean probe immediately. If that probe
+ * shares one rare ASCII identifier with a legacy candidate, `armMoved` also goes true — on the
+ * strength of that single legacy token. Both halves of `comparable` are then satisfied at the margin
+ * gate, and `tauMargin` gets applied to a rank whose lexical component was built from half the
+ * evidence, because the candidate's Korean bigrams do not exist yet. Measured on a three-concept
+ * fixture: the same probe ranks its winner 0.9002 against legacy postings and 1.7437 against
+ * regenerated ones, and at a tauMargin between the two resulting margins the legacy store ASKS where
+ * both the pre-#38 store and the correctly-indexed store proceed. Pre-#38 the gate could not fire at
+ * all for such a probe — coverage was 0.238, below LEXICAL_COVERAGE_MIN — so this is a new refusal
+ * conjured by a half-upgraded index.
+ *
+ * A VERSION, NOT A BOOLEAN, and for the reason CENTROID_REPROJECTION_VERSION had to learn: the next
+ * tokenizer revision has the same problem and needs the same one-time pass. Bumping this constant is
+ * the whole protocol; the `>=` gate below re-runs every store exactly once per bump. The numbering
+ * is meaningful rather than ordinal — 1 is the Latin-only tokenizer that shipped with #156 and never
+ * stamped anything (so untouched stores read DEFAULT 0, which is correctly "older than 2"), 2 is the
+ * two-class tokenizer #38 introduced.
+ *
+ * WHY BACKFILL RATHER THAN VERSION THE POSTINGS AND BRANCH AT READ TIME. Branching would put a
+ * permanent per-store fork inside the arm — every read asking which tokenizer wrote this row — and
+ * would keep the two token vocabularies apart forever, so a v1 candidate could never match a v2
+ * probe no matter how much evidence they share. Regenerating dissolves the mismatch instead of
+ * routing around it, and it is what lets the #38 read-side gain reach stores that already exist.
+ */
+const LEXICAL_TOKENS_VERSION = 2;
 // Rung 13: the source subsystem's retirement (#16). The ruling that dropped the subsystem is
 // what makes the purge safe — its content was always a materialized copy of files that live
 // outside the store, and nothing can re-read it once the connector is gone.
@@ -2757,6 +2791,10 @@ export class MonetCore {
     // triggers are installed (ensureSyncClosureSchema, at the end of migrate()) — the repair
     // suppresses those triggers deliberately, which requires them to be there to suppress.
     this.repairDriftedConceptCentroids();
+    // Same placement argument as the line above — after migrate() has guaranteed the sentinel
+    // column exists. Order relative to the centroid repair is free: that one reads and writes
+    // vectors, this one reads content and writes postings, and they share no row.
+    this.reindexLexicalTokens();
     // Constructor-time pin guard (embedder-pin ADR, review hardening) — synchronous, added no
     // async to the constructor. MUST run after initSyncIdentity (above): that is where a genuinely
     // FRESH store writes its own 'created' pin, matching this.embedderModelId by construction, so
@@ -3169,6 +3207,10 @@ export class MonetCore {
         -- is the one that matters, because an existing store is exactly the population carrying
         -- short or blend-drifted centroids. A fresh store pays one scan over zero rows and stamps 1.
         centroids_reprojected INTEGER NOT NULL DEFAULT 0,
+        -- Which tokenizer wrote observation_tokens (see LEXICAL_TOKENS_VERSION). DEFAULT 0 means
+        -- "older than the current tokenizer" for both a fresh store and migrate()'s guarded ALTER;
+        -- a fresh store pays one scan over zero rows and stamps the current version.
+        lexical_tokens_version INTEGER NOT NULL DEFAULT 0,
         clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical')),
         embedder_model_id TEXT,
         embedder_pin_source TEXT CHECK (embedder_pin_source IN ('created', 'backfilled', 'migrated')),
@@ -3393,6 +3435,9 @@ export class MonetCore {
     }
     if (!syncMetaCols.some((c) => c.name === "centroids_reprojected")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN centroids_reprojected INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!syncMetaCols.some((c) => c.name === "lexical_tokens_version")) {
+      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN lexical_tokens_version INTEGER NOT NULL DEFAULT 0`);
     }
     if (!syncMetaCols.some((c) => c.name === "clock_mode")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))`);
@@ -4186,6 +4231,63 @@ export class MonetCore {
   }
 
   /**
+   * ONE-TIME RE-TOKENIZATION of `observation_tokens` when the tokenizer that wrote it is older than
+   * the one now running. See LEXICAL_TOKENS_VERSION for what goes wrong without it — in short, a
+   * store upgraded across #38 reads Korean on the probe side and holds Latin-only postings on the
+   * candidate side, which makes the margin gate fire on half the evidence.
+   *
+   * NO EMBEDDER, AND THAT IS WHY THIS IS SIMPLER THAN ITS NEIGHBOUR. Tokens are a pure function of
+   * `observations.content`, which nothing here is async about, so the whole pass fits in ONE
+   * transaction instead of `resegmentObservations`' one-per-observation shape — that method splits
+   * because it must await an embed and SQLite's write reservation cannot be held across an await.
+   *
+   * NO TRIGGER SUPPRESSION, ESTABLISHED RATHER THAN ASSUMED. `repairDriftedConceptCentroids` takes
+   * `applying_remote` because it writes `concepts`, which carries the sync clock triggers. This
+   * writes only `observation_tokens`, and that table has no triggers at all: it is not in the
+   * `trigger(...)` roster in ensureSyncClosureSchema, `sqlite_master` on a real store lists none for
+   * it, and it structurally cannot carry one — the triggers key off `NEW.sync_writer`/`sync_revision`
+   * and this table's only columns are `(observation_id, token)`. So no write here advances
+   * `last_mutation_at` or enters an export. Taking the latch anyway would add a leak path (every
+   * holder must set AND clear it in one transaction) to buy nothing.
+   *
+   * NOTHING TO DEFER ON, for the same reason. Its neighbour returns early during an embedder
+   * migration because a half-migrated store holds vectors from two spaces and averaging them is not
+   * a repair. There is no such hazard here: a migration rewrites EMBEDDINGS and deliberately leaves
+   * this table alone (see the note in migrateEmbeddings — tokens hold no vector), and `content` is
+   * the one thing a migration never touches. Running mid-migration is therefore correct, not merely
+   * tolerable, so the gate is spent unconditionally rather than held back for a "clean" open that a
+   * resumed migration might never produce.
+   *
+   * THE POPULATION IS EVERY NON-SOURCE OBSERVATION, live or superseded, attached or not. Not the
+   * reader's filter (live and attached), because a narrower rewrite would leave the table half in
+   * one tokenizer and half in another — the exact mixed state this exists to end — and liveness can
+   * change after the pass has run. `kind != 'source'` matches the only writer that states a rule
+   * (the sync graft path) and the layer's native-only scope.
+   */
+  private reindexLexicalTokens(): void {
+    // A custom StoragePort, or a store this build never migrated, may not carry the sentinel. No
+    // column means no gate, and running ungated would repeat this on every open.
+    const cols = this.db.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "lexical_tokens_version")) return;
+    const gate = this.db.prepare(`SELECT lexical_tokens_version AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number } | undefined;
+    if (gate === undefined || gate.value >= LEXICAL_TOKENS_VERSION) return;
+    this.db.immediateTransaction((): void => {
+      // Re-read under the write reservation: another process may have finished between the unlocked
+      // probe above and this transaction, and the pass must not run twice.
+      const pending = this.db.prepare(`SELECT lexical_tokens_version AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number } | undefined;
+      if (pending === undefined || pending.value >= LEXICAL_TOKENS_VERSION) return;
+      // DELETE EVERYTHING, then rebuild. Not a per-observation replace: a row whose observation has
+      // since been hard-deleted has no writer left to clean it up, and this is the one pass that can
+      // see the whole table at once.
+      this.db.prepare(`DELETE FROM observation_tokens`).run();
+      const insert = this.db.prepare(`INSERT OR IGNORE INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
+      const rows = this.db.prepare(`SELECT id, content FROM observations WHERE kind != 'source'`).all() as Array<{ id: string; content: string }>;
+      for (const row of rows) for (const token of lexicalTokens(row.content)) insert.run(row.id, token);
+      this.db.prepare(`UPDATE sync_meta SET lexical_tokens_version = ? WHERE singleton = 1`).run(LEXICAL_TOKENS_VERSION);
+    })();
+  }
+
+  /**
    * The fallback for a row reprojection cannot reach — retired, no live evidence, or evidence whose
    * widths disagree. Rescales a short non-zero vector to unit length and leaves everything else
    * exactly as found. This is the whole of the original #90 §3.1 repair, kept for the population the
@@ -4240,6 +4342,7 @@ export class MonetCore {
     addColumn("sync_meta", "applying_remote", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "closure_migrated", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "centroids_reprojected", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("sync_meta", "lexical_tokens_version", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "clock_mode", "TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))");
     addColumn("concept_tombstones", "updated_at", "INTEGER");
     addColumn("concept_restorations", "updated_at", "INTEGER");
