@@ -1017,6 +1017,71 @@ describe("an ambiguous store writes nothing", () => {
     }
   });
 
+  /**
+   * THE SHORTLIST IS CAPPED, AND THE CAP IS APPLIED TO THE RANKING. Two separate claims, and the
+   * two-concept fixture above can prove neither: it can never overflow the cap, and any order a
+   * pair comes out in is trivially sorted. So this seeds SEVEN near-tied concepts and reads both
+   * claims off one ask — the payload must be the top AMBIGUOUS_CANDIDATES_MAX by rank, not the
+   * first N rows the scan happened to visit and not every concept it could not choose between.
+   *
+   * Geometry first, as everywhere in this file, and here it does double duty: the expected ordering
+   * is DERIVED from measured cosines rather than restated from the engine. That is sound only
+   * because `HashingEmbeddingProvider` leaves `needsLexicalArm` unset, so the scorer defines rank as
+   * the raw cosine for every input (retrieval.ts: "With it off, `rank` is a copy of `score`"). Under
+   * an arm-on embedder rank and score are different quantities and this derivation would not hold.
+   */
+  it("offers the top AMBIGUOUS_CANDIDATES_MAX by rank — capped at five, and capped on the ordering", async () => {
+    const VARIANTS = [
+      A,
+      B,
+      "the ferry to the island leaves at quarter past on public holidays",
+      "the ferry to the island leaves at quarter past during the summer",
+      "the ferry to the island leaves at quarter past outside the winter",
+      "the ferry to the island leaves at quarter past except on Sundays",
+      "the ferry to the island leaves at quarter past unless the weather closes it",
+    ];
+    const core = newCore({ tauAttach: 0.5, tauAmbiguous: 0.3, tauMargin: 0.1 });
+    try {
+      const ids: string[] = [];
+      for (const variant of VARIANTS) ids.push(await seedConcept(core, [variant]));
+
+      const measured = ids
+        .map((id) => ({ id, score: geometry(core, id, PROBE).bestObservation }))
+        .sort((a2, b2) => b2.score - a2.score);
+
+      // PREMISE 1: the legal set is genuinely BIGGER than the cap, and every member of it is a real
+      // candidate — otherwise a length-5 payload would prove nothing about capping.
+      expect(measured.length).toBeGreaterThan(5);
+      for (const m of measured) expect(m.score).toBeGreaterThanOrEqual(0.5);
+
+      // PREMISE 2: the top two sit inside the gate, so what fires below is the ambiguity ask and
+      // not some other branch that also happens to refuse the write.
+      expect(measured[0]!.score - measured[1]!.score).toBeLessThan(0.1);
+
+      // PREMISE 3: the 5/6 boundary is not a tie, so "the top five" names ONE set and this test
+      // cannot start flipping on a tie-break it is not about.
+      expect(measured[4]!.score).toBeGreaterThan(measured[5]!.score);
+
+      let thrown: unknown;
+      try {
+        await core.store(PROBE, { circle: CIRCLE });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(AmbiguousNominationError);
+      const { candidates } = thrown as AmbiguousNominationError;
+
+      // THE CAP: five of the seven it could not choose between.
+      expect(candidates).toHaveLength(5);
+      // THE ORDERING: those five are the five highest-ranked, in rank order. Asserted as one exact
+      // sequence rather than as membership — a cap applied before the sort would still be length 5
+      // and would still hold "some" of the right ids.
+      expect(candidates.map((c) => c.conceptId)).toEqual(measured.slice(0, 5).map((m) => m.id));
+    } finally {
+      core.close();
+    }
+  });
+
   it("attaches on the retry once the caller names one — the ask is answerable, not a dead end", async () => {
     const { core, a } = await fixture(0.1);
     try {

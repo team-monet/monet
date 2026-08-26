@@ -167,11 +167,50 @@ const CO_OCCURRED_WEIGHT = 0.85;
 const FOLLOWS_WEIGHT = 0.5;
 const ASSERTED_WEIGHT = 0.95;
 const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
-// How many concepts an ambiguous nomination offers the caller (#86). Measured, not chosen for
-// roundness: the true home is in the top 3 for 80% of asks on the corpus tauMargin was derived on,
-// and top 5 raises that only to 86%. A miss forks rather than mis-merges, so the extra two buy
-// little and are read on every ask.
-const AMBIGUOUS_CANDIDATES_MAX = 3;
+/*
+ * How many concepts an ambiguous nomination offers the caller (#86).
+ *
+ * MEASURED OVER THE POPULATION THAT SEES IT. Not the whole write corpus — the asks the gate
+ * actually fires, which is a different and much harder population: every one of them is a write
+ * where the scorer already failed to separate two candidates. Legality-aware, engine-driven replay
+ * of the live monet-hq circle (every observation withheld in turn through the real nomination scan
+ * and the real legality filters, 788 probes, 267 gate firings), embedding space
+ * `Xenova/bge-m3:cls:q8`, 2026-08-26. "Rank" is the position in `legal` — the array the shortlist
+ * below is sliced out of — so k here is exactly this constant:
+ *
+ *   k                                          1       2       3       4       5      10
+ *   all asks (n=267)                        58.1%   76.0%   83.5%   85.8%   88.0%   94.8%
+ *   asks the gate was RIGHT to raise         0.0%   42.9%   60.7%   66.1%   71.4%   87.5%
+ *     (winner was NOT the home, n=112)
+ *
+ * THREE TO FIVE IS BOUGHT ON THE SECOND ROW, and only there. On the other 155 firings the winner
+ * WAS the home, so the home sits at rank 1 by construction and every slot past the first is pure
+ * payload. The second row is the population a shortlist exists for, and ranks 4-5 reach the home on
+ * 12 of those 112 — 10.7% of the asks where the winner was actually wrong (4.5% of all asks). Two
+ * extra `{conceptId,title,score}` triples on roughly a third of stores, against one caught misfile
+ * in nine, is the trade this constant now records.
+ *
+ * RETIRED BY THAT MEASUREMENT — the text this constant carried until 2026-08-26:
+ *
+ *   "Measured, not chosen for roundness: the true home is in the top 3 for 80% of asks on the
+ *    corpus tauMargin was derived on, and top 5 raises that only to 86%. A miss forks rather than
+ *    mis-merges, so the extra two buy little and are read on every ask."
+ *
+ * It named no corpus and no embedding space, so no reader could check it against anything — the
+ * defect class PR #90 exists to end, and "the corpus tauMargin was derived on" is a pointer to a
+ * corpus that is not identified either. Its numbers are near the measured ones (83.5% / 88.0%), but
+ * its CONCLUSION does not survive: "the extra two buy little" was read off the all-asks row, where
+ * a right-winner ask dilutes the gain to nothing. Read where the slots are actually spent, the two
+ * extra buy one caught misfile in nine.
+ *
+ * WHAT THE NUMBER RESTS ON, stated rather than left to be discovered: "the true home" is the
+ * concept the store already holds the observation under. That is the store's own placement, not an
+ * adjudicated ground truth — a blinded audit of 60 scorer/store disagreements found the store right
+ * 66.7% and the scorer right 20.0%, so these rates are an upper bound on catch, not certified
+ * accuracy. Re-derive here on any embedder or model change: this table is in bge-m3 space and says
+ * nothing about another one.
+ */
+const AMBIGUOUS_CANDIDATES_MAX = 5;
 /** Pair/contradiction/gate-exception queues stay top-10; counts or omission fields carry true totals. */
 export const OVERVIEW_EXCEPTION_LIMIT = 10;
 /** Opt-in dirty/stale enumeration reuses the existing checkpoint-scale worklist bound. */
