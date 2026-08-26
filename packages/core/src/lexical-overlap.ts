@@ -71,12 +71,49 @@ const LATIN_TOKEN = "[a-z0-9][a-z0-9_-]{2,}";
 const CJK_CHAR = "(?=[\\p{L}\\p{N}])[\\p{scx=Han}\\p{scx=Hangul}\\p{scx=Hiragana}\\p{scx=Katakana}]";
 
 /**
+ * A combining or variation mark sitting INSIDE a CJK run, admitted so it cannot split one, then
+ * DROPPED before grams are cut (Codex P2, PR #97 round 4).
+ *
+ * WHY NFC IS NOT ENOUGH. `prepare` composes what Unicode can compose, and for the common Kana case
+ * that is everything: か + U+3099 becomes が, one character, one gram. But composition is only
+ * defined where a precomposed character EXISTS. Two shapes have none, and both are valid text:
+ *
+ *   セ + U+309A — the Ainu semi-voiced katakana. NFC leaves it decomposed because there is no
+ *   precomposed `セ゚`, and U+309A is `Mn`, not a letter, so the old class rejected it and split
+ *   `セ゚ト` into two one-character runs. Both were then dropped by the lone-run rule and the text
+ *   emitted NOTHING, where plain `セト` emits one bigram.
+ *
+ *   見 + U+E0100 — an ideographic variation selector, used to pin a glyph in Han names. Also `Mn`,
+ *   also NFC-stable, same split, same silence. (Note it is `Inherited`, not `scx=Han`, so widening
+ *   the script class would not have caught it — this has to be a mark class.)
+ *
+ * DROPPED RATHER THAN CARRIED, and the reason is the gram invariant. A gram is CJK_GRAM BASE
+ * characters; carrying a mark into one would make `セ゚ト` a three-code-point "bigram" that no other
+ * spelling of the same text can equal, so mark-carrying and plain spellings would stop matching each
+ * other — which is the defect, relocated rather than fixed. Dropping makes them match, and it is
+ * what a variation selector deserves outright: it selects a glyph, not a meaning, so a search for 見
+ * should find 見 with any selector on it. The one thing dropping gives up is telling `セ゚` from `セ`,
+ * and that is a distinction NFC already keeps wherever Unicode gives it a character to keep it in.
+ *
+ * A run must still START with a real CJK character, so a stray mark after Latin or punctuation opens
+ * nothing. Marks are `[\p{L}\p{N}]`-negative, so they were never in `lexicalCoverage`'s denominator
+ * and must not reach its numerator either — `scanLexical` counts base characters only.
+ */
+const CJK_MARK = "[\\p{Mn}\\p{Me}]";
+
+/** One mark, for stripping a matched run down to its base characters. */
+const CJK_MARK_ONE = /[\p{Mn}\p{Me}]/u;
+
+/**
  * ONE PASS, BOTH CLASSES. Alternation rather than two independent scans, so every character of the
  * text is claimed by at most one branch and `scanLexical` below can count coverage off the same walk
  * that emits the tokens. Two scans would let the two measures drift apart, which is the failure the
  * counting invariant in `lexicalCoverage` exists to prevent.
  */
-const LEXICAL_SCAN = new RegExp(`(?<latin>${LATIN_TOKEN})|(?<cjk>(?:${CJK_CHAR})+)`, "gu");
+const LEXICAL_SCAN = new RegExp(
+  `(?<latin>${LATIN_TOKEN})|(?<cjk>${CJK_CHAR}(?:${CJK_CHAR}|${CJK_MARK})*)`,
+  "gu",
+);
 
 /** Letters and digits — `lexicalCoverage`'s denominator, and the class `CJK_CHAR` intersects with. */
 const ALNUM = /[\p{L}\p{N}]/gu;
@@ -178,8 +215,10 @@ function scanLexical(lower: string): { tokens: string[]; covered: number } {
       continue;
     }
     // Code points, not UTF-16 units: CJK Extension B and beyond are astral, and a bigram cut at a
-    // surrogate boundary is a token no other text can ever match.
-    const run = [...(m.groups?.cjk ?? "")];
+    // surrogate boundary is a token no other text can ever match. Marks were admitted by the scan so
+    // they could not split the run; they are dropped here so grams stay a fixed number of BASE
+    // characters and so `covered` counts only what the denominator counts. See CJK_MARK.
+    const run = [...(m.groups?.cjk ?? "")].filter((c) => !CJK_MARK_ONE.test(c));
     if (run.length < CJK_GRAM) continue; // read by nothing, so covered by nothing
     for (let i = 0; i + CJK_GRAM <= run.length; i++) tokens.push(run.slice(i, i + CJK_GRAM).join(""));
     covered += run.length;
@@ -309,6 +348,29 @@ export function lexicalCoverage(text: string): number {
 
 /** The token set of one text. A SET, not a bag: this measures whether a term is shared, not how
  *  often it is repeated, so a long observation cannot outscore a short one by restating itself. */
+/**
+ * THE TOKENIZER-VERSION MARKER, written into `observation_tokens` beside every observation's real
+ * postings (engine.ts, `writeObservationTokens`). Its presence is what tells a later open that a
+ * row's postings came from THIS tokenizer; its absence is the only staleness signal the repair
+ * needs, and the only one that does not depend on the writer having cooperated.
+ *
+ * IT LIVES HERE, NOT IN THE ENGINE, because its safety is a fact about this file: the marker must be
+ * a string `lexicalTokens` can never emit, and only this file knows what it can emit.
+ *
+ * COLLISION-FREE BY A LEADING SPACE. Every token this module produces comes from exactly one of two
+ * classes. Latin tokens match `[a-z0-9][a-z0-9_-]{2,}`, so every character is in `[a-z0-9_-]`. CJK
+ * grams are cut from runs whose every character satisfies `[\p{L}\p{N}]`. U+0020 is in neither: it
+ * is not in the Latin class's character set, and it is neither a letter nor a number. `prepare`
+ * cannot introduce one either — NFC composes, and `toLowerCase` never produces a space from a
+ * non-space. So no emitted token begins with, or contains, a space, and this value cannot be
+ * mistaken for evidence.
+ *
+ * IT CARRIES THE VERSION, which is what makes a tokenizer bump self-executing: raise
+ * LEXICAL_TOKENS_VERSION and every stored marker stops matching, so every row reads as stale and is
+ * rebuilt, with no separate migration to write.
+ */
+export const lexicalTokensMarker = (version: number): string => ` lex:${version}`;
+
 export function lexicalTokens(text: string): Set<string> {
   return new Set(scanLexical(prepare(text)).tokens);
 }

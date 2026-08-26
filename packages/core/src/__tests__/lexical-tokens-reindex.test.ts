@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore } from "../engine";
 import { HashingEmbeddingProvider } from "../embedding";
-import { lexicalCoverage, lexicalTokens } from "../lexical-overlap";
+import { lexicalCoverage, lexicalTokens, lexicalTokensMarker } from "../lexical-overlap";
 import type { StoragePort } from "../storage";
 
 const dbOf = (core: MonetCore): StoragePort => (core as unknown as { db: StoragePort }).db;
@@ -30,10 +30,6 @@ const KO = "페리는 매시 십오분에 섬으로 출발한다";
 const KO_WITH_ID = "zeta9 페리는 주말에만 항구에서 섬으로 출발한다";
 
 
-/** Shared by both watermark describes below. */
-const watermark = (core: MonetCore): string | null =>
-  (dbOf(core).prepare(`SELECT lexical_tokens_reindexed_through AS w FROM sync_meta WHERE singleton = 1`)
-      .get() as { w: string | null }).w;
 const clockOf = (core: MonetCore): number =>
   (dbOf(core).prepare(`SELECT last_mutation_at AS t FROM sync_meta WHERE singleton = 1`).get() as { t: number }).t;
 /**
@@ -83,9 +79,25 @@ const open = (dbPath: string): MonetCore =>
 const sentinel = (core: MonetCore): number =>
   (dbOf(core).prepare(`SELECT lexical_tokens_version AS v FROM sync_meta WHERE singleton = 1`).get() as { v: number }).v;
 
+const MARKER = lexicalTokensMarker(2);
+
+/** The REAL postings for an observation — the version marker is deliberately excluded so every
+ *  assertion below compares against `lexicalTokens(text)` directly. */
 const postingsFor = (core: MonetCore, observationId: string): Set<string> =>
-  new Set((dbOf(core).prepare(`SELECT token FROM observation_tokens WHERE observation_id = ?`)
-    .all(observationId) as Array<{ token: string }>).map((r) => r.token));
+  new Set((dbOf(core).prepare(`SELECT token FROM observation_tokens WHERE observation_id = ? AND token != ?`)
+    .all(observationId, MARKER) as Array<{ token: string }>).map((r) => r.token));
+
+/** Whether this observation carries the current tokenizer's marker — the staleness signal itself. */
+const hasMarker = (core: MonetCore, observationId: string): boolean =>
+  dbOf(core).prepare(`SELECT 1 FROM observation_tokens WHERE observation_id = ? AND token = ?`)
+    .get(observationId, MARKER) !== undefined;
+
+/** The two counts the fast-path probe compares. */
+const probe = (core: MonetCore): { observations: number; markers: number } =>
+  dbOf(core).prepare(
+    `SELECT lexical_tokens_observation_count AS observations, lexical_tokens_marker_count AS markers
+       FROM sync_meta WHERE singleton = 1`,
+  ).get() as { observations: number; markers: number };
 
 /** Put the store back into the state an upgrade across #38 produces: Latin-only rows, no sentinel. */
 function downgradeToLegacy(core: MonetCore): void {
@@ -237,89 +249,134 @@ describe("canonically equivalent text tokenizes identically (NFC)", () => {
  * with the old tokenizer. The sentinel alone would then skip the pass forever and leave those rows
  * mis-tokenized. These pin the trailing repair that heals them at the next open.
  */
-describe("the trailing watermark repair — a legacy writer on a stamped store", () => {
-
+describe("the posting-version marker — any marker-ignorant writer is healed at the next open", () => {
   const rowidOf = (core: MonetCore, id: string): number =>
     (dbOf(core).prepare(`SELECT rowid AS r FROM observations WHERE id = ?`).get(id) as { r: number }).r;
-
-
 
   /**
    * A pre-upgrade binary's GRAFT of a higher-revision shell for an observation that already exists.
    * The real path is `INSERT ... ON CONFLICT(id) DO UPDATE SET <envelope columns>` — content is not
    * among them — followed by deleting that observation's postings and re-deriving them from the
-   * payload text with whatever tokenizer is running. The row is updated IN PLACE, so its rowid never
-   * moves and the position anchor cannot see it. `updated_at` is bound from `nextSyncTimestamp()`,
-   * which bumps `last_mutation_at` first, so both are advanced here exactly as the graft does.
+   * payload text. The row is updated IN PLACE, so its rowid never moves.
    */
   function legacyGraftRewrites(core: MonetCore, id: string, payloadText: string): void {
     const db = dbOf(core);
-    db.prepare(
-      `UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at + 1, ?) WHERE singleton = 1`,
-    ).run(Date.now());
+    db.prepare(`UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at + 1, ?) WHERE singleton = 1`).run(Date.now());
     const relayAt = clockOf(core);
-    db.prepare(
-      `UPDATE observations SET updated_at = ?, sync_revision = sync_revision + 1, sync_writer = 'legacy-peer' WHERE id = ?`,
-    ).run(relayAt, id);
+    db.prepare(`UPDATE observations SET updated_at = ?, sync_revision = sync_revision + 1, sync_writer = 'legacy-peer' WHERE id = ?`)
+      .run(relayAt, id);
     db.prepare(`DELETE FROM observation_tokens WHERE observation_id = ?`).run(id);
     const insert = db.prepare(`INSERT OR IGNORE INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
     for (const token of retiredTokens(payloadText)) insert.run(id, token);
   }
 
+  /**
+   * A pre-#38 binary running the SHIPPED resegment command. `writeObservationSegments` (v1.8.0,
+   * engine.ts:8949) deletes an existing observation's postings and rewrites them with the Latin-only
+   * tokenizer, and `resegmentObservations` drives it from `monet repair`. It touches the observation
+   * row not at all: no rowid change, no `updated_at`, no mutation clock. This is the path that
+   * defeated every writer-side signal, and the reason staleness is carried by the row instead.
+   */
+  function legacyResegmentRewrites(core: MonetCore, id: string, content: string): void {
+    const db = dbOf(core);
+    db.prepare(`DELETE FROM observation_tokens WHERE observation_id = ?`).run(id);
+    const insert = db.prepare(`INSERT OR IGNORE INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
+    for (const token of retiredTokens(content)) insert.run(id, token);
+  }
 
-  it("re-tokenizes what a legacy writer added after the stamp, and advances the watermark", withStore(async (dbPath) => {
-    let core = open(dbPath);
-    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
-    core.close();
-    settle(dbPath);
-    core = open(dbPath);
-    expect(sentinel(core)).toBe(2);
-    const markBefore = watermark(core);
-    expect(markBefore).not.toBeNull(); // the mark is at the top: only the TRAILING path can fire now
-
-    // The pre-upgrade daemon commits a Korean observation while the store is already stamped.
-    const clockBefore = clockOf(core);
-    legacyWriterInserts(core, "legacy-obs-1", KO_WITH_ID);
-    expect(clockOf(core), "premise: a real legacy write advances the mutation clock").toBeGreaterThan(clockBefore);
-    expect([...postingsFor(core, "legacy-obs-1")]).toEqual(["zeta9"]); // Latin-only, as the old build wrote
-    core.close();
-
-    // A current build opens: the sentinel is already 2, so ONLY the watermark can catch this.
-    core = open(dbPath);
-    expect(sentinel(core)).toBe(2);
-    expect(postingsFor(core, "legacy-obs-1")).toEqual(lexicalTokens(KO_WITH_ID));
-    expect([...postingsFor(core, "legacy-obs-1")].some((t) => /[\p{scx=Hangul}]/u.test(t))).toBe(true);
-    expect(watermark(core)).toBe("legacy-obs-1"); // moved past the row it just healed
-    expect(watermark(core)).not.toBe(markBefore);
-    core.close();
-  }));
-
-  it("does not rewrite anything when nothing lies beyond the watermark", withStore(async (dbPath) => {
-    // THE FAST PATH. `observation_tokens` is a rowid table, so a DELETE+INSERT cycle would renumber
-    // its rows — comparing rowids detects a rewrite that comparing (observation_id, token) pairs
-    // would miss entirely.
+  it("heals a legacy resegment that moved NOTHING but the postings", withStore(async (dbPath) => {
     let core = open(dbPath);
     await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
     await core.store(KO_WITH_ID, { circle: CIRCLE, resolution: "forceNew" });
     core.close();
-    settle(dbPath); // mark now at the top, so the next open has genuinely nothing to do
+    settle(dbPath);
+
     core = open(dbPath);
-    const before = dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all();
-    expect(before.length).toBeGreaterThan(0);
-    const markBefore = watermark(core);
-    expect(markBefore).not.toBeNull();
+    const victim = (dbOf(core).prepare(`SELECT id FROM observations WHERE content = ?`).get(KO) as { id: string }).id;
+    const rowidBefore = rowidOf(core, victim);
+    const clockBefore = clockOf(core);
+    const updatedBefore = (dbOf(core).prepare(`SELECT updated_at AS u FROM observations WHERE id = ?`).get(victim) as { u: number }).u;
+    expect(hasMarker(core, victim)).toBe(true);
+
+    legacyResegmentRewrites(core, victim, KO);
+
+    // PREMISE: nothing a writer-side signal could have seen moved. Only the marker is gone.
+    expect(rowidOf(core, victim)).toBe(rowidBefore);
+    expect(clockOf(core)).toBe(clockBefore);
+    expect((dbOf(core).prepare(`SELECT updated_at AS u FROM observations WHERE id = ?`).get(victim) as { u: number }).u).toBe(updatedBefore);
+    expect(hasMarker(core, victim)).toBe(false);
+    expect(postingsFor(core, victim).size).toBe(0); // Latin-only tokenizer on pure Korean
     core.close();
 
     core = open(dbPath);
-    const after = dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all();
-    expect(after).toEqual(before);          // byte-identical, rowids included: nothing was rewritten
-    expect(watermark(core)).toBe(markBefore);
+    expect(postingsFor(core, victim)).toEqual(lexicalTokens(KO));
+    expect(hasMarker(core, victim)).toBe(true);
     core.close();
   }));
 
-  it("covers a trailing SOURCE observation rather than rescanning it every open", withStore(async (dbPath) => {
-    // A source row is skipped for tokenizing but must still move the mark, or every later open pays
-    // the scan again and the fast path above never engages.
+  it("heals a row a legacy writer APPENDED after the last repair", withStore(async (dbPath) => {
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    core.close();
+    settle(dbPath);
+
+    core = open(dbPath);
+    legacyWriterInserts(core, "legacy-obs-1", KO_WITH_ID);
+    expect([...postingsFor(core, "legacy-obs-1")]).toEqual(["zeta9"]);
+    expect(hasMarker(core, "legacy-obs-1")).toBe(false);
+    core.close();
+
+    core = open(dbPath);
+    expect(postingsFor(core, "legacy-obs-1")).toEqual(lexicalTokens(KO_WITH_ID));
+    expect(hasMarker(core, "legacy-obs-1")).toBe(true);
+    core.close();
+  }));
+
+  it("heals an in-place graft rewrite that never moved the row", withStore(async (dbPath) => {
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    await core.store(KO_WITH_ID, { circle: CIRCLE, resolution: "forceNew" });
+    core.close();
+    settle(dbPath);
+
+    core = open(dbPath);
+    const victim = (dbOf(core).prepare(`SELECT id FROM observations WHERE content = ?`).get(KO) as { id: string }).id;
+    const rowidBefore = rowidOf(core, victim);
+    legacyGraftRewrites(core, victim, KO);
+    expect(rowidOf(core, victim)).toBe(rowidBefore); // in place
+    expect(hasMarker(core, victim)).toBe(false);
+    core.close();
+
+    core = open(dbPath);
+    expect(postingsFor(core, victim)).toEqual(lexicalTokens(KO));
+    expect(hasMarker(core, victim)).toBe(true);
+    core.close();
+  }));
+
+  it("rewrites nothing when both probe counts are unchanged", withStore(async (dbPath) => {
+    // THE FAST PATH. `observation_tokens` is a rowid table, so a DELETE+INSERT cycle renumbers its
+    // rows — comparing rowids detects a rewrite that comparing (observation_id, token) pairs would
+    // miss entirely.
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    await core.store(KO_WITH_ID, { circle: CIRCLE, resolution: "forceNew" });
+    core.close();
+    settle(dbPath);
+
+    core = open(dbPath);
+    const before = dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all();
+    const probeBefore = probe(core);
+    expect(before.length).toBeGreaterThan(0);
+    core.close();
+
+    core = open(dbPath);
+    expect(dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all())
+      .toEqual(before);                       // byte-identical, rowids included: nothing rewritten
+    expect(probe(core)).toEqual(probeBefore);
+    core.close();
+  }));
+
+  it("does not re-scan forever because of a source observation, which never earns a marker", withStore(async (dbPath) => {
     let core = open(dbPath);
     await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
     const db = dbOf(core);
@@ -332,45 +389,18 @@ describe("the trailing watermark repair — a legacy writer on a stamped store",
     settle(dbPath);
 
     core = open(dbPath);
-    expect(watermark(core)).toBe("src-1");            // covered...
-    expect(postingsFor(core, "src-1").size).toBe(0);  // ...but deliberately not indexed
+    expect(hasMarker(core, "src-1")).toBe(false);       // excluded from tokenizing, so never marked
+    expect(postingsFor(core, "src-1").size).toBe(0);
+    const before = dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all();
+    core.close();
+
+    // ...and the probe still settles, so the next open does no work despite the permanent absence.
+    core = open(dbPath);
+    expect(dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all()).toEqual(before);
     core.close();
   }));
 
-  it("heals an in-place graft rewrite that never moved the row — the position anchor's blind spot", withStore(async (dbPath) => {
-    // FINDING F. The graft updates an existing observation's ENVELOPE (`ON CONFLICT(id) DO UPDATE`,
-    // rowid preserved) and re-derives its postings from the payload text. A legacy daemon doing that
-    // below the watermark leaves Latin-only tokens on a row the rowid anchor has already passed.
-    let core = open(dbPath);
-    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
-    await core.store(KO_WITH_ID, { circle: CIRCLE, resolution: "forceNew" });
-    core.close();
-    settle(dbPath);
-
-    core = open(dbPath);
-    const victim = (dbOf(core).prepare(`SELECT id FROM observations WHERE content = ?`).get(KO) as { id: string }).id;
-    const markBefore = watermark(core)!;
-    const rowidBefore = rowidOf(core, victim);
-    // PREMISE: the victim sits at or below the mark, so ONLY the clock dimension can reach it.
-    expect(rowidBefore).toBeLessThanOrEqual(rowidOf(core, markBefore));
-    expect(postingsFor(core, victim)).toEqual(lexicalTokens(KO)); // correct before the legacy graft
-
-    legacyGraftRewrites(core, victim, KO);
-    expect(postingsFor(core, victim).size).toBe(0);        // Latin-only tokenizer on pure Korean
-    expect(rowidOf(core, victim)).toBe(rowidBefore);       // in place: the anchor cannot see this
-    core.close();
-
-    core = open(dbPath);
-    expect(postingsFor(core, victim)).toEqual(lexicalTokens(KO));
-    expect([...postingsFor(core, victim)].some((t) => /[\p{scx=Hangul}]/u.test(t))).toBe(true);
-    core.close();
-  }));
-
-  it("never leaves the watermark ahead of what was actually tokenized", withStore(async (dbPath) => {
-    // The invariant crash-safety exists to preserve. A true mid-transaction crash is not cheaply
-    // reachable in-process — better-sqlite3 runs the whole pass inside one synchronous
-    // `immediateTransaction`, so there is no yield point to interrupt — so this asserts the property
-    // that transaction buys instead: everything at or below the mark really is current-tokenizer.
+  it("leaves every non-source observation marked and correctly tokenized after a repair", withStore(async (dbPath) => {
     let core = open(dbPath);
     await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
     await core.store(KO_WITH_ID, { circle: CIRCLE, resolution: "forceNew" });
@@ -378,14 +408,11 @@ describe("the trailing watermark repair — a legacy writer on a stamped store",
     core.close();
 
     core = open(dbPath);
-    const mark = watermark(core)!;
-    const markRow = rowidOf(core, mark);
-    const covered = dbOf(core).prepare(
-      `SELECT id, content, kind FROM observations WHERE rowid <= ? ORDER BY rowid`,
-    ).all(markRow) as Array<{ id: string; content: string; kind: string }>;
-    expect(covered.length).toBeGreaterThan(2);
-    for (const row of covered) {
+    const all = dbOf(core).prepare(`SELECT id, content, kind FROM observations`).all() as Array<{ id: string; content: string; kind: string }>;
+    expect(all.length).toBeGreaterThan(2);
+    for (const row of all) {
       if (row.kind === "source") continue;
+      expect(hasMarker(core, row.id), row.id).toBe(true);
       expect(postingsFor(core, row.id), row.id).toEqual(lexicalTokens(row.content));
     }
     core.close();
@@ -456,40 +483,113 @@ describe("a first_block pin converted from a legacy graft carries its postings",
  * index mixed in both halves with the sentinel lying about both.
  */
 describe("an older binary on a newer store touches nothing", () => {
-  const meta = (core: MonetCore) =>
-    dbOf(core).prepare(
-      `SELECT lexical_tokens_version AS version, lexical_tokens_reindexed_through AS through,
-              lexical_tokens_reindexed_at AS clock FROM sync_meta WHERE singleton = 1`,
-    ).get() as { version: number; through: string | null; clock: number };
+  const version = (core: MonetCore): number =>
+    (dbOf(core).prepare(`SELECT lexical_tokens_version AS v FROM sync_meta WHERE singleton = 1`).get() as { v: number }).v;
 
-  it("leaves postings, sentinel and watermark untouched when the store is stamped ahead", withStore(async (dbPath) => {
+  it("leaves postings and the sentinel untouched when the store is stamped ahead", withStore(async (dbPath) => {
     let core = open(dbPath);
     await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
     core.close();
     settle(dbPath);
 
-    // A FUTURE build (version 3) owned this store: it stamped 3 and left its own watermark.
+    // A FUTURE build (version 3) owned this store: it stamped 3, and its markers read ' lex:3'.
     core = open(dbPath);
-    const futureMark = meta(core).through;
-    dbOf(core).prepare(`UPDATE sync_meta SET lexical_tokens_version = 3 WHERE singleton = 1`).run();
-    // ...and rows exist beyond that watermark, which is what would drag this build into the
-    // trailing repair if the version guard were missing.
-    legacyWriterInserts(core, "written-after-v3", KO_WITH_ID);
-    const postingsBefore = dbOf(core).prepare(
-      `SELECT observation_id, token FROM observation_tokens ORDER BY observation_id, token`,
-    ).all();
-    const metaBefore = meta(core);
-    expect(metaBefore.version).toBe(3);
+    const db = dbOf(core);
+    db.prepare(`UPDATE sync_meta SET lexical_tokens_version = 3 WHERE singleton = 1`).run();
+    db.prepare(`UPDATE observation_tokens SET token = ? WHERE token = ?`).run(lexicalTokensMarker(3), MARKER);
+    // ...and a row exists that this build would read as stale, which is what would drag it into the
+    // repair if the version guard were missing.
+    legacyWriterInserts(core, "written-under-v3", KO_WITH_ID);
+    const postingsBefore = db.prepare(`SELECT observation_id, token FROM observation_tokens ORDER BY observation_id, token`).all();
+    const probeBefore = probe(core);
+    expect(version(core)).toBe(3);
     core.close();
 
-    // This build is version 2. It must decline entirely.
+    // This build is version 2. It must decline entirely rather than rewrite v3 rows with its own
+    // tokenizer and stamp itself in.
     core = open(dbPath);
-    expect(meta(core).version).toBe(3);                    // NOT downgraded to 2
-    expect(meta(core).through).toBe(futureMark);           // watermark unmoved
-    expect(meta(core).clock).toBe(metaBefore.clock);       // clock unmoved
-    expect(dbOf(core).prepare(
-      `SELECT observation_id, token FROM observation_tokens ORDER BY observation_id, token`,
-    ).all()).toEqual(postingsBefore);                      // not one posting rewritten
+    expect(version(core)).toBe(3);                       // NOT downgraded
+    expect(probe(core)).toEqual(probeBefore);            // probe counts unmoved
+    expect(dbOf(core).prepare(`SELECT observation_id, token FROM observation_tokens ORDER BY observation_id, token`).all())
+      .toEqual(postingsBefore);                          // not one posting rewritten
     core.close();
   }));
+});
+
+/**
+ * A store old enough to predate the v8 sync-closure columns must still open. The lexical repair runs
+ * in the constructor, so anything it needs has to exist by then — and `ensureSyncClosureSchema`,
+ * which adds `observations.updated_at`, runs INSIDE `migrate()`, after `init()`. An earlier draft of
+ * this repair created an index on that column from `init()` and made every such store unopenable.
+ */
+describe("a pre-v8 store, without the sync-closure columns, still opens", () => {
+  it("opens, migrates and tokenizes when observations has no updated_at column", withStore(async (dbPath) => {
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    const id = (dbOf(core).prepare(`SELECT id FROM observations`).get() as { id: string }).id;
+    // Wind the schema back to the pre-v8 shape: drop the sync-closure columns from observations and
+    // the lexical sentinels from sync_meta, exactly what a store from before those rungs looks like.
+    // The sync-clock TRIGGERS go too — `ensureSyncClosureSchema` installs them alongside the columns
+    // they read, so a store without the columns never had the triggers either.
+    for (const trigger of ["sync_observations_insert", "sync_observations_update"]) {
+      dbOf(core).exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+    }
+    for (const column of ["updated_at", "sync_revision", "sync_writer"]) {
+      dbOf(core).exec(`ALTER TABLE observations DROP COLUMN ${column}`);
+    }
+    for (const column of ["lexical_tokens_version", "lexical_tokens_observation_count", "lexical_tokens_marker_count"]) {
+      dbOf(core).exec(`ALTER TABLE sync_meta DROP COLUMN ${column}`);
+    }
+    dbOf(core).exec(`DELETE FROM observation_tokens`);
+    expect((dbOf(core).prepare(`PRAGMA table_info(observations)`).all() as Array<{ name: string }>)
+      .some((c) => c.name === "updated_at")).toBe(false); // premise: the column really is gone
+    core.close();
+
+    // The whole assertion is that this does not throw.
+    core = open(dbPath);
+    expect((dbOf(core).prepare(`PRAGMA table_info(observations)`).all() as Array<{ name: string }>)
+      .some((c) => c.name === "updated_at")).toBe(true);  // migrate() put it back
+    expect(postingsFor(core, id)).toEqual(lexicalTokens(KO)); // and the repair still ran
+    expect(hasMarker(core, id)).toBe(true);
+    core.close();
+  }));
+});
+
+/**
+ * NFC composes what Unicode has a composed form for. Where it does not, the mark is still part of
+ * the word and must not cut the run in half.
+ */
+describe("combining and variation marks inside a CJK run", () => {
+  it("keeps a run whole across a mark NFC cannot compose (Ainu セ゚)", () => {
+    const plain = "セト";
+    const marked = "セ゚ト";                       // セ U+309A ト
+    expect(marked.normalize("NFC")).toBe(marked); // premise: NFC leaves this alone
+    expect([...marked].length).toBe(3);
+    expect(lexicalTokens(marked)).toEqual(lexicalTokens(plain));
+    expect([...lexicalTokens(marked)]).toEqual(["セト"]);
+    expect(lexicalCoverage(marked)).toBeCloseTo(1, 10);
+  });
+
+  it("keeps a Han run whole across an ideographic variation selector", () => {
+    const plain = "見識";
+    const marked = "見󠄀識";                        // 見 U+E0100 識
+    expect(marked.normalize("NFC")).toBe(marked);
+    expect([...marked].length).toBe(3);
+    expect(lexicalTokens(marked)).toEqual(lexicalTokens(plain));
+    expect([...lexicalTokens(marked)]).toEqual(["見識"]);
+    expect(lexicalCoverage(marked)).toBeCloseTo(1, 10);
+  });
+
+  it("does not let a stray mark open a run of its own", () => {
+    // A mark may only extend a run that a real CJK character already started.
+    expect(lexicalTokens("abc ゚ def").size).toBe(2); // `abc`, `def` — the mark yields nothing
+    expect(lexicalTokens("゚").size).toBe(0);
+  });
+
+  it("still composes the marks Unicode CAN compose, rather than dropping them", () => {
+    // The distinction が/か is carried by NFC, so dropping marks must not reach it: these are
+    // different tokens, and must stay different.
+    expect([...lexicalTokens("がき")]).toEqual(["がき"]);
+    expect(lexicalTokens("かき")).not.toEqual(lexicalTokens("がき"));
+  });
 });
