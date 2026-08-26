@@ -6785,10 +6785,15 @@ export class MonetCore {
    * recomputeSourceConceptBody, never from observations.embedding — so re-embedding one here
    * would still be pure waste, not a fix.
    *
-   * Deliberately un-filtered by supersession: detach()'s own read of a native concept's
-   * observations (srcObsRows) is itself unfiltered by superseded_by/superseded_at, so a superseded
-   * observation's embedding can still be read and written back into a concept's vector via that
-   * path. Re-embedding only the active subset would leave that same gap half-closed.
+   * Deliberately un-filtered by supersession, because A SUPERSEDED ROW CAN COME BACK TO LIFE. The
+   * reason used to be that detach() read observations without the live predicate and could write a
+   * dead row's vector straight into a concept's centroid; that is no longer true — every centroid
+   * writer now averages `liveConceptEvidence` only. What survives that change is revival: detach()'s
+   * inbound cleanup CLEARS both supersession columns on a remaining row whose superseder moves away,
+   * and the outbound half does the same for a moved row whose superseder stays behind. Either one
+   * turns a dead observation into live evidence, and the very next centroid taken over it reads its
+   * stored vector. Re-embedding only the currently-active subset would leave those rows in the OLD
+   * space, ready to re-open the incompatible-space comparison the moment they are revived.
    *
    * No CAS/fingerprint retry (unlike recomputeSourceConceptBody): this exists for the exclusively
    * locked migrateEmbeddings lifecycle, not for the live concurrent-write path — the same
