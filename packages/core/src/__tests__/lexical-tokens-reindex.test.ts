@@ -29,6 +29,43 @@ const retiredTokens = (t: string): Set<string> => new Set(t.toLowerCase().match(
 const KO = "페리는 매시 십오분에 섬으로 출발한다";
 const KO_WITH_ID = "zeta9 페리는 주말에만 항구에서 섬으로 출발한다";
 
+
+/** Shared by both watermark describes below. */
+const watermark = (core: MonetCore): string | null =>
+  (dbOf(core).prepare(`SELECT lexical_tokens_reindexed_through AS w FROM sync_meta WHERE singleton = 1`)
+      .get() as { w: string | null }).w;
+const clockOf = (core: MonetCore): number =>
+  (dbOf(core).prepare(`SELECT last_mutation_at AS t FROM sync_meta WHERE singleton = 1`).get() as { t: number }).t;
+/**
+ * Bring the mark up to the top of the table. A store's FIRST open happens before it holds any
+ * observations, so the mark is set to NULL there and only reaches the newest row at the next open.
+ * The scenario under test needs a mark that already sits at the top, which is what a real upgraded
+ * store looks like — its first open sees every row it has.
+ */
+const settle = (dbPath: string): void => { open(dbPath).close(); };
+/**
+ * A pre-upgrade binary's store(): insert the observation, then write postings with the Latin-only
+ * tokenizer. Bypasses the engine's tokenizer, because the engine cannot be made to emit the old
+ * tokens any more — which is the point of the scenario.
+ *
+ * `sync_writer` IS LEFT NULL ON PURPOSE, matching the real insert (engine.ts store()): that is the
+ * condition `sync_observations_insert` fires on, and the trigger is what advances the global
+ * mutation clock. Binding it here would suppress the trigger and simulate a writer that does not
+ * exist — an earlier draft of this helper did exactly that and made the repair look broken.
+ */
+function legacyWriterInserts(core: MonetCore, id: string, content: string): void {
+  const db = dbOf(core);
+  const donor = db.prepare(`SELECT embedding, circle, concept_id FROM observations LIMIT 1`)
+    .get() as { embedding: string; circle: string; concept_id: string | null };
+  db.prepare(
+    `INSERT INTO observations
+       (id, content, embedding, kind, circle, concept_id, author_agent_id, created_at)
+     VALUES (?, ?, ?, 'statement', ?, ?, 'legacy-daemon', ?)`,
+  ).run(id, content, donor.embedding, donor.circle, donor.concept_id, Date.now());
+  const insert = db.prepare(`INSERT OR IGNORE INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
+  for (const token of retiredTokens(content)) insert.run(id, token);
+}
+
 function withStore(fn: (dbPath: string) => Promise<void> | void): () => Promise<void> {
   return async () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-lexical-reindex-"));
@@ -201,38 +238,34 @@ describe("canonically equivalent text tokenizes identically (NFC)", () => {
  * mis-tokenized. These pin the trailing repair that heals them at the next open.
  */
 describe("the trailing watermark repair — a legacy writer on a stamped store", () => {
-  const watermark = (core: MonetCore): string | null =>
-    (dbOf(core).prepare(`SELECT lexical_tokens_reindexed_through AS w FROM sync_meta WHERE singleton = 1`)
-      .get() as { w: string | null }).w;
 
   const rowidOf = (core: MonetCore, id: string): number =>
     (dbOf(core).prepare(`SELECT rowid AS r FROM observations WHERE id = ?`).get(id) as { r: number }).r;
 
-  /**
-   * Exactly what a pre-upgrade binary does: insert the observation, then write postings with the
-   * Latin-only tokenizer. Bypasses the engine entirely, because the engine cannot be made to write
-   * the old tokens any more — which is the point of the scenario.
-   */
-  function legacyWriterInserts(core: MonetCore, id: string, content: string): void {
-    const db = dbOf(core);
-    const donor = db.prepare(`SELECT embedding, circle, concept_id FROM observations LIMIT 1`)
-      .get() as { embedding: string; circle: string; concept_id: string | null };
-    db.prepare(
-      `INSERT INTO observations
-         (id, content, embedding, kind, circle, concept_id, author_agent_id, created_at, updated_at, sync_revision, sync_writer)
-       VALUES (?, ?, ?, 'statement', ?, ?, 'legacy-daemon', ?, ?, 1, 'legacy-daemon')`,
-    ).run(id, content, donor.embedding, donor.circle, donor.concept_id, Date.now(), Date.now());
-    const insert = db.prepare(`INSERT OR IGNORE INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
-    for (const token of retiredTokens(content)) insert.run(id, token);
-  }
+
 
   /**
-   * Bring the mark up to the top of the table. A store's FIRST open happens before it holds any
-   * observations, so the mark is set to NULL there and only reaches the newest row at the next open.
-   * The scenario under test needs a mark that already sits at the top, which is what a real upgraded
-   * store looks like — its first open sees every row it has.
+   * A pre-upgrade binary's GRAFT of a higher-revision shell for an observation that already exists.
+   * The real path is `INSERT ... ON CONFLICT(id) DO UPDATE SET <envelope columns>` — content is not
+   * among them — followed by deleting that observation's postings and re-deriving them from the
+   * payload text with whatever tokenizer is running. The row is updated IN PLACE, so its rowid never
+   * moves and the position anchor cannot see it. `updated_at` is bound from `nextSyncTimestamp()`,
+   * which bumps `last_mutation_at` first, so both are advanced here exactly as the graft does.
    */
-  const settle = (dbPath: string): void => { open(dbPath).close(); };
+  function legacyGraftRewrites(core: MonetCore, id: string, payloadText: string): void {
+    const db = dbOf(core);
+    db.prepare(
+      `UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at + 1, ?) WHERE singleton = 1`,
+    ).run(Date.now());
+    const relayAt = clockOf(core);
+    db.prepare(
+      `UPDATE observations SET updated_at = ?, sync_revision = sync_revision + 1, sync_writer = 'legacy-peer' WHERE id = ?`,
+    ).run(relayAt, id);
+    db.prepare(`DELETE FROM observation_tokens WHERE observation_id = ?`).run(id);
+    const insert = db.prepare(`INSERT OR IGNORE INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
+    for (const token of retiredTokens(payloadText)) insert.run(id, token);
+  }
+
 
   it("re-tokenizes what a legacy writer added after the stamp, and advances the watermark", withStore(async (dbPath) => {
     let core = open(dbPath);
@@ -245,7 +278,9 @@ describe("the trailing watermark repair — a legacy writer on a stamped store",
     expect(markBefore).not.toBeNull(); // the mark is at the top: only the TRAILING path can fire now
 
     // The pre-upgrade daemon commits a Korean observation while the store is already stamped.
+    const clockBefore = clockOf(core);
     legacyWriterInserts(core, "legacy-obs-1", KO_WITH_ID);
+    expect(clockOf(core), "premise: a real legacy write advances the mutation clock").toBeGreaterThan(clockBefore);
     expect([...postingsFor(core, "legacy-obs-1")]).toEqual(["zeta9"]); // Latin-only, as the old build wrote
     core.close();
 
@@ -299,6 +334,35 @@ describe("the trailing watermark repair — a legacy writer on a stamped store",
     core = open(dbPath);
     expect(watermark(core)).toBe("src-1");            // covered...
     expect(postingsFor(core, "src-1").size).toBe(0);  // ...but deliberately not indexed
+    core.close();
+  }));
+
+  it("heals an in-place graft rewrite that never moved the row — the position anchor's blind spot", withStore(async (dbPath) => {
+    // FINDING F. The graft updates an existing observation's ENVELOPE (`ON CONFLICT(id) DO UPDATE`,
+    // rowid preserved) and re-derives its postings from the payload text. A legacy daemon doing that
+    // below the watermark leaves Latin-only tokens on a row the rowid anchor has already passed.
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    await core.store(KO_WITH_ID, { circle: CIRCLE, resolution: "forceNew" });
+    core.close();
+    settle(dbPath);
+
+    core = open(dbPath);
+    const victim = (dbOf(core).prepare(`SELECT id FROM observations WHERE content = ?`).get(KO) as { id: string }).id;
+    const markBefore = watermark(core)!;
+    const rowidBefore = rowidOf(core, victim);
+    // PREMISE: the victim sits at or below the mark, so ONLY the clock dimension can reach it.
+    expect(rowidBefore).toBeLessThanOrEqual(rowidOf(core, markBefore));
+    expect(postingsFor(core, victim)).toEqual(lexicalTokens(KO)); // correct before the legacy graft
+
+    legacyGraftRewrites(core, victim, KO);
+    expect(postingsFor(core, victim).size).toBe(0);        // Latin-only tokenizer on pure Korean
+    expect(rowidOf(core, victim)).toBe(rowidBefore);       // in place: the anchor cannot see this
+    core.close();
+
+    core = open(dbPath);
+    expect(postingsFor(core, victim)).toEqual(lexicalTokens(KO));
+    expect([...postingsFor(core, victim)].some((t) => /[\p{scx=Hangul}]/u.test(t))).toBe(true);
     core.close();
   }));
 
@@ -383,4 +447,49 @@ describe("a first_block pin converted from a legacy graft carries its postings",
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+/**
+ * The version comparison is one-directional. A newer tokenizer repairs what an older one wrote; an
+ * older binary opening a store a newer one has stamped must leave the index completely alone, or it
+ * rewrites the newest rows with the older tokenizer AND stamps the sentinel back down, leaving the
+ * index mixed in both halves with the sentinel lying about both.
+ */
+describe("an older binary on a newer store touches nothing", () => {
+  const meta = (core: MonetCore) =>
+    dbOf(core).prepare(
+      `SELECT lexical_tokens_version AS version, lexical_tokens_reindexed_through AS through,
+              lexical_tokens_reindexed_at AS clock FROM sync_meta WHERE singleton = 1`,
+    ).get() as { version: number; through: string | null; clock: number };
+
+  it("leaves postings, sentinel and watermark untouched when the store is stamped ahead", withStore(async (dbPath) => {
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    core.close();
+    settle(dbPath);
+
+    // A FUTURE build (version 3) owned this store: it stamped 3 and left its own watermark.
+    core = open(dbPath);
+    const futureMark = meta(core).through;
+    dbOf(core).prepare(`UPDATE sync_meta SET lexical_tokens_version = 3 WHERE singleton = 1`).run();
+    // ...and rows exist beyond that watermark, which is what would drag this build into the
+    // trailing repair if the version guard were missing.
+    legacyWriterInserts(core, "written-after-v3", KO_WITH_ID);
+    const postingsBefore = dbOf(core).prepare(
+      `SELECT observation_id, token FROM observation_tokens ORDER BY observation_id, token`,
+    ).all();
+    const metaBefore = meta(core);
+    expect(metaBefore.version).toBe(3);
+    core.close();
+
+    // This build is version 2. It must decline entirely.
+    core = open(dbPath);
+    expect(meta(core).version).toBe(3);                    // NOT downgraded to 2
+    expect(meta(core).through).toBe(futureMark);           // watermark unmoved
+    expect(meta(core).clock).toBe(metaBefore.clock);       // clock unmoved
+    expect(dbOf(core).prepare(
+      `SELECT observation_id, token FROM observation_tokens ORDER BY observation_id, token`,
+    ).all()).toEqual(postingsBefore);                      // not one posting rewritten
+    core.close();
+  }));
 });

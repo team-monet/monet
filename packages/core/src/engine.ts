@@ -3132,6 +3132,11 @@ export class MonetCore {
       CREATE INDEX IF NOT EXISTS idx_concept_dirty ON concepts(dirty);
       CREATE INDEX IF NOT EXISTS idx_obs_concept ON observations(concept_id);
       CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id);
+      -- The second dimension of the lexical-posting repair (see reindexLexicalTokens). Without it
+      -- that repair's OR-predicate degrades to a full table SCAN on every open where anything at all
+      -- was written — measured at 10.1ms over 2554 observations, and linear from there. With it,
+      -- SQLite plans MULTI-INDEX OR over the rowid range and this index and the probe stays flat.
+      CREATE INDEX IF NOT EXISTS idx_obs_updated_at ON observations(updated_at);
       CREATE INDEX IF NOT EXISTS idx_concept_tombstones_retired_at ON concept_tombstones(retired_at);
       CREATE INDEX IF NOT EXISTS idx_concept_restorations_restored_at ON concept_restorations(restored_at);
       CREATE INDEX IF NOT EXISTS idx_contradiction_concept ON contradictions(concept_id, status);
@@ -3214,6 +3219,9 @@ export class MonetCore {
         -- The highest observation (by id, see reindexLexicalTokens) whose postings this build wrote.
         -- NULL = nothing tokenized yet, which a fresh store resolves on its first open.
         lexical_tokens_reindexed_through TEXT,
+        -- The sync clock the pass last ran at, for the second repair dimension (an in-place graft
+        -- rewrite keeps its rowid; see reindexLexicalTokens). 0 = never run.
+        lexical_tokens_reindexed_at INTEGER NOT NULL DEFAULT 0,
         clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical')),
         embedder_model_id TEXT,
         embedder_pin_source TEXT CHECK (embedder_pin_source IN ('created', 'backfilled', 'migrated')),
@@ -3444,6 +3452,9 @@ export class MonetCore {
     }
     if (!syncMetaCols.some((c) => c.name === "lexical_tokens_reindexed_through")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN lexical_tokens_reindexed_through TEXT`);
+    }
+    if (!syncMetaCols.some((c) => c.name === "lexical_tokens_reindexed_at")) {
+      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN lexical_tokens_reindexed_at INTEGER NOT NULL DEFAULT 0`);
     }
     if (!syncMetaCols.some((c) => c.name === "clock_mode")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))`);
@@ -4297,11 +4308,16 @@ export class MonetCore {
    *
    * THE TRAILING SET IS EVERYTHING WRITTEN SINCE THE LAST OPEN, not everything written by a legacy
    * build — this cannot tell the two apart, and does not try. When nothing was written it is empty
-   * and the whole pass is two indexed lookups (measured at 7 microseconds on a 2554-observation
-   * store, against ~1.5s for the full rebuild). Otherwise it re-tokenizes those rows, which is
-   * wasted work for the ones a current build already indexed correctly and is idempotent for all of
-   * them. That waste is bounded by the write rate between opens, and buying it back is what the
-   * final paragraph below refuses to do.
+   * and the whole pass is a `sync_meta` read plus one indexed lookup, because the global mutation
+   * clock not having moved is proof that no writer of any kind has committed. Otherwise it
+   * re-tokenizes those rows, which is wasted work for the ones a current build already indexed
+   * correctly and is idempotent for all of them. That waste is bounded by the write rate between
+   * opens, and buying it back is what the final paragraph below refuses to do.
+   *
+   * THE VERSION COMPARISON IS ONE-DIRECTIONAL. A newer tokenizer repairs what an older one wrote;
+   * an older binary opening a store a newer one has stamped returns without touching anything at
+   * all. See the guard at the top of the method for why the alternative corrupts the index in both
+   * halves at once.
    *
    * IT IS AN OBSERVATION ID, NOT A ROWID, and that is the whole reason it survives maintenance.
    * `observations` is a rowid table whose primary key is TEXT, so it has no INTEGER PRIMARY KEY
@@ -4314,11 +4330,17 @@ export class MonetCore {
    * resolves at all, the row was hard-deleted and the pass rebuilds wholesale rather than trusting a
    * position it cannot place.
    *
-   * WHY A POSITION IS SOUND AT ALL: `observations.content` is immutable. Every `UPDATE observations
-   * SET` in this file touches `updated_at`, `sync_writer`, `concept_id`, `superseded_by`,
-   * `superseded_at`, `embedding` or `circle` — never `content`. So a row's postings can only be
-   * wrong because of WHO INSERTED IT, never because its text changed afterwards, and "everything at
-   * or below this row is correct" stays true once established.
+   * A POSITION ALONE IS NOT ENOUGH, AND THE REASON CORRECTS AN EARLIER CLAIM IN THIS BLOCK.
+   * `observations.content` really is immutable — every `UPDATE observations SET` in this file
+   * touches `updated_at`, `sync_writer`, `concept_id`, `superseded_by`, `superseded_at`, `embedding`
+   * or `circle`, and the graft's `ON CONFLICT(id) DO UPDATE SET` list is envelope columns only, with
+   * no `content` among them. What does NOT follow, and what an earlier draft of this comment claimed
+   * anyway, is that a row's postings can therefore only be wrong because of who INSERTED it. The
+   * graft rewrites postings on an envelope-only update: `r.changes > 0` is true for the DO UPDATE
+   * branch, and the block under it deletes that observation's tokens and re-derives them from the
+   * payload's text with whatever tokenizer is running. The row is updated in place, so its rowid
+   * never moves and the anchor cannot see it. Hence the second dimension, `updated_at`, described at
+   * the query that uses it.
    *
    * DO NOT ADVANCE THE MARK FROM `store()` TO MAKE THE TRAILING SET EMPTY. It looks like a free
    * optimisation and it is a correctness hole: writers interleave, so a current-build row at rowid
@@ -4328,54 +4350,89 @@ export class MonetCore {
    * handful of rows written since the last open is the price of that, and it is idempotent.
    */
   private reindexLexicalTokens(): void {
-    // A custom StoragePort, or a store this build never migrated, may not carry the sentinel. No
+    // A custom StoragePort, or a store this build never migrated, may not carry the sentinels. No
     // column means no gate, and running ungated would repeat this on every open.
     const cols = this.db.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
-    if (!cols.some((c) => c.name === "lexical_tokens_version")) return;
-    if (!cols.some((c) => c.name === "lexical_tokens_reindexed_through")) return;
+    for (const needed of ["lexical_tokens_version", "lexical_tokens_reindexed_through", "lexical_tokens_reindexed_at"]) {
+      if (!cols.some((c) => c.name === needed)) return;
+    }
     const gate = this.db.prepare(
-      `SELECT lexical_tokens_version AS version, lexical_tokens_reindexed_through AS through
+      `SELECT lexical_tokens_version AS version, lexical_tokens_reindexed_through AS through,
+              lexical_tokens_reindexed_at AS clock, last_mutation_at AS now
          FROM sync_meta WHERE singleton = 1`,
-    ).get() as { version: number; through: string | null } | undefined;
+    ).get() as { version: number; through: string | null; clock: number; now: number } | undefined;
     if (gate === undefined) return;
 
-    // THE FAST PATH, and the one that runs on almost every open. A watermark that still resolves and
-    // has nothing after it means every observation in the store was tokenized by this build, so
-    // there is nothing to repair and no write transaction worth opening. Two indexed lookups.
-    if (gate.version >= LEXICAL_TOKENS_VERSION && gate.through !== null) {
-      const trailing = this.db.prepare(
-        `SELECT 1 FROM observations
-          WHERE rowid > COALESCE((SELECT rowid FROM observations WHERE id = ?), -1) LIMIT 1`,
-      ).get(gate.through);
-      // `through` resolving to nothing means the row was hard-deleted (or rowids were renumbered out
-      // from under it): fall through to the transaction, which rebuilds wholesale rather than
-      // trusting a position it can no longer place.
-      const resolvable = this.db.prepare(`SELECT 1 FROM observations WHERE id = ?`).get(gate.through) !== undefined;
-      if (resolvable && trailing === undefined) return;
+    // AN OLDER BINARY ON A NEWER STORE TOUCHES NOTHING (Codex P2, PR #97 round 3). If a later
+    // tokenizer has owned this index, every row it wrote is BETTER than anything this build can
+    // produce, and the trailing repair below would rewrite the newest rows with an older tokenizer
+    // and then stamp the sentinel back down — leaving version-N postings before the watermark and
+    // version-(N-1) after it, with the sentinel lying about both. The asymmetry is deliberate and
+    // one-directional: a newer binary repairs what an older one wrote, never the reverse. Rows THIS
+    // build writes from here on will indeed be tokenized with the older tokenizer, and that is
+    // exactly what the newer binary's own trailing repair exists to heal at its next open.
+    if (gate.version > LEXICAL_TOKENS_VERSION) return;
+
+    // THE FAST PATH, and the one that runs on almost every open. `last_mutation_at` advances on
+    // every write any binary makes (the sync-clock triggers for local writes, `nextSyncTimestamp()`
+    // for grafts), so a clock that has not moved since the pass ran means NOTHING has been written
+    // by anyone and nothing can need repair. One row of sync_meta, already read above, plus one
+    // indexed lookup to confirm the watermark still names a row.
+    if (gate.version === LEXICAL_TOKENS_VERSION && gate.through !== null && gate.clock >= gate.now) {
+      if (this.db.prepare(`SELECT 1 FROM observations WHERE id = ?`).get(gate.through) !== undefined) return;
     }
 
     this.db.immediateTransaction((): void => {
       // Re-read under the write reservation: another process may have finished between the unlocked
       // probe above and this transaction, and the pass must not run twice.
       const pending = this.db.prepare(
-        `SELECT lexical_tokens_version AS version, lexical_tokens_reindexed_through AS through
+        `SELECT lexical_tokens_version AS version, lexical_tokens_reindexed_through AS through,
+                lexical_tokens_reindexed_at AS clock, last_mutation_at AS now
            FROM sync_meta WHERE singleton = 1`,
-      ).get() as { version: number; through: string | null } | undefined;
+      ).get() as { version: number; through: string | null; clock: number; now: number } | undefined;
       if (pending === undefined) return;
+      if (pending.version > LEXICAL_TOKENS_VERSION) return; // re-checked under the lock; see above
       const anchor = pending.through === null
         ? undefined
         : this.db.prepare(`SELECT rowid AS rowid FROM observations WHERE id = ?`).get(pending.through) as { rowid: number } | undefined;
       // FULL REBUILD when the tokenizer moved, when nothing has ever been stamped, or when the
       // watermark no longer names a row. TRAILING REPAIR otherwise. Same code below either way —
-      // only the floor differs — so the two cannot drift apart.
+      // only the two floors differ — so the two cannot drift apart.
       const full = pending.version < LEXICAL_TOKENS_VERSION || anchor === undefined;
-      const floor = full ? -1 : anchor.rowid;
+      const rowFloor = full ? -1 : anchor.rowid;
+      const clockFloor = full ? -1 : pending.clock;
 
+      /*
+       * TWO DIMENSIONS, because a position alone has a blind spot (Codex P2, PR #97 round 3).
+       * The graft path rewrites an EXISTING observation's postings in place — `INSERT ... ON
+       * CONFLICT(id) DO UPDATE`, which updates the row and PRESERVES its rowid — so a legacy daemon
+       * grafting a higher-revision shell re-derives that row's tokens with the old tokenizer without
+       * appending anything the rowid anchor could see. `updated_at` is what that rewrite cannot
+       * skip: the graft binds it to `nextSyncTimestamp()`, whose `MAX(last_mutation_at + 1, wall)`
+       * is strictly monotone regardless of wall-clock direction, and local writes get the same
+       * counter through the sync-clock triggers.
+       *
+       * OVER-COVERAGE IS DELIBERATE AND CHEAP. A row touched for a reason that changed no text — a
+       * circle move, a supersede, a concept rebind — also advances `updated_at` and so is
+       * re-tokenized here to byte-identical postings. Paying for a few idempotent rewrites is worth
+       * not having to enumerate which envelope updates can and cannot disturb the index.
+       */
+      /*
+       * `updated_at > ?` rather than `COALESCE(updated_at, 0) > ?`, and NO `ORDER BY`. Both are
+       * load-bearing for the plan rather than stylistic: wrapping the column in a function makes the
+       * index unusable, and ordering by rowid forces a rowid-ordered traversal that rules out the
+       * union. With neither, SQLite plans MULTI-INDEX OR across the rowid range and idx_obs_updated_at;
+       * with either, it falls back to SCAN. Nothing downstream needs the ordering — the mark is
+       * computed by its own query below, not taken from the last row here.
+       *
+       * A row with NULL `updated_at` (pre-v8, before the column existed) compares false, which is
+       * the same answer COALESCE gave for any non-negative floor. It cannot be missed regardless:
+       * such rows are ancient, so the full rebuild's `rowid > -1` has always covered them.
+       */
       const rows = this.db.prepare(
         `SELECT rowid AS rowid, id AS id, content AS content, kind AS kind
-           FROM observations WHERE rowid > ? ORDER BY rowid`,
-      ).all(floor) as Array<{ rowid: number; id: string; content: string; kind: string }>;
-      if (rows.length === 0 && !full) return; // raced: another process advanced it first
+           FROM observations WHERE rowid > ? OR updated_at > ?`,
+      ).all(rowFloor, clockFloor) as Array<{ rowid: number; id: string; content: string; kind: string }>;
 
       if (full) {
         // DELETE EVERYTHING, not a per-observation replace: a row whose observation has since been
@@ -4392,14 +4449,27 @@ export class MonetCore {
         for (const token of lexicalTokens(row.content)) insert.run(row.id, token);
       }
 
-      // THE WATERMARK IS THE HIGHEST ROW CONSIDERED, of ANY kind — a trailing source observation is
-      // skipped for tokenizing but still covered, or every later open would rescan it forever.
-      // Written in THIS transaction, from the very rows just processed, so a crash cannot leave the
-      // mark ahead of the work: either both land or neither does.
-      const covered = rows.length > 0 ? rows[rows.length - 1].id : pending.through;
+      /*
+       * THE MARK IS THE TABLE'S HIGHEST ROW, NOT THE LAST ROW PROCESSED. With two dimensions the
+       * selected set is no longer a suffix: a clock-selected rewrite of an OLD row can be the last
+       * element of `rows`, and taking its id would drag the anchor BACKWARDS and re-tokenize the
+       * rows above it on every subsequent open. Everything at or below the table maximum is correct
+       * once this pass commits — either it was already below both floors, or it was selected and
+       * just rewritten — so the maximum is the honest mark. Of ANY kind: a trailing source
+       * observation is skipped for tokenizing but still covered, or later opens rescan it forever.
+       *
+       * BOTH DIMENSIONS ADVANCE IN THIS TRANSACTION, alongside the rows they describe, so a crash
+       * cannot leave either mark ahead of the work: all three land together or none do. The clock
+       * stored is the one read at the TOP of this transaction, so any write that lands after it —
+       * including one already holding a stamp and blocked on this very write reservation — sits
+       * strictly above it and is caught at the next open.
+       */
+      const top = this.db.prepare(`SELECT id AS id FROM observations ORDER BY rowid DESC LIMIT 1`).get() as { id: string } | undefined;
       this.db.prepare(
-        `UPDATE sync_meta SET lexical_tokens_version = ?, lexical_tokens_reindexed_through = ? WHERE singleton = 1`,
-      ).run(LEXICAL_TOKENS_VERSION, covered);
+        `UPDATE sync_meta
+            SET lexical_tokens_version = ?, lexical_tokens_reindexed_through = ?, lexical_tokens_reindexed_at = ?
+          WHERE singleton = 1`,
+      ).run(LEXICAL_TOKENS_VERSION, top?.id ?? null, pending.now);
     })();
   }
 
@@ -4460,6 +4530,7 @@ export class MonetCore {
     addColumn("sync_meta", "centroids_reprojected", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "lexical_tokens_version", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "lexical_tokens_reindexed_through", "TEXT");
+    addColumn("sync_meta", "lexical_tokens_reindexed_at", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "clock_mode", "TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))");
     addColumn("concept_tombstones", "updated_at", "INTEGER");
     addColumn("concept_restorations", "updated_at", "INTEGER");
