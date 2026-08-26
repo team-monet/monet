@@ -4297,12 +4297,20 @@ export class MonetCore {
    * against a ~44 ms open, projecting to ~15 ms at 50k. That is what the retired probe was
    * defending, and it was not worth an argument that needed defending.
    *
-   * THE POPULATION IS EVERY NON-SOURCE OBSERVATION, live or superseded, attached or not — not the
-   * reader's filter (live and attached), because liveness changes after the pass has run and a
+   * THE MARKER MEANS "UP TO DATE WITH TOKENIZER vN", NOT "HAS POSTINGS", and the difference is what
+   * lets EVERY observation carry one. A native row is up to date when it has this tokenizer's
+   * postings and the marker; a source row, permanently excluded from the lexical arm, is up to date
+   * when it has the marker and no postings at all. Marking source rows is not bookkeeping tidiness —
+   * a row that can never earn a marker can never leave the stale set, so one source observation used
+   * to drag every open into the write transaction forever (see markSourceObservationCurrent).
+   *
+   * THE POPULATION IS EVERY OBSERVATION, live or superseded, attached or not, source or native — not
+   * the reader's filter (live and attached), because liveness changes after the pass has run and a
    * narrower rewrite would leave the table half in one tokenizer and half in another. `kind` is
    * filtered in TypeScript rather than in the anti-join on purpose: `WHERE kind != 'source'` costs a
    * full table scan (9.4 ms measured) because nothing indexes `kind`, while the anti-join without it
-   * is index-only on both sides (0.75 ms).
+   * is index-only on both sides (0.75 ms) — and with source rows marked there is nothing left for
+   * that filter to exclude anyway.
    */
   private reindexLexicalTokens(): void {
     // A custom StoragePort, or a store this build never migrated, may not carry the sentinel. No
@@ -4320,8 +4328,8 @@ export class MonetCore {
      * THE STALE SET, index-only on both sides: the left leg walks the observations primary-key
      * index, the right leg searches `idx_observation_tokens_token` for exactly the marker rows.
      * `kind` is deliberately absent — filtering it here costs a full table scan (9.4 ms measured
-     * against 0.75 ms without, because nothing indexes `kind`) — so source rows come back and are
-     * dropped in the loop below.
+     * against 0.75 ms without, because nothing indexes `kind`) — and it is not needed: source rows
+     * carry the marker too, so a healthy store yields an empty set whether or not it holds any.
      *
      * Read FIRST, outside any transaction. An empty result is the whole fast path, and reaching it
      * without a write reservation is what keeps a multi-daemon store from serialising on every open.
@@ -4345,8 +4353,9 @@ export class MonetCore {
         const observation = this.db.prepare(
           `SELECT content AS content, kind AS kind FROM observations WHERE id = ?`,
         ).get(row.id) as { content: string; kind: string } | undefined;
-        if (observation === undefined || observation.kind === "source") continue;
-        this.writeObservationTokens(row.id, observation.content);
+        if (observation === undefined) continue;
+        if (observation.kind === "source") this.markSourceObservationCurrent(row.id);
+        else this.writeObservationTokens(row.id, observation.content);
       }
 
       // The sentinel records which build owns the index. It is not a staleness signal — the markers
@@ -4371,6 +4380,25 @@ export class MonetCore {
     const insert = this.db.prepare(`INSERT OR IGNORE INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
     for (const token of lexicalTokens(content)) insert.run(observationId, token);
     insert.run(observationId, lexicalTokensMarker(LEXICAL_TOKENS_VERSION));
+  }
+
+  /**
+   * A SOURCE observation gets the marker and NO postings, which is what the marker means: not "this
+   * row has been tokenized" but "this row is up to date with tokenizer vN". For a native row that
+   * means postings plus marker; for a source row, whose exclusion from the lexical arm is deliberate
+   * and permanent, being up to date means having no postings at all.
+   *
+   * WITHOUT THIS A SOURCE ROW IS PERMANENTLY STALE (Codex P2, PR #97 round 6). The staleness check
+   * is marker absence, and a marker-less row can never leave the stale set — so a store holding one
+   * source observation entered the write transaction on EVERY open, took a SQLite write reservation,
+   * skipped the row, wrote nothing, and did it again next time. On the shared store this whole
+   * compatibility path exists for, that serialises startup against every other daemon. Marking the
+   * row costs one posting row and ends it.
+   */
+  private markSourceObservationCurrent(observationId: string): void {
+    this.db.prepare(`DELETE FROM observation_tokens WHERE observation_id = ?`).run(observationId);
+    this.db.prepare(`INSERT OR IGNORE INTO observation_tokens (observation_id, token) VALUES (?, ?)`)
+      .run(observationId, lexicalTokensMarker(LEXICAL_TOKENS_VERSION));
   }
 
   /**
@@ -14346,7 +14374,12 @@ export class MonetCore {
          * receiver. Tokens need no embedding, so unlike segments they can be written right here in
          * the sync transaction. Segments cannot, and remain the backfill's job.
          */
-        if (r.changes > 0 && row.kind !== "source") this.writeObservationTokens(row.id, row.content);
+        if (r.changes > 0) {
+          // A source row is marked but not tokenized; see markSourceObservationCurrent for why the
+          // marker still has to be written for a row that deliberately carries no postings.
+          if (row.kind === "source") this.markSourceObservationCurrent(row.id);
+          else this.writeObservationTokens(row.id, row.content);
+        }
         const winning = this.db.prepare(
           `SELECT concept_id, circle FROM observations WHERE id = ?`,
         ).get(row.id) as { concept_id: string | null; circle: string } | undefined;

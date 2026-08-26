@@ -92,6 +92,40 @@ const hasMarker = (core: MonetCore, observationId: string): boolean =>
   dbOf(core).prepare(`SELECT 1 FROM observation_tokens WHERE observation_id = ? AND token = ?`)
     .get(observationId, MARKER) !== undefined;
 
+/**
+ * How many write reservations the repair actually takes. `immediateTransaction(fn)` returns a
+ * wrapped function and the BEGIN happens when THAT is invoked, so the counter sits on the
+ * invocation rather than on the call that builds it.
+ *
+ * The repair runs inside the constructor, so it is re-invoked directly here with the spy installed.
+ * A whole-constructor probe cannot answer this: opening a store takes a write reservation for
+ * migrations and sync identity regardless of what the repair decides, so an outside-in test (holding
+ * a foreign write lock and seeing the open fail) reports "locked" even on a store the repair returns
+ * early on — verified, and it is why this measures the method rather than the open.
+ */
+function reservationsTakenBy(core: MonetCore, run: () => void): number {
+  const db = dbOf(core) as unknown as Record<string, unknown>;
+  const original = db.immediateTransaction as (fn: unknown) => (...args: unknown[]) => unknown;
+  let taken = 0;
+  db.immediateTransaction = ((fn: unknown) => {
+    const wrapped = original.call(db, fn);
+    return (...args: unknown[]): unknown => { taken++; return wrapped(...args); };
+  }) as unknown as typeof db.immediateTransaction;
+  try { run(); } finally { db.immediateTransaction = original as unknown as typeof db.immediateTransaction; }
+  return taken;
+}
+
+/** The engine's own stale-set query, so the test reads exactly what the repair reads. */
+const staleIds = (core: MonetCore): string[] =>
+  (dbOf(core).prepare(
+    `SELECT id FROM observations EXCEPT SELECT observation_id FROM observation_tokens WHERE token = ?`,
+  ).all(MARKER) as Array<{ id: string }>).map((r) => r.id);
+
+/** Re-run the repair on an already-open core (it normally only runs in the constructor). */
+const runRepair = (core: MonetCore): void => {
+  (core as unknown as { reindexLexicalTokens: () => void }).reindexLexicalTokens();
+};
+
 /** Put the store back into the state an upgrade across #38 produces: Latin-only rows, no sentinel. */
 function downgradeToLegacy(core: MonetCore): void {
   const db = dbOf(core);
@@ -411,7 +445,14 @@ describe("the posting-version marker — any marker-ignorant writer is healed at
     core.close();
   }));
 
-  it("does not re-scan forever because of a source observation, which never earns a marker", withStore(async (dbPath) => {
+  it("marks a source observation instead of leaving it permanently stale", withStore(async (dbPath) => {
+    /*
+     * A source row is excluded from the lexical arm on purpose, so it carries no postings — but the
+     * staleness check is marker ABSENCE, and a row that can never earn a marker can never leave the
+     * stale set. Before the marker covered them, one source observation dragged every open into the
+     * write transaction forever: the repair entered, skipped the row, wrote nothing, and found it
+     * again next time. The marker means "up to date with tokenizer vN", which a source row can be.
+     */
     let core = open(dbPath);
     await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
     const db = dbOf(core);
@@ -424,14 +465,41 @@ describe("the posting-version marker — any marker-ignorant writer is healed at
     settle(dbPath);
 
     core = open(dbPath);
-    expect(hasMarker(core, "src-1")).toBe(false);       // excluded from tokenizing, so never marked
-    expect(postingsFor(core, "src-1").size).toBe(0);
-    const before = dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all();
+    expect(hasMarker(core, "src-1")).toBe(true);        // up to date...
+    expect(postingsFor(core, "src-1").size).toBe(0);    // ...and still carries no postings
+    expect(staleIds(core)).toEqual([]);                 // so the anti-join is genuinely empty
+    // THE POINT: a settled store holding a source row takes no write reservation at all.
+    expect(reservationsTakenBy(core, () => runRepair(core))).toBe(0);
+    core.close();
+  }));
+
+  it("heals a source row a legacy writer inserted — marker added, still no postings", withStore(async (dbPath) => {
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    core.close();
+    settle(dbPath);
+
+    // A pre-upgrade daemon relays a source observation. It knows nothing about markers.
+    core = open(dbPath);
+    const db = dbOf(core);
+    const donor = db.prepare(`SELECT embedding, circle FROM observations LIMIT 1`).get() as { embedding: string; circle: string };
+    db.prepare(
+      `INSERT INTO observations (id, content, embedding, kind, circle, author_agent_id, created_at)
+       VALUES ('legacy-src', ?, ?, 'source', ?, 'legacy-daemon', ?)`,
+    ).run(KO, donor.embedding, donor.circle, Date.now());
+    expect(hasMarker(core, "legacy-src")).toBe(false);
+    expect(staleIds(core)).toEqual(["legacy-src"]);     // it IS stale, and only it
     core.close();
 
-    // ...and the probe still settles, so the next open does no work despite the permanent absence.
     core = open(dbPath);
-    expect(dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all()).toEqual(before);
+    expect(hasMarker(core, "legacy-src")).toBe(true);   // healed: marker added...
+    expect(postingsFor(core, "legacy-src").size).toBe(0); // ...and NO postings generated for it
+    core.close();
+
+    // ...and the open after that is clean again.
+    core = open(dbPath);
+    expect(staleIds(core)).toEqual([]);
+    expect(reservationsTakenBy(core, () => runRepair(core))).toBe(0);
     core.close();
   }));
 
