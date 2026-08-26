@@ -117,8 +117,46 @@ const CJK_CHAR = "(?=[\\p{L}\\p{N}])[\\p{scx=Han}\\p{scx=Hangul}\\p{scx=Hiragana
  */
 const CJK_MARK = "\\p{M}";
 
-/** One mark, for stripping a matched run down to its base characters. */
-const CJK_MARK_ONE = /\p{M}/u;
+/**
+ * SPACING MODIFIERS THAT ARE NOT MARKS AT ALL (Codex P2, PR #97 round 8). `\p{M}` still misses the
+ * spacing dakuten `U+309B` and handakuten `U+309C`, because Unicode classifies them as `Sk` — modifier
+ * SYMBOLS, not marks — even though they are `scx=Hiragana`/`scx=Katakana` and annotate the character
+ * before them exactly as their combining twins `U+3099`/`U+309A` do. NFC leaves them alone, so
+ * `か` + U+309B + `き` split into two dropped runs and emitted nothing.
+ *
+ * THE CARVE-OUT IS THE WHOLE CATEGORY, NOT THE TWO CHARACTERS THAT WERE REPORTED. Sweeping every
+ * code point whose Script_Extensions name a CJK script and which the class does not already admit
+ * returns 794, and they sort cleanly: 743 are `So` Kangxi RADICAL forms (U+2E80…), which are bases
+ * rather than modifiers and do not occur in running prose; ~40 are punctuation (`Po`/`Ps`/`Pe`/`Pd`,
+ * including `、`, `。`, `・` and the halfwidth `｡｢｣`) which must keep breaking runs; and 13 are `Sk`
+ * — U+309B/U+309C here, the Bopomofo tone marks U+02D9/U+02EA/U+02EB, and the Chinese tone letters
+ * U+A700–U+A707. Those 13 are one kind of thing: a spacing annotation on the preceding base. Taking
+ * the category rather than the pair is what makes this complete. (Iteration marks `々ヽヾゝゞ` never
+ * appear in that sweep — they are `Lm`, and `\p{L}` has always admitted them.)
+ */
+const CJK_SPACING_MODIFIER =
+  "(?=\\p{Sk})[\\p{scx=Han}\\p{scx=Hangul}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=Bopomofo}]";
+
+/**
+ * DECIMAL DIGITS CONTINUE A RUN BUT NEVER START ONE (Codex P2, PR #97 round 8). Digits are
+ * `Script_Extensions=Common`, so they satisfy the `[\p{L}\p{N}]` half of CJK_CHAR's intersection and
+ * fail the script half — which cut `第3章` and `제3장` into three one-character runs and emitted
+ * nothing at all. Numbered terms like these are ordinary Korean and Japanese, not edge cases.
+ *
+ * CONTINUATION ONLY, and the asymmetry is the point: a digit cannot open a run, so a bare number is
+ * still the Latin class's business and nothing about the `[a-z0-9]` contract moves. Punctuation
+ * between a digit and a character still breaks the run, because only these classes continue it.
+ *
+ * KEPT IN THE GRAM, unlike the marks above — `第3章` yields `第3` and `3章`. A chapter number is
+ * evidence, not decoration, and dropping it would make every numbered section of a document collide.
+ * Digits are `\p{N}`, so they are in `lexicalCoverage`'s denominator already and being read by a gram
+ * is what keeps the numerator honest about them.
+ */
+const CJK_DIGIT = "\\p{Nd}";
+
+/** One character to strip from a matched run: marks and spacing modifiers, never digits. */
+const CJK_STRIP_ONE =
+  /\p{M}|(?=\p{Sk})[\p{scx=Han}\p{scx=Hangul}\p{scx=Hiragana}\p{scx=Katakana}\p{scx=Bopomofo}]/u;
 
 /**
  * ONE PASS, BOTH CLASSES. Alternation rather than two independent scans, so every character of the
@@ -127,7 +165,7 @@ const CJK_MARK_ONE = /\p{M}/u;
  * counting invariant in `lexicalCoverage` exists to prevent.
  */
 const LEXICAL_SCAN = new RegExp(
-  `(?<latin>${LATIN_TOKEN})|(?<cjk>${CJK_CHAR}(?:${CJK_CHAR}|${CJK_MARK})*)`,
+  `(?<latin>${LATIN_TOKEN})|(?<cjk>${CJK_CHAR}(?:${CJK_CHAR}|${CJK_MARK}|${CJK_SPACING_MODIFIER}|${CJK_DIGIT})*)`,
   "gu",
 );
 
@@ -234,7 +272,7 @@ function scanLexical(lower: string): { tokens: string[]; covered: number } {
     // surrogate boundary is a token no other text can ever match. Marks were admitted by the scan so
     // they could not split the run; they are dropped here so grams stay a fixed number of BASE
     // characters and so `covered` counts only what the denominator counts. See CJK_MARK.
-    const run = [...(m.groups?.cjk ?? "")].filter((c) => !CJK_MARK_ONE.test(c));
+    const run = [...(m.groups?.cjk ?? "")].filter((c) => !CJK_STRIP_ONE.test(c));
     if (run.length < CJK_GRAM) continue; // read by nothing, so covered by nothing
     for (let i = 0; i + CJK_GRAM <= run.length; i++) tokens.push(run.slice(i, i + CJK_GRAM).join(""));
     covered += run.length;
@@ -270,7 +308,35 @@ function scanLexical(lower: string): { tokens: string[]; covered: number } {
  * (engine.ts) regenerates every posting row from stored text at the first open that carries this
  * code, so both sides of every comparison come from this function or neither does.
  */
-const prepare = (text: string): string => text.normalize("NFC").toLowerCase();
+/**
+ * HALF-WIDTH KATAKANA, FOLDED TO FULL WIDTH BEFORE ANYTHING ELSE (Codex P2, PR #97 round 8).
+ *
+ * NFC composes; it does not fold COMPATIBILITY width. So `ｶﾞｷ` (U+FF76 U+FF9E U+FF77, three code
+ * points) and `ガキ` (U+30AC U+30AD, two) are the same text to a reader and NFC-stable to us, and
+ * they tokenized to disjoint posting sets — `ｶﾞ`/`ﾞｷ` against `ガキ` — so neither could ever match
+ * the other.
+ *
+ * THE DOMAIN IS EXACTLY U+FF66–U+FF9F: the halfwidth katakana letters, plus the halfwidth voiced and
+ * semi-voiced sound marks U+FF9E/U+FF9F at the top of that range. Nothing else is touched.
+ *
+ * NOT NFKC ON THE WHOLE STRING, which would fold two things that must not fold. Full-width Latin
+ * (`Ａ` -> `a`) would silently enter the `[a-z0-9]` token contract, so text nobody wrote in ASCII
+ * would start matching ASCII identifiers. And halfwidth CJK punctuation — `｡` `｢` `｣` `､` `･`, which
+ * sit at U+FF61–U+FF65, immediately below this range — must keep breaking runs, exactly as their
+ * full-width forms do; folding them would still leave punctuation, but widening the domain to
+ * include them buys nothing and costs the property that this fold touches only letters.
+ *
+ * PER CODE POINT, THEN COMPOSED. Each character in range is NFKC'd on its own — `ｶ` -> `カ`,
+ * `ﾞ` -> U+3099, the COMBINING voiced mark — and `prepare`'s existing NFC pass then composes
+ * `カ` + U+3099 into the single character `ガ`. So the three-code-point halfwidth spelling lands as
+ * the two-code-point full-width one, and both cut the same gram.
+ */
+const HALFWIDTH_KANA = /[\uFF66-\uFF9F]/u;
+const HALFWIDTH_KANA_ALL = /[\uFF66-\uFF9F]/gu;
+const foldHalfwidthKana = (text: string): string =>
+  HALFWIDTH_KANA.test(text) ? text.replace(HALFWIDTH_KANA_ALL, (c) => c.normalize("NFKC")) : text;
+
+const prepare = (text: string): string => foldHalfwidthKana(text).normalize("NFC").toLowerCase();
 
 /**
  * The share of a text's letters and digits that the tokenizer above actually consumes — "how much of
@@ -296,26 +362,28 @@ const prepare = (text: string): string => text.normalize("NFC").toLowerCase();
  *
  * RE-DERIVED 2026-08-26 — space `Xenova/bge-m3:cls:q8` 1024-dim, corpus `cjk-corpus-2026-08-26`
  * (1285 live observations over 161 concepts, 75.3% CJK-heavy, 83.8% carrying any CJK), tokenizer as
- * of this file's #38 CJK branch. Coverage by script class, `cjkShare` of the observation:
+ * of this file's #38 CJK branch. Coverage by script class, `cjkShare` of the observation, re-measured
+ * 2026-08-27 after the spacing-modifier, in-run-digit and halfwidth-Kana refinements:
  *
  *                          n     min    p01    p05    p50    p99   >= 0.8
  *   CJK-heavy (>0.5)     967   0.750  0.819  0.865  0.932  0.989   99.4%
  *     of which >0.8      343   0.827  0.863  0.888  0.946  0.990  100.0%
- *   mixed (0.2-0.5]       95   0.748  0.748  0.794  0.928  1.000   94.7%
+ *   mixed (0.2-0.5]       95   0.748  0.748  0.804  0.928  1.000   95.8%
  *   Latin (<=0.2)        223   0.856  0.863  0.893  0.940  0.979  100.0%
- *   ALL                 1285   0.748  0.812  0.863  0.933  0.989   99.1%
+ *   ALL                 1285   0.748  0.813  0.863  0.934  0.989   99.2%
  *
  * THE POPULATIONS DID NOT SEPARATE — THEY CONVERGED, and that is what settles the per-script
  * question this constant raised. CJK-heavy text now lands where Latin text lands (medians 0.932 vs
  * 0.940), so one global constant serves both and no script-aware variant is needed. Before #38 the
  * same three classes read 0.205 / 0.540 / 0.938 at the median and 0.0% / 0.0% / 98.7% over the bar.
  *
- * LATIN IS UNTOUCHED, BY CONSTRUCTION AND BY MEASUREMENT. All 208 observations with NO CJK at all
- * score identical coverage and identical token counts before and after — the CJK branch cannot fire
+ * LATIN IS UNTOUCHED, BY CONSTRUCTION AND BY MEASUREMENT — re-checked after every refinement since,
+ * most recently 2026-08-27. All 208 observations with NO CJK at all score identical coverage and
+ * identical token counts before and after — the CJK branch cannot fire
  * on them. The Latin CLASS moves (min 0.761 -> 0.856) only because `cjkShare <= 0.2` admits a little
  * CJK, and that little is now read.
  *
- * WHAT 0.8 NOW COSTS, because it is no longer free. It refuses 11 of 1285 observations (0.9%), 6 of
+ * WHAT 0.8 NOW COSTS, because it is no longer free. It refuses 10 of 1285 observations (0.8%), 6 of
  * them CJK-heavy (0.6% of that class). That is the trade-off the retired argument did not have to
  * make, and the number to weigh against any proposal to move it.
  *

@@ -717,6 +717,53 @@ describe("combining and variation marks inside a CJK run", () => {
     }
   });
 
+  it("keeps a Kana run whole across the SPACING dakuten (Sk, not a mark at all)", () => {
+    // U+309B/U+309C are `Sk` — modifier SYMBOLS — so `\p{M}` does not reach them, yet they annotate
+    // the preceding character exactly as their combining twins U+3099/U+309A do.
+    for (const mark of ["\u309B", "\u309C"]) {
+      const marked = `か${mark}き`;
+      expect(marked.normalize("NFC")).toBe(marked);   // premise: NFC leaves it decomposed
+      expect([...marked].length).toBe(3);
+      expect(/\p{Sk}/u.test(mark)).toBe(true);        // premise: symbol, not mark
+      expect(/\p{M}/u.test(mark)).toBe(false);
+      expect(lexicalTokens(marked), mark).toEqual(lexicalTokens("かき"));
+      expect(lexicalCoverage(marked)).toBeCloseTo(1, 10);
+    }
+  });
+
+  it("lets a digit continue a CJK run, but never start one", () => {
+    // Digits are Script_Extensions=Common, so they pass the letter/number half of the CJK class and
+    // fail the script half — which used to cut 第3章 into three dropped one-character runs.
+    expect(/\p{scx=Common}/u.test("3")).toBe(true);   // premise
+    expect(/\p{scx=Han}/u.test("3")).toBe(false);
+    expect([...lexicalTokens("第3章")]).toEqual(["第3", "3章"]);
+    expect([...lexicalTokens("제3장")]).toEqual(["제3", "3장"]);  // ordinary Korean, not an edge case
+    expect(lexicalCoverage("제3장")).toBeCloseTo(1, 10);
+    // The digit is KEPT in the gram: a chapter number is evidence, so 3 and 4 must not collide.
+    expect(lexicalTokens("제3장")).not.toEqual(lexicalTokens("제4장"));
+    // ...and a digit still cannot OPEN a run, so a bare number stays the Latin class's business.
+    expect([...lexicalTokens("360 도")]).toEqual(["360"]);
+    expect(lexicalTokens("3장").has("3장")).toBe(false);
+  });
+
+  it("folds half-width Katakana so it matches its full-width spelling", () => {
+    const full = "ガキ";                  // U+30AC U+30AD
+    const half = "ｶﾞｷ";                 // U+FF76 U+FF9E U+FF77 — letter, voiced mark, letter
+    expect([...full].length).toBe(2);
+    expect([...half].length).toBe(3);
+    expect(half.normalize("NFC")).toBe(half); // premise: NFC does NOT fold compatibility width
+    expect(lexicalTokens(half)).toEqual(lexicalTokens(full));
+    expect([...lexicalTokens(half)]).toEqual(["ガキ"]);  // the composed full-width gram, not a pair
+  });
+
+  it("folds only half-width KANA — not full-width Latin, and not CJK punctuation", () => {
+    // The fold's domain is U+FF66-U+FF9F exactly. Widening it to NFKC would put full-width Latin
+    // into the `[a-z0-9]` token contract, and would fold the halfwidth punctuation that must keep
+    // breaking runs.
+    expect(lexicalTokens("ＡＢＣ").size).toBe(0);        // full-width Latin stays out of the Latin class
+    expect([...lexicalTokens("ｱｲ｡ｳｴ")]).toEqual(["アイ", "ウエ"]); // halfwidth ｡ still breaks the run
+  });
+
   it("does not let a stray mark open a run of its own", () => {
     // A mark may only extend a run that a real CJK character already started.
     expect(lexicalTokens("abc ゚ def").size).toBe(2); // `abc`, `def` — the mark yields nothing
