@@ -1269,8 +1269,10 @@ export function registerMonetCoreTools(
       } catch (e) {
         // NOT A FAILURE, and it must not read as one (#86). The evidence matched several concepts
         // closely enough that nothing distinguished them, so the write was refused rather than
-        // guessed — under that bar the guess is wrong about 64% of the time. The caller is the only
-        // party that knows which of these it meant, and it knows now, in this turn.
+        // guessed — under that bar the guess is wrong 41.7% of the time (bge-m3, monet-hq,
+        // legality-aware engine-driven replay 2026-08-26, n=266; this said "about 64%" until that
+        // replay refuted it — see embedding.ts's tauMargin block). The caller is the only party
+        // that knows which of these it meant, and it knows now, in this turn.
         //
         // The candidates ARE the payload: an instruction alone would send the agent to search for
         // what this call already computed. `resolutionMode` says which decision produced this so it

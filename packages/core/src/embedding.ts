@@ -36,11 +36,45 @@ export interface EmbeddingThresholds {
    * without asking. A separate question from tauAttach, and the one that actually discriminates:
    * `score >= tauAttach` asks "is this similar enough", never "am I sure it is THIS one".
    *
-   * WHY A SECOND GATE RATHER THAN A HIGHER FIRST ONE. The margin separates where tauAttach does
-   * not: among misfiles its median is 0.0335, below the p10 of 0.0346 for correct decisions. Below
-   * this bar the winner is wrong ~64% of the time, which is worse than a coin flip, so the decision
-   * is handed to the caller (see resolution.ts's ASK outcome) instead of being taken on evidence
-   * that does not identify a unique target.
+   * WHY A SECOND GATE RATHER THAN A HIGHER FIRST ONE. Because it asks a different question:
+   * tauAttach asks "is this similar enough", the margin asks "am I sure it is THIS one", and only
+   * the second is a statement about identity. That is the whole case, and it is an argument about
+   * which question is being answered — not a claim about any number.
+   *
+   * THE NUMERIC CASE THAT USED TO STAND HERE IS REFUTED (2026-08-26), and it inverted rather than
+   * merely weakened. It read: "The margin separates where tauAttach does not: among misfiles its
+   * median is 0.0335, below the p10 of 0.0346 for correct decisions. Below this bar the winner is
+   * wrong ~64% of the time, which is worse than a coin flip." Re-derived by a legality-aware,
+   * engine-driven replay on the bge-m3 monet-hq store (2026-08-26), over the LEGAL winner-runner-up
+   * gap — the same quantity the engine actually gates on, `legalMargin`, not the raw all-candidates
+   * gap the original script measured:
+   *
+   *   misfile median   0.0537   (n=682)      <- ABOVE, not below
+   *   correct p10      0.0481   (n=682)
+   *   winner wrong at tauMargin = 0.12       41.7%  (n=266), not ~64%
+   *
+   * So in this space the misfile median sits ABOVE the correct-decision p10: the separation the
+   * sentence claimed runs the other way, and the gate's band is not "worse than a coin flip" — it
+   * is wrong about two times in five. Every site that quoted 0.0335 / 0.0346 / ~64% was quoting
+   * this one derivation, never an independent measurement, and all of them were corrected together
+   * (resolution.ts's ASK branch, engine.ts's AmbiguousNominationError doc, mcp-server.ts's
+   * ambiguous-write envelope).
+   *
+   * WHAT SURVIVES AND WHAT DOES NOT. The identity-vs-similarity case survives untouched — it never
+   * rested on these numbers. The numeric case does not survive, and no number here should be quoted
+   * as evidence that the band is uniquely bad. `tauMargin` DOES NOT MOVE on this: 0.12 is unchanged.
+   *
+   * 0.12 IS A CHOSEN OPERATING POINT, NOT A DERIVED PEAK. The same replay swept tauMargin across
+   * this space and found a smooth trade-off with NO interior optimum — nothing to maximize, no
+   * knee, just more catching bought with more exchanging as the bar rises. At 0.12 it catches 79.3%
+   * of misfiles and exchanges 1.40 correct decisions per misfile caught. Anyone re-tuning it is
+   * picking a point on a monotone curve according to what an unnecessary ASK costs against what a
+   * misfile costs, and should say which they weighted — there is no measurement that will pick it
+   * for them.
+   *
+   * SPACE PROVENANCE (#90's discipline): every figure above is `bge-m3` on the live `monet-hq`
+   * store, legality-aware engine-driven replay, 2026-08-26, n=682 over the legal gap and n=266 at
+   * the 0.12 bar. None of it travels to another embedder — see PER-MODEL below.
    *
    * THE FLATNESS ARGUMENT THAT ORIGINALLY MADE THIS CASE IS SUPERSEDED (2026-08-25). It read:
    * "Precision of attaches is FLAT at ~74% across the whole tauAttach range (measured 0.50 -> 0.75
