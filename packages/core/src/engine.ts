@@ -19,7 +19,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { StoragePort, BetterSqlitePort, StorageExclusiveLockError } from "./storage";
+import { StoragePort, BetterSqlitePort, StorageExclusiveLockError, type Statement } from "./storage";
 import { mintMomentId, spoolInterception, spoolOutcome, spoolRuleRead, startMomentRun } from "./moment-spool";
 import type { MomentAnswer } from "./moment-spool";
 import {
@@ -318,6 +318,26 @@ const FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION = 12;
 // wants. The rung is unconditional because the ladder has to stay a ladder: a rung that only some
 // stores climb leaves rung 14 with no single predecessor to gate on.
 const SOURCE_RETIREMENT_SCHEMA_VERSION = 13;
+/**
+ * How far a stored vector's L2 norm may sit from 1 and still count as unit-length, for
+ * `normalizeStoredCentroidInPlace`'s "is this row already normalized" test — the fallback
+ * `repairDriftedConceptCentroids` uses on rows it cannot reproject from evidence. The reprojection
+ * path itself needs no tolerance: it recomputes the vector rather than judging the stored one.
+ *
+ * CHOSEN INSIDE A MEASURED GAP, which is why the exact value is not load-bearing — and the gap was
+ * measured rather than reasoned about, over the real `normalizeVector` -> `embToJson` ->
+ * `jsonToEmb` round trip the store actually performs (2000 trials per dimension):
+ *
+ *   worst |norm - 1| for a genuinely normalized row   dim 384: 6.2e-9   768: 9.1e-9   1024: 4.6e-9
+ *   smallest |norm - 1| among unnormalised centroids  dim 1024: 2.7e-1
+ *
+ * Eight orders of magnitude separate the two populations, because the defect is not a rounding
+ * error: an unnormalised mean of disagreeing unit vectors is short by PERCENT (two at 60 degrees
+ * average to 0.87). Any bar between ~1e-8 and ~1e-2 partitions them identically. 1e-6 sits three
+ * orders above the float32 noise floor and five below the smallest real defect, so neither a
+ * false repair nor a missed one is reachable from either side.
+ */
+const CENTROID_UNIT_NORM_TOLERANCE = 1e-6;
 // Rung 13: the source subsystem's retirement (#16). The ruling that dropped the subsystem is
 // what makes the purge safe — its content was always a materialized copy of files that live
 // outside the store, and nothing can re-read it once the connector is gone.
@@ -401,7 +421,13 @@ interface RankedCandidate extends AmbiguousCandidate { rank: number }
 
 /**
  * The evidence cleared `tauAttach` but did not identify WHICH concept (#86): the winner's rank was
- * within `tauMargin` of the runner-up, and under that bar the winner is wrong about 64% of the time.
+ * within `tauMargin` of the runner-up, so the evidence says "similar enough" without saying "it is
+ * THIS one". Under that bar the winner is wrong 41.7% of the time (bge-m3, monet-hq, legality-aware
+ * engine-driven replay 2026-08-26, n=266).
+ *
+ * THAT FIGURE REPLACES "about 64% of the time", which this comment carried until 2026-08-26 and
+ * which was refuted by that replay — see embedding.ts's tauMargin block for what else inverted with
+ * it. The gate's case never rested on the number: it rests on the two questions being different.
  *
  * THROWN RATHER THAN RETURNED, for the reason `recordResolutionEvent` states about its own absence
  * of a try/catch: this runs inside the store transaction, so throwing is what makes "nothing was
@@ -2654,6 +2680,10 @@ export class MonetCore {
     }
     this.migrateFirstBlockPins();
     this.migrateSourceRetirement();
+    // AFTER the sentinel column exists (migrate(), above, guards the ALTER) and after the sync
+    // triggers are installed (ensureSyncClosureSchema, at the end of migrate()) — the repair
+    // suppresses those triggers deliberately, which requires them to be there to suppress.
+    this.repairDriftedConceptCentroids();
     // Constructor-time pin guard (embedder-pin ADR, review hardening) — synchronous, added no
     // async to the constructor. MUST run after initSyncIdentity (above): that is where a genuinely
     // FRESH store writes its own 'created' pin, matching this.embedderModelId by construction, so
@@ -3060,6 +3090,12 @@ export class MonetCore {
         last_mutation_at INTEGER NOT NULL,
         applying_remote INTEGER NOT NULL DEFAULT 0,
         closure_migrated INTEGER NOT NULL DEFAULT 0,
+        -- One-time gate for repairDriftedConceptCentroids (see that method). DEFAULT 0 = "not yet
+        -- converged" for BOTH the fresh store this CREATE TABLE builds and the older store
+        -- migrate()'s guarded ALTER backfills, and that uniformity is the point: the ALTER default
+        -- is the one that matters, because an existing store is exactly the population carrying
+        -- short or blend-drifted centroids. A fresh store pays one scan over zero rows and stamps 1.
+        centroids_reprojected INTEGER NOT NULL DEFAULT 0,
         clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical')),
         embedder_model_id TEXT,
         embedder_pin_source TEXT CHECK (embedder_pin_source IN ('created', 'backfilled', 'migrated')),
@@ -3281,6 +3317,9 @@ export class MonetCore {
     }
     if (!syncMetaCols.some((c) => c.name === "closure_migrated")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN closure_migrated INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!syncMetaCols.some((c) => c.name === "centroids_reprojected")) {
+      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN centroids_reprojected INTEGER NOT NULL DEFAULT 0`);
     }
     if (!syncMetaCols.some((c) => c.name === "clock_mode")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))`);
@@ -3622,9 +3661,49 @@ export class MonetCore {
     //     by saveWorkstream() remain NULL by design (excluded by kind != 'workstream' guard).
     //
     // Column-guard pattern: PRAGMA table_info, then ALTER only if missing (SQLite has no IF NOT EXISTS).
-    const priorApplyingRemote = (this.db.prepare(`SELECT applying_remote AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number }).value;
-    this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
-    try {
+    //
+    // ONE TRANSACTION AROUND READ-SET-WORK-RESTORE, not a bare try/finally. The suppression flag is
+    // a read-modify-write on a row every process sharing this store also writes, and the old shape
+    // — read prior, set 1, work, restore the READ prior in a `finally` — made the transient 1
+    // observable to anyone else mid-migration. That is a PERMANENT LATCH, no crash required. With
+    // A and B both opening the same store (three processes observed on one store in the field):
+    //
+    //   A: reads prior = 0, sets applying_remote = 1
+    //   B: reads prior = 1   <- A's TRANSIENT, adopted as B's "prior"
+    //   B: sets 1, does its work
+    //   A: restores 0
+    //   B: restores 1        <- B lands LAST and writes A's transient back. Latched at 1 forever:
+    //                           nothing else on any path ever resets it, and every subsequent open
+    //                           now reads 1 as ITS prior and re-restores it.
+    //
+    // applying_remote = 1 suppresses the sync-clock triggers (see the `(SELECT applying_remote ...)
+    // = 0` guards below), so a latched 1 silently disables clock advancement for the store's whole
+    // remaining life. Nothing downstream distinguishes "a remote apply is genuinely in flight" from
+    // "a migration leaked its own suppression flag".
+    //
+    // `immediateTransaction` (storage.ts: better-sqlite3's own `db.transaction(fn).immediate`, the
+    // wrapper this file's graftRows comment documents and probes) takes SQLite's write reservation
+    // BEFORE the read, so the read-set-work-restore is one atomic unit: a concurrent migrate()
+    // serializes on the write lock instead of interleaving, and its read therefore sees the
+    // COMMITTED prior, never the transient. Two properties the try/finally could not give:
+    //   - The transient is never visible outside this transaction — under WAL another connection
+    //     reads the last committed value, so there is no window in which 1 can be adopted at all.
+    //   - A crash or throw ROLLS BACK, which is strictly better than the old `finally`: the old one
+    //     restored the flag but left a half-applied ALTER/UPDATE committed, and a SIGKILL skipped
+    //     the `finally` entirely and latched 1 the same way.
+    //
+    // THE BODY IS LEGAL HERE — verified against these exact statements, not assumed. SQLite's DDL
+    // is transactional: `PRAGMA table_info`, a conditional `ALTER TABLE ... ADD COLUMN`, the
+    // `UPDATE`s and `PRAGMA user_version` all run inside `.transaction(fn).immediate` and commit
+    // together; a throw mid-transaction rolls the ADD COLUMN back too (probed directly: the column
+    // was gone from `PRAGMA table_info` afterwards). `migrateFirstBlockPins` already wraps the same
+    // mix of guarded DDL and `pragma("user_version = ...")` in this same wrapper.
+    //
+    // The `finally` is gone deliberately — restoring in a `finally` is what would re-open the hole
+    // if the body ever threw, since the restore would then commit on its own outside the rollback.
+    this.db.immediateTransaction((): void => {
+      const priorApplyingRemote = (this.db.prepare(`SELECT applying_remote AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number }).value;
+      this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
       const conceptCols2 = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
       if (!conceptCols2.some((c) => c.name === "last_confirmed_at")) {
       // State A: columns missing — add AND backfill atomically in this branch. Independent of
@@ -3648,9 +3727,8 @@ export class MonetCore {
     // The WHERE-NULL predicate makes it a no-op for State C and D (no rows to update).
     // Excludes kind='workstream' — those rows are NULL by design.
       this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL AND kind != 'workstream'`);
-    } finally {
       this.db.prepare(`UPDATE sync_meta SET applying_remote = ? WHERE singleton = 1`).run(priorApplyingRemote);
-    }
+    })();
     // Version gate: bump to TEMPORAL_SCHEMA_VERSION once the graph backfill slot has been consumed.
     // Guards the graph-schema-version invariant; the temporal backfill itself is now independent
     // of this gate (handled in State A and B paths above).
@@ -3812,6 +3890,204 @@ export class MonetCore {
     this.db.pragma(`user_version = ${SOURCE_RETIREMENT_SCHEMA_VERSION}`);
   }
 
+  /**
+   * ONE-TIME CONVERGENCE OF PERSISTED CONCEPT CENTROIDS (PR #90 round-10 finding + the blend
+   * path-dependence finding). Runs once per store, at open, gated by a sync_meta sentinel.
+   *
+   * TWO DEFECT CLASSES, ONE PASS, because the same write repairs both:
+   *
+   *   SHORT CENTROIDS (#90 §3.1). `recomputeNativeConceptProjection` used to write the plain
+   *   arithmetic mean of the live observation vectors. A mean of unit vectors that disagree is
+   *   SHORT (two at 60 degrees average to 0.87), and `cosine()` is a bare dot product, so a short
+   *   centroid deflates every read of it. #90 made that path normalize; it did not repair what
+   *   earlier builds had already persisted, and a settled concept may never be recomputed again.
+   *
+   *   BLEND DRIFT. `attach()` folds each new observation in with a RUNNING `blend()`, which
+   *   re-inflates the accumulated direction to full integer weight at every step as if every prior
+   *   member had agreed perfectly. The stored centroid therefore depends on the ORDER the
+   *   observations arrived in, and drifts away from the true normalized mean of the same evidence.
+   *   Reproduced through the real engine: the same five observations attached in two different
+   *   orders give two different centroids (cos 0.9968). Cauchy-Schwarz makes the direction of the
+   *   error one-way — drift can only lower a concept's self-similarity to its own evidence — and on
+   *   the live store the multi-member population's median cosine to its true mean is 0.9030.
+   *
+   * Recomputing the centroid from the live evidence fixes both at once: the result is the true
+   * normalized mean, which is short-free by construction and order-free by construction.
+   *
+   * WHY THIS DOES NOT CALL `repairNativeProjections`, WHICH WOULD HAVE BEEN THE OBVIOUS REUSE.
+   * Checked before writing this, not assumed — three findings, any one of them disqualifying:
+   *
+   *   1. IT THROWS ON THE STORES THIS EXISTS FOR. `recomputeNativeConceptProjection`'s first line is
+   *      `assertPinSatisfied()`, and `assertWriteWidthSatisfied` follows it. Both raise
+   *      `EmbedderPinUnsatisfiedError` when the pin is NULL and the store holds vectors — i.e. every
+   *      pre-pin legacy store — and when the pin names a different model than the constructor's
+   *      embedder. This runs INSIDE the constructor, before `ensureEmbedderPin()` (async, after
+   *      construction) has had any chance to backfill that pin. Verified by running it: opening a
+   *      pre-pin store and calling `repairNativeProjections` throws "This store is pinned to
+   *      '(unknown)' but the engine was constructed with 'hashing:dim=256:tok=2'". Reusing it here
+   *      would convert an ordinary open of a legacy store into a constructor throw.
+   *
+   *   2. IT IS NOT A CENTROID WRITE. Its UPDATE also sets `support_count`, `confidence`, `status`,
+   *      `last_confirmed_at`, `last_confirmed_session_id` and `updated_at`. A store-wide call would
+   *      rewrite the entire native read-model to repair a vector. `support_count` in particular
+   *      would be reconciled to `observations.length` on every concept — a visible semantic change
+   *      that no finding asked for and that this pass deliberately does NOT make.
+   *
+   *   3. ITS EMPTY BRANCH IS A WRITE, NOT A SKIP. For a concept with no live observations it sets
+   *      `last_confirmed_at = NULL`, `last_confirmed_session_id = NULL`, `support_count = 0`,
+   *      `confidence = 0` and a `this.embedder.dim`-sized zero vector. Store-wide that would erase
+   *      evidence-confirmation timestamps, and the dim-sized write is exactly the unsafe one on a
+   *      store whose space this constructor cannot yet vouch for.
+   *
+   * So the centroid computation is reproduced here — the mean loop and `normalizeVector`, in the
+   * same order over the same `ORDER BY id ASC` evidence — and NOTHING BUT `concepts.embedding` is
+   * written. That makes the result floating-point identical to what the engine's own recompute
+   * would later write for that column, which is what "converged" has to mean: a subsequent real
+   * recompute must find nothing left to change.
+   *
+   * WHAT EACH ROW GETS:
+   *   - Non-retired, >= 1 live observation -> full reprojection from the evidence.
+   *   - Retired, or zero live observations -> NORM-ONLY repair (rescale a short non-zero vector to
+   *     unit length; leave a zero placeholder at zero). There is no evidence to reproject from, and
+   *     writing a `this.embedder.dim` placeholder here would be finding 3 above. `restoreConcept`
+   *     re-runs the real recompute, so a restored concept self-heals anyway.
+   *   - `kind = 'source'` -> untouched. Source concepts had their own body-recompute path (retired
+   *     at rung 13) and were never centroided from observations.
+   *
+   * A ZERO VECTOR STAYS ZERO on both paths — the placeholder `isZeroVector` exists to detect, and
+   * scaling it would turn "not measured" into a measurement (`normalizeVector`'s `mag || 1`).
+   *
+   * NO EMBEDDER OR PIN TRUST REQUIRED, unlike the graph backfill this constructor defers when the
+   * pin is unsettled. That backfill COMPARES vectors across concepts, so it needs thresholds
+   * calibrated for the space those vectors are in. This one averages a single concept's own
+   * evidence and rescales the result — both operations stay inside whatever space the store is
+   * already in, and neither reads `this.embedder`. Width comes from the observations themselves,
+   * never from `this.embedder.dim`, so there is no window in which running it early is wrong.
+   *
+   * BEHAVIOURAL CONSEQUENCE, measured on the live store rather than predicted: centroids move
+   * toward the true mean and self-similarity RISES (mean +0.1266 across the multi-member
+   * population). At `tauAmbiguous = 0.5` about 0.89% of centroid reads change side, and all of them
+   * in the same direction — the stored vector said "fork signal" where the true mean says "attach".
+   * That is the deflation #90 described being removed, not a new behaviour being introduced.
+   *
+   * WHY A SENTINEL COLUMN AND NOT A `user_version` RUNG. The ladder's rungs gate SCHEMA SHAPE, and
+   * `MONET_SCHEMA_VERSION` tops it: adding rung 14 forces 13 -> 14, which changes what
+   * `diagnostics.assess` calls a healthy store (`schemaVersion !== MONET_SCHEMA_VERSION` downgrades
+   * every not-yet-upgraded store to "unknown") and what `repair-cli` refuses as "newer than
+   * supported". This changes no shape at all, so it takes the in-file precedent for exactly that —
+   * `closure_migrated`, a sync_meta sentinel gating a one-time data migration — and leaves the shape
+   * ladder alone. `sync_meta` is local-only and not in the sync payload, so the sentinel does not
+   * travel: each peer converges its own copy on its own open, which is also why the repaired rows
+   * are not exported (see SUPPRESSED below).
+   *
+   * SUPPRESSED, because this is a local representation repair and not a semantic edit. `embedding`
+   * is in `conceptSemanticChange`, so an unsuppressed pass would fire `sync_concepts_update` on
+   * every row it touched: one sync-clock tick and one `sync_revision`/`updated_at` bump per concept,
+   * then an export pushing all of it at peers who are about to run this same pass themselves. Same
+   * read-set-work-restore-inside-one-`immediateTransaction` discipline the temporal block in
+   * `migrate()` documents, for the same reason: a transient 1 that escapes can latch permanently.
+   *
+   * WHAT ONE-TIME COSTS, stated rather than hidden: `attach()`'s running blend is still the live
+   * write path, so drift begins accumulating again on the next attach. This converges the backlog;
+   * it does not change the ongoing writer. Changing `attach()` is a separate decision with its own
+   * behavioural surface, and is deliberately not taken here.
+   */
+  private repairDriftedConceptCentroids(): void {
+    const cols = this.db.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
+    // A custom StoragePort or a store this build never migrated may not carry the sentinel. No
+    // column means no gate, and running ungated would repeat the pass on every open.
+    if (!cols.some((c) => c.name === "centroids_reprojected")) return;
+    const gate = this.db.prepare(`SELECT centroids_reprojected AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number } | undefined;
+    if (gate === undefined || gate.value !== 0) return;
+    this.db.immediateTransaction((): void => {
+      // Re-read under the write reservation: another process may have finished the pass between the
+      // unlocked probe above and this transaction, and it must not run twice.
+      const pending = this.db.prepare(`SELECT centroids_reprojected AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number } | undefined;
+      if (pending === undefined || pending.value !== 0) return;
+      const priorApplyingRemote = (this.db.prepare(`SELECT applying_remote AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number }).value;
+      this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
+      const update = this.db.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`);
+
+      // ONE grouped scan rather than a query per concept. `ORDER BY concept_id, id` reproduces the
+      // per-concept `ORDER BY id ASC` the engine's own recompute uses, and that ordering is
+      // load-bearing rather than cosmetic: floating-point summation is order-dependent, so a
+      // different order would give a centroid that is merely close to what a later real recompute
+      // writes instead of identical to it.
+      const liveVectors = new Map<string, Float32Array[]>();
+      for (const row of this.db.prepare(
+        `SELECT o.concept_id AS conceptId, o.embedding AS embedding
+           FROM observations o JOIN concepts c ON c.id = o.concept_id
+          WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
+            AND o.embedding IS NOT NULL AND c.kind != 'source' AND c.status != 'retired'
+          ORDER BY o.concept_id, o.id`,
+      ).all() as Array<{ conceptId: string; embedding: string }>) {
+        let vector: Float32Array;
+        try {
+          vector = jsonToEmb(row.embedding);
+        } catch {
+          continue; // diagnostics' `malformed` population has its own reporting path
+        }
+        const bucket = liveVectors.get(row.conceptId);
+        if (bucket === undefined) liveVectors.set(row.conceptId, [vector]);
+        else bucket.push(vector);
+      }
+
+      for (const row of this.db.prepare(
+        `SELECT id, embedding FROM concepts WHERE kind != 'source' AND embedding IS NOT NULL`,
+      ).all() as Array<{ id: string; embedding: string }>) {
+        const vectors = liveVectors.get(row.id);
+        if (vectors === undefined || vectors.length === 0) {
+          this.normalizeStoredCentroidInPlace(row.id, row.embedding, update);
+          continue;
+        }
+        const width = vectors[0]!.length;
+        // A concept whose own evidence disagrees on width is already the EmbedderWidthConflictError
+        // population. The engine's mean loop would zero-fill the short ones and silently persist a
+        // truncated centroid; at migration time, leaving the row as found is the safer answer.
+        if (vectors.some((v) => v.length !== width)) {
+          this.normalizeStoredCentroidInPlace(row.id, row.embedding, update);
+          continue;
+        }
+        const centroid = new Float32Array(width);
+        for (let d = 0; d < width; d++) {
+          let sum = 0;
+          for (const vector of vectors) sum += vector[d] ?? 0;
+          centroid[d] = sum / vectors.length;
+        }
+        // A concept whose every live observation is still a zero PLACEHOLDER centroids to zero, and
+        // `normalizeVector`'s `mag || 1` keeps it there — isZeroVector must keep meaning "not
+        // measured". Exactly the engine's own behaviour on this branch.
+        normalizeVector(centroid);
+        const next = embToJson(centroid);
+        if (next !== row.embedding) update.run(next, row.id); // idempotent: a converged store writes nothing
+      }
+
+      this.db.prepare(`UPDATE sync_meta SET applying_remote = ? WHERE singleton = 1`).run(priorApplyingRemote);
+      this.db.prepare(`UPDATE sync_meta SET centroids_reprojected = 1 WHERE singleton = 1`).run();
+    })();
+  }
+
+  /**
+   * The fallback for a row reprojection cannot reach — retired, no live evidence, or evidence whose
+   * widths disagree. Rescales a short non-zero vector to unit length and leaves everything else
+   * exactly as found. This is the whole of the original #90 §3.1 repair, kept for the population the
+   * reprojection subsumes it on.
+   */
+  private normalizeStoredCentroidInPlace(conceptId: string, stored: string, update: Statement): void {
+    let vector: Float32Array;
+    try {
+      vector = jsonToEmb(stored);
+    } catch {
+      return;
+    }
+    let mag = 0;
+    for (let i = 0; i < vector.length; i++) mag += vector[i]! * vector[i]!;
+    mag = Math.sqrt(mag);
+    if (!Number.isFinite(mag) || mag === 0) return; // placeholder, or unrepairable: leave as found
+    if (Math.abs(mag - 1) <= CENTROID_UNIT_NORM_TOLERANCE) return; // already unit
+    update.run(embToJson(normalizeVector(vector)), conceptId);
+  }
+
   /** v8: replay-safe row clocks and per-writer edge components. */
   private ensureSyncClosureSchema(): void {
     const addColumn = (table: string, name: string, definition: string): boolean => {
@@ -3845,6 +4121,7 @@ export class MonetCore {
     addColumn("sessions", "sync_writer", "TEXT");
     addColumn("sync_meta", "applying_remote", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "closure_migrated", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("sync_meta", "centroids_reprojected", "INTEGER NOT NULL DEFAULT 0");
     addColumn("sync_meta", "clock_mode", "TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))");
     addColumn("concept_tombstones", "updated_at", "INTEGER");
     addColumn("concept_restorations", "updated_at", "INTEGER");
