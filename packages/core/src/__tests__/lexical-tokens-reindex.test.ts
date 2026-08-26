@@ -192,3 +192,195 @@ describe("canonically equivalent text tokenizes identically (NFC)", () => {
     }
   });
 });
+
+/**
+ * A store can be written by more than one binary at a time. Monet's primary deployment runs several
+ * long-lived daemons against one file, and a daemon keeps its own build until its host restarts — so
+ * an upgraded CLI can stamp the sentinel while a pre-upgrade server is still committing observations
+ * with the old tokenizer. The sentinel alone would then skip the pass forever and leave those rows
+ * mis-tokenized. These pin the trailing repair that heals them at the next open.
+ */
+describe("the trailing watermark repair — a legacy writer on a stamped store", () => {
+  const watermark = (core: MonetCore): string | null =>
+    (dbOf(core).prepare(`SELECT lexical_tokens_reindexed_through AS w FROM sync_meta WHERE singleton = 1`)
+      .get() as { w: string | null }).w;
+
+  const rowidOf = (core: MonetCore, id: string): number =>
+    (dbOf(core).prepare(`SELECT rowid AS r FROM observations WHERE id = ?`).get(id) as { r: number }).r;
+
+  /**
+   * Exactly what a pre-upgrade binary does: insert the observation, then write postings with the
+   * Latin-only tokenizer. Bypasses the engine entirely, because the engine cannot be made to write
+   * the old tokens any more — which is the point of the scenario.
+   */
+  function legacyWriterInserts(core: MonetCore, id: string, content: string): void {
+    const db = dbOf(core);
+    const donor = db.prepare(`SELECT embedding, circle, concept_id FROM observations LIMIT 1`)
+      .get() as { embedding: string; circle: string; concept_id: string | null };
+    db.prepare(
+      `INSERT INTO observations
+         (id, content, embedding, kind, circle, concept_id, author_agent_id, created_at, updated_at, sync_revision, sync_writer)
+       VALUES (?, ?, ?, 'statement', ?, ?, 'legacy-daemon', ?, ?, 1, 'legacy-daemon')`,
+    ).run(id, content, donor.embedding, donor.circle, donor.concept_id, Date.now(), Date.now());
+    const insert = db.prepare(`INSERT OR IGNORE INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
+    for (const token of retiredTokens(content)) insert.run(id, token);
+  }
+
+  /**
+   * Bring the mark up to the top of the table. A store's FIRST open happens before it holds any
+   * observations, so the mark is set to NULL there and only reaches the newest row at the next open.
+   * The scenario under test needs a mark that already sits at the top, which is what a real upgraded
+   * store looks like — its first open sees every row it has.
+   */
+  const settle = (dbPath: string): void => { open(dbPath).close(); };
+
+  it("re-tokenizes what a legacy writer added after the stamp, and advances the watermark", withStore(async (dbPath) => {
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    core.close();
+    settle(dbPath);
+    core = open(dbPath);
+    expect(sentinel(core)).toBe(2);
+    const markBefore = watermark(core);
+    expect(markBefore).not.toBeNull(); // the mark is at the top: only the TRAILING path can fire now
+
+    // The pre-upgrade daemon commits a Korean observation while the store is already stamped.
+    legacyWriterInserts(core, "legacy-obs-1", KO_WITH_ID);
+    expect([...postingsFor(core, "legacy-obs-1")]).toEqual(["zeta9"]); // Latin-only, as the old build wrote
+    core.close();
+
+    // A current build opens: the sentinel is already 2, so ONLY the watermark can catch this.
+    core = open(dbPath);
+    expect(sentinel(core)).toBe(2);
+    expect(postingsFor(core, "legacy-obs-1")).toEqual(lexicalTokens(KO_WITH_ID));
+    expect([...postingsFor(core, "legacy-obs-1")].some((t) => /[\p{scx=Hangul}]/u.test(t))).toBe(true);
+    expect(watermark(core)).toBe("legacy-obs-1"); // moved past the row it just healed
+    expect(watermark(core)).not.toBe(markBefore);
+    core.close();
+  }));
+
+  it("does not rewrite anything when nothing lies beyond the watermark", withStore(async (dbPath) => {
+    // THE FAST PATH. `observation_tokens` is a rowid table, so a DELETE+INSERT cycle would renumber
+    // its rows — comparing rowids detects a rewrite that comparing (observation_id, token) pairs
+    // would miss entirely.
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    await core.store(KO_WITH_ID, { circle: CIRCLE, resolution: "forceNew" });
+    core.close();
+    settle(dbPath); // mark now at the top, so the next open has genuinely nothing to do
+    core = open(dbPath);
+    const before = dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all();
+    expect(before.length).toBeGreaterThan(0);
+    const markBefore = watermark(core);
+    expect(markBefore).not.toBeNull();
+    core.close();
+
+    core = open(dbPath);
+    const after = dbOf(core).prepare(`SELECT rowid AS r, observation_id, token FROM observation_tokens ORDER BY rowid`).all();
+    expect(after).toEqual(before);          // byte-identical, rowids included: nothing was rewritten
+    expect(watermark(core)).toBe(markBefore);
+    core.close();
+  }));
+
+  it("covers a trailing SOURCE observation rather than rescanning it every open", withStore(async (dbPath) => {
+    // A source row is skipped for tokenizing but must still move the mark, or every later open pays
+    // the scan again and the fast path above never engages.
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    const db = dbOf(core);
+    const donor = db.prepare(`SELECT embedding, circle FROM observations LIMIT 1`).get() as { embedding: string; circle: string };
+    db.prepare(
+      `INSERT INTO observations (id, content, embedding, kind, circle, author_agent_id, created_at, updated_at, sync_revision, sync_writer)
+       VALUES ('src-1', ?, ?, 'source', ?, 'x', 1, 1, 1, 'x')`,
+    ).run(KO, donor.embedding, donor.circle);
+    core.close();
+    settle(dbPath);
+
+    core = open(dbPath);
+    expect(watermark(core)).toBe("src-1");            // covered...
+    expect(postingsFor(core, "src-1").size).toBe(0);  // ...but deliberately not indexed
+    core.close();
+  }));
+
+  it("never leaves the watermark ahead of what was actually tokenized", withStore(async (dbPath) => {
+    // The invariant crash-safety exists to preserve. A true mid-transaction crash is not cheaply
+    // reachable in-process — better-sqlite3 runs the whole pass inside one synchronous
+    // `immediateTransaction`, so there is no yield point to interrupt — so this asserts the property
+    // that transaction buys instead: everything at or below the mark really is current-tokenizer.
+    let core = open(dbPath);
+    await core.store(KO, { circle: CIRCLE, resolution: "forceNew" });
+    await core.store(KO_WITH_ID, { circle: CIRCLE, resolution: "forceNew" });
+    legacyWriterInserts(core, "legacy-obs-2", KO);
+    core.close();
+
+    core = open(dbPath);
+    const mark = watermark(core)!;
+    const markRow = rowidOf(core, mark);
+    const covered = dbOf(core).prepare(
+      `SELECT id, content, kind FROM observations WHERE rowid <= ? ORDER BY rowid`,
+    ).all(markRow) as Array<{ id: string; content: string; kind: string }>;
+    expect(covered.length).toBeGreaterThan(2);
+    for (const row of covered) {
+      if (row.kind === "source") continue;
+      expect(postingsFor(core, row.id), row.id).toEqual(lexicalTokens(row.content));
+    }
+    core.close();
+  }));
+});
+
+/**
+ * The protocol-13 compatibility path mints observations rather than relaying them, and it was the
+ * one insert into `observations` that never wrote the matching postings. It runs AFTER startup on a
+ * store already stamped at the current tokenizer version, so the open-time rebuild is not coming
+ * back for it — a Korean summary arriving this way had no lexical evidence at all.
+ */
+describe("a first_block pin converted from a legacy graft carries its postings", () => {
+  it("tokenizes the converted observation in the graft transaction", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-fb-graft-tokens-"));
+    try {
+      const KO_SUMMARY = "페리는 매시 십오분에 섬으로 출발한다";
+      const sourcePath = join(dir, "source.db");
+      const source = new MonetCore(sourcePath, { embedder: new HashingEmbeddingProvider(), tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const stored = await source.store("First block graft target.", { circle: CIRCLE, resolution: "forceNew" });
+      const payload = source.exportDelta(0);
+      source.close();
+
+      // A protocol-13 peer still exports pins; the receiver converts them to evidence.
+      payload.schemaVersion = 13;
+      payload.firstBlock = [{
+        id: "fb:legacy-korean-pin",
+        concept_id: stored.conceptId,
+        circle: CIRCLE,
+        summary: KO_SUMMARY,
+        summary_dirty: 0,
+        position: 0,
+        promoted_at: 1_700_000_000_000,
+        promoted_by: null,
+        updated_at: 1_700_000_000_000,
+        sync_revision: 1,
+        sync_writer: "legacy-peer",
+        deleted_at: null,
+      }];
+
+      const receiver = new MonetCore(join(dir, "receiver.db"), {
+        embedder: new HashingEmbeddingProvider(), tauAttach: 1.1, tauAmbiguous: 1.1,
+      });
+      expect(receiver.graftRows(payload).converted.first_block).toBe(1);
+
+      const converted = dbOf(receiver).prepare(
+        `SELECT id, content FROM observations WHERE author_agent_id = 'schema-12-first-block-migration'`,
+      ).get() as { id: string; content: string };
+      expect(converted).toBeDefined();
+      expect(converted.content).toContain(KO_SUMMARY);
+
+      // The point: postings exist, and they are the CJK grams the arm actually reads.
+      const stored_tokens = postingsFor(receiver, converted.id);
+      expect(stored_tokens).toEqual(lexicalTokens(converted.content));
+      expect(stored_tokens.size).toBeGreaterThan(0);
+      expect([...stored_tokens].some((t) => /[\p{scx=Hangul}]/u.test(t))).toBe(true);
+      receiver.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
