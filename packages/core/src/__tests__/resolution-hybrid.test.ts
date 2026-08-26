@@ -1215,6 +1215,13 @@ describe("the margin gate declines to fire", () => {
     // text fully readable. None of them could see the last case at all — in a two-concept circle
     // `tokenIdf(2, df)` clamps every weight to zero, so the arm cannot boost anything however English
     // the text is, and the margin is a raw-cosine gap that 0.12 was never calibrated against.
+    //
+    // WHY THE CJK ROWS STILL PASS AFTER #38, and it is not the reason they used to. Every fixture
+    // here holds TWO concepts, so `tokenIdf(2, df)` zeroes every weight and the arm is silent
+    // whatever the tokenizer reads. Before #38 the CJK rows were ALSO silent for a second reason —
+    // the tokenizer emitted nothing at all — and that reason is gone. They are kept because the
+    // clamp is the case under test and the scripts are still worth carrying through it; the
+    // tokenizer-blindness case they used to double as now lives in the accented-Latin fixture below.
     for (const [label, a, b, probe] of [
       ["CJK", "페리는 매시 십오분에 섬으로 출발한다", "페리는 주말에 매시 십오분에 출발한다", "페리는 매시 십오분에 섬으로"],
       ["mixed script", "API 페리는 매시 십오분에 섬으로 출발한다", "API 페리는 주말에 십오분에 출발한다", "API 페리는 매시 십오분에"],
@@ -1258,30 +1265,63 @@ describe("the margin gate declines to fire", () => {
   });
 
   it("nor when a shared ASCII token is the ONLY thing the arm can read", async () => {
-    // Movement alone re-admits the case it was meant to close (Codex P1, round 7): a mostly-Korean
-    // probe sharing one identifier with its candidates gets a positive IDF boost, so `rank !== score`
-    // goes true while the Korean carries no lexical signal at all. Coverage and movement are
-    // independent necessary conditions, and the second arriving was not a reason to drop the first.
+    // Movement alone re-admits the case it was meant to close (Codex P1, round 7): a probe in a
+    // script the tokenizer cannot read, sharing one identifier with its candidates, gets a positive
+    // IDF boost — so `rank !== score` goes true while the prose carries no lexical signal at all.
+    // Coverage and movement are independent necessary conditions, and the second arriving was not a
+    // reason to drop the first.
+    //
+    // THE SCRIPT HERE CHANGED WITH #38, AND THE CASE DID NOT. This fixture was Korean, because
+    // Korean was the standing example of text the tokenizer could not read. It now reads Korean
+    // (see lexical-overlap.ts), so Korean would pass the coverage bar and stop testing anything —
+    // the assertion below would be checking the tokenizer's blindness, not the gate's second
+    // condition. Accented Latin is the contrast case the LEXICAL_COVERAGE_MIN note has cited since
+    // its first derivation and the one #38 did NOT widen: `[a-z0-9_-]` still drops every accented
+    // character, so `précis` tokenizes as `cis`.
     const core = armedCore(5);
     try {
       // `api` must sit in exactly ONE concept or tokenIdf clamps it: at N=3 a term in two or three
       // concepts weighs log(3/3) or less, which is zero after the clamp.
-      const A = "API 페리는 매시 십오분에 섬으로 출발한다";
-      const B = "페리는 주말에 매시 십오분에 출발한다";
-      const C = "트램은 항구에서 다른 시간표로 운행한다";
-      const PROBE = "API 페리는 매시 십오분에 섬으로";
+      const A = "API le ferry pour l'île part à midi précis";
+      const B = "le ferry pour l'île part à midi le dimanche";
+      const C = "le tramway du port suit un horaire différent";
+      const PROBE = "API le ferry pour l'île part à midi précis";
       await seedConcept(core, [A]);
       await seedConcept(core, [B]);
       await seedConcept(core, [C]); // three concepts, so tokenIdf does not clamp to zero
       // PREMISE: the arm DOES move a rank here — movement alone would call this comparable...
       expect(armContributed(core, PROBE)).toBe(true);
-      // ...while the tokenizer reads almost none of it.
+      // ...while the tokenizer reads too little of it for the calibrated regime to apply.
       expect(lexicalCoverage(PROBE)).toBeLessThan(LEXICAL_COVERAGE_MIN);
 
       const before = rows(core);
       const r = await core.store(PROBE, { circle: CIRCLE });
       expect(["attached", "created", "ambiguous"]).toContain(r.action);
       expect(rows(core)).toBe(before + 1);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("but DOES fire for Korean now that the arm can read it — issue #38's write side", async () => {
+    // THE WRITE-SIDE HALF OF #38, PINNED. Before the CJK branch, `lexicalCoverage` on Korean read
+    // 0.000, `comparable` was false at engine.ts's margin gate, and the tauMargin ambiguity ask
+    // could not evaluate for a Korean write AT ALL — measured on the #38 corpus as 0 of 967
+    // CJK-heavy observations clearing LEXICAL_COVERAGE_MIN. This test fails on the old tokenizer at
+    // the coverage premise, which is what makes it a regression test rather than a restatement.
+    //
+    // Three concepts, for the same reason as the fixture above: at N=2 `tokenIdf` clamps every
+    // weight to zero and the arm cannot move a rank however readable the text is.
+    const core = armedCore(5); // bar above every reachable margin, so this asserts the gate is LIVE
+    try {
+      const PROBE = "페리는 매시 십오분에 섬으로 출발한다";
+      await seedConcept(core, ["페리는 매시 십오분에 섬으로 출발한다 그리고 정시에 도착한다"]);
+      await seedConcept(core, ["페리는 주말에만 항구에서 섬으로 출발한다 겨울에는 운항하지 않는다"]);
+      await seedConcept(core, ["트램은 도심에서 다른 시간표로 운행한다 승차권은 따로 구입한다"]);
+      // BOTH necessary conditions, asserted as premises rather than assumed:
+      expect(lexicalCoverage(PROBE)).toBeGreaterThanOrEqual(LEXICAL_COVERAGE_MIN); // was 0.000
+      expect(armContributed(core, PROBE)).toBe(true);
+      await expect(core.store(PROBE, { circle: CIRCLE })).rejects.toThrow(AmbiguousNominationError);
     } finally {
       core.close();
     }
