@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readInflightStatements } from "../statement-trace";
-import { BetterSqlitePort, StoreBusyError } from "../storage";
+import { BetterSqlitePort, StoreBusyError, schemaRegionContentionError, storeContentionError } from "../storage";
 import { MonetCore } from "../engine";
 
 const dirs: string[] = [];
@@ -352,5 +352,86 @@ describe("the region's elapsed time is not a lock wait, and the message must not
     expect(open.message).toContain(openPath);
     expect(region.message).toMatch(/is busy/);
     expect(region.message).toContain(regionPath);
+  });
+});
+
+/**
+ * FINDING A, from the SECOND review round of this PR. Widening the translated window from the
+ * connection open to the whole schema region also widened what the contention predicate is exposed
+ * to, and the predicate has a bare `/database is locked/i` message arm.
+ *
+ * WHY THAT ARM IS SAFE WHERE IT WAS WRITTEN AND NOT HERE. The open path's catch wraps
+ * `new Database()` and two pragmas — a driver error is the only thing that can reach it. The region
+ * runs MonetCore's entire construction: ~10 statements plus every migration and repair pass, each
+ * free to throw anything. `initSyncIdentity` quotes a device id the CALLER supplied, so the phrase
+ * can arrive inside an error that has nothing to do with SQLite.
+ *
+ * WHAT THE MISTRANSLATION COSTS is not a wording nit: the operator is told a write lock could not be
+ * taken, sent to look for the holder, and advised to retry — for a device-id mismatch that will fail
+ * identically forever. The reproduction below is the review's own.
+ *
+ * NARROWED ON THIS PATH ONLY. The message arm still exists for contention SQLite reports without a
+ * code, and startup-diagnosis.test.ts depends on the open path admitting exactly that shape. The
+ * last test here pins the open path's message against its own bytes for the very input the region
+ * now rejects.
+ */
+describe("the region translates SQLite's contention and nothing else (#102 review, finding A)", () => {
+  const FIXED = "/nonexistent-monet-region-predicate-dir/monet.db";
+
+  it("a genuine SQLITE_BUSY still translates", () => {
+    // The end-to-end proof against a real held lock is "translates on the path branch", above; this
+    // is the same case at the predicate, so the narrowing cannot quietly take the code path with it.
+    const busy = schemaRegionContentionError(FIXED, Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }), 8035);
+    expect(busy).toBeInstanceOf(StoreBusyError);
+    expect(busy?.message).toMatch(/had been running for 8035ms/);
+
+    const locked = schemaRegionContentionError(FIXED, Object.assign(new Error("database table is locked"), { code: "SQLITE_LOCKED" }), 10);
+    expect(locked).toBeInstanceOf(StoreBusyError);
+  });
+
+  it("a codeless lock report from SQLite still translates — the case the message arm exists for", () => {
+    // No code anywhere, identified only by the class that threw it. Measured on this driver, a real
+    // contended statement carries name "SqliteError"; the arm exists because #148 recorded SQLite
+    // reporting contention without a code, and narrowing must not delete that case.
+    const bare = Object.assign(new Error("database is locked"), { name: "SqliteError" });
+    expect((bare as { code?: unknown }).code).toBeUndefined();
+    expect(schemaRegionContentionError(FIXED, bare, 42)).toBeInstanceOf(StoreBusyError);
+  });
+
+  it("a non-SQLite error carrying the phrase is NOT contention — the review's repro, end to end", () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "monet-core.db");
+    // The phrase reaches the region inside an ordinary error, through a value the CALLER chose.
+    const first = new MonetCore(dbPath, { syncDeviceId: "device-a" });
+    first.close();
+
+    let caught: unknown;
+    try {
+      new MonetCore(dbPath, { syncDeviceId: "database is locked" });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).not.toBeInstanceOf(StoreBusyError);
+    expect((caught as Error).message).toBe("syncDeviceId mismatch: store is 'device-a', requested 'database is locked'");
+    // Nothing about a lock survives into what the operator reads: no wait, no holder, no retry.
+    expect((caught as Error).message).not.toMatch(/is busy|write lock|retry/);
+  });
+
+  it("the OPEN path still admits that same error, byte for byte", () => {
+    const carrier = new Error("syncDeviceId mismatch: store is 'device-a', requested 'database is locked'");
+    // THE INPUT THE REGION NOW REJECTS, asserted against the open path's own pre-change bytes rather
+    // than a regex — a narrowing that leaked into the shared predicate would change this string, and
+    // a pattern loose enough to keep matching is exactly what would hide it.
+    expect(storeContentionError(FIXED, carrier, 5000)?.message).toBe(
+      "The store at /nonexistent-monet-region-predicate-dir/monet.db is busy: could not take its write lock after 5000ms. " +
+      "Nothing beside the store records who holds it. That happens when statement tracing is off (set MONET_TRACE_SQL=1 on " +
+      "every monet process sharing this store and reproduce), and also when the holder is idle between statements while " +
+      "keeping the lock — an absent RECORD either way, never an absent holder. One MCP server and one `monet` CLI call " +
+      "sharing a store is the supported topology, so this is usually transient — retry once the other process finishes. If " +
+      "nothing ever finishes, the holder is wedged rather than busy.",
+    );
+    // And the two paths now disagree about it, which is the whole content of this fix.
+    expect(schemaRegionContentionError(FIXED, carrier, 5000)).toBeUndefined();
   });
 });

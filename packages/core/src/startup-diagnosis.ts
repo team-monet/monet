@@ -210,12 +210,41 @@ function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max)}… [truncated]`;
 }
 
-/** A string `code` on this value, or undefined. Reads any object, so it can be pointed at a cause. */
+/**
+ * A string `code` on this value, or undefined. Reads any object, so it can be pointed at a cause.
+ *
+ * READS BEHIND A GUARD, because `code` is optional and the record is not (#102 review, finding B).
+ * Both the `in` test and the property read run arbitrary third-party code — a getter, a Proxy trap —
+ * and a throw from either used to escape into recordStartupFailure's outer catch, which reports by
+ * returning null. That traded a whole startup diagnosis, whose name, message and stack were all
+ * perfectly readable, for one optional field. An uninspectable code is an ABSENT code here, which is
+ * the state this record already has a meaning for.
+ */
 function errorCode(value: unknown): string | undefined {
-  const code = typeof value === "object" && value !== null && "code" in value
-    ? (value as { code?: unknown }).code
-    : undefined;
-  return typeof code === "string" ? code : undefined;
+  try {
+    const code = typeof value === "object" && value !== null && "code" in value
+      ? (value as { code?: unknown }).code
+      : undefined;
+    return typeof code === "string" ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The error's `cause`, or undefined when reading it throws.
+ *
+ * SEPARATE FROM THE GUARD ABOVE, deliberately: `error.cause` is its own property read on its own
+ * object, so a throwing `cause` accessor and a throwing `code` accessor are two failures, and one
+ * must not cost the other. A poisoned `.code` on the error still lets a readable cause supply the
+ * code, and a poisoned `.cause` still lets the error's own code stand.
+ */
+function errorCause(error: Error): unknown {
+  try {
+    return error.cause;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -234,7 +263,7 @@ function errorCode(value: unknown): string | undefined {
  */
 function describe(error: unknown): StartupFailureRecord["error"] & { stack: string | null } {
   if (error instanceof Error) {
-    const code = errorCode(error) ?? errorCode(error.cause);
+    const code = errorCode(error) ?? errorCode(errorCause(error));
     return {
       name: error.name,
       message: truncate(error.message, MESSAGE_MAX_CHARS),

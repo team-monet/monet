@@ -103,6 +103,37 @@ function isStoreContention(error: unknown): boolean {
 }
 
 /**
+ * Did this error come from SQLite at all? Asked ONLY by the region path, and this is why.
+ *
+ * `isStoreContention`'s second arm is a bare message match, which is safe exactly where it was
+ * written: the open path's catch (BetterSqlitePort's constructor, below) wraps `new Database()` and
+ * two pragmas, so a driver error is the only thing that can arrive and the arm cannot meet anything
+ * else. The schema region is the opposite — MonetCore's whole construction runs inside it, ~10
+ * statements plus every migration and repair pass, all free to throw whatever they like. Measured:
+ * `initSyncIdentity` raises a plain Error quoting a device id the CALLER chose, so reopening a store
+ * with `syncDeviceId: "database is locked"` produced a StoreBusyError blaming a write lock, naming a
+ * holder and advising a retry, for a mismatch with no lock anywhere in it.
+ *
+ * WHY THE MESSAGE ARM IS NARROWED HERE RATHER THAN DELETED. It exists for contention SQLite reports
+ * WITHOUT a code (`isStoreContention`'s own comment, #148), and something still depends on that
+ * shape: startup-diagnosis.test.ts drives `storeContentionError` with a codeless `database is
+ * locked` to prove the record leaves `code` ABSENT rather than fabricating `SQLITE_BUSY`. Requiring
+ * the error to be SQLite's keeps every case the arm was written for and drops only the errors that
+ * were never SQLite's — which is the whole population this region added to it.
+ *
+ * WHAT COUNTS AS SQLITE'S: a `SQLITE_`-prefixed code, or the driver's own error class name. Measured
+ * on this driver: a real contended `CREATE TABLE` throws `name: "SqliteError"`, `code:
+ * "SQLITE_BUSY"`, `message: "database is locked"`. The name arm is what carries a codeless report —
+ * matching on the class that threw rather than on a code that is not there.
+ */
+function isSqliteError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = "code" in error ? (error as { code?: unknown }).code : undefined;
+  if (typeof code === "string" && code.startsWith("SQLITE_")) return true;
+  return error instanceof Error && error.name === "SqliteError";
+}
+
+/**
  * Turn a contention failure into a sentence an operator can act on, or return undefined so the
  * original error propagates untouched.
  *
@@ -203,6 +234,10 @@ export function schemaRegionContentionError(
   error: unknown,
   regionElapsedMs: number,
 ): StoreBusyError | undefined {
+  // NOT EVERY FAILURE IN THIS REGION IS SQLITE'S (PR #102 review, finding A). The open path can hand
+  // `isStoreContention` nothing but driver errors; this one hands it the whole constructor. See
+  // isSqliteError for what the difference costs and why the narrowing lands here and not there.
+  if (!isSqliteError(error)) return undefined;
   return contentionError(
     dbPath,
     error,

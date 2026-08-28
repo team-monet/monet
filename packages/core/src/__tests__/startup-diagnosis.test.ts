@@ -17,7 +17,7 @@
  * `new StdioServerTransport()` is reached (the same property the pin choke-point test in
  * embedder-pin.test.ts relies on), so nothing in this file can seize the test runner's own stdio.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -703,5 +703,128 @@ describe("the error's code when the error keeps it on its cause (#102 review, fi
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * FINDING B, from the SECOND review round of this PR. Reading the code from `.cause` added two
+ * property reads on a foreign object — `error.cause`, and `.code` on whatever comes back — and both
+ * ran inside the block whose failure mode is "return null, publish nothing".
+ *
+ * SO ONE OPTIONAL FIELD COULD DESTROY THE WHOLE RECORD. A third-party Error exposing `cause` (or its
+ * cause's `code`) through a throwing accessor is enough: `describe()` throws while describing an
+ * error whose name, message and stack are all perfectly readable, the outer catch absorbs it as
+ * designed, and the startup that died publishes no diagnosis at all — in the one code path that
+ * exists so a death before the transport can still be explained.
+ *
+ * NOT KNOWN IS NOT A VERDICT, which is the same distinction the rest of this module turns on. An
+ * uninspectable code is recorded the way an absent one always was: by leaving the key out. What must
+ * never happen is that it takes the record with it.
+ *
+ * THE FOUR STATES ARE ASSERTED TOGETHER on purpose. Three of them omit the key, so a guard that
+ * omitted it always would pass all three — the readable case is what proves the fallback still
+ * works, and it belongs in the same test as the failures it has to survive.
+ */
+describe("a cause that cannot be read costs the code, never the record (#102 review, finding B)", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    while (dirs.length) rmSync(dirs.pop() as string, { recursive: true, force: true });
+  });
+  function store(): string {
+    const dir = tempDir();
+    dirs.push(dir);
+    return storeIn(dir);
+  }
+
+  it("cause ABSENT: the record is published and the key stays out", () => {
+    const path = store();
+    expect(recordStartupFailure({ store: path, error: new Error("no cause at all") })).not.toBeNull();
+    const read = readStartupFailure(path);
+    expect(read.status).toBe("found");
+    if (read.status !== "found") return;
+    expect("code" in read.record.error).toBe(false);
+    expect(read.record.error.message).toBe("no cause at all");
+  });
+
+  it("cause PRESENT AND READABLE: the record is published and carries the cause's code", () => {
+    const path = store();
+    const error = new Error("wrapped", { cause: Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }) });
+    expect(recordStartupFailure({ store: path, error })).not.toBeNull();
+    const read = readStartupFailure(path);
+    expect(read.status).toBe("found");
+    if (read.status !== "found") return;
+    expect(read.record.error.code).toBe("SQLITE_BUSY");
+  });
+
+  it("cause PRESENT BUT THROWING: the record survives whole, only the code is missing", () => {
+    const path = store();
+    const error = new Error("the original, entirely readable failure");
+    Object.defineProperty(error, "cause", {
+      get() { throw new TypeError("a third-party cause accessor that throws"); },
+    });
+
+    // Before the guard this returned null and published nothing at all.
+    expect(recordStartupFailure({ store: path, error })).not.toBeNull();
+    const read = readStartupFailure(path);
+    expect(read.status).toBe("found");
+    if (read.status !== "found") return;
+    expect("code" in read.record.error).toBe(false);
+    // Everything the error could still say, it still says.
+    expect(read.record.error.name).toBe("Error");
+    expect(read.record.error.message).toBe("the original, entirely readable failure");
+    expect(read.record.stack).toContain("the original, entirely readable failure");
+  });
+
+  it("cause present with a THROWING .code: the record survives whole, only the code is missing", () => {
+    const path = store();
+    const cause = {};
+    Object.defineProperty(cause, "code", {
+      get() { throw new TypeError("a third-party code accessor that throws"); },
+    });
+    const error = new Error("the original, entirely readable failure", { cause });
+
+    expect(recordStartupFailure({ store: path, error })).not.toBeNull();
+    const read = readStartupFailure(path);
+    expect(read.status).toBe("found");
+    if (read.status !== "found") return;
+    expect("code" in read.record.error).toBe(false);
+    expect(read.record.error.message).toBe("the original, entirely readable failure");
+  });
+
+  /**
+   * The guards are per-read, not one net around both, so a poisoned `.code` on the ERROR does not
+   * cost a readable code on its cause — the exact shape StoreBusyError has, which is why the
+   * fallback was added in the first place.
+   */
+  it("a throwing top-level .code still lets the cause supply one", () => {
+    const path = store();
+    const error = new Error("wrapped", { cause: Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }) });
+    Object.defineProperty(error, "code", {
+      get() { throw new TypeError("a third-party code accessor that throws"); },
+    });
+
+    expect(recordStartupFailure({ store: path, error })).not.toBeNull();
+    const read = readStartupFailure(path);
+    expect(read.status).toBe("found");
+    if (read.status !== "found") return;
+    expect(read.record.error.code).toBe("SQLITE_BUSY");
+  });
+
+  /**
+   * THE BOUNDARY THIS DOES NOT MOVE. `message` is not optional — a record without one describes
+   * nothing — so the established contract for an unreadable one stays exactly as it was: absorbed,
+   * reported by returning null, never re-thrown ("the recorder is TOTAL", above).
+   */
+  it("an unreadable MESSAGE still returns null — the optional-field guard did not widen", () => {
+    const path = store();
+    const poisoned = new Error("unreadable");
+    Object.defineProperty(poisoned, "message", {
+      get() { throw new TypeError("poisoned getter"); },
+    });
+    let result: string | null | undefined;
+    expect(() => {
+      result = recordStartupFailure({ store: path, error: poisoned });
+    }).not.toThrow();
+    expect(result).toBeNull();
   });
 });
