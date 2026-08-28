@@ -250,6 +250,69 @@ describe("SQL.health — avgConfidence/graphDensity computed over non-retired co
     expect(health(SQL.health).avgConfidence).toBe(1.0);
     expect(health(SQL.healthIncludeRetired).avgConfidence).toBe(0.5);
   });
+
+  // graphDensity is a STRUCTURAL metric — edges per concept in the connection
+  // graph. Both of core's PAIR FLAG types (engine.ts PAIR_FLAG_EDGE_TYPES =
+  // possible_duplicate_of, extraction_candidate) are open curation questions
+  // put in front of a human, not structural connections, so counting either in
+  // the numerator inflates density with links the graph doesn't actually hold.
+  //
+  // Fixture is deliberately a MIX rather than either end, and is built so the
+  // numerator yields THREE distinguishable values — a regression that drops
+  // only one of the two exclusions still fails:
+  //
+  //   SQL.health (denominator = a,b,c,d = 4)        | includeRetired (= 5)
+  //     neither excluded    6/4 = 1.5               |   9/5 = 1.8
+  //     dup excluded only   4/4 = 1.0               |   6/5 = 1.2
+  //     both excluded       2/4 = 0.5  <- asserted  |   3/5 = 0.6  <- asserted
+  function seedMixedGraph(): void {
+    // 4 non-retired concepts (health denominator), 5 total (includeRetired denominator).
+    insertConcept({ id: "a" });
+    insertConcept({ id: "b" });
+    insertConcept({ id: "c" });
+    insertConcept({ id: "d" });
+    insertConcept({ id: "r", status: "retired" });
+
+    // Live structural edges between non-retired concepts — counted in both variants.
+    insertEdge({ id: "e-rel-1", src_id: "a", dst_id: "b", type: "related" });
+    insertEdge({ id: "e-cooc-1", src_id: "b", dst_id: "c", type: "co_occurred" });
+
+    // Live pair flags between non-retired concepts — the defect: counted today.
+    // Two of EACH type, so dropping either exclusion moves the numerator by 2.
+    insertEdge({ id: "e-dup-1", src_id: "a", dst_id: "c", type: "possible_duplicate_of" });
+    insertEdge({ id: "e-dup-2", src_id: "b", dst_id: "d", type: "possible_duplicate_of" });
+    insertEdge({ id: "e-ext-1", src_id: "c", dst_id: "a", type: "extraction_candidate" });
+    insertEdge({ id: "e-ext-2", src_id: "d", dst_id: "b", type: "extraction_candidate" });
+
+    // Dismissed edges of every kind — already excluded by `dismissed_at IS NULL`
+    // in both variants, and must stay excluded (they move no number here).
+    insertEdge({ id: "e-dup-dismissed", src_id: "c", dst_id: "d", type: "possible_duplicate_of", dismissed_at: 1 });
+    insertEdge({ id: "e-ext-dismissed", src_id: "a", dst_id: "d", type: "extraction_candidate", dismissed_at: 1 });
+    insertEdge({ id: "e-rel-dismissed", src_id: "d", dst_id: "a", type: "related", dismissed_at: 1 });
+
+    // Edges touching the retired concept — dropped by SQL.health's endpoint
+    // joins, but live for healthIncludeRetired, which has no retired filter.
+    insertEdge({ id: "e-rel-retired", src_id: "a", dst_id: "r", type: "related" });
+    insertEdge({ id: "e-dup-retired", src_id: "b", dst_id: "r", type: "possible_duplicate_of" });
+    insertEdge({ id: "e-ext-retired", src_id: "c", dst_id: "r", type: "extraction_candidate" });
+  }
+
+  it("excludes both pair-flag edge types from the density numerator (retired-filtered variant)", () => {
+    seedMixedGraph();
+    // Numerator: e-rel-1 + e-cooc-1 = 2 structural live edges between non-retired
+    // concepts. The four live pair flags (2 dup + 2 ext) are excluded by type;
+    // e-*-dismissed by dismissal; e-*-retired by the endpoint joins.
+    // Denominator: a,b,c,d = 4. Excluding neither gives 1.5, dup only gives 1.0.
+    expect(health(SQL.health).graphDensity).toBe(0.5);
+  });
+
+  it("excludes both pair-flag edge types from the density numerator (includeRetired variant)", () => {
+    seedMixedGraph();
+    // No retired filter here, so the numerator is e-rel-1 + e-cooc-1 +
+    // e-rel-retired = 3 live structural edges, over all 5 concepts.
+    // Excluding neither gives 1.8, dup only gives 1.2.
+    expect(health(SQL.healthIncludeRetired).graphDensity).toBe(0.6);
+  });
 });
 
 describe("SQL.entityLinks — links to a retired concept excluded by default", () => {

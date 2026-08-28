@@ -314,23 +314,42 @@ export const SQL = {
   // the stat-bar numbers describe what's actually on screen, not a metric
   // dominated by an 82%-retired store. graphDensity's edge subquery is joined
   // to concepts on both endpoints, mirroring SQL.edges/counts.edgesLive.
+  //
+  // Core's two PAIR FLAG edge types are excluded from the numerator in BOTH
+  // variants: graphDensity reports how densely the connection graph links
+  // concepts, and a pair flag is a curation question awaiting a human (which is
+  // why `counts` above reports possibleDuplicatePairs separately), not a
+  // structural link between two distinct concepts.
+  //
+  // The list is `PAIR_FLAG_EDGE_TYPES` in monet-core (engine.ts ~:293) — that
+  // constant is the SOURCE OF TRUTH for which types are pair flags, and its own
+  // doc comment exists because the set had already drifted across hand-written
+  // lists once. It is module-private there (not exported from core's index, not
+  // in its .d.ts) and this file imports nothing from core, so the two literals
+  // are repeated here rather than reused. If a third pair flag is ever added to
+  // that constant, it belongs here too.
   health: `
     SELECT
       AVG(CASE WHEN confidence IS NOT NULL THEN confidence END) as avgConfidence,
       (SELECT COUNT(*) FROM memory_edge e
          JOIN concepts esrc ON esrc.id = e.src_id AND esrc.${RETIRED_FILTER}
          JOIN concepts edst ON edst.id = e.dst_id AND edst.${RETIRED_FILTER}
-        WHERE e.dismissed_at IS NULL) * 1.0 /
+        WHERE e.type NOT IN ('possible_duplicate_of', 'extraction_candidate')
+          AND e.dismissed_at IS NULL) * 1.0 /
         NULLIF((SELECT COUNT(*) FROM concepts WHERE ${RETIRED_FILTER}), 0) as graphDensity
     FROM concepts
     WHERE ${RETIRED_FILTER}
   `,
 
-  // includeRetired=1 variant — the original ungenerated query.
+  // includeRetired=1 variant — identical to `health` minus every retired
+  // exclusion. The pair-flag exclusion is NOT a retired exclusion, so it
+  // applies here too.
   healthIncludeRetired: `
     SELECT
       AVG(CASE WHEN confidence IS NOT NULL THEN confidence END) as avgConfidence,
-      (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NULL) * 1.0 /
+      (SELECT COUNT(*) FROM memory_edge
+        WHERE type NOT IN ('possible_duplicate_of', 'extraction_candidate')
+          AND dismissed_at IS NULL) * 1.0 /
         NULLIF((SELECT COUNT(*) FROM concepts), 0) as graphDensity
     FROM concepts
   `,
