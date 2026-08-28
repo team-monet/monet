@@ -2335,7 +2335,7 @@ export function stageLookup(db: StoragePort, opts: StageLookupOptions): StageLoo
  * moment replaced it, and the rates did NOT survive the move: `momentCounts` reports populations
  * only. Every rate came off on 2026-08-22 once nothing wrote the columns behind them, `overflows`'
  * successor `ungoverned` with them for restating `total` (see `MomentCounts`). The read dimension
- * is answered by `momentStageReads` against this registry.
+ * is answered by `momentRuleReadsByStage` against this registry.
  *
  * WHAT REMAINS IS EVERYTHING THAT READS `stages` AND `rule_bindings` — facts about what is
  * DECLARED, not about what happened. Those never depended on the event table and are unchanged.
@@ -2362,7 +2362,7 @@ export interface GateCoverage {
    *
    * THE DENOMINATOR FOR THE READ DIMENSION, and the reason it is here rather than derived by a
    * caller: "which stages has nobody ever looked up" is this list minus the stages agents have
-   * actually named (momentStageReads). Scoped to stages with something live to deliver, so an empty
+   * actually named (momentRuleReadsByStage). Scoped to stages with something live to deliver, so an empty
    * registry entry cannot manufacture a finding.
    */
   liveStages: Array<{ stageId: string; stageName: string }>;

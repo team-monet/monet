@@ -386,9 +386,9 @@ describe("R2 P2 — stage-read coverage is scoped to the circle that asked", () 
     cores.push(core);
     // One lookup of a global stage, in circle-a only.
     core.recordRuleReads(null, ["rule-a"], "stage-shared", "circle-a");
-    expect(core.momentStageReads("circle-a").get("stage-shared")).toBe(1);
+    expect(core.momentRuleReadsByStage("circle-a").get("stage-shared")).toBe(1);
     // circle-b has never looked this stage up, and must still report it as unread.
-    expect(core.momentStageReads("circle-b").has("stage-shared")).toBe(false);
+    expect(core.momentRuleReadsByStage("circle-b").has("stage-shared")).toBe(false);
   });
 });
 
@@ -558,7 +558,7 @@ describe("R5 — governed moments survive a circle MERGE, not only a rename", ()
     core.closeStoreMoment(id, "{}", "ok");
     core.recordRuleReads(null, ["rule-a"], "stage-shared", "old-team");
     expect(core.momentCounts("old-team").total).toBe(1);
-    expect(core.momentStageReads("old-team").get("stage-shared")).toBe(1);
+    expect(core.momentRuleReadsByStage("old-team").get("stage-shared")).toBe(1);
 
     await core.mergeCircle("old-team", "new-team");
 
@@ -567,7 +567,7 @@ describe("R5 — governed moments survive a circle MERGE, not only a rename", ()
     // resolves to any more — reachable from neither side.
     expect(core.momentCounts("new-team").total).toBe(1);
     expect(core.momentCounts("old-team").total).toBe(1);
-    expect(core.momentStageReads("new-team").get("stage-shared")).toBe(1);
+    expect(core.momentRuleReadsByStage("new-team").get("stage-shared")).toBe(1);
     expect(core.momentCounts("new-team").unattributed).toBe(0);
   });
 });
@@ -655,6 +655,6 @@ describe("R6 — the public stageLookup() record for a library caller", () => {
     const r = core.stageLookup({ stage: "terraform apply" });
     expect(r.rules.length).toBeGreaterThan(0);
     // Without this, a stage an embedder consults every day reads as one nobody has ever looked up.
-    expect(core.momentStageReads("acme-widgets").size).toBeGreaterThan(0);
+    expect(core.momentRuleReadsByStage("acme-widgets").size).toBeGreaterThan(0);
   });
 });
