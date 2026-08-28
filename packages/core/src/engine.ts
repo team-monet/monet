@@ -28,7 +28,7 @@ import {
   momentConformance,
   momentCounts,
   momentLossCount,
-  momentStageReads,
+  momentRuleReadsByStage,
   momentsOwingAQuestion,
 } from "./moment-ledger";
 import type { MomentConformance, MomentCounts } from "./moment-ledger";
@@ -9098,7 +9098,7 @@ export class MonetCore {
     // the stages nothing has ever asked for, because that is the one state indistinguishable from
     // health. Derived by joining the live registry against the stages agents actually NAMED —
     // never against the stage the gate matched, which is a different fact.
-    const namedStages = this.momentStageReads(circle);
+    const namedStages = this.momentRuleReadsByStage(circle);
     const unreadStagesAll = coverage.liveStages
       .filter((stage) => !namedStages.has(stage.stageId))
       .map(({ stageId, stageName }) => ({ stageId, stageName }));
@@ -12950,14 +12950,15 @@ export class MonetCore {
   }
 
   /**
-   * How many times each stage was NAMED by an agent through stage_lookup.
+   * Rule reads keyed by the stage an agent NAMED through stage_lookup — one lookup contributes one
+   * count per rule it returned, so membership is exact but the magnitude counts rule reads.
    *
    * A caller joins this against the stage registry: a declared stage ABSENT from the map is one
    * nobody has ever looked up, which is otherwise indistinguishable from a healthy quiet stage.
    */
-  momentStageReads(circle?: string): Map<string, number> {
+  momentRuleReadsByStage(circle?: string): Map<string, number> {
     if (this.momentSpoolPath === null) return new Map();
-    return momentStageReads(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
+    return momentRuleReadsByStage(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }
 
   /** The four conformance states. Folds first. Zeroes when no spool is configured. */
@@ -13239,7 +13240,7 @@ export class MonetCore {
     // the advisory path. The record shrinks the undecidable to that core and no further.
     const result = this.stageLookupUnjournaled(opts);
     // STAGE-READ COVERAGE FOR THE PUBLIC API. Only the MCP adapter recorded these, so a library
-    // caller's lookups were invisible to `momentStageReads` — and that map's whole job is to name
+    // caller's lookups were invisible to `momentRuleReadsByStage` — and that map's whole job is to name
     // the stages NOBODY has ever consulted. A stage an embedder looks up every day read as one
     // never looked up at all. `momentId: null`: a library caller has no interception to name, which
     // is the documented unjoinable-read case rather than a defect.

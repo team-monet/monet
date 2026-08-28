@@ -18,7 +18,7 @@ import { MonetCore } from "../engine";
 import { registerMonetCoreTools } from "../mcp-server";
 import { BetterSqlitePort } from "../storage";
 import type { StoragePort } from "../storage";
-import { foldMomentSpool, momentStageReads, observedMomentLosses, readGovernedMoment } from "../moment-ledger";
+import { foldMomentSpool, momentRuleReadsByStage, observedMomentLosses, readGovernedMoment } from "../moment-ledger";
 
 const dirs: string[] = [];
 const ports: StoragePort[] = [];
@@ -172,7 +172,7 @@ describe("the stage the agent named", () => {
     // named a stage, and before this field that read carried no stage attribution at all.
     core.recordRuleReads(null, ["rule-a"], "stage-alpha");
 
-    expect(momentStageReads(db, spoolPath, "acme-widgets").get("stage-alpha")).toBe(1);
+    expect(momentRuleReadsByStage(db, spoolPath, "acme-widgets").get("stage-alpha")).toBe(1);
     // Still an unjoinable read: naming a stage does not manufacture a moment.
     expect(foldMomentSpool(db, spoolPath).unjoinableReads).toBe(0); // already folded above
     expect(db.prepare(`SELECT COUNT(*) AS n FROM moment_reads WHERE moment_id IS NULL`).get()).toEqual({ n: 1 });
@@ -190,8 +190,8 @@ describe("the stage the agent named", () => {
     core.recordRuleReads("m1", ["rule-a"], "stage-beta");
 
     expect(readGovernedMoment(db, spoolPath, "m1")?.stageId).toBe("stage-1");
-    expect(momentStageReads(db, spoolPath, "acme-widgets").get("stage-beta")).toBe(1);
-    expect(momentStageReads(db, spoolPath, "acme-widgets").has("stage-1")).toBe(false);
+    expect(momentRuleReadsByStage(db, spoolPath, "acme-widgets").get("stage-beta")).toBe(1);
+    expect(momentRuleReadsByStage(db, spoolPath, "acme-widgets").has("stage-1")).toBe(false);
   });
 
   it("leaves a stage nobody named absent from the map, which is what makes the zero visible", () => {
@@ -201,7 +201,7 @@ describe("the stage the agent named", () => {
     const core = coreWithSpool(spoolPath);
     core.recordRuleReads(null, ["rule-a"], "stage-alpha");
 
-    const reads = momentStageReads(db, spoolPath, "acme-widgets");
+    const reads = momentRuleReadsByStage(db, spoolPath, "acme-widgets");
     // A caller joins this against the stage registry; a declared stage missing here is one nobody
     // has ever looked up. That absence IS the finding.
     expect(reads.has("stage-never-asked-for")).toBe(false);
@@ -214,10 +214,10 @@ describe("the stage the agent named", () => {
     const db = mkDb();
     const core = coreWithSpool(spoolPath);
     core.recordRuleReads(null, ["rule-a"], "stage-alpha");
-    expect(momentStageReads(db, spoolPath, "acme-widgets").get("stage-alpha")).toBe(1);
+    expect(momentRuleReadsByStage(db, spoolPath, "acme-widgets").get("stage-alpha")).toBe(1);
 
     db.prepare(`UPDATE moment_fold_cursor SET byte_offset = 0 WHERE singleton = 1`).run();
-    expect(momentStageReads(db, spoolPath, "acme-widgets").get("stage-alpha")).toBe(1);
+    expect(momentRuleReadsByStage(db, spoolPath, "acme-widgets").get("stage-alpha")).toBe(1);
   });
 });
 
@@ -252,7 +252,7 @@ describe("stage_lookup records the stage the agent named", () => {
       await client.close();
     }
 
-    const reads = momentStageReads(db, spoolPath, "acme-widgets");
+    const reads = momentRuleReadsByStage(db, spoolPath, "acme-widgets");
     // Some stage was named, and it is the one the caller asked for — not null, not the gate's.
     expect([...reads.values()].reduce((a, b) => a + b, 0)).toBe(1);
     expect([...reads.keys()][0]).toEqual(expect.any(String));
@@ -455,7 +455,7 @@ describe("a stage_lookup carries its own moment through the whole chain", () => 
       // THE ATTEMPT IS STILL RECORDED (F7). Withholding the key must not also silence the read —
       // the lookup happened, and it is the numerator a recognition rate needs. If this ever goes to
       // zero, the fix has traded one silent loss for another.
-      expect([...momentStageReads(db, spoolPath, "acme-widgets").values()].reduce((a, b) => a + b, 0)).toBe(1);
+      expect([...momentRuleReadsByStage(db, spoolPath, "acme-widgets").values()].reduce((a, b) => a + b, 0)).toBe(1);
     });
   });
 

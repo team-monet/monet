@@ -55,7 +55,7 @@ import { readMomentSpool, spoolAnswer, spoolAsk } from "./moment-spool";
  * NO INDEX SHIPS HERE ON INTUITION. Each of the two below names a read that already exists and is
  * scoped to it — `idx_governed_moments_tool_use` for the fold's own outcome lookup (its own comment:
  * "the query exists and is named before the index is"), `idx_moment_reads_named_stage` for
- * `momentStageReads`. Nothing else here is queried by anything but its primary key, and nothing else
+ * `momentRuleReadsByStage`. Nothing else here is queried by anything but its primary key, and nothing else
  * gets an index. The precedent this note used to argue from — the one measured index on
  * `gate_events` — went with that table, so the discipline now stands on the two indexes below
  * instead. When a real read exists, measure it and add the index that read needs.
@@ -1010,7 +1010,11 @@ export function momentCounts(db: StoragePort, spoolPath: string, circle: string)
 }
 
 /**
- * How many times each stage was NAMED by an agent, across every read — joined or not.
+ * Rule reads keyed by the stage an agent NAMED, across every read — joined or not.
+ *
+ * ONE ROW PER RULE, NOT PER LOOKUP. The spool writes a read row for each rule a lookup delivered, so
+ * a lookup returning N rules contributes N here. Membership is exact — which is what the zeroes rest
+ * on — but the magnitude is a count of rule reads, not of lookups.
  *
  * THE ZEROES ARE THE POINT, which is why this returns counts by id and leaves the caller to join it
  * against the stage registry: a stage that appears here with a count is being asked for, and a
@@ -1022,7 +1026,7 @@ export function momentCounts(db: StoragePort, spoolPath: string, circle: string)
  * an action is a different fact and lives on the moment as `stage_id`; the two can disagree in one
  * call and are deliberately never merged.
  */
-export function momentStageReads(db: StoragePort, spoolPath: string, circle: string): Map<string, number> {
+export function momentRuleReadsByStage(db: StoragePort, spoolPath: string, circle: string): Map<string, number> {
   foldMomentSpool(db, spoolPath);
   // SCOPED, for the same reason every other count here is: the spool is home-level and this store
   // folds every project's reads. Unscoped, one lookup of a global stage in circle A made that stage
