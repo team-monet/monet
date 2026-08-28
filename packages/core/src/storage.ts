@@ -100,7 +100,7 @@ function isStoreContention(error: unknown): boolean {
  * record and an absent holder are different facts, and reporting the first as the second is how a
  * diagnostic starts lying.
  */
-function storeContentionError(dbPath: string, error: unknown, waitedMs: number): StoreBusyError | undefined {
+export function storeContentionError(dbPath: string, error: unknown, waitedMs: number): StoreBusyError | undefined {
   if (!isStoreContention(error)) return undefined;
   // ONLY MARKERS THAT NAME THIS STORE (Codex review, PR #216). A marker carries no proof that its
   // process owns the lock, and a directory can hold several databases — so an unfiltered list can

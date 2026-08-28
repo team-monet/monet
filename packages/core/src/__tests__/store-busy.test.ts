@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readInflightStatements } from "../statement-trace";
 import { BetterSqlitePort, StoreBusyError } from "../storage";
+import { MonetCore } from "../engine";
 
 const dirs: string[] = [];
 function tempDir(): string {
@@ -159,5 +160,108 @@ describe("a startup blocked by another process says so, and names it (#148)", ()
     } finally {
       holder.close();
     }
+  });
+});
+
+/**
+ * #82: the two halves above are the ENDS of startup — no contention, and contention on the very
+ * first connection open (BetterSqlitePort's own constructor, which has translated since #148).
+ * This describe covers the MIDDLE: contention that is already present, or arrives, while
+ * MonetCore's constructor runs its schema/migration statements — after the connection is open.
+ *
+ * WHY THAT WINDOW EXISTS AT ALL, and why it is not exotic. In WAL mode a writer does not block
+ * readers, so opening a second connection against a store whose write lock is held succeeds:
+ * `new Database()` executes no SQL, and `journal_mode = WAL` against an already-WAL file is a read.
+ * The first thing that actually needs the write lock is `init()`'s `CREATE TABLE IF NOT EXISTS`
+ * — the first statement of the constructor's schema region. So the ordinary supported topology
+ * (an MCP server and a `monet` CLI call sharing one `.monet` DB) reaches the region, not the open.
+ *
+ * These tests do not simulate the lock: a second BetterSqlitePort holds a real `BEGIN IMMEDIATE`
+ * write reservation, and the statements under test fail against it for real.
+ */
+describe("contention DURING the constructor's schema region, not at the open (#82)", () => {
+  it("translates on the path branch: a write lock held while the schema statements run", () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "monet-core.db");
+    const holder = new BetterSqlitePort(dbPath); // creates the file and puts it in WAL
+    try {
+      holder.exec("BEGIN IMMEDIATE"); // a real write reservation, held for the whole construction
+      let caught: unknown;
+      try {
+        new MonetCore(dbPath);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(StoreBusyError);
+      const busy = caught as StoreBusyError;
+      expect(busy.dbPath).toBe(dbPath);
+      expect(busy.waitedMs).toBeGreaterThan(0);
+      expect(busy.message).toMatch(/is busy/);
+      expect(busy.message).toMatch(/after \d+ms/);
+      // The original is kept, not replaced: the SQLite code stays reachable for anyone who wants it.
+      expect((busy.cause as { code?: string } | undefined)?.code).toBe("SQLITE_BUSY");
+    } finally {
+      try { holder.exec("ROLLBACK"); } catch { /* the assertions above are the news */ }
+      holder.close();
+    }
+  });
+
+  /**
+   * KNOWN UNFIXED, asserted deliberately so the gap is pinned rather than forgotten (#82 stays
+   * open for it). `storeContentionError` needs the store's path; a caller-supplied StoragePort
+   * exposes none (`BetterSqlitePort.dbPath` is private, and the interface has no path member), so
+   * this branch cannot produce the translated message and still surfaces SQLite's own text.
+   * `packages/cli/src/repair-cli.ts` builds MonetCore this way, which is why `monet doctor` and
+   * `monet repair` keep the bare behaviour. When that is closed, this test flips.
+   */
+  it("KNOWN UNFIXED — the StoragePort branch still surfaces the bare SQLite error", () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "monet-core.db");
+    const holder = new BetterSqlitePort(dbPath);
+    // Opened BEFORE the lock is taken, so the port's own constructor (which does translate) is not
+    // what fails here — the failure lands in the region, exactly as in the test above.
+    const port = new BetterSqlitePort(dbPath);
+    // The default is 5000ms and this test does not measure the wait, only what is thrown.
+    port.pragma("busy_timeout = 200");
+    try {
+      holder.exec("BEGIN IMMEDIATE");
+      let caught: unknown;
+      try {
+        new MonetCore(port);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).not.toBeInstanceOf(StoreBusyError);
+      expect((caught as Error).message).toMatch(/database is locked/);
+      expect((caught as { code?: string }).code).toBe("SQLITE_BUSY");
+    } finally {
+      try { holder.exec("ROLLBACK"); } catch { /* same */ }
+      port.close();
+      holder.close();
+    }
+  });
+
+  /**
+   * The catch must be a translator, not a net. `initSyncIdentity` throws a plain Error from inside
+   * the region on a device-id mismatch — an ordinary failure with nothing to do with contention.
+   */
+  it("re-throws a non-contention failure from inside the region unchanged", () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "monet-core.db");
+    const first = new MonetCore(dbPath, { syncDeviceId: "device-alpha" });
+    first.close();
+
+    let caught: unknown;
+    try {
+      new MonetCore(dbPath, { syncDeviceId: "device-beta" });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(StoreBusyError);
+    expect((caught as Error).message).toBe("syncDeviceId mismatch: store is 'device-alpha', requested 'device-beta'");
   });
 });
