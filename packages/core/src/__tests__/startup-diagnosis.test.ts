@@ -26,6 +26,7 @@ import { MonetCore } from "../engine";
 import { HashingEmbeddingProvider } from "../embedding";
 import { UnsatisfiableEmbedderError } from "../embedding-onnx";
 import { createMonetCoreMcpServer } from "../mcp-server";
+import { StoreBusyError, storeContentionError } from "../storage";
 import {
   STARTUP_FAILURE_FORMAT,
   STARTUP_FAILURE_SUFFIX,
@@ -628,6 +629,77 @@ describe("a fragment is never presented as a verdict", () => {
         expect(readStartupFailure(store).status).toBe("found");
       }
       expect(existsSync(startupFailurePath(store))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * FINDING B, from the review of PR #102. `StoreBusyError` carries no top-level `code`: the SQLite
+ * one survives on `.cause`, where #148 deliberately kept the original rather than replacing it. But
+ * `describe()` read `code` top-level only and omits the key when it finds none, so `SQLITE_BUSY`
+ * disappeared from THREE readers at once — this record, `monet doctor`'s stderr line
+ * (repair-cli.ts, which prints `record.error.code` in brackets) and `monet doctor --json`, which
+ * carries the record through verbatim. It went missing for exactly the failure they exist to
+ * explain: the startup that could not take the store's write lock.
+ *
+ * Both tests build a REAL StoreBusyError through the shipped factory rather than a hand-made
+ * lookalike. The whole finding is about where that class puts its code, so a stand-in with a `cause`
+ * bolted on would assert against the test's own assumption instead of against the shipped shape.
+ */
+describe("the error's code when the error keeps it on its cause (#102 review, finding B)", () => {
+  it("recovers SQLITE_BUSY from the cause, for the record and both doctor readers", () => {
+    const dir = tempDir();
+    const store = storeIn(dir);
+    try {
+      const busy = storeContentionError(
+        store,
+        Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }),
+        5000,
+      );
+      // THE PREMISE, asserted rather than assumed — if StoreBusyError ever grows a top-level `code`
+      // this test would otherwise keep passing while testing nothing.
+      expect(busy).toBeInstanceOf(StoreBusyError);
+      expect((busy as unknown as { code?: unknown }).code).toBeUndefined();
+      expect((busy?.cause as { code?: unknown } | undefined)?.code).toBe("SQLITE_BUSY");
+
+      markStartupPhase(busy as Error, "store-open");
+      recordStartupFailure({ store, error: busy });
+
+      const read = readStartupFailure(store);
+      expect(read.status).toBe("found");
+      if (read.status !== "found") return;
+      expect(read.record.error.code).toBe("SQLITE_BUSY");
+      expect(read.record.error.name).toBe("StoreBusyError");
+      expect(read.record.phase).toBe("store-open");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * A FALLBACK, NEVER A FABRICATOR. `isStoreContention` (storage.ts) admits three cases and the
+   * third is a bare `/database is locked/i` MESSAGE match with NO code anywhere — SQLite reports
+   * contention that way on some platforms. The key must stay ABSENT there: a record that supplied
+   * `SQLITE_BUSY` for a store that never reported one would publish a guess as an observation, which
+   * is the same failure the three-state startupFailure read exists to prevent.
+   */
+  it("leaves the key ABSENT when neither the error nor its cause carries a code", () => {
+    const dir = tempDir();
+    const store = storeIn(dir);
+    try {
+      const busy = storeContentionError(store, new Error("database is locked"), 5000);
+      expect(busy).toBeInstanceOf(StoreBusyError);
+      expect((busy?.cause as { code?: unknown } | undefined)?.code).toBeUndefined();
+
+      recordStartupFailure({ store, error: busy });
+
+      const read = readStartupFailure(store);
+      expect(read.status).toBe("found");
+      if (read.status !== "found") return;
+      expect("code" in read.record.error).toBe(false);
+      expect(read.record.error.name).toBe("StoreBusyError");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

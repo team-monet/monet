@@ -57,6 +57,21 @@ export class StorageExclusiveLockError extends Error {
 }
 
 /**
+ * The busy timeout this port arms on every connection it opens, and therefore the ceiling on how
+ * long ONE statement can wait for the write lock before SQLite gives up with SQLITE_BUSY.
+ *
+ * NAMED because a message quotes it (schemaRegionContentionError, below). A hard-coded 5000 in that
+ * sentence would keep claiming a bound after someone changed the pragma, and a diagnostic that
+ * describes a bound which is no longer set is worse than one that describes none.
+ *
+ * NOT the budget the connection OPEN runs under: better-sqlite3 arms `sqlite3_busy_timeout` from its
+ * own `timeout` option before this pragma is ever reached (see the constructor's comment on that).
+ * The two happen to agree at 5000; this constant governs only statements that run after the pragma,
+ * which is every statement outside BetterSqlitePort's own constructor.
+ */
+export const STORE_BUSY_TIMEOUT_MS = 5000;
+
+/**
  * The store could not be opened because another process holds its write lock (#148).
  *
  * Distinct from StorageExclusiveLockError, which is about a lock this process asked for and could
@@ -99,8 +114,17 @@ function isStoreContention(error: unknown): boolean {
  * tracing is off there are none, and the message leads with THAT rather than with "no holder" — an absent
  * record and an absent holder are different facts, and reporting the first as the second is how a
  * diagnostic starts lying.
+ *
+ * `lead` is the caller's own first sentence, because the callers do not measure the same thing: see
+ * schemaRegionContentionError, which is why this split exists at all. Everything after it — the
+ * holder evidence and what to do next — is identical whoever asked, so it lives here once.
  */
-export function storeContentionError(dbPath: string, error: unknown, waitedMs: number): StoreBusyError | undefined {
+function contentionError(
+  dbPath: string,
+  error: unknown,
+  elapsedMs: number,
+  lead: string,
+): StoreBusyError | undefined {
   if (!isStoreContention(error)) return undefined;
   // ONLY MARKERS THAT NAME THIS STORE (Codex review, PR #216). A marker carries no proof that its
   // process owns the lock, and a directory can hold several databases — so an unfiltered list can
@@ -127,13 +151,68 @@ export function storeContentionError(dbPath: string, error: unknown, waitedMs: n
       `proof it still runs.`;
   return new StoreBusyError(
     dbPath,
-    waitedMs,
+    elapsedMs,
     holders,
-    `The store at ${dbPath} is busy: could not take its write lock after ${waitedMs}ms. ${held} ` +
+    `${lead} ${held} ` +
       `One MCP server and one \`monet\` CLI call sharing a store is the supported topology, so this ` +
       `is usually transient — retry once the other process finishes. If nothing ever finishes, the ` +
       `holder is wedged rather than busy.`,
     { cause: error },
+  );
+}
+
+/**
+ * Contention met while TAKING the connection — BetterSqlitePort's own constructor. Here `waitedMs`
+ * is a measured wait and nothing else: the interval it times contains the open and the setup
+ * pragmas, which is SQLite work and no work of ours, so the number is exactly what it says.
+ */
+export function storeContentionError(dbPath: string, error: unknown, waitedMs: number): StoreBusyError | undefined {
+  return contentionError(
+    dbPath,
+    error,
+    waitedMs,
+    `The store at ${dbPath} is busy: could not take its write lock after ${waitedMs}ms.`,
+  );
+}
+
+/**
+ * Contention met INSIDE MonetCore's schema region, after the connection is already open (#82).
+ *
+ * WHY THIS CANNOT REUSE THE SENTENCE ABOVE. The region's clock starts before `init()` and stops on
+ * the throw, so its elapsed time is prefix work PLUS whatever waiting happened — and the prefix is
+ * not small: `repairDriftedConceptCentroids()` scans every live observation and holds the whole live
+ * vector population in memory before it writes, and #95 and #97 re-armed the centroid and lexical
+ * gates so both passes run on the first open of every existing store. Measured: a holder taking the
+ * lock 3828ms into the region produced 8035, which the shared sentence reported as a 8035ms wait for
+ * a wait of 5000ms.
+ *
+ * THAT IS NOT A ROUNDING ERROR, because of what the closing sentence then tells the operator: a wait
+ * that never ends means the holder is WEDGED rather than busy. An inflated number argues for that
+ * conclusion about a holder that behaved normally, and sends the reader after a hang that is not
+ * there.
+ *
+ * WHAT IS SAID INSTEAD is only what is true and free at this point. The elapsed number is named as
+ * elapsed. The actual wait is not measured — per-statement timing would mean a wrapper on a hot path
+ * that `prepare`/`transaction`/`immediateTransaction` deliberately leave unwrapped when tracing is
+ * off — so it is BOUNDED instead: one statement failed, and one statement's wait cannot exceed this
+ * connection's busy timeout. A bound the reader can check beats a measurement that costs an
+ * allocation on every statement to obtain.
+ */
+export function schemaRegionContentionError(
+  dbPath: string,
+  error: unknown,
+  regionElapsedMs: number,
+): StoreBusyError | undefined {
+  return contentionError(
+    dbPath,
+    error,
+    regionElapsedMs,
+    `The store at ${dbPath} is busy: a statement in the startup's schema region could not take its ` +
+      `write lock. That region had been running for ${regionElapsedMs}ms when it failed, but that is ` +
+      `the region's own elapsed time, not a wait — schema, migration and index-repair passes run ` +
+      `inside it before any statement blocks. The failing statement's wait is bounded by this ` +
+      `connection's ${STORE_BUSY_TIMEOUT_MS}ms busy_timeout, so do not read the number above as time ` +
+      `the holder has held anything.`,
   );
 }
 
@@ -225,9 +304,9 @@ export class BetterSqlitePort implements StoragePort {
     //
     // And the budget that wait runs under is NOT the pragma two lines below it: better-sqlite3 arms
     // `sqlite3_busy_timeout` from its own `timeout` option at open, which defaults to 5000
-    // (lib/database.js). Our explicit `busy_timeout = 5000` runs AFTER the wait it looks like it
-    // governs. Separating a real boot budget therefore has to go through `new Database(path, {
-    // timeout })`, which is #215, not through editing that constant.
+    // (lib/database.js). Our explicit `busy_timeout = STORE_BUSY_TIMEOUT_MS` runs AFTER the wait it
+    // looks like it governs. Separating a real boot budget therefore has to go through `new
+    // Database(path, { timeout })`, which is #215, not through editing that constant.
     //
     // The wait is timed from here so the message can say how long was actually spent, rather than
     // quoting a configured number and hoping the two match.
@@ -250,7 +329,7 @@ export class BetterSqlitePort implements StoragePort {
         : undefined);
     try {
       this.pragma("journal_mode = WAL");
-      this.pragma("busy_timeout = 5000");
+      this.pragma(`busy_timeout = ${STORE_BUSY_TIMEOUT_MS}`);
     } catch (error) {
       // RELEASE WHAT THIS CONSTRUCTOR ALREADY TOOK (Codex review, PR #216). Reaching here means the
       // instance will never exist, so nothing else can ever close these: the SQLite handle would be

@@ -170,7 +170,12 @@ export interface StartupFailureRecord {
   error: {
     name: string;
     message: string;
-    /** SQLite and Node errno codes (SQLITE_BUSY, ENOENT, ...); absent when the error carries none. */
+    /**
+     * SQLite and Node errno codes (SQLITE_BUSY, ENOENT, ...). Taken from the error, or from its
+     * `cause` when the error itself carries none — StoreBusyError keeps the SQLite code there.
+     * Absent when neither has one, which is a real state: contention is also detectable from the
+     * message alone, with no code anywhere to report.
+     */
     code?: string;
   };
   /** Truncated at STACK_MAX_CHARS; null when the throw carried no stack. */
@@ -205,9 +210,31 @@ function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max)}… [truncated]`;
 }
 
+/** A string `code` on this value, or undefined. Reads any object, so it can be pointed at a cause. */
+function errorCode(value: unknown): string | undefined {
+  const code = typeof value === "object" && value !== null && "code" in value
+    ? (value as { code?: unknown }).code
+    : undefined;
+  return typeof code === "string" ? code : undefined;
+}
+
+/**
+ * THE CODE CAN LIVE ONE LEVEL DOWN, so this looks there before giving up. `StoreBusyError`
+ * (storage.ts) carries no top-level `code`: #148 kept the SQLite original on `.cause` rather than
+ * replacing it, which is the right call and left this reader looking in the wrong place. Reading
+ * top-level only therefore dropped `SQLITE_BUSY` from three readers at once — this record, `monet
+ * doctor`'s stderr line and `monet doctor --json` — for exactly the failure they exist to explain.
+ *
+ * A FALLBACK, NOT A FABRICATOR. When neither the error nor its cause carries one the key stays
+ * ABSENT, as it always did. `isStoreContention` admits a bare `database is locked` message with no
+ * code anywhere, and supplying `SQLITE_BUSY` there would publish a guess as an observation.
+ *
+ * One level, not a walk of the whole chain: one level is where the shape that motivated this puts
+ * it, and a deeper walk would start attributing a code to an error several removes from it.
+ */
 function describe(error: unknown): StartupFailureRecord["error"] & { stack: string | null } {
   if (error instanceof Error) {
-    const code = (error as NodeJS.ErrnoException).code;
+    const code = errorCode(error) ?? errorCode(error.cause);
     return {
       name: error.name,
       message: truncate(error.message, MESSAGE_MAX_CHARS),

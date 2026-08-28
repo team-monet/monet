@@ -198,7 +198,10 @@ describe("contention DURING the constructor's schema region, not at the open (#8
       expect(busy.dbPath).toBe(dbPath);
       expect(busy.waitedMs).toBeGreaterThan(0);
       expect(busy.message).toMatch(/is busy/);
-      expect(busy.message).toMatch(/after \d+ms/);
+      // A DURATION IS STILL REPORTED, but as the region's elapsed time rather than as a wait: this
+      // line read /after \d+ms/ until the review of this PR showed the region cannot honestly make
+      // the open path's claim. The wording distinction itself is pinned by its own test below.
+      expect(busy.message).toMatch(/running for \d+ms/);
       // The original is kept, not replaced: the SQLite code stays reachable for anyone who wants it.
       expect((busy.cause as { code?: string } | undefined)?.code).toBe("SQLITE_BUSY");
     } finally {
@@ -263,5 +266,91 @@ describe("contention DURING the constructor's schema region, not at the open (#8
     expect(caught).toBeInstanceOf(Error);
     expect(caught).not.toBeInstanceOf(StoreBusyError);
     expect((caught as Error).message).toBe("syncDeviceId mismatch: store is 'device-alpha', requested 'device-beta'");
+  });
+});
+
+/**
+ * FINDING A, from the review of this PR. `storeContentionError` is SHARED with the connection open,
+ * where its number genuinely is a measured wait — but the region reuses it for a number that is not
+ * one, and the sentence said "could not take its write lock after 8035ms" for a wait of 5000ms.
+ *
+ * WHY THAT NUMBER CANNOT BE A WAIT, structurally rather than by measurement: `busy_timeout = 5000`
+ * (storage.ts) caps ONE statement's wait at 5000ms, so anything above that is prefix work inside the
+ * region. `repairDriftedConceptCentroids()` supplies it — a grouped scan of every live observation,
+ * holding the whole live vector population in memory before it writes — and #95 and #97 re-armed the
+ * centroid and lexical gates, so both passes run on the first open of every existing store.
+ *
+ * WHY IT IS HARMFUL rather than merely imprecise: the message's own closing sentence tells an
+ * operator that a wait which never ends means the holder is WEDGED rather than busy. An inflated
+ * number argues for that conclusion about a holder that behaved perfectly normally.
+ *
+ * The two paths are asserted AGAINST EACH OTHER on purpose. Asserting that the region produces some
+ * message is not coverage of a fix whose whole content is that the two callers must say different
+ * things — and the open path's wording has to survive intact, because for the open path it is true.
+ */
+describe("the region's elapsed time is not a lock wait, and the message must not say it is", () => {
+  it("says 'had been running for' on the region path and keeps 'wait' for the OPEN path only", () => {
+    // SEPARATE STORES for the two halves, not one. The region half leaves MonetCore's connection
+    // open when it throws (a pre-existing leak this PR did not introduce and does not close), and an
+    // exclusive-ownership acquisition in the open half must not have to race that leftover handle.
+    const regionDir = tempDir();
+    const regionPath = join(regionDir, "monet-core.db");
+    const openDir = tempDir();
+    const openPath = join(openDir, "monet-core.db");
+
+    // THE REGION PATH. In WAL mode the open does NOT block, so the connection is established and the
+    // first statement needing the write lock — init()'s CREATE TABLE — is what meets the holder.
+    const regionHolder = new BetterSqlitePort(regionPath);
+    let region: StoreBusyError;
+    try {
+      regionHolder.exec("BEGIN IMMEDIATE"); // a real write reservation, held across the construction
+      let caught: unknown;
+      try {
+        new MonetCore(regionPath);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StoreBusyError);
+      region = caught as StoreBusyError;
+    } finally {
+      try { regionHolder.exec("ROLLBACK"); } catch { /* the assertions below are the news */ }
+      regionHolder.close();
+    }
+
+    // THE OPEN PATH, for comparison: an exclusive lock, so the connection setup itself is what waits.
+    const openHolder = new BetterSqlitePort(openPath);
+    let open: StoreBusyError;
+    try {
+      openHolder.acquireExclusiveOwnership();
+      let caught: unknown;
+      try {
+        new BetterSqlitePort(openPath);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StoreBusyError);
+      open = caught as StoreBusyError;
+    } finally {
+      openHolder.close();
+    }
+
+    // UNCHANGED where it was already true. The open path measured an actual wait, and still says so.
+    expect(open.message).toMatch(/could not take its write lock after \d+ms/);
+    expect(open.message).not.toMatch(/had been running for/);
+
+    // The region path must never make the open path's claim about a number that cannot support it.
+    expect(region.message).not.toMatch(/could not take its write lock after \d+ms/);
+    // What the number actually is...
+    expect(region.message).toMatch(/had been running for \d+ms/);
+    // ...said as elapsed rather than as waiting, in words and not only by omission...
+    expect(region.message).toMatch(/elapsed time, not a wait/);
+    // ...and the one bound that makes the real wait knowable from the message alone.
+    expect(region.message).toMatch(/bounded by this connection's 5000ms busy_timeout/);
+
+    // Both are still the same diagnosis about the same kind of trouble, and still name their store.
+    expect(open.message).toMatch(/is busy/);
+    expect(open.message).toContain(openPath);
+    expect(region.message).toMatch(/is busy/);
+    expect(region.message).toContain(regionPath);
   });
 });

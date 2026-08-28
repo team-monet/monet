@@ -19,7 +19,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { StoragePort, BetterSqlitePort, StorageExclusiveLockError, storeContentionError, type Statement } from "./storage";
+import { StoragePort, BetterSqlitePort, StorageExclusiveLockError, schemaRegionContentionError, type Statement } from "./storage";
 import { mintMomentId, spoolInterception, spoolOutcome, spoolRuleRead, startMomentRun } from "./moment-spool";
 import type { MomentAnswer } from "./moment-spool";
 import {
@@ -2872,8 +2872,8 @@ export class MonetCore {
         || (pinRow.embedder_model_id !== null && pinRow.embedder_model_id !== this.embedderModelId);
     } catch (error) {
       // ONLY THE PATH BRANCH IS TRANSLATED, KNOWINGLY — #82 stays open for the rest. The message
-      // storeContentionError builds is built AROUND the store's path: it names the store and keeps
-      // only the holder markers belonging to it. A caller-supplied StoragePort exposes no path —
+      // schemaRegionContentionError builds is built AROUND the store's path: it names the store and
+      // keeps only the holder markers belonging to it. A caller-supplied StoragePort exposes no path —
       // the interface has no path member, and BetterSqlitePort.dbPath is private with no getter —
       // so there is nothing to build that message from, and a MonetCore constructed on a port
       // (packages/cli/src/repair-cli.ts, i.e. `monet doctor` and `monet repair`) still reports the
@@ -2881,9 +2881,12 @@ export class MonetCore {
       // rather than left to be rediscovered.
       if (typeof db !== "string") throw error;
       // Same normalization BetterSqlitePort applies to its own dbPath, so the marker filter inside
-      // storeContentionError compares the identical string; `:memory:` is passed through as itself.
+      // the contention builder compares the identical string; `:memory:` passes through as itself.
       const dbPath = db === ":memory:" ? db : resolve(db);
-      throw storeContentionError(dbPath, error, Date.now() - schemaStartedAt) ?? error;
+      // The REGION builder, not the open one. What this clock measured is the region's elapsed time
+      // — schema, migration and repair passes plus whatever waiting happened — and the open path's
+      // sentence would report all of it as a lock wait (see schemaRegionContentionError).
+      throw schemaRegionContentionError(dbPath, error, Date.now() - schemaStartedAt) ?? error;
     }
   }
 
