@@ -15579,7 +15579,37 @@ export class MonetCore {
       const hasNormative =
         !!this.db.prepare(`SELECT 1 FROM lifecycle_edges WHERE circle = ? LIMIT 1`).get(from) ||
         !!this.db.prepare(`SELECT 1 FROM ratifications WHERE circle = ? LIMIT 1`).get(from);
-      if (!hasConcepts && !hasAlias && !hasNormative) throw new Error(`circle not found: ${from}`);
+      // THE GOVERNED-MOMENT POPULATION KEEPS A CIRCLE ALIVE TOO — the same doctrine as
+      // `hasNormative` just above, applied to the population `moveMomentCircle` (below) already
+      // moves at the end of this very method.
+      //
+      // `mergeCircle` HAS NO EXISTENCE GUARD AT ALL and calls that same private helper, so the two
+      // paths disagreed about whether one and the same circle existed: a merge relocated its
+      // moments, a rename refused it as `circle not found`. These rows reach the table with no
+      // concept ever having lived there, and by the ordinary path rather than an exotic one — the
+      // MCP wrapper opens a moment for EVERY circle-accepting call (mcp-server.ts,
+      // `core.openStoreMoment(toolName, callCircle)`) before the handler runs, and nothing along
+      // that path checks that the circle exists, so a first-ever call naming a fresh circle mints
+      // exactly this shape.
+      //
+      // BOTH TABLES, matching what `moveMomentCircle` moves rather than the narrower
+      // `governed_moments` alone: `moment_reads` carries its OWN circle and exists independently of
+      // any moment (a stage_lookup reached from agent_context names none — see that column's own
+      // comment), so a circle can hold reads and no moments at all. Covering only one half would
+      // leave that shape refused by a rename while a merge still moved it, which is the same
+      // disagreement this check exists to close.
+      //
+      // TABLE-EXISTENCE GUARDED, for the same reason `moveMomentCircle` is: the moment tables are
+      // created lazily by the first fold and are deliberately off the `PRAGMA user_version` ladder,
+      // so a store that has never recorded a moment genuinely does not have them.
+      const hasMomentTable = (table: string): boolean =>
+        this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table) !== undefined;
+      const hasMoments =
+        (hasMomentTable("governed_moments") &&
+          !!this.db.prepare(`SELECT 1 FROM governed_moments WHERE circle = ? LIMIT 1`).get(from)) ||
+        (hasMomentTable("moment_reads") &&
+          !!this.db.prepare(`SELECT 1 FROM moment_reads WHERE circle = ? LIMIT 1`).get(from));
+      if (!hasConcepts && !hasAlias && !hasNormative && !hasMoments) throw new Error(`circle not found: ${from}`);
 
       // ONE STAMP FOR THE WHOLE RENAME, computed before any table moves so rule_bindings (kept here,
       // never part of the shared helper below — see that method's own comment for why) and every

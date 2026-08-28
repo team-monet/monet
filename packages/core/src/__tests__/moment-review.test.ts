@@ -398,8 +398,9 @@ describe("R2 P2 — governed moments survive a circle rename", () => {
     const spool = join(dir, "moments.jsonl");
     const core = new MonetCore(":memory:", { defaultCircle: "old-name", momentSpoolPath: spool });
     cores.push(core);
-    // A circle is renameable because it HOLDS something — governed moments alone do not make one
-    // exist, so this mirrors the only shape a rename actually happens in.
+    // A concept here keeps this test's subject the PRE-RENAME HISTORY rather than the existence
+    // question. (Governed moments alone DO make a circle exist as of issue #66 — see that fix's own
+    // describe block at the end of this file; this comment used to assert the opposite.)
     await core.store("A fact that gives this circle something to hold.", { kind: "fact" });
     const id = core.openStoreMoment("memory_recall");
     core.closeStoreMoment(id, "{}", "ok");
@@ -656,5 +657,94 @@ describe("R6 — the public stageLookup() record for a library caller", () => {
     expect(r.rules.length).toBeGreaterThan(0);
     // Without this, a stage an embedder consults every day reads as one nobody has ever looked up.
     expect(core.momentStageReads("acme-widgets").size).toBeGreaterThan(0);
+  });
+});
+
+describe("issue #66 — a circle held open by nothing but governed moments exists", () => {
+  /** The core's own database, which is where renameCircle's existence check reads. */
+  type RawDb = { prepare(sql: string): { get(...p: unknown[]): unknown } };
+  const rawDb = (c: MonetCore): RawDb => (c as unknown as { db: RawDb }).db;
+  const momentsIn = (c: MonetCore, circle: string): number =>
+    (rawDb(c).prepare(`SELECT COUNT(*) AS n FROM governed_moments WHERE circle = ?`).get(circle) as { n: number }).n;
+
+  it("renames it, and MOVES the population rather than merely not throwing", () => {
+    const spool = join(mkTmp(), "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "moments-only", momentSpoolPath: spool });
+    cores.push(core);
+    // THROUGH THE REAL PATH, not hand-inserted rows: this is exactly what the MCP wrapper does on
+    // every circle-accepting call (mcp-server.ts, `core.openStoreMoment(toolName, callCircle)`),
+    // and `momentCounts` is what folds the spool into this store's own `governed_moments`.
+    // Nothing on that path checks that the circle exists, so a name reaches the table having
+    // never held a concept — a first-ever call against a fresh circle is the ordinary case.
+    const id = core.openStoreMoment("memory_recall", "moments-only");
+    core.closeStoreMoment(id, "{}", "ok");
+    expect(core.momentCounts("moments-only").total).toBe(1);
+    // Nothing else holds this circle open: no concepts, no alias, no normative rows.
+    expect(momentsIn(core, "moments-only")).toBe(1);
+
+    core.renameCircle("moments-only", "renamed");
+
+    // THE MOVE, ASSERTED ON THE ROWS THEMSELVES. Reading through `momentCounts` alone cannot tell
+    // a real move from a rename that left every row behind, because the alias makes BOTH names
+    // resolve to `renamed` either way — which is precisely how a guard-removal-only change would
+    // pass. The old name must hold nothing.
+    expect(momentsIn(core, "renamed")).toBe(1);
+    expect(momentsIn(core, "moments-only")).toBe(0);
+    expect(core.momentCounts("renamed").total).toBe(1);
+  });
+
+  it("counts a reads-only circle too, which is the other half of the same population", () => {
+    const spool = join(mkTmp(), "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "home", momentSpoolPath: spool });
+    cores.push(core);
+    // A stage_lookup reached from agent_context names no moment, so this writes a `moment_reads`
+    // row carrying a circle with NO `governed_moments` row behind it. `moveMomentCircle` moves this
+    // table as well, so the existence check has to see it or a rename refuses what a merge moves.
+    core.recordRuleReads(null, ["rule-a"], "stage-x", "reads-only");
+    core.momentCounts("reads-only");
+    const readsIn = (circle: string): number =>
+      (rawDb(core).prepare(`SELECT COUNT(*) AS n FROM moment_reads WHERE circle = ?`).get(circle) as { n: number }).n;
+    expect(momentsIn(core, "reads-only")).toBe(0);
+    expect(readsIn("reads-only")).toBe(1);
+
+    core.renameCircle("reads-only", "reads-renamed");
+
+    expect(readsIn("reads-renamed")).toBe(1);
+    expect(readsIn("reads-only")).toBe(0);
+  });
+
+  it("still refuses a circle nothing holds open at all", () => {
+    const spool = join(mkTmp(), "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "home", momentSpoolPath: spool });
+    cores.push(core);
+    expect(() => core.renameCircle("never-existed", "target")).toThrow(/circle not found/);
+  });
+
+  it("still refuses when the moments are in a DIFFERENT circle than the one being renamed", () => {
+    const spool = join(mkTmp(), "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "home", momentSpoolPath: spool });
+    cores.push(core);
+    const id = core.openStoreMoment("memory_recall", "somewhere-else");
+    core.closeStoreMoment(id, "{}", "ok");
+    expect(core.momentCounts("somewhere-else").total).toBe(1);
+    // The check must be scoped to `from`. A bare "are there any moments at all" test would pass
+    // here and rename a circle that genuinely does not exist.
+    expect(() => core.renameCircle("empty-circle", "target")).toThrow(/circle not found/);
+  });
+
+  it("does not open a door past the retired-concept refusal", async () => {
+    const spool = join(mkTmp(), "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "with-retired", momentSpoolPath: spool });
+    cores.push(core);
+    const stored = await core.store("A fact that will be retired in place.", { kind: "fact" });
+    (core as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
+      .prepare(`UPDATE concepts SET status = 'retired' WHERE id = ?`)
+      .run(stored.conceptId);
+    const id = core.openStoreMoment("memory_recall", "with-retired");
+    core.closeStoreMoment(id, "{}", "ok");
+    expect(core.momentCounts("with-retired").total).toBe(1);
+    // The retirement guard runs BEFORE the existence check, so widening existence must not change
+    // this outcome — and the message proves it refused for the retirement reason, not by accident.
+    expect(() => core.renameCircle("with-retired", "target")).toThrow(/retired concepts/);
   });
 });
