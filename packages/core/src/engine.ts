@@ -1978,6 +1978,43 @@ export interface WorkstreamSaveResult extends Workstream {
   openedItemIds: string[];
   closedItemIds: string[];
   statusChanged: boolean;
+  /**
+   * Did this checkpoint land in a circle the store has flagged ARCHIVED? `IngestResult` carries the
+   * same verdict for `memory_store` (#55/#78); these two writers reach the same attic through the
+   * same door — `resolveCircle` — and were left behind, which is #81.
+   *
+   * WHO CONSUMES IT, ON WHICH TURN, WHAT BREAKS WITHOUT IT (minimization): the agent that just
+   * checkpointed, on the very next turn, through `memory_checkpoint`'s receipt — the only reader.
+   * Without it that agent has just recorded its plan or its find into a circle that has dropped out
+   * of the default circle listing, and has been told nothing, so the route a later session takes
+   * back to this work — list the circles, pick one, read its workstreams — no longer passes through
+   * it. Nothing else reads this field, and it never touches the wire on an ordinary checkpoint.
+   *
+   * MEASURED, AND NARROWER THAN #55's. A workstream is never in store-wide search at all — `search`
+   * filters `kind != 'workstream'` on every branch — so archiving takes nothing away there, and
+   * repeating #55's "out of store-wide recall" would name a loss that did not happen. Measured
+   * either side of `archiveCircle` on a circle holding concepts and a checkpoint: the checkpoint
+   * stays fully readable by naming the circle (`getActiveWorkstreams`, `getWorkstreamInbox`), and
+   * the circle leaves `listCircles`' default listing. That single exclusion is the whole cost.
+   *
+   * READ INSIDE THE WRITE TRANSACTION, for the same reason `IngestResult`'s is: both writers await
+   * `checkedEmbed` between resolving the circle and mutating anything, and one `.monet` file shared
+   * by the MCP server and a `monet` CLI call is a supported topology (storage.ts) — so a second
+   * connection committing `archiveCircle` inside that window would reproduce the exact silence this
+   * field exists to end, through a narrower gap. Keyed on the circle re-resolved under the
+   * reservation, which is the one these writers already re-derive for the rename race.
+   *
+   * NO FROZEN `landedCircle` COMPANION, unlike `IngestResult`. That field exists because a receipt
+   * replay rehydrates `concept.circle` live, so the verdict needed its subject stored beside it.
+   * Here `circle` is read off the row inside the same transaction as this boolean, so the two
+   * already come from one instant — and neither `saveWorkstream` nor `captureFind` takes an
+   * `operationId` or writes a receipt row, so there is no replay to freeze anything for.
+   *
+   * ANSWERED EVERY TIME, `false` included: the write asked, under the reservation, and both answers
+   * are verdicts. There is no "not known" case to protect here, precisely because there is no
+   * replay — which is why this is a plain `boolean` where `IngestResult`'s is optional.
+   */
+  landedInArchivedCircle: boolean;
 }
 
 export interface WorkstreamCandidate {
@@ -2009,6 +2046,14 @@ export class WorkstreamAddressRequiredError extends Error {
 export interface CaptureFindResult {
   itemId: string;
   row: Workstream;
+  /**
+   * Did this find land in an archived circle? Same verdict, same discipline and same single reader
+   * as `WorkstreamSaveResult.landedInArchivedCircle` — see that field for why it is read under the
+   * write reservation, why it needs no frozen circle beside it, and what archiving actually costs a
+   * checkpoint. Carried separately because a `memory_checkpoint` may capture a find without saving a
+   * workstream at all, and that is the commonest checkpoint there is.
+   */
+  landedInArchivedCircle: boolean;
 }
 
 const WORKSTREAM_INBOX_ID = "inbox";
@@ -5970,6 +6015,7 @@ export class MonetCore {
       openedItemIds: string[];
       closedItemIds: string[];
       statusChanged: boolean;
+      landedInArchivedCircle: boolean;
     } | null => {
       this.assertNoEmbedderMigrationReentry("save a workstream");
       this.assertPinSatisfied();
@@ -5979,6 +6025,13 @@ export class MonetCore {
       // lands where the circle now lives instead of in a vacated source circle behind an alias
       // (Codex round 5 on #212).
       const txCircle = this.resolveCircle(circle);
+      // THE DISCLOSURE (#81), asked of the SAME re-resolved name the row is about to be written
+      // under and inside the same reservation — see WorkstreamSaveResult.landedInArchivedCircle.
+      // Asked here rather than beside the caller's `circle` above because the archived flag is
+      // mutable and the pre-embed reading has a shelf life; asked on both branches below at once
+      // because a mint and an update are equally invisible in an archived circle, and the update is
+      // the commoner shape (the circle was worked in, then shelved).
+      const landedInArchivedCircle = this.isArchivedCircle(txCircle);
       // Settling finds must see every replicated sibling's items, or a close by id would be a
       // silent no-op against a row this store cannot reach.
       if (target.inbox) this.reconcileInboxSiblings(txCircle);
@@ -6085,15 +6138,19 @@ export class MonetCore {
         openedItemIds,
         closedItemIds,
         statusChanged,
+        landedInArchivedCircle,
       };
     })();
     if (result === null) return null;
     this.installEmbeddingWidthProof(result.proofToken);
     return {
+      // `circle` comes from the row read inside the transaction, so it names the same instant the
+      // verdict below was taken at — which is why this pair needs no frozen companion field.
       ...toWorkstream(result.row),
       openedItemIds: result.openedItemIds,
       closedItemIds: result.closedItemIds,
       statusChanged: result.statusChanged,
+      landedInArchivedCircle: result.landedInArchivedCircle,
     };
   }
 
@@ -6126,7 +6183,11 @@ export class MonetCore {
     delete preview.title;
     const emb = await this.checkedEmbed(workstreamText(preview), "native");
 
-    const result = this.db.immediateTransaction((): { row: ConceptRow; proofToken?: EmbeddingWidthProofToken } => {
+    const result = this.db.immediateTransaction((): {
+      row: ConceptRow;
+      proofToken?: EmbeddingWidthProofToken;
+      landedInArchivedCircle: boolean;
+    } => {
       this.assertNoEmbedderMigrationReentry("capture a find");
       this.assertPinSatisfied();
       this.assertEmbedderOutput(emb, "native");
@@ -6135,6 +6196,9 @@ export class MonetCore {
       // checkedEmbed was in flight would otherwise leave this find in a vacated source circle the
       // read surface resolves AWAY from (Codex round 5 on #212).
       const txCircle = this.resolveCircle(circle);
+      // THE DISCLOSURE (#81), on the same re-resolved name and under the same reservation as the
+      // append below — see WorkstreamSaveResult.landedInArchivedCircle for the full reasoning.
+      const landedInArchivedCircle = this.isArchivedCircle(txCircle);
       const txSlug = workstreamInboxSlug(txCircle);
       // A graft may have left replica-minted siblings at this slug; collapse them before choosing
       // the row to append to, so this find joins one inbox rather than a third.
@@ -6180,10 +6244,11 @@ export class MonetCore {
       this.writeRevision(conceptId, version, body);
       const savedRow = this.getRow(conceptId);
       if (!savedRow) throw new Error("workstream inbox row missing after capture");
-      return { row: savedRow, proofToken: this.captureEmbeddingWidthProof(emb.length) };
+      return { row: savedRow, proofToken: this.captureEmbeddingWidthProof(emb.length), landedInArchivedCircle };
     })();
     this.installEmbeddingWidthProof(result.proofToken);
-    return { itemId, row: toWorkstream(result.row) };
+    // `row.circle` is read inside the same transaction as the verdict, so both describe one instant.
+    return { itemId, row: toWorkstream(result.row), landedInArchivedCircle: result.landedInArchivedCircle };
   }
 
   /**

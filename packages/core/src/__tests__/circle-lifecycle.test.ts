@@ -13,6 +13,9 @@
  *   - archiveCircle/unarchiveCircle: listCircles flags, explicit access still works, store-to-archived allowed
  *   - store-to-archived DISCLOSES (#55): every resolution branch, aliased destinations, and a
  *     circle archived mid-write; memory_store's acknowledgement carries the sentence
+ *   - checkpoint-to-archived DISCLOSES (#81): saveWorkstream and captureFind each alone, the mint
+ *     and update branches, aliased destinations, a circle archived mid-checkpoint, and
+ *     memory_checkpoint's receipt for inbox-only, workstream-only and combined calls
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -55,6 +58,13 @@ async function makeMcpPair(core: MonetCore): Promise<{ client: Client; cleanup: 
 /** Call memory_store over the wire and parse the acknowledgement envelope. */
 async function storeOverMcp(client: Client, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const res = await client.callTool({ name: "memory_store", arguments: args }) as
+    { content: Array<{ type: string; text: string }> };
+  return JSON.parse(res.content[0].text) as Record<string, unknown>;
+}
+
+/** Call memory_checkpoint over the wire and parse the receipt envelope. */
+async function checkpointOverMcp(client: Client, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await client.callTool({ name: "memory_checkpoint", arguments: args }) as
     { content: Array<{ type: string; text: string }> };
   return JSON.parse(res.content[0].text) as Record<string, unknown>;
 }
@@ -817,6 +827,234 @@ describe("archiveCircle / unarchiveCircle", () => {
 
       const live = await storeOverMcp(client, { content: "The nightly export writes to S3.", circle: "current" });
       expect(live.conceptId).toBeDefined();
+      expect(live).not.toHaveProperty("guidance");
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ---- checkpoint into an archived circle (#81) --------------------------------
+
+/**
+ * #78 gave `memory_store` a disclosure when a write lands in an archived circle and left the two
+ * checkpoint writers behind. `saveWorkstream` and `captureFind` reach the same attic through the
+ * same door — `resolveCircle` — and said nothing about it.
+ *
+ * WHAT DOES NOT TRANSFER FROM #78, and is deliberately not built here: neither function takes an
+ * `operationId` and neither has a receipt table, so there is no replay to freeze a verdict for.
+ * `ingest_operations.landed_in_archived_circle` exists because a retry must not re-derive a mutable
+ * flag; with no retry, the whole class is absent and inventing an equivalent would be new schema
+ * for a caller that cannot reach it.
+ *
+ * THE EXCLUSION LIST IS MEASURED, AND IT IS NOT #78's. A workstream is never in store-wide search
+ * at all — `search` filters `kind != 'workstream'` on every branch — so telling a checkpointing
+ * agent it fell "out of store-wide recall" would name a loss archiving did not cause. Measured
+ * before and after `archiveCircle`, with a circle holding concepts AND a checkpoint: the checkpoint
+ * stays fully readable by naming the circle, and the one thing that changes is that the circle
+ * drops out of the default `listCircles` listing. That is the whole cost, and it is what the
+ * sentence says.
+ */
+describe("checkpoint into an archived circle discloses (#81)", () => {
+  /**
+   * THE TWO WRITERS, EACH ON ITS OWN. A combined `memory_checkpoint` calls both, so a disclosure
+   * carried by only one of them would go silent for every caller that used the other alone — and
+   * `inbox` alone is the commonest checkpoint there is.
+   *
+   * A LIVE CIRCLE ANSWERS TOO, and answers `false`: the destination was asked about under the
+   * reservation and is fine. That is a verdict, not the silence this fix removes.
+   */
+  it("discloses on saveWorkstream and on captureFind independently, and answers false in a live circle", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+
+    const liveSave = await core.saveWorkstream({ title: "Live plan", open: [{ slot: "step", text: "still working here" }] }, { circle: "current" });
+    expect(liveSave!.landedInArchivedCircle).toBe(false);
+    const liveFind = await core.captureFind("a find in a live circle", { circle: "current" });
+    expect(liveFind.landedInArchivedCircle).toBe(false);
+
+    core.archiveCircle("attic");
+    const saved = await core.saveWorkstream({ title: "Shelved plan", open: [{ slot: "step", text: "wire the CSV writer" }] }, { circle: "attic" });
+    expect(saved!.landedInArchivedCircle).toBe(true);
+    const captured = await core.captureFind("the retry budget looks wrong", { circle: "attic" });
+    expect(captured.landedInArchivedCircle).toBe(true);
+
+    // DISCLOSURE, NOT REFUSAL — the archive contract is unchanged. Both writes landed, in the
+    // circle that was asked for, and both are readable by naming it.
+    expect(saved!.circle).toBe("attic");
+    expect(captured.row.circle).toBe("attic");
+    expect(core.getActiveWorkstreams("attic").map((w) => w.title)).toContain("Shelved plan");
+    expect(core.getWorkstreamInbox("attic")?.payload.items.map((i) => i.text))
+      .toContain("the retry budget looks wrong");
+
+    core.close();
+  });
+
+  /**
+   * THE ALIASED DESTINATION, the same case #78 keys on the RESOLVED circle to cover. The caller
+   * names a circle with no archived row of its own and the rename alias lands the checkpoint in the
+   * attic anyway — keying on the caller's own string would be silent exactly where the caller
+   * cannot see it coming.
+   */
+  it("discloses when an ACTIVE alias resolves onto an archived circle", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await core.store("Deployment runbook for the billing service.", { circle: "old-project" });
+    core.renameCircle("old-project", "new-project");
+    core.archiveCircle("new-project");
+
+    const saved = await core.saveWorkstream({ title: "Runbook work", open: [{ slot: "step", text: "step two" }] }, { circle: "old-project" });
+    expect(saved!.circle).toBe("new-project");
+    expect(saved!.landedInArchivedCircle).toBe(true);
+
+    const captured = await core.captureFind("a find aimed at the old name", { circle: "old-project" });
+    expect(captured.row.circle).toBe("new-project");
+    expect(captured.landedInArchivedCircle).toBe(true);
+
+    core.close();
+  });
+
+  /**
+   * THE MIDDLE CASE, against a REAL second connection. Both functions resolve the circle, then await
+   * `checkedEmbed` before opening `BEGIN IMMEDIATE` — and they already re-resolve the circle inside
+   * that reservation for the rename race (Codex round 5 on #212). The archived read has to be taken
+   * at the same point and against the same re-resolved name, or "the destination was live when we
+   * resolved it" is a fact with a shelf life, and #81 comes back through a narrower window.
+   */
+  it("answers the archived question INSIDE the write reservation, against a second connection archiving mid-checkpoint", async () => {
+    const dbPath = tmpDbPath();
+    const a = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const b = new MonetCore(dbPath); // the competing writer: its own connection to the same file
+
+    // Not archived when these resolve, which is the premise of the test.
+    const before = await a.saveWorkstream({ title: "Pre-archive plan", open: [{ slot: "step", text: "before" }] }, { circle: "shelf" });
+    expect(before!.landedInArchivedCircle).toBe(false);
+
+    type Embedder = { checkedEmbed(text: string, domain: string): Promise<Float32Array> };
+    const original = (Object.getPrototypeOf(a) as Embedder).checkedEmbed;
+    let raced = 0;
+    const spy = vi.spyOn(a as unknown as Embedder, "checkedEmbed").mockImplementation(async (text: string, domain: string) => {
+      const emb = await original.call(a as unknown as Embedder, text, domain);
+      if (raced === 0) {
+        raced = 1;
+        b.archiveCircle("shelf"); // a real commit, on a real second connection, mid-window
+      }
+      return emb;
+    });
+    const during = await a.saveWorkstream({ title: "Pre-archive plan", open: [{ slot: "step", text: "during" }] }, { circle: "shelf" });
+    spy.mockRestore();
+    expect(raced).toBe(1);
+    expect(during!.landedInArchivedCircle).toBe(true);
+
+    // ...and the same window on captureFind, which owns its own resolve/embed/reserve sequence.
+    b.unarchiveCircle("shelf");
+    const findBefore = await a.captureFind("before the archive", { circle: "shelf" });
+    expect(findBefore.landedInArchivedCircle).toBe(false);
+    let racedFind = 0;
+    const findSpy = vi.spyOn(a as unknown as Embedder, "checkedEmbed").mockImplementation(async (text: string, domain: string) => {
+      const emb = await original.call(a as unknown as Embedder, text, domain);
+      if (racedFind === 0) {
+        racedFind = 1;
+        b.archiveCircle("shelf");
+      }
+      return emb;
+    });
+    const findDuring = await a.captureFind("during the archive", { circle: "shelf" });
+    findSpy.mockRestore();
+    expect(racedFind).toBe(1);
+    expect(findDuring.landedInArchivedCircle).toBe(true);
+
+    a.close();
+    b.close();
+  });
+
+  /**
+   * THE UPSERT PATH. Both writers have two branches — mint a row, or update the one already there —
+   * and a checkpoint into an archived circle most often finds its thread ALREADY EXISTING, because
+   * the circle was worked in before it was shelved. A disclosure that only fired on the insert would
+   * go quiet for the commonest shape of this bug. Closing an item exercises the update branch on
+   * both writers at once.
+   */
+  it("discloses on the update branch too, when the thread and the inbox item already exist", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const opened = await core.saveWorkstream({ title: "Long-running plan", open: [{ slot: "step", text: "half done" }] }, { circle: "proj" });
+    expect(opened!.landedInArchivedCircle).toBe(false);
+    const find = await core.captureFind("a find raised while the circle was live", { circle: "proj" });
+    expect(find.landedInArchivedCircle).toBe(false);
+
+    core.archiveCircle("proj");
+
+    // The thread exists, the item exists, and this checkpoint CLOSES it — the update branch.
+    const closed = await core.saveWorkstream(
+      { title: "Long-running plan", close: [{ id: opened!.openedItemIds[0]!, as: "done" }] },
+      { circle: "proj" },
+    );
+    expect(closed!.landedInArchivedCircle).toBe(true);
+    expect(closed!.closedItemIds).toEqual([opened!.openedItemIds[0]]);
+
+    // The inbox row exists too, so this find appends rather than mints.
+    const second = await core.captureFind("a second find, appended to the existing inbox", { circle: "proj" });
+    expect(second.landedInArchivedCircle).toBe(true);
+    expect(second.row.payload.items.length).toBe(2);
+
+    core.close();
+  });
+
+  /**
+   * THE WIRE, which is where the fix is actually delivered: the flag exists to reach the agent that
+   * just checkpointed, on the turn it checkpointed. All three call shapes are covered because a
+   * combined call routes through both writers and the receipt has one guidance slot to fill.
+   *
+   * SILENT FOR A LIVE CIRCLE — a key repeating "not archived" on every ordinary checkpoint is
+   * payload with no reader.
+   */
+  it("memory_checkpoint's receipt carries the archived-circle guidance for inbox, workstream and a combined call, and stays silent for a live circle", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    core.archiveCircle("shelved");
+    const { client, cleanup } = await makeMcpPair(core);
+    try {
+      // INBOX ALONE.
+      const inboxOnly = await checkpointOverMcp(client, { circle: "shelved", inbox: "the retry budget looks wrong" });
+      expect(inboxOnly.circle).toBe("shelved");
+      expect(inboxOnly.guidance).toContain("ARCHIVED CIRCLE");
+      expect(inboxOnly.guidance).toContain("'shelved' was archived when this checkpoint landed");
+
+      // WORKSTREAM ALONE.
+      const wsOnly = await checkpointOverMcp(client, {
+        circle: "shelved",
+        workstream: { title: "Shelved plan", open: [{ kind: "step", text: "wire the CSV writer" }] },
+      });
+      expect(wsOnly.guidance).toContain("ARCHIVED CIRCLE");
+
+      // COMBINED — one call, both writers, one sentence.
+      const combined = await checkpointOverMcp(client, {
+        circle: "shelved",
+        inbox: "a second find",
+        workstream: { title: "Shelved plan", open: [{ kind: "step", text: "and another step" }] },
+      });
+      expect(combined.guidance).toContain("ARCHIVED CIRCLE");
+      // The receipt still reports everything it did: the write is disclosed, not refused.
+      expect((combined.inbox as { opened: string[] }).opened.length).toBe(1);
+      expect((combined.workstream as { opened: string[] }).opened.length).toBe(1);
+
+      // THE SENTENCE SAYS ONLY WHAT IS MEASURABLY TRUE. Dated to the write, consequence conditional
+      // on the circle STILL being archived, and a place to look rather than an act to perform —
+      // the three properties #78 landed on after its own rounds 3 and 4.
+      const guidance = String(combined.guidance);
+      expect(guidance).toContain("reachable by naming that circle");
+      expect(guidance).toContain("while that circle remains archived");
+      expect(guidance).toContain("out of the default circle listing");
+      expect(guidance).toContain("memory_circle_manage");
+      expect(guidance).not.toMatch(/is archived/);
+      expect(guidance).not.toMatch(/unarchive/i);
+      // AND IT DOES NOT REPEAT #78's CLAUSE, which is false here: a workstream is never in
+      // store-wide search, archived or not, so archiving took nothing away there.
+      expect(guidance).not.toMatch(/store-wide/i);
+      // Measured, not assumed: the checkpoint really is readable by naming the circle.
+      expect(core.getActiveWorkstreams("shelved").map((w) => w.title)).toContain("Shelved plan");
+      expect(core.getWorkstreamInbox("shelved")?.payload.items.length).toBe(2);
+
+      // A LIVE CIRCLE STAYS SILENT.
+      const live = await checkpointOverMcp(client, { circle: "current", inbox: "an ordinary find" });
+      expect(live.circle).toBe("current");
       expect(live).not.toHaveProperty("guidance");
     } finally {
       await cleanup();
