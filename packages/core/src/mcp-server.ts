@@ -2175,7 +2175,7 @@ export function registerMonetCoreTools(
     },
   );
 
-  const checkpointDescription = "Track work and capture finds as they happen — nothing is owed at session end. When a work directive lands, open the plan: work-level items that may outlive the session (fine-grained decomposition stays in the host's own todo). When something surfaces that is not this work, `inbox` it — one line, keep moving. Before reporting completion, settle: close what resolved, and dispose the inbox with the user — do it now, `filed` with a `ref`, `dropped`, or leave open to keep. This MERGES: `open` adds, `close` resolves by id, anything unnamed stays untouched. Address a workstream by `title` (mints if new) or `id` (exact); with neither, the one this session already touched, or the only active one — several active means refusal with the list. The receipt is only what this call did: `opened`/`closed` item ids, `status` only when this call changed it.";
+  const checkpointDescription = "Track work and capture finds as they happen — nothing is owed at session end. When a work directive lands, open the plan: work-level items that may outlive the session (fine-grained decomposition stays in the host's own todo). When something surfaces that is not this work, `inbox` it — one line, keep moving. Before reporting completion, settle: close what resolved, and dispose the inbox with the user — do it now, `filed` with a `ref`, `dropped`, or leave open to keep. This MERGES: `open` adds, `close` resolves by id, anything unnamed stays untouched. Address a workstream by `title` (mints if new) or `id` (exact); with neither, the one this session already touched, or the only active one — several active means refusal with the list. The receipt is only what this call did: `opened`/`closed` item ids, `status` only when this call changed it, and — only when the checkpoint landed in an archived circle — `guidance` naming that circle.";
   const checkpointSchema = z.object({
     circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
     inbox: z.string().min(1).optional(),
@@ -2281,6 +2281,19 @@ export function registerMonetCoreTools(
               },
             }
           : {};
+        // THE ARCHIVED-DESTINATION DISCLOSURE (#81) — the gap #55 closed for memory_store, still
+        // open on the two checkpoint writers. Each writer carries its own (verdict, circle) pair,
+        // both halves read inside its own write transaction, and the sentence takes BOTH halves
+        // from whichever pair answered `true`: a verdict from one writer wearing the other's circle
+        // name is the half-fact #55's rounds 2 and 4 spent themselves closing. `saved` is preferred
+        // only to match this receipt's own precedence for `circle` above; absent a mid-call rename
+        // the two writers resolve to the same place, so the choice is invisible in every ordinary
+        // call. A combined call therefore discloses once, not twice.
+        const archivedLanding = saved?.landedInArchivedCircle === true
+          ? saved.circle
+          : inboxSaved?.landedInArchivedCircle === true
+            ? inboxSaved.row.circle
+            : undefined;
         return mutOk({
           // The circle the writes actually landed in — a mid-call rename moves them, and the
           // receipt names where the work IS, not where the request aimed.
@@ -2295,6 +2308,32 @@ export function registerMonetCoreTools(
             },
           } : {}),
           ...inboxReceipt,
+          // PRESENT ONLY WHEN IT FIRES: a key repeating "not archived" on every ordinary checkpoint
+          // is payload with no reader.
+          //
+          // THE EXCLUSION LIST IS MEASURED AND IS NOT #55's. A workstream is never in store-wide
+          // search — `search` filters `kind != 'workstream'` on every branch — so telling a
+          // checkpointing agent it fell "out of store-wide recall" would name a loss archiving did
+          // not cause. Measured either side of `archiveCircle` on a circle holding concepts and a
+          // checkpoint: `getActiveWorkstreams` and `getWorkstreamInbox` both still return it when
+          // the circle is named, and the one thing that changes is that the circle leaves
+          // `listCircles`' default listing — which is the route a later session takes back to this
+          // work. That single exclusion is what the sentence claims, and all it claims.
+          //
+          // DATED TO THE WRITE, with a consequence conditional on the circle STILL being archived
+          // and a place to LOOK rather than an act to perform — the three properties #55 settled on
+          // in its rounds 3 and 4. Both halves here are frozen at the write, so the sentence may not
+          // assert what the circle IS by the time it is read, and it must not prescribe
+          // `unarchiveCircle`, which throws outright for an aliased name.
+          ...(archivedLanding !== undefined
+            ? {
+              guidance:
+                `ARCHIVED CIRCLE: '${archivedLanding}' was archived when this checkpoint landed. ` +
+                `The checkpoint is saved and reachable by naming that circle, but while that circle ` +
+                `remains archived it stays out of the default circle listing. Check or change the ` +
+                `circle's state with memory_circle_manage.`,
+            }
+            : {}),
         }, "memory_checkpoint", capturedBlock);
       } catch (e) {
         if (e instanceof WorkstreamAddressRequiredError) return err(e.message);
