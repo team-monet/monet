@@ -95,9 +95,22 @@ export class StoreBusyError extends Error {
 
 /** SQLite reports contention two ways, and the second is not a code (see diagnostics.ts on WSL2). */
 function isStoreContention(error: unknown): boolean {
-  const code = typeof error === "object" && error !== null && "code" in error
-    ? String((error as { code?: unknown }).code)
-    : "";
+  // GUARDED FOR THE SAME REASON isSqliteError IS (PR #102 review): the `in` test and the property
+  // read both run arbitrary third-party code, and every caller of this predicate is already inside
+  // a catch, where a throw from classifying REPLACES the failure being classified. An uninspectable
+  // code falls through to the message arm rather than deciding anything, so an error that answers
+  // neither question propagates untouched instead of becoming a TypeError from the inspection.
+  //
+  // This costs the open path nothing it was getting right: for any error whose code is readable the
+  // answer is unchanged, and for a poisoned one it previously threw here rather than returning.
+  let code = "";
+  try {
+    code = typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code?: unknown }).code)
+      : "";
+  } catch {
+    /* fall through to the message arm */
+  }
   if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
   return error instanceof Error && /database is locked/i.test(error.message);
 }
@@ -128,8 +141,24 @@ function isStoreContention(error: unknown): boolean {
  */
 function isSqliteError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
-  const code = "code" in error ? (error as { code?: unknown }).code : undefined;
-  if (typeof code === "string" && code.startsWith("SQLITE_")) return true;
+  // THE CODE READ IS GUARDED, for the reason startup-diagnosis.ts guards its own (PR #102 review).
+  // Both the `in` test and the property read run arbitrary third-party code — a getter, a Proxy
+  // trap — and this gate runs INSIDE the constructor's catch, where a throw does not fall through
+  // to `?? error` but replaces the constructor's real failure with a TypeError from the inspection.
+  // Reachable rather than theoretical: `initSyncIdentity` reads `this.embedderModelId` inside the
+  // guarded region, and the embedder is caller-supplied, so a third-party `modelId` getter can
+  // raise the very error this gate then destroys while classifying it.
+  //
+  // AN UNINSPECTABLE CODE IS AN ABSENT CODE, NOT A VERDICT ON THE ERROR. The catch falls through to
+  // the name arm rather than returning false: a poisoned `code` on an error that IS SQLite's must
+  // not cost the classification, which is exactly the codeless-report case the name arm exists to
+  // carry. Only an error that answers neither question is left to propagate untouched.
+  try {
+    const code = "code" in error ? (error as { code?: unknown }).code : undefined;
+    if (typeof code === "string" && code.startsWith("SQLITE_")) return true;
+  } catch {
+    /* fall through to the name arm */
+  }
   return error instanceof Error && error.name === "SqliteError";
 }
 

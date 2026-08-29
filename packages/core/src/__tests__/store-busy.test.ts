@@ -418,6 +418,33 @@ describe("the region translates SQLite's contention and nothing else (#102 revie
     expect((caught as Error).message).not.toMatch(/is busy|write lock|retry/);
   });
 
+  it("an error whose code accessor throws is left alone, not replaced by the inspection", () => {
+    // THE GATE RUNS INSIDE THE CONSTRUCTOR'S CATCH, so a throw from classifying does not fall
+    // through to `?? error` — it replaces the constructor's real failure with a TypeError raised by
+    // the inspection itself. Reachable rather than theoretical: initSyncIdentity reads
+    // this.embedderModelId inside the guarded region and the embedder is caller-supplied.
+    const poisoned = new Error("the failure the caller actually needs to see");
+    Object.defineProperty(poisoned, "code", {
+      get() {
+        throw new TypeError("poisoned code getter");
+      },
+    });
+
+    // Classification refuses rather than throwing: an uninspectable code is not SQLite's code.
+    expect(() => schemaRegionContentionError(FIXED, poisoned, 5000)).not.toThrow();
+    expect(schemaRegionContentionError(FIXED, poisoned, 5000)).toBeUndefined();
+
+    // And a poisoned code must not cost an error that IS SQLite's — the name arm still answers.
+    const named = new Error("database is locked");
+    named.name = "SqliteError";
+    Object.defineProperty(named, "code", {
+      get() {
+        throw new TypeError("poisoned code getter");
+      },
+    });
+    expect(schemaRegionContentionError(FIXED, named, 5000)).toBeInstanceOf(StoreBusyError);
+  });
+
   it("the OPEN path still admits that same error, byte for byte", () => {
     const carrier = new Error("syncDeviceId mismatch: store is 'device-a', requested 'database is locked'");
     // THE INPUT THE REGION NOW REJECTS, asserted against the open path's own pre-change bytes rather
