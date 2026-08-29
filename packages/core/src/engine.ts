@@ -2760,6 +2760,20 @@ export class MonetCore {
    */
   constructor(db: string | StoragePort = ":memory:", opts: MonetCoreOptions = {}) {
     this.storeHome = typeof db === "string" && db !== ":memory:" ? dirname(resolve(db)) : null;
+    // THE PATH THIS CONNECTION OPENED, NORMALIZED ONCE, HERE (#102 review, finding C). The schema
+    // region's catch used to run `resolve(db)` for itself, which resolves against the cwd AT THAT
+    // MOMENT — and between this line and that catch the constructor calls caller-supplied code (the
+    // embedder's `modelId` getter, the options object's own getters), any of which may
+    // `process.chdir()`. A relative `db` then named a store that was never opened: the wrong path in
+    // the message, and the holder markers of the REAL store filtered out of it as belonging to
+    // someone else. Resolved beside the open instead, both readings are the same string by
+    // construction. `:memory:` passes through as itself, exactly as BetterSqlitePort treats it.
+    //
+    // RECOMPUTED RATHER THAN REUSED, deliberately: BetterSqlitePort derives this identical value for
+    // its own `dbPath`, but that field is private with no getter, and exposing it would widen the
+    // port's public surface — for a StoragePort the interface still has no path member — to save one
+    // `resolve` call on a string this constructor already holds.
+    const dbPath = typeof db === "string" ? (db === ":memory:" ? db : resolve(db)) : null;
     this.db = typeof db === "string" ? new BetterSqlitePort(db) : db;
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
     this.embedderLoader = opts.embedderLoader ?? instantiateEmbedderForPin;
@@ -2828,8 +2842,14 @@ export class MonetCore {
     // identity is deliberately re-derived from the new one (see applyEmbedderDerivedThresholds), so
     // a cached field would serve the pre-swap identity forever. These two locals are threaded to
     // the three sites that used to re-read them and nowhere further.
-    const embedderModelId = this.embedderModelId;
-    const stableEmbedderModelId = this.stableEmbedderModelId;
+    //
+    // ONE RAW READ, BOTH IDENTITIES DERIVED FROM IT (#102 review, finding B). Reading the two
+    // getters here — one line apart, each consulting the caller's `modelId` getter for itself — let
+    // a stateful getter describe two different embedders to one construction, and initSyncIdentity
+    // combines the pair: `undefined` then a real id pinned a fresh store to the synthetic `dim:N`
+    // under the OTHER read's verdict that the identity was persistable. See embedderIdentity for
+    // why the fix is the snapshot rather than a guard, and why it lives beside the getters.
+    const { runtime: embedderModelId, stable: stableEmbedderModelId } = this.embedderIdentity(this.embedder.modelId);
     // AND THE LAST `opts` READ, for the same reason. Every other option is read above this line;
     // this one alone happened inside the region, so a getter or Proxy on the options object was a
     // second way for caller code to raise inside the catch. Reading it here makes "the guarded
@@ -2905,10 +2925,11 @@ export class MonetCore {
       // (packages/cli/src/repair-cli.ts, i.e. `monet doctor` and `monet repair`) still reports the
       // bare SQLite error from this region. That gap is asserted explicitly in store-busy.test.ts
       // rather than left to be rediscovered.
-      if (typeof db !== "string") throw error;
-      // Same normalization BetterSqlitePort applies to its own dbPath, so the marker filter inside
-      // the contention builder compares the identical string; `:memory:` passes through as itself.
-      const dbPath = db === ":memory:" ? db : resolve(db);
+      // `dbPath` is null for exactly the StoragePort branch this line has always refused. It carries
+      // the normalization BetterSqlitePort applies to its own dbPath — captured beside the open
+      // rather than recomputed here, see its comment — so the marker filter inside the contention
+      // builder compares the identical string.
+      if (dbPath === null) throw error;
       // The REGION builder, not the open one. What this clock measured is the region's elapsed time
       // — schema, migration and repair passes plus whatever waiting happened — and the open path's
       // sentence would report all of it as a lock wait (see schemaRegionContentionError).
@@ -9357,15 +9378,44 @@ export class MonetCore {
    * stableEmbedderModelId is the stricter identity used for every persistence contract.
    */
   private get embedderModelId(): string {
-    return this.embedder.modelId ?? `dim:${this.embedder.dim}`;
+    return this.embedderIdentity(this.embedder.modelId).runtime;
   }
 
   /** Persistable identity, deliberately excluding blank and synthetic dim:N labels. */
   private get stableEmbedderModelId(): string | null {
-    const raw = this.embedder.modelId;
-    if (raw === undefined) return null;
+    return this.embedderIdentity(this.embedder.modelId).stable;
+  }
+
+  /**
+   * BOTH IDENTITIES FROM ONE RAW `modelId`, which is why this takes the raw value instead of reading
+   * it (#102 review, finding B).
+   *
+   * The two getters above are separate reads of a CALLER-SUPPLIED getter, and a stateful one can
+   * answer them differently. Read consecutively — as the constructor's capture did — `undefined`
+   * then a real id makes `runtime` the synthetic `dim:N` fallback while `stable` says the identity is
+   * persistable, and those two answers describe different embedders. `initSyncIdentity` combines
+   * exactly that pair: it reads the second as its permission to pin and writes the FIRST, so a fresh
+   * store took `dim:256` as its durable `created` pin — the value FIX W exists to keep out of that
+   * column, and a reopen under the now-stable provider then reported a mismatch against a pin the
+   * store should never have had. Unlike a bad message, that one is written down.
+   *
+   * A SNAPSHOT, NOT A GUARD, and not a memoized field either. Nothing here detects or rejects a
+   * changing getter — it cannot, and does not need to: derived from one value, the pair is internally
+   * consistent whatever the getter does next, which is the only property the pin invariant needs.
+   * The getters stay live for every other caller (ensureEmbedderPin may swap `this.embedder`, and the
+   * identity is deliberately re-derived from the new one).
+   *
+   * DEFINITIONS IN ONE PLACE is the other half. The alternative — the constructor deriving both from
+   * its own raw read inline — is the same snapshot with the `dim:N` fallback and the stable-identity
+   * rule copied to a second site, where the copy is free to drift from the getters that everything
+   * else reads.
+   */
+  private embedderIdentity(raw: string | undefined): { runtime: string; stable: string | null } {
+    // `this.embedder.dim` is touched only on the fallback path, exactly as the `??` it replaces did.
+    const runtime = raw ?? `dim:${this.embedder.dim}`;
+    if (raw === undefined) return { runtime, stable: null };
     const modelId = raw.trim();
-    return modelId && raw === modelId && !modelId.startsWith("dim:") ? modelId : null;
+    return { runtime, stable: modelId && raw === modelId && !modelId.startsWith("dim:") ? modelId : null };
   }
 
   private requireStableEmbedderIdentity(): string {

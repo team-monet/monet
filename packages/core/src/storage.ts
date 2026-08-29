@@ -276,6 +276,15 @@ export function storeContentionError(dbPath: string, error: unknown, waitedMs: n
  * off — so it is BOUNDED instead: one statement failed, and one statement's wait cannot exceed this
  * connection's busy timeout. A bound the reader can check beats a measurement that costs an
  * allocation on every statement to obtain.
+ *
+ * NOR IS THE LOCK MODE NAMED, for the same reason and found in the same family (PR #102 review). This
+ * function is handed an error and an elapsed number, never the statement that raised them, and the
+ * region's statements are not all writes: the pin `SELECT` that closes it and the `PRAGMA
+ * table_info` / `user_version` reads inside `migrate()` are reads. A process that takes EXCLUSIVE
+ * ownership after this connection opened blocks those too, so SQLITE_BUSY here can belong to a
+ * statement that never asked for a write lock — and the sentence said it had. The open path's own
+ * lead keeps that claim, where it is earned: that catch wraps `new Database()` and `journal_mode =
+ * WAL`, and the measured blocker is the WAL pragma taking the write lock (see its comment).
  */
 export function schemaRegionContentionError(
   dbPath: string,
@@ -290,8 +299,8 @@ export function schemaRegionContentionError(
     dbPath,
     error,
     regionElapsedMs,
-    `The store at ${dbPath} is busy: a statement in the startup's schema region could not take its ` +
-      `write lock. That region had been running for ${regionElapsedMs}ms when it failed, but that is ` +
+    `The store at ${dbPath} is busy: SQLite reported it locked while a statement in the startup's ` +
+      `schema region ran. That region had been running for ${regionElapsedMs}ms when it failed, but that is ` +
       `the region's own elapsed time, not a wait — schema, migration and index-repair passes run ` +
       `inside it before any statement blocks. The failing statement's wait is bounded by this ` +
       `connection's ${STORE_BUSY_TIMEOUT_MS}ms busy_timeout, so do not read the number above as time ` +

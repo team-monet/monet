@@ -6,7 +6,7 @@
  * contention failure into a sentence naming the holder and the wait.
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readInflightStatements } from "../statement-trace";
@@ -341,6 +341,9 @@ describe("the region's elapsed time is not a lock wait, and the message must not
 
     // The region path must never make the open path's claim about a number that cannot support it.
     expect(region.message).not.toMatch(/could not take its write lock after \d+ms/);
+    // NOR THE CLAIM ABOUT WHICH LOCK, end to end (see the lock-mode describe below for why). The
+    // open path's sentence one assertion up still carries it, because there it is what happened.
+    expect(region.message).not.toMatch(/write lock/);
     // What the number actually is...
     expect(region.message).toMatch(/had been running for \d+ms/);
     // ...said as elapsed rather than as waiting, in words and not only by omission...
@@ -353,6 +356,55 @@ describe("the region's elapsed time is not a lock wait, and the message must not
     expect(open.message).toContain(openPath);
     expect(region.message).toMatch(/is busy/);
     expect(region.message).toContain(regionPath);
+  });
+});
+
+/**
+ * FINDING B, from a later review round of this PR, and the same family as the `waitedMs` correction
+ * above: the region message asserted a fact the region does not hold.
+ *
+ * WHAT IT CANNOT KNOW. `schemaRegionContentionError` receives an error and an elapsed number — never
+ * the statement that failed. The region's statements are not all writes: the pin `SELECT` that
+ * closes it and the `PRAGMA table_info` / `user_version` reads inside `migrate()` are reads, and a
+ * process that takes exclusive ownership after this connection opened blocks those too, so SQLite
+ * can report SQLITE_BUSY for a statement that never asked for a write lock. Naming the mode is a
+ * verdict on evidence the wrapper does not have — and this repo's own rule is that a record must
+ * distinguish "not known" from a verdict.
+ *
+ * WHAT IS SAID INSTEAD: the store is locked, which is exactly what SQLite reported and all that was
+ * observed. THE OPEN PATH KEEPS ITS SENTENCE, because there the claim is earned: that catch wraps
+ * `new Database()` and `journal_mode = WAL`, and the measured blocker is the WAL pragma taking the
+ * write lock. It is pinned here against its own bytes for the same reason the finding-A round pinned
+ * it — a correction that leaked into the shared builder would rewrite this string, and a regex loose
+ * enough to keep matching is what would hide it.
+ */
+describe("the region says the store is locked, not which lock it could not take (#102 review)", () => {
+  const FIXED = "/nonexistent-monet-region-lockmode-dir/monet.db";
+  const contended = (): Error => Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+
+  it("the region message asserts no lock mode", () => {
+    const region = schemaRegionContentionError(FIXED, contended(), 8035);
+    expect(region).toBeInstanceOf(StoreBusyError);
+    // The assertion the region cannot support: it does not retain which statement failed.
+    expect(region?.message).not.toMatch(/write lock/);
+    // What it does say — the store is locked, which is what SQLite actually reported.
+    expect(region?.message).toMatch(/SQLite reported it locked/);
+    // Everything the previous round established is untouched by the narrowing.
+    expect(region?.message).toMatch(/had been running for 8035ms/);
+    expect(region?.message).toMatch(/elapsed time, not a wait/);
+    expect(region?.message).toMatch(/bounded by this connection's 5000ms busy_timeout/);
+    expect(region?.message).toContain(FIXED);
+  });
+
+  it("the OPEN path's sentence is byte-identical for the same error", () => {
+    expect(storeContentionError(FIXED, contended(), 5000)?.message).toBe(
+      "The store at /nonexistent-monet-region-lockmode-dir/monet.db is busy: could not take its write lock after 5000ms. " +
+      "Nothing beside the store records who holds it. That happens when statement tracing is off (set MONET_TRACE_SQL=1 on " +
+      "every monet process sharing this store and reproduce), and also when the holder is idle between statements while " +
+      "keeping the lock — an absent RECORD either way, never an absent holder. One MCP server and one `monet` CLI call " +
+      "sharing a store is the supported topology, so this is usually transient — retry once the other process finishes. If " +
+      "nothing ever finishes, the holder is wedged rather than busy.",
+    );
   });
 });
 
@@ -664,5 +716,185 @@ describe("the guarded schema region runs no caller-supplied code (#102, root cau
     } finally {
       port.close();
     }
+  });
+});
+
+/**
+ * FINDING B's SERIOUS HALF, from the same review round, and the only one in it whose consequence is
+ * DURABLE: a wrong value written into `sync_meta`, not a wrong sentence on stderr.
+ *
+ * THE DEFECT. The capture above resolved the two identities with two SEPARATE reads of the
+ * caller-supplied `modelId` getter — `this.embedderModelId` then `this.stableEmbedderModelId`, one
+ * line apart, each reading `this.embedder.modelId` for itself. A stateful getter can answer them
+ * differently, and the two answers are then combined as though they described one embedder:
+ * `undefined` first and a real id second makes `embedderModelId` the SYNTHETIC `dim:N` fallback
+ * while `stableEmbedderModelId` says the identity is persistable. `initSyncIdentity` reads the
+ * second as its permission to pin and writes the first, so a fresh store takes `dim:256` as its
+ * durable `created` pin — the exact value the pin invariant exists to keep out of that column (see
+ * FIX W in initSyncIdentity: an anonymous provider does not get to mint a pin, because any other
+ * anonymous provider of the same dimension satisfies it trivially). A later reopen under the now-
+ * stable provider then reports a mismatch against a pin the store should never have had.
+ *
+ * THE FIX IS THE SNAPSHOT, NOT A GUARD: the raw `modelId` is read ONCE and both identities are
+ * derived from that single value, so the two can no longer describe different embedders. Every case
+ * below is stated as what the STORE ENDS UP PINNED TO, because that is what outlives the process.
+ *
+ * THE MIDDLE CASES ARE HERE ON PURPOSE. Two of these four (stable-and-real, stable-and-undefined)
+ * are the ordinary population, and they are what proves the snapshot changed nothing for anybody
+ * whose getter is a normal one.
+ */
+describe("the two identities come from ONE read of modelId, so no store is pinned to a synthetic id (#102 review)", () => {
+  /**
+   * A `modelId` getter that answers differently over time — the shape the two reads were exposed to.
+   * `values` is consumed in order and the last value repeats, so a single-element list is an
+   * ordinary stable provider and a two-element one changes between the first and second read.
+   */
+  function modelIdSequence(values: ReadonlyArray<string | undefined>): { embedder: EmbeddingProvider; reads: () => number } {
+    const base = new HashingEmbeddingProvider(256);
+    let reads = 0;
+    const embedder = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "modelId") {
+          const value = values[Math.min(reads, values.length - 1)];
+          reads += 1;
+          return value;
+        }
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    }) as EmbeddingProvider;
+    return { embedder, reads: () => reads };
+  }
+
+  /** What the store durably records — the whole point of this describe. */
+  function pinOf(dbPath: string): { modelId: string | null; source: string | null } {
+    const port = new BetterSqlitePort(dbPath);
+    try {
+      const row = port
+        .prepare(`SELECT embedder_model_id, embedder_pin_source FROM sync_meta WHERE singleton = 1`)
+        .get() as { embedder_model_id: string | null; embedder_pin_source: string | null };
+      return { modelId: row.embedder_model_id, source: row.embedder_pin_source };
+    } finally {
+      port.close();
+    }
+  }
+
+  /** The downstream consequence a wrong pin produces: a reopen that reports a mismatch. */
+  function reopenStablyAndReadPinFlag(dbPath: string, modelId: string): boolean {
+    const core = new MonetCore(dbPath, { embedder: modelIdSequence([modelId]).embedder });
+    const unsatisfied = (core as unknown as { pinUnsatisfied: boolean }).pinUnsatisfied;
+    core.close();
+    return unsatisfied;
+  }
+
+  it("STABLE and real — the ordinary case: the pin is the embedder's own modelId, and one read produced it", () => {
+    const dbPath = join(tempDir(), "monet-core.db");
+    const { embedder, reads } = modelIdSequence(["real-model-alpha"]);
+    new MonetCore(dbPath, { embedder }).close();
+
+    expect(pinOf(dbPath)).toEqual({ modelId: "real-model-alpha", source: "created" });
+    // The structural half of the same claim: the constructor consults the getter ONCE. A second read
+    // is what let two answers describe one embedder, so its absence is worth pinning directly.
+    expect(reads()).toBe(1);
+    expect(reopenStablyAndReadPinFlag(dbPath, "real-model-alpha")).toBe(false);
+  });
+
+  it("STABLE and undefined — the other ordinary case: no pin is minted at all", () => {
+    const dbPath = join(tempDir(), "monet-core.db");
+    const { embedder } = modelIdSequence([undefined]);
+    new MonetCore(dbPath, { embedder }).close();
+
+    // Not `dim:256`, and not anything else: an anonymous provider does not get to pin this store.
+    expect(pinOf(dbPath)).toEqual({ modelId: null, source: null });
+  });
+
+  it("CHANGING undefined -> real: the store is NOT pinned to dim:N under a persistable verdict", () => {
+    const dbPath = join(tempDir(), "monet-core.db");
+    const { embedder } = modelIdSequence([undefined, "real-model-beta"]);
+    new MonetCore(dbPath, { embedder }).close();
+
+    // THE INVARIANT. The synthetic fallback is a comparison convenience, never a durable identity.
+    expect(pinOf(dbPath).modelId ?? "(no pin)").not.toMatch(/^dim:/);
+    // And what one consistent snapshot says about this store: the first thing the getter reported
+    // was `undefined`, which is not persistable, so nothing is pinned.
+    expect(pinOf(dbPath)).toEqual({ modelId: null, source: null });
+    // The consequence the wrong pin carried into every later session: a reopen under the stable
+    // provider found `dim:256` where it expected `real-model-beta` and armed the mismatch flag.
+    expect(reopenStablyAndReadPinFlag(dbPath, "real-model-beta")).toBe(false);
+  });
+
+  it("CHANGING real -> undefined: the same invariant from the other side", () => {
+    const dbPath = join(tempDir(), "monet-core.db");
+    const { embedder } = modelIdSequence(["real-model-gamma", undefined]);
+    new MonetCore(dbPath, { embedder }).close();
+
+    expect(pinOf(dbPath).modelId ?? "(no pin)").not.toMatch(/^dim:/);
+    // The snapshot is what the getter said when it was asked: a real, persistable id. The store is
+    // pinned to it rather than to a mixture of both answers.
+    expect(pinOf(dbPath)).toEqual({ modelId: "real-model-gamma", source: "created" });
+    expect(reopenStablyAndReadPinFlag(dbPath, "real-model-gamma")).toBe(false);
+  });
+});
+
+/**
+ * FINDING C, from the same review round. The region's catch resolved `db` for ITSELF, and a relative
+ * `db` resolves against the cwd at the moment of the call — not the cwd the connection opened under.
+ *
+ * THE WINDOW IS REAL, if narrow: between `new BetterSqlitePort(db)` and the catch, the constructor
+ * runs caller-supplied code — the embedder's `modelId` getter and the options object's own getters —
+ * and any of them may `process.chdir()`. The message then named a store that was never opened, and
+ * the holder markers of the store that IS locked were filtered out of it as belonging to some other
+ * database (see the marker filter in contentionError). The path is captured beside the open now.
+ *
+ * ON `process.chdir()` IN A TEST, since it is process-global. Everything between the chdir and its
+ * restore here is SYNCHRONOUS — `new MonetCore(...)` is a constructor, and no `await` sits inside
+ * this window — so nothing else in this process can observe the moved cwd, and the restore is in a
+ * `finally`. Test files get their own child process (pool `forks`, see vitest.config.ts), so no other
+ * file shares it. Under a `threads` pool `process.chdir` does not exist at all, which would fail this
+ * test loudly rather than flakily.
+ *
+ * IT COSTS THE BUSY TIMEOUT (5s), like every other end-to-end contention test in this file: the drift
+ * is only observable through the catch, and only real contention reaches it.
+ */
+describe("the region names the store the connection opened, not one the cwd moved to (#102 review)", () => {
+  it("a chdir between the open and the failure does not rename the store", () => {
+    const home = realpathSync(tempDir());
+    const elsewhere = realpathSync(tempDir());
+    const dbPath = join(home, "monet-core.db");
+    // The caller-supplied read the constructor still makes, after the connection is open.
+    const base = new HashingEmbeddingProvider(256);
+    const embedder = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "modelId") {
+          process.chdir(elsewhere);
+          return "real-model-delta";
+        }
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    }) as EmbeddingProvider;
+
+    const holder = new BetterSqlitePort(dbPath); // creates the file and puts it in WAL
+    const originalCwd = process.cwd();
+    let caught: unknown;
+    try {
+      holder.exec("BEGIN IMMEDIATE"); // a real write reservation, held across the construction
+      process.chdir(home);
+      try {
+        new MonetCore("monet-core.db", { embedder }); // relative, resolved against `home` at the open
+      } catch (error) {
+        caught = error;
+      }
+    } finally {
+      process.chdir(originalCwd);
+      try { holder.exec("ROLLBACK"); } catch { /* the assertions below are the news */ }
+      holder.close();
+    }
+
+    expect(caught).toBeInstanceOf(StoreBusyError);
+    // The store that is actually locked — not `elsewhere`, where the cwd was when the catch ran.
+    expect((caught as StoreBusyError).dbPath).toBe(dbPath);
+    expect((caught as StoreBusyError).message).toContain(dbPath);
+    expect((caught as StoreBusyError).message).not.toContain(elsewhere);
   });
 });
