@@ -112,7 +112,15 @@ function isStoreContention(error: unknown): boolean {
     /* fall through to the message arm */
   }
   if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
-  return error instanceof Error && /database is locked/i.test(error.message);
+  // `message` is a property read like any other and can throw for the same reasons `code` can. Here
+  // the catch answers false rather than falling through, because this IS the last arm: an error
+  // whose message cannot be read has answered neither question, and not-contention is what leaves
+  // the original failure to propagate untouched.
+  try {
+    return error instanceof Error && /database is locked/i.test(error.message);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -159,7 +167,13 @@ function isSqliteError(error: unknown): boolean {
   } catch {
     /* fall through to the name arm */
   }
-  return error instanceof Error && error.name === "SqliteError";
+  // Same for `name`, and the same reasoning as the message arm below: this is the last question
+  // this gate asks, so an unreadable name is a no rather than a throw.
+  try {
+    return error instanceof Error && error.name === "SqliteError";
+  } catch {
+    return false;
+  }
 }
 
 /**

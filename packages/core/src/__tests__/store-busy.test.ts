@@ -445,6 +445,35 @@ describe("the region translates SQLite's contention and nothing else (#102 revie
     expect(schemaRegionContentionError(FIXED, named, 5000)).toBeInstanceOf(StoreBusyError);
   });
 
+  it("a throwing name or message accessor is a no, not a throw — the whole classification is guarded", () => {
+    // THE SAME HAZARD AS THE code GETTER, one property along. `name` is read by the region gate and
+    // `message` by the contention predicate, and both run inside the constructor's catch, so an
+    // unreadable one used to replace the failure being classified. Every arm is guarded now; a
+    // partial guard just moves the throw to the next read, which is how the code arm's fix went.
+    const poisonedName = new Error("the failure the caller actually needs to see");
+    Object.defineProperty(poisonedName, "name", {
+      get() {
+        throw new TypeError("poisoned name getter");
+      },
+    });
+    expect(() => schemaRegionContentionError(FIXED, poisonedName, 5000)).not.toThrow();
+    expect(schemaRegionContentionError(FIXED, poisonedName, 5000)).toBeUndefined();
+
+    // A readable SqliteError name gets past the gate, and then the message arm must not throw either.
+    const poisonedMessage = new Error("readable at construction");
+    poisonedMessage.name = "SqliteError";
+    Object.defineProperty(poisonedMessage, "message", {
+      get() {
+        throw new TypeError("poisoned message getter");
+      },
+    });
+    expect(() => schemaRegionContentionError(FIXED, poisonedMessage, 5000)).not.toThrow();
+    expect(schemaRegionContentionError(FIXED, poisonedMessage, 5000)).toBeUndefined();
+
+    // And the open path, which shares the contention predicate, is equally unable to throw.
+    expect(() => storeContentionError(FIXED, poisonedMessage, 5000)).not.toThrow();
+  });
+
   it("the OPEN path still admits that same error, byte for byte", () => {
     const carrier = new Error("syncDeviceId mismatch: store is 'device-a', requested 'database is locked'");
     // THE INPUT THE REGION NOW REJECTS, asserted against the open path's own pre-change bytes rather
