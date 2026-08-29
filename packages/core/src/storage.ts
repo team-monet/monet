@@ -153,9 +153,14 @@ function isSqliteError(error: unknown): boolean {
   // Both the `in` test and the property read run arbitrary third-party code — a getter, a Proxy
   // trap — and this gate runs INSIDE the constructor's catch, where a throw does not fall through
   // to `?? error` but replaces the constructor's real failure with a TypeError from the inspection.
-  // Reachable rather than theoretical: `initSyncIdentity` reads `this.embedderModelId` inside the
-  // guarded region, and the embedder is caller-supplied, so a third-party `modelId` getter can
-  // raise the very error this gate then destroys while classifying it.
+  // THE CALLER-SUPPLIED READ THIS ONCE CITED IS GONE (#102, root-cause round): `initSyncIdentity`
+  // and `migrate()` used to read `this.embedderModelId` inside the guarded region, and the embedder
+  // is caller-supplied, so a third-party `modelId` getter could raise the very error this gate then
+  // destroyed while classifying it. That identity is now resolved BEFORE the region opens (see the
+  // constructor's capture in engine.ts) — the root-cause fix, because no inspection of an error can
+  // tell a foreign SqliteError from one of ours, so the foreign code moved out instead of the
+  // classifier learning to guess. These guards stay as defence in depth for what our OWN statements
+  // raise: a driver error's own properties are not ours to assume readable either.
   //
   // AN UNINSPECTABLE CODE IS AN ABSENT CODE, NOT A VERDICT ON THE ERROR. The catch falls through to
   // the name arm rather than returning false: a poisoned `code` on an error that IS SQLite's must

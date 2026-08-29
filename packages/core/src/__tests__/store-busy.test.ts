@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { readInflightStatements } from "../statement-trace";
 import { BetterSqlitePort, StoreBusyError, schemaRegionContentionError, storeContentionError } from "../storage";
 import { MonetCore } from "../engine";
+import { HashingEmbeddingProvider, type EmbeddingProvider } from "../embedding";
 
 const dirs: string[] = [];
 function tempDir(): string {
@@ -421,8 +422,9 @@ describe("the region translates SQLite's contention and nothing else (#102 revie
   it("an error whose code accessor throws is left alone, not replaced by the inspection", () => {
     // THE GATE RUNS INSIDE THE CONSTRUCTOR'S CATCH, so a throw from classifying does not fall
     // through to `?? error` — it replaces the constructor's real failure with a TypeError raised by
-    // the inspection itself. Reachable rather than theoretical: initSyncIdentity reads
-    // this.embedderModelId inside the guarded region and the embedder is caller-supplied.
+    // the inspection itself. The caller-supplied read that once made this reachable is gone (the
+    // embedder identity is resolved before the region opens, #102's root-cause round); this stays
+    // because the errors our OWN statements raise are still not ours to assume inspectable.
     const poisoned = new Error("the failure the caller actually needs to see");
     Object.defineProperty(poisoned, "code", {
       get() {
@@ -489,5 +491,178 @@ describe("the region translates SQLite's contention and nothing else (#102 revie
     );
     // And the two paths now disagree about it, which is the whole content of this fix.
     expect(schemaRegionContentionError(FIXED, carrier, 5000)).toBeUndefined();
+  });
+});
+
+/**
+ * ROUND 5, AND THE ROOT CAUSE UNDER ALL THREE ROUNDS OF THIS PR. The first two findings were a
+ * poisoned `code` getter and a poisoned `name`/`message`; both were answered by guarding the reads
+ * inside the classifier. The third was different in kind: a GENUINE SQLite error — `name:
+ * "SqliteError"`, `code: "SQLITE_BUSY"`, `message: "database is locked"` — raised from a DIFFERENT
+ * database, which every guard above admits because it is, byte for byte, what our own contention
+ * looks like. No inspection of an error can decide whether it belongs to THIS connection, so the
+ * classifier cannot be made sound by asking it better questions.
+ *
+ * THE PROPERTY THESE TESTS PIN, and the reason they exist as a group: `this.embedder` is read ZERO
+ * times inside the constructor's guarded schema region. The fix is not a smarter classifier — it is
+ * that caller-supplied code does not run in there at all, so nothing it raises ever reaches the
+ * catch. The embedder identity is resolved into locals before the region opens and threaded to the
+ * sites that used to re-read it (see the capture's comment in engine.ts).
+ *
+ * WHY BOTH PATHS BELOW, when they look like the same test twice. The getter was read from FOUR
+ * places in the region, and which one throws first depends on the store: a FRESH store reaches
+ * `initSyncIdentity`'s stable-identity check first, while a REOPEN of a pinned store early-returns
+ * out of `initSyncIdentity` entirely and meets `migrate()`'s graph-backfill check instead. A test
+ * covering one path leaves the other's read site free to come back.
+ *
+ * The last two tests are the other half of the contract. Translation of REAL contention is the whole
+ * point of #82 and must survive; and the captured identity must be the SAME value the region's sites
+ * read before, `dim:N` fallback included, or the capture has quietly changed what the pin means.
+ */
+describe("the guarded schema region runs no caller-supplied code (#102, root cause)", () => {
+  /** The only caller-supplied surface the region ever read: `this.embedder`'s own `modelId` getter. */
+  function embedderWhoseModelIdThrows(raise: () => unknown): EmbeddingProvider {
+    const base = new HashingEmbeddingProvider(256);
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop === "modelId") throw raise();
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    }) as EmbeddingProvider;
+  }
+
+  /** A real modelId-less provider: `embedderModelId` falls back to `dim:${dim}` for it. */
+  function anonymousEmbedder(): EmbeddingProvider {
+    const base = new HashingEmbeddingProvider(256);
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop === "modelId") return undefined;
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    }) as EmbeddingProvider;
+  }
+
+  /**
+   * SQLite's contention, exactly as this driver reports it — measured on a real contended CREATE
+   * TABLE (see isSqliteError). Raised here by a caller's getter against a database that is not this
+   * store, which is precisely the error no classifier can tell from our own.
+   */
+  function foreignSqliteBusy(): Error {
+    const error = Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+    error.name = "SqliteError";
+    return error;
+  }
+
+  function expectPropagatedUntouched(caught: unknown): void {
+    // NOT translated: the operator must not be sent after a holder of a lock nobody took.
+    expect(caught).not.toBeInstanceOf(StoreBusyError);
+    // And not replaced by the inspection either — the caller's own error arrives whole.
+    expect((caught as Error).name).toBe("SqliteError");
+    expect((caught as { code?: unknown }).code).toBe("SQLITE_BUSY");
+    expect((caught as Error).message).toBe("database is locked");
+  }
+
+  it("FRESH store: a foreign SQLITE_BUSY from the caller's modelId getter is not this store's contention", () => {
+    const dbPath = join(tempDir(), "monet-core.db");
+    let caught: unknown;
+    try {
+      new MonetCore(dbPath, { embedder: embedderWhoseModelIdThrows(foreignSqliteBusy) });
+    } catch (error) {
+      caught = error;
+    }
+    expectPropagatedUntouched(caught);
+  });
+
+  it("REOPEN of a pinned store: the same error, arriving at the region's OTHER read site", () => {
+    const dbPath = join(tempDir(), "monet-core.db");
+    // The pin makes this a reopen rather than a fresh store: initSyncIdentity early-returns, so the
+    // read that used to fire is migrate()'s graph-backfill trustworthiness check, not the pin write.
+    new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256) }).close();
+
+    let caught: unknown;
+    try {
+      new MonetCore(dbPath, { embedder: embedderWhoseModelIdThrows(foreignSqliteBusy) });
+    } catch (error) {
+      caught = error;
+    }
+    expectPropagatedUntouched(caught);
+  });
+
+  it("REAL contention still translates — the half of the contract the two tests above must not cost", () => {
+    // Here to be read beside them: a change that "fixed" the foreign case by narrowing translation
+    // away, rather than by moving the foreign code out of the region, fails right here.
+    const dbPath = join(tempDir(), "monet-core.db");
+    const holder = new BetterSqlitePort(dbPath);
+    let caught: unknown;
+    try {
+      holder.exec("BEGIN IMMEDIATE"); // a real write reservation, held across the construction
+      try {
+        new MonetCore(dbPath);
+      } catch (error) {
+        caught = error;
+      }
+    } finally {
+      try { holder.exec("ROLLBACK"); } catch { /* the assertions below are the news */ }
+      holder.close();
+    }
+
+    expect(caught).toBeInstanceOf(StoreBusyError);
+    expect((caught as StoreBusyError).message).toMatch(/had been running for \d+ms/);
+    expect((caught as StoreBusyError).message).toContain(dbPath);
+  });
+
+  it("the identity captured before the region is the same value its sites read before — dim:N fallback included", () => {
+    // WHAT THIS CATCHES that the tests above cannot: a capture that resolves something subtly
+    // different from `this.embedderModelId` — the raw `modelId`, an empty string, a stale pin —
+    // would move the region's foreign reads out just as well and quietly change what the pin means.
+    //
+    // The discriminator is the `dim:${dim}` fallback, because a store is never pinned to one by the
+    // engine itself (an anonymous provider does not get to mint a pin — see initSyncIdentity), so a
+    // pin written here BY HAND can only be matched by a capture that computes the identical string.
+    function pinnedTo(dbPath: string, modelId: string): void {
+      const port = new BetterSqlitePort(dbPath);
+      try {
+        port
+          .prepare(`UPDATE sync_meta SET embedder_model_id = ?, embedder_pin_source = 'created', embedder_pinned_at = ? WHERE singleton = 1`)
+          .run(modelId, Date.now());
+      } finally {
+        port.close();
+      }
+    }
+    function reopenAnonymousAndReadPinFlag(dbPath: string): boolean {
+      const core = new MonetCore(dbPath, { embedder: anonymousEmbedder() });
+      // The constructor's own pin comparison, which is one of the sites the captured value feeds.
+      const unsatisfied = (core as unknown as { pinUnsatisfied: boolean }).pinUnsatisfied;
+      core.close();
+      return unsatisfied;
+    }
+
+    const matching = join(tempDir(), "monet-core.db");
+    new MonetCore(matching, { embedder: new HashingEmbeddingProvider(256) }).close();
+    pinnedTo(matching, "dim:256");
+    // Satisfied ONLY if the captured identity is exactly `dim:256` for a 256-dim anonymous provider.
+    expect(reopenAnonymousAndReadPinFlag(matching)).toBe(false);
+
+    const otherDim = join(tempDir(), "monet-core.db");
+    new MonetCore(otherDim, { embedder: new HashingEmbeddingProvider(256) }).close();
+    pinnedTo(otherDim, "dim:999");
+    // Still discriminating: a capture that matched everything would pass the assertion above too.
+    expect(reopenAnonymousAndReadPinFlag(otherDim)).toBe(true);
+
+    // And the value a normal construction PERSISTS is unchanged: the pin is the embedder's own
+    // modelId, written from the captured local rather than from a re-read of the getter.
+    const named = join(tempDir(), "monet-core.db");
+    const embedder = new HashingEmbeddingProvider(256);
+    new MonetCore(named, { embedder }).close();
+    const port = new BetterSqlitePort(named);
+    try {
+      expect(
+        (port.prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`).get() as { embedder_model_id: string | null }).embedder_model_id,
+      ).toBe(embedder.modelId);
+    } finally {
+      port.close();
+    }
   });
 });

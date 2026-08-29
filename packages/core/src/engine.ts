@@ -2809,13 +2809,39 @@ export class MonetCore {
     // The whole run is one region rather than three named statements, because every statement in it
     // writes and any of them can be the one that meets the lock.
     //
+    // THE CALLER'S CODE RUNS BEFORE THE REGION, NEVER INSIDE IT (#102 review, rounds 3-5). Three
+    // successive findings — a poisoned `code` getter, then a poisoned `name`/`message`, then a
+    // genuine `SQLITE_BUSY` raised from a DIFFERENT database — are one defect wearing three faces.
+    // `this.embedder` is caller-supplied and its `modelId` getter was read from four places inside
+    // the guarded region (measured: initSyncIdentity's stable-identity check and its 'created' pin
+    // write, migrate()'s graph-backfill trustworthiness check, and the pin read that closes the
+    // region). Whatever that getter raises used to arrive at a catch whose only remaining question
+    // is whether the error belongs to THIS connection — and no inspection of an error can answer it:
+    // a foreign `SqliteError` carrying `SQLITE_BUSY` is byte-for-byte what our own contention looks
+    // like. So the read moves out rather than the classifier learning to guess. Resolved here, a
+    // hostile or merely unlucky getter throws BEFORE the try and its error propagates untouched.
+    // The predicate guards inside the classifier stay: they are defence in depth for what our own
+    // statements can still raise, and their tests pin real behaviour.
+    //
+    // CAPTURED FOR THIS REGION, NOT MEMOIZED ON THE INSTANCE. Both getters must stay live
+    // everywhere else — ensureEmbedderPin may swap this.embedder after construction and the
+    // identity is deliberately re-derived from the new one (see applyEmbedderDerivedThresholds), so
+    // a cached field would serve the pre-swap identity forever. These two locals are threaded to
+    // the three sites that used to re-read them and nowhere further.
+    const embedderModelId = this.embedderModelId;
+    const stableEmbedderModelId = this.stableEmbedderModelId;
+    // AND THE LAST `opts` READ, for the same reason. Every other option is read above this line;
+    // this one alone happened inside the region, so a getter or Proxy on the options object was a
+    // second way for caller code to raise inside the catch. Reading it here makes "the guarded
+    // region runs no caller-supplied code" a property that holds rather than nearly holds.
+    const requestedSyncDeviceId = opts.syncDeviceId;
     // Timed from here, not from the connection open: the message reports the wait that actually
     // happened, and this region's wait is a different one from the open's.
     const schemaStartedAt = Date.now();
     try {
       this.init();
-      this.initSyncIdentity(opts.syncDeviceId);
-      this.migrate();
+      this.initSyncIdentity(requestedSyncDeviceId, embedderModelId, stableEmbedderModelId);
+      this.migrate(embedderModelId);
       // A SECOND migrateGateColumns() PASS, HERE (Codex round 11, item 3). `init()`, above, already
       // runs createGateTables -> migrateLegacyStarCircle -> migrateGateColumns as its own "GATE
       // SUBSTRATE, IN THREE EXPLICIT PHASES" sequence (init()'s own comment). This call was added
@@ -2869,7 +2895,7 @@ export class MonetCore {
       // FIX: an incomplete migration always wins over a matching pin. begin stamps the target pin before
       // vectors are rewritten, so equality alone is not evidence that this store is safe to serve.
       this.pinUnsatisfied = this.readEmbedderMigration() !== undefined
-        || (pinRow.embedder_model_id !== null && pinRow.embedder_model_id !== this.embedderModelId);
+        || (pinRow.embedder_model_id !== null && pinRow.embedder_model_id !== embedderModelId);
     } catch (error) {
       // ONLY THE PATH BRANCH IS TRANSLATED, KNOWINGLY — #82 stays open for the rest. The message
       // schemaRegionContentionError builds is built AROUND the store's path: it names the store and
@@ -2890,7 +2916,13 @@ export class MonetCore {
     }
   }
 
-  private initSyncIdentity(requested?: string): void {
+  /**
+   * Both identities ARRIVE AS PARAMETERS rather than being read off `this`: they are resolved before
+   * the constructor's guarded schema region opens, because the getters behind them run
+   * caller-supplied code and this method runs inside that region (see the capture's own comment in
+   * the constructor). Re-reading either getter below reopens #102.
+   */
+  private initSyncIdentity(requested: string | undefined, embedderModelId: string, stableEmbedderModelId: string | null): void {
     const existing = this.db.prepare(`SELECT device_id FROM sync_meta WHERE singleton = 1`).get() as { device_id: string } | undefined;
     const deviceId = existing?.device_id ?? requested ?? randomUUID();
     if (existing && requested && requested !== existing.device_id) {
@@ -2936,7 +2968,7 @@ export class MonetCore {
       // All three reasons (FIX E, FIX V, FIX W) converge on the exact SAME "write the legacy-shape
       // row" branch below — there is nothing shape-specific about any one of them once the decision
       // is "don't pin yet".
-      if (this.hasAnyStoredVector() || this.deferCreatedPin || this.stableEmbedderModelId === null) {
+      if (this.hasAnyStoredVector() || this.deferCreatedPin || stableEmbedderModelId === null) {
         // Leave embedder_model_id/embedder_pin_source/embedder_pinned_at NULL — identical to a
         // pre-pin store that has ALWAYS had a sync_meta row. The constructor-time guard read below
         // (this method returns before that code runs) sees NULL and stays unarmed — nothing is
@@ -2955,7 +2987,7 @@ export class MonetCore {
             `INSERT INTO sync_meta (singleton, device_id, last_mutation_at, embedder_model_id, embedder_pin_source, embedder_pinned_at)
              VALUES (1, ?, ?, ?, 'created', ?)`,
           )
-          .run(deviceId, seed, this.embedderModelId, Date.now());
+          .run(deviceId, seed, embedderModelId, Date.now());
       }
     }
     this.syncDeviceId = deviceId;
@@ -3501,8 +3533,15 @@ export class MonetCore {
     migrateGateColumns(this.db);
   }
 
-  /** Guarded migration for older DBs: add columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
-  private migrate(): void {
+  /**
+   * Guarded migration for older DBs: add columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS).
+   *
+   * `embedderModelId` ARRIVES AS A PARAMETER rather than being read off `this` — it is resolved
+   * before the constructor's guarded schema region opens, because the getter behind it runs
+   * caller-supplied code and this method runs inside that region (see the capture's own comment in
+   * the constructor). Re-reading `this.embedderModelId` anywhere below reopens #102.
+   */
+  private migrate(embedderModelId: string): void {
     // `sync_meta` was introduced by v8. Keep migration resilient to a partially-created v8 store
     // that has the table but predates the remote-application guard column.
     const syncMetaCols = this.db.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
@@ -3827,7 +3866,7 @@ export class MonetCore {
     const graphBackfillTrustworthy =
       this.readEmbedderMigration() === undefined
       && (pinRowForGraphBackfill.embedder_model_id !== null
-        ? pinRowForGraphBackfill.embedder_model_id === this.embedderModelId // pinned: trustworthy only if the pin matches what's about to score
+        ? pinRowForGraphBackfill.embedder_model_id === embedderModelId // pinned: trustworthy only if the pin matches what's about to score
         : !this.hasAnyStoredVector()); // unpinned: trustworthy only if there's nothing yet to mis-score (genuinely empty)
     if (graphBackfillTrustworthy) {
       this.runGraphBackfillIfPending();
