@@ -373,7 +373,9 @@ describe("retirement tombstone replication", () => {
       await new Promise((resolve) => setTimeout(resolve, 2));
       legacy
         // @ts-expect-error invokes the upgrade migration after inserting legacy-only state
-        .migrate();
+        // The identity argument is what the constructor resolves before its guarded schema region
+        // opens (#102) — same provider freshCore's default embedder uses, per basePayload's note.
+        .migrate(new HashingEmbeddingProvider().modelId);
       const delta = legacy.exportDelta(watermark);
       expect(delta.concepts).toEqual([]);
       expect(delta.tombstones).toContainEqual(expect.objectContaining({ concept_id: "legacy-retired" }));

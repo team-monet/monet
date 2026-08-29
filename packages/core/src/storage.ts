@@ -57,6 +57,21 @@ export class StorageExclusiveLockError extends Error {
 }
 
 /**
+ * The busy timeout this port arms on every connection it opens, and therefore the ceiling on how
+ * long ONE statement can wait for the write lock before SQLite gives up with SQLITE_BUSY.
+ *
+ * NAMED because a message quotes it (schemaRegionContentionError, below). A hard-coded 5000 in that
+ * sentence would keep claiming a bound after someone changed the pragma, and a diagnostic that
+ * describes a bound which is no longer set is worse than one that describes none.
+ *
+ * NOT the budget the connection OPEN runs under: better-sqlite3 arms `sqlite3_busy_timeout` from its
+ * own `timeout` option before this pragma is ever reached (see the constructor's comment on that).
+ * The two happen to agree at 5000; this constant governs only statements that run after the pragma,
+ * which is every statement outside BetterSqlitePort's own constructor.
+ */
+export const STORE_BUSY_TIMEOUT_MS = 5000;
+
+/**
  * The store could not be opened because another process holds its write lock (#148).
  *
  * Distinct from StorageExclusiveLockError, which is about a lock this process asked for and could
@@ -80,11 +95,90 @@ export class StoreBusyError extends Error {
 
 /** SQLite reports contention two ways, and the second is not a code (see diagnostics.ts on WSL2). */
 function isStoreContention(error: unknown): boolean {
-  const code = typeof error === "object" && error !== null && "code" in error
-    ? String((error as { code?: unknown }).code)
-    : "";
+  // GUARDED FOR THE SAME REASON isSqliteError IS (PR #102 review): the `in` test and the property
+  // read both run arbitrary third-party code, and every caller of this predicate is already inside
+  // a catch, where a throw from classifying REPLACES the failure being classified. An uninspectable
+  // code falls through to the message arm rather than deciding anything, so an error that answers
+  // neither question propagates untouched instead of becoming a TypeError from the inspection.
+  //
+  // This costs the open path nothing it was getting right: for any error whose code is readable the
+  // answer is unchanged, and for a poisoned one it previously threw here rather than returning.
+  let code = "";
+  try {
+    code = typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code?: unknown }).code)
+      : "";
+  } catch {
+    /* fall through to the message arm */
+  }
   if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
-  return error instanceof Error && /database is locked/i.test(error.message);
+  // `message` is a property read like any other and can throw for the same reasons `code` can. Here
+  // the catch answers false rather than falling through, because this IS the last arm: an error
+  // whose message cannot be read has answered neither question, and not-contention is what leaves
+  // the original failure to propagate untouched.
+  try {
+    return error instanceof Error && /database is locked/i.test(error.message);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Did this error come from SQLite at all? Asked ONLY by the region path, and this is why.
+ *
+ * `isStoreContention`'s second arm is a bare message match, which is safe exactly where it was
+ * written: the open path's catch (BetterSqlitePort's constructor, below) wraps `new Database()` and
+ * two pragmas, so a driver error is the only thing that can arrive and the arm cannot meet anything
+ * else. The schema region is the opposite — MonetCore's whole construction runs inside it, ~10
+ * statements plus every migration and repair pass, all free to throw whatever they like. Measured:
+ * `initSyncIdentity` raises a plain Error quoting a device id the CALLER chose, so reopening a store
+ * with `syncDeviceId: "database is locked"` produced a StoreBusyError blaming a write lock, naming a
+ * holder and advising a retry, for a mismatch with no lock anywhere in it.
+ *
+ * WHY THE MESSAGE ARM IS NARROWED HERE RATHER THAN DELETED. It exists for contention SQLite reports
+ * WITHOUT a code (`isStoreContention`'s own comment, #148), and something still depends on that
+ * shape: startup-diagnosis.test.ts drives `storeContentionError` with a codeless `database is
+ * locked` to prove the record leaves `code` ABSENT rather than fabricating `SQLITE_BUSY`. Requiring
+ * the error to be SQLite's keeps every case the arm was written for and drops only the errors that
+ * were never SQLite's — which is the whole population this region added to it.
+ *
+ * WHAT COUNTS AS SQLITE'S: a `SQLITE_`-prefixed code, or the driver's own error class name. Measured
+ * on this driver: a real contended `CREATE TABLE` throws `name: "SqliteError"`, `code:
+ * "SQLITE_BUSY"`, `message: "database is locked"`. The name arm is what carries a codeless report —
+ * matching on the class that threw rather than on a code that is not there.
+ */
+function isSqliteError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  // THE CODE READ IS GUARDED, for the reason startup-diagnosis.ts guards its own (PR #102 review).
+  // Both the `in` test and the property read run arbitrary third-party code — a getter, a Proxy
+  // trap — and this gate runs INSIDE the constructor's catch, where a throw does not fall through
+  // to `?? error` but replaces the constructor's real failure with a TypeError from the inspection.
+  // THE CALLER-SUPPLIED READ THIS ONCE CITED IS GONE (#102, root-cause round): `initSyncIdentity`
+  // and `migrate()` used to read `this.embedderModelId` inside the guarded region, and the embedder
+  // is caller-supplied, so a third-party `modelId` getter could raise the very error this gate then
+  // destroyed while classifying it. That identity is now resolved BEFORE the region opens (see the
+  // constructor's capture in engine.ts) — the root-cause fix, because no inspection of an error can
+  // tell a foreign SqliteError from one of ours, so the foreign code moved out instead of the
+  // classifier learning to guess. These guards stay as defence in depth for what our OWN statements
+  // raise: a driver error's own properties are not ours to assume readable either.
+  //
+  // AN UNINSPECTABLE CODE IS AN ABSENT CODE, NOT A VERDICT ON THE ERROR. The catch falls through to
+  // the name arm rather than returning false: a poisoned `code` on an error that IS SQLite's must
+  // not cost the classification, which is exactly the codeless-report case the name arm exists to
+  // carry. Only an error that answers neither question is left to propagate untouched.
+  try {
+    const code = "code" in error ? (error as { code?: unknown }).code : undefined;
+    if (typeof code === "string" && code.startsWith("SQLITE_")) return true;
+  } catch {
+    /* fall through to the name arm */
+  }
+  // Same for `name`, and the same reasoning as the message arm below: this is the last question
+  // this gate asks, so an unreadable name is a no rather than a throw.
+  try {
+    return error instanceof Error && error.name === "SqliteError";
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -99,8 +193,17 @@ function isStoreContention(error: unknown): boolean {
  * tracing is off there are none, and the message leads with THAT rather than with "no holder" — an absent
  * record and an absent holder are different facts, and reporting the first as the second is how a
  * diagnostic starts lying.
+ *
+ * `lead` is the caller's own first sentence, because the callers do not measure the same thing: see
+ * schemaRegionContentionError, which is why this split exists at all. Everything after it — the
+ * holder evidence and what to do next — is identical whoever asked, so it lives here once.
  */
-function storeContentionError(dbPath: string, error: unknown, waitedMs: number): StoreBusyError | undefined {
+function contentionError(
+  dbPath: string,
+  error: unknown,
+  elapsedMs: number,
+  lead: string,
+): StoreBusyError | undefined {
   if (!isStoreContention(error)) return undefined;
   // ONLY MARKERS THAT NAME THIS STORE (Codex review, PR #216). A marker carries no proof that its
   // process owns the lock, and a directory can hold several databases — so an unfiltered list can
@@ -127,13 +230,81 @@ function storeContentionError(dbPath: string, error: unknown, waitedMs: number):
       `proof it still runs.`;
   return new StoreBusyError(
     dbPath,
-    waitedMs,
+    elapsedMs,
     holders,
-    `The store at ${dbPath} is busy: could not take its write lock after ${waitedMs}ms. ${held} ` +
+    `${lead} ${held} ` +
       `One MCP server and one \`monet\` CLI call sharing a store is the supported topology, so this ` +
       `is usually transient — retry once the other process finishes. If nothing ever finishes, the ` +
       `holder is wedged rather than busy.`,
     { cause: error },
+  );
+}
+
+/**
+ * Contention met while TAKING the connection — BetterSqlitePort's own constructor. Here `waitedMs`
+ * is a measured wait and nothing else: the interval it times contains the open and the setup
+ * pragmas, which is SQLite work and no work of ours, so the number is exactly what it says.
+ */
+export function storeContentionError(dbPath: string, error: unknown, waitedMs: number): StoreBusyError | undefined {
+  return contentionError(
+    dbPath,
+    error,
+    waitedMs,
+    `The store at ${dbPath} is busy: could not take its write lock after ${waitedMs}ms.`,
+  );
+}
+
+/**
+ * Contention met INSIDE MonetCore's schema region, after the connection is already open (#82).
+ *
+ * WHY THIS CANNOT REUSE THE SENTENCE ABOVE. The region's clock starts before `init()` and stops on
+ * the throw, so its elapsed time is prefix work PLUS whatever waiting happened — and the prefix is
+ * not small: `repairDriftedConceptCentroids()` scans every live observation and holds the whole live
+ * vector population in memory before it writes, and #95 and #97 re-armed the centroid and lexical
+ * gates so both passes run on the first open of every existing store. Measured: a holder taking the
+ * lock 3828ms into the region produced 8035, which the shared sentence reported as a 8035ms wait for
+ * a wait of 5000ms.
+ *
+ * THAT IS NOT A ROUNDING ERROR, because of what the closing sentence then tells the operator: a wait
+ * that never ends means the holder is WEDGED rather than busy. An inflated number argues for that
+ * conclusion about a holder that behaved normally, and sends the reader after a hang that is not
+ * there.
+ *
+ * WHAT IS SAID INSTEAD is only what is true and free at this point. The elapsed number is named as
+ * elapsed. The actual wait is not measured — per-statement timing would mean a wrapper on a hot path
+ * that `prepare`/`transaction`/`immediateTransaction` deliberately leave unwrapped when tracing is
+ * off — so it is BOUNDED instead: one statement failed, and one statement's wait cannot exceed this
+ * connection's busy timeout. A bound the reader can check beats a measurement that costs an
+ * allocation on every statement to obtain.
+ *
+ * NOR IS THE LOCK MODE NAMED, for the same reason and found in the same family (PR #102 review). This
+ * function is handed an error and an elapsed number, never the statement that raised them, and the
+ * region's statements are not all writes: the pin `SELECT` that closes it and the `PRAGMA
+ * table_info` / `user_version` reads inside `migrate()` are reads. A process that takes EXCLUSIVE
+ * ownership after this connection opened blocks those too, so SQLITE_BUSY here can belong to a
+ * statement that never asked for a write lock — and the sentence said it had. The open path's own
+ * lead keeps that claim, where it is earned: that catch wraps `new Database()` and `journal_mode =
+ * WAL`, and the measured blocker is the WAL pragma taking the write lock (see its comment).
+ */
+export function schemaRegionContentionError(
+  dbPath: string,
+  error: unknown,
+  regionElapsedMs: number,
+): StoreBusyError | undefined {
+  // NOT EVERY FAILURE IN THIS REGION IS SQLITE'S (PR #102 review, finding A). The open path can hand
+  // `isStoreContention` nothing but driver errors; this one hands it the whole constructor. See
+  // isSqliteError for what the difference costs and why the narrowing lands here and not there.
+  if (!isSqliteError(error)) return undefined;
+  return contentionError(
+    dbPath,
+    error,
+    regionElapsedMs,
+    `The store at ${dbPath} is busy: SQLite reported it locked while a statement in the startup's ` +
+      `schema region ran. That region had been running for ${regionElapsedMs}ms when it failed, but that is ` +
+      `the region's own elapsed time, not a wait — schema, migration and index-repair passes run ` +
+      `inside it before any statement blocks. The failing statement's wait is bounded by this ` +
+      `connection's ${STORE_BUSY_TIMEOUT_MS}ms busy_timeout, so do not read the number above as time ` +
+      `the holder has held anything.`,
   );
 }
 
@@ -225,9 +396,9 @@ export class BetterSqlitePort implements StoragePort {
     //
     // And the budget that wait runs under is NOT the pragma two lines below it: better-sqlite3 arms
     // `sqlite3_busy_timeout` from its own `timeout` option at open, which defaults to 5000
-    // (lib/database.js). Our explicit `busy_timeout = 5000` runs AFTER the wait it looks like it
-    // governs. Separating a real boot budget therefore has to go through `new Database(path, {
-    // timeout })`, which is #215, not through editing that constant.
+    // (lib/database.js). Our explicit `busy_timeout = STORE_BUSY_TIMEOUT_MS` runs AFTER the wait it
+    // looks like it governs. Separating a real boot budget therefore has to go through `new
+    // Database(path, { timeout })`, which is #215, not through editing that constant.
     //
     // The wait is timed from here so the message can say how long was actually spent, rather than
     // quoting a configured number and hoping the two match.
@@ -250,7 +421,7 @@ export class BetterSqlitePort implements StoragePort {
         : undefined);
     try {
       this.pragma("journal_mode = WAL");
-      this.pragma("busy_timeout = 5000");
+      this.pragma(`busy_timeout = ${STORE_BUSY_TIMEOUT_MS}`);
     } catch (error) {
       // RELEASE WHAT THIS CONSTRUCTOR ALREADY TOOK (Codex review, PR #216). Reaching here means the
       // instance will never exist, so nothing else can ever close these: the SQLite handle would be
