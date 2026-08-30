@@ -1633,7 +1633,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_overview",
-    "Read-only curation workbench for one circle: compact counts, livingModel cards, bounded queues for possibleDuplicates, extractionCandidates, openContradictions and gate exceptions, plus the ratified skeleton. Opt into dirty or stale worklists; truncation fields report omissions. It never returns bodies: memory_fetch an id, use memory_resolve for contradictions or pair flags, and memory_detach with destConceptId to consolidate a duplicate. Pass entity to list one hub's memories.",
+    "Read-only curation workbench for one circle: compact counts, livingModel cards, bounded queues for possibleDuplicates, extractionCandidates, openContradictions and gate exceptions, plus the ratified skeleton. A skeleton member's `homeCircle` names the circle it is homed in and appears only when that is not the circle you asked from; its absence means the member is homed here, and memory_ratify only accepts a candidate homed in the circle you pass. Opt into dirty or stale worklists; truncation fields report omissions. It never returns bodies: memory_fetch an id, use memory_resolve for contradictions or pair flags, and memory_detach with destConceptId to consolidate a duplicate. Pass entity to list one hub's memories.",
     {
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       entity: z.string().optional(),
@@ -1872,7 +1872,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "stage_lookup",
-    "At a stage named by agent_context, fetch its rules before acting. A hit returns bounded rules with reasons and omission recovery fields. `parentDisputed:true` means `disputedParentIds` should be memory_fetched; projectedFromPrincipleId is only the display parent. A miss returns the live stage index.",
+    "At a stage named by agent_context, fetch its rules before acting. A hit returns bounded rules with reasons and omission recovery fields. `homeCircle` names the circle a rule is homed in, and appears only when that is not the circle you asked from; its absence means the rule is homed here. `parentDisputed:true` means `disputedParentIds` should be memory_fetched; projectedFromPrincipleId is only the display parent. A miss returns the live stage index.",
     {
       stage: z.string().max(STAGE_NAME_MAX_CHARS).describe("Stage name or id from agent_context/prewarm."),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
@@ -1970,6 +1970,16 @@ export function registerMonetCoreTools(
             // serialized as an explicit `null`).
             origin: rule.origin,
             ...(rule.modelTag !== null ? { modelTag: rule.modelTag } : {}),
+            // WHERE THE RULE IS HOMED, present only when that is not the circle asked about
+            // (gates.ts, GateRule.homeCircle). A rule reaching this response from another circle —
+            // a breadth binding, typically a norm meant to reach every project — used to arrive
+            // byte-identical to a local one, while the response's own top-level `circle` names the
+            // SESSION's circle and so quietly read as the rule's. The agent is told elsewhere that
+            // another circle's memory is analogy at best; at a stage the rule is binding, so it
+            // needs the same provenance a recall card already carries. Omitted in the ordinary
+            // case for this response's usual reason: on every rule of every lookup it would be
+            // resident cost with none of the signal.
+            ...(rule.homeCircle !== undefined ? { homeCircle: rule.homeCircle } : {}),
             ...(bodyClip ? { body: bodyClip.text } : {}),
             ...(rule.projectedFromPrincipleId !== undefined ? { projectedFromPrincipleId: rule.projectedFromPrincipleId } : {}),
             // FIRE-TIME DOUBT DISCLOSURE (slice 5-B, D5) — present (always `true`) only when one of
@@ -3037,7 +3047,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "agent_context",
-    "Session-start orientation. Call first. Returns resolved `circle`; `resolvedFrom` marks an alias. `stageIndex` names moments whose rules require stage_lookup. Skeleton delivery has three states: no mirror fields means loaded standing files are current; `mirrorStale` + `instruction` requires user-confirmed reconciliation; `skeleton` contains members not covered by a standing file. `open` counts workstreams and inbox items still open — mention them to the user; resume only when asked.",
+    "Session-start orientation. Call first. Returns resolved `circle`; `resolvedFrom` marks an alias. `stageIndex` names moments whose rules require stage_lookup. Skeleton delivery has three states: no mirror fields means loaded standing files are current; `mirrorStale` + `instruction` requires user-confirmed reconciliation; `skeleton` contains members not covered by a standing file. A member's `homeCircle` names the circle it is homed in and appears only when that is not the circle you asked from; its absence means the member is homed here. `open` counts workstreams and inbox items still open — mention them to the user; resume only when asked.",
     { circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional() },
     async ({ circle }) => {
       const resolvedCircle = scope(circle);
@@ -3070,6 +3080,10 @@ export function registerMonetCoreTools(
         const mirrorOmitted = mirrorStale === undefined ? 0 : mirrorStale.length - mirrorCount;
         const fittedStages = stageIndexItems?.slice(0, stageCount);
         const stageOmitted = stageIndexFull === undefined ? 0 : stageIndexTrueTotal - stageCount;
+        // VERBATIM, by design — this surface fits the array by COUNT and never reshapes a member
+        // field-by-field, so every field toSkeletonEntry sets reaches the wire, `homeCircle` (#127)
+        // included. Kept deliberately: the response's own top-level `circle` is the ASKING circle,
+        // so without the member's own home a globally delivered member reads as homed here.
         const fittedSkeleton = skeleton?.slice(0, skeletonCount);
         const skeletonOmitted = skeleton === undefined ? 0 : skeleton.length - skeletonCount;
         return {

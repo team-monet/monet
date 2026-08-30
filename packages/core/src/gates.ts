@@ -1534,6 +1534,28 @@ export interface GateRule {
   /** Which matched stage this rule is bound to, so a multi-stage fire stays attributable. */
   stageId: string;
   /**
+   * THE CIRCLE THIS RULE IS HOMED IN — present ONLY when that is not the circle that asked.
+   *
+   * OMITTED IN THE ORDINARY CASE, and absence is a positive statement, not a gap: delivery already
+   * requires `b.circle` to equal the asking circle (or the breadth marker), and every write path
+   * that moves a rule's local circle keeps `rule_bindings.circle` in step with its concept's — see
+   * `RULE_LIVENESS_WHERE`'s own comment. So for an ordinary binding the home IS the circle asked
+   * about, and a field restating it on every rule of every lookup would be the resident cost with
+   * none of the signal — the same discipline `projectedFromPrincipleId` and `parentDisputed` are
+   * held to, for the same reason.
+   *
+   * COMPARED AGAINST THE ASKING CIRCLE, NEVER INFERRED FROM "is this a breadth binding". Breadth is
+   * the only binding ALLOWED to diverge from its concept's circle, but that is an invariant of the
+   * local write paths, and this read also serves rows grafted from a peer. Computing the field from
+   * the two actual values makes a row that broke the invariant SAY so; deriving it from the breadth
+   * marker would encode the invariant as a premise and hide exactly the row worth seeing.
+   *
+   * DECLARED HERE, NOT ON `StageLookupRule`: this is provenance, not the capability payload. A
+   * cross-circle rule arriving byte-identical to a local one is the same defect on any future
+   * always-on delivery path, which is precisely what `GateRule` is kept separate to serve.
+   */
+  homeCircle?: string;
+  /**
    * The principle this rule was derived from, when one exists. "A firing projected rule announces
    * its provenance ('derived from principle P'), so a wrong projection misfires in front of the
    * human" — which only works if the gate response carries the parent.
@@ -1727,6 +1749,10 @@ interface BindingJoinRow {
    */
   body: string | null;
   created_at: number;
+  /** The rule CONCEPT's own circle (`c.circle`) — never the binding's. Carried so the mapper can
+   *  compare it with the circle that asked; see `GateRule.homeCircle` for why the comparison is on
+   *  these two values rather than on the binding's breadth marker. */
+  home_circle: string;
   parent_concept_id: string | null;
   /** 1 when any locally resolved derivation parent is a disputed, still-member principle. */
   parent_disputed: number;
@@ -1854,6 +1880,16 @@ function rulesForStages(
     .prepare(
       `SELECT b.concept_id, b.stage_id, b.severity, b.scope, b.model_tag, b.origin, ${reasonColumn} AS reason,
               c.title, ${bodyColumn} AS body, b.created_at,
+              -- AFTER both placeholder-bearing columns (reason, body) ON PURPOSE. This one binds
+              -- nothing, so it cannot shift the param order by itself — but the param array above
+              -- is assembled by TEXTUAL COLUMN ORDER, and the last edit to this SELECT list swapped
+              -- two caps precisely by changing which placeholder came first. Appending after them
+              -- keeps that reading true for whoever adds the next column.
+              --
+              -- c.circle, NOT b.circle: the concept's home is the question (GateRule.homeCircle),
+              -- and the binding's circle is already pinned by the delivery predicate to either the
+              -- asking circle or the breadth marker, so it could never answer it.
+              c.circle AS home_circle,
               -- The parent principle, when there is one, as a CORRELATED SCALAR rather than a
               -- join: a rule may carry several derivation edges, and a join would multiply the
               -- gate's own rows to report a field. Scalar subquery = one row per rule, always,
@@ -2031,8 +2067,14 @@ function countLiveStages(db: StoragePort, circle: string): number {
   return row.n;
 }
 
-/** The gate's own delivery shape: title + reason, NEVER the body — see GateRule's own comment. */
-function toGateRule(row: BindingJoinRow): GateRule {
+/**
+ * The gate's own delivery shape: title + reason, NEVER the body — see GateRule's own comment.
+ *
+ * `askingCircle` is a PARAMETER because the row cannot supply it: `b.circle` holds `'*'` for a
+ * breadth binding and `c.circle` is the rule's answer, not the caller's question. Only the caller
+ * knows which circle delivery was scoped to, so only the caller can say when the two differ.
+ */
+function toGateRule(row: BindingJoinRow, askingCircle: string): GateRule {
   return {
     conceptId: row.concept_id,
     text: row.title,
@@ -2067,6 +2109,9 @@ function toGateRule(row: BindingJoinRow): GateRule {
     modelTag: row.model_tag,
     origin: row.origin,
     stageId: row.stage_id,
+    // PRESENT ONLY WHEN THE HOME DIFFERS — see GateRule.homeCircle for why absence is the ordinary
+    // case and why this reads the two circles rather than the binding's breadth marker.
+    ...(row.home_circle !== askingCircle ? { homeCircle: row.home_circle } : {}),
     ...(row.parent_concept_id !== null ? { projectedFromPrincipleId: row.parent_concept_id } : {}),
     // SET ONLY WHEN TRUE, and only alongside a display parent. The EXISTS probe may find a later
     // disputed parent while `projectedFromPrincipleId` deliberately stays the earliest stable one;
@@ -2084,8 +2129,8 @@ function toGateRule(row: BindingJoinRow): GateRule {
 }
 
 /** stageLookup's own delivery shape: everything toGateRule carries, plus the body payload. */
-function toStageLookupRule(row: BindingJoinRow): StageLookupRule {
-  return { ...toGateRule(row), body: hasNoBody(row.body) ? null : row.body };
+function toStageLookupRule(row: BindingJoinRow, askingCircle: string): StageLookupRule {
+  return { ...toGateRule(row, askingCircle), body: hasNoBody(row.body) ? null : row.body };
 }
 
 /**
@@ -2269,7 +2314,9 @@ export function evaluateStageLookup(db: StoragePort, opts: StageLookupOptions): 
   );
   const capped = primaryRows.length > STAGE_LOOKUP_RULES_CAP;
   const shownRows = capped ? primaryRows.slice(0, STAGE_LOOKUP_RULES_CAP) : primaryRows;
-  const rules = shownRows.map(toStageLookupRule);
+  // The SAME circle handed to `rulesForStages` above — delivery scope and provenance comparison
+  // must read one value, or a rule could be selected as local and then labelled foreign.
+  const rules = shownRows.map((row) => toStageLookupRule(row, opts.circle));
 
   // Only when the primary fetch actually hit the cap: an EXACT total (one indexed COUNT(*), a cost
   // paid only in this — expected rare — case) and a compact outline of the rules the primary fetch

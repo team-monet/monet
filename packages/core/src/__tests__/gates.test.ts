@@ -3513,6 +3513,99 @@ describe("breadth inherits into the recognized surfaces", () => {
     ]);
     c.close();
   });
+
+  /**
+   * BREADTH DELIVERY WITHOUT PROVENANCE (#122). The delivery above is correct and stays — a norm
+   * declared once should reach every project rather than be re-declared per circle. What was
+   * missing is that the delivered rule said nothing about where it came from: a global norm and an
+   * unrelated project's norm arrived byte-identical, and the response's own top-level `circle` names
+   * the SESSION's, so there was nothing to weigh a foreign rule against. `homeCircle` closes that,
+   * and ONLY for the rules that actually have a different one.
+   */
+  it("a breadth rule delivered into another circle names the circle it is homed in (#122)", async () => {
+    const c = core({ circle: "circle-a" });
+    const globalDeny = await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "publish or send externally",
+      content: "Never publish without the owner's go-ahead.", severity: "blocking",
+      reason: "a published mistake cannot be recalled", scope: "domain",
+    });
+    if (globalDeny.species !== "rule") throw new Error("unreachable");
+    // The divergence this field exists to report: the BINDING reaches everywhere, the CONCEPT is
+    // filed in the circle it was declared from. Asserted so the fixture cannot silently stop
+    // producing a cross-circle rule and leave the assertion below passing for the wrong reason.
+    expect(globalDeny.binding.circle).toBe(BREADTH_CIRCLE);
+    expect(c.circleOf(globalDeny.conceptId)).toBe("circle-a");
+
+    const elsewhere = c.stageLookup({ stage: "publish or send externally", circle: "circle-b" });
+    expect(elsewhere.rules.map((r) => r.conceptId)).toEqual([globalDeny.conceptId]);
+    expect(elsewhere.rules[0]!.homeCircle).toBe("circle-a");
+    c.close();
+  });
+
+  it("a rule homed in the circle that asked carries no homeCircle at all (#122)", async () => {
+    const c = core({ circle: "circle-a" });
+    const local = await c.declare({
+      species: "rule", stage: "publish or send externally",
+      content: "Announce in the ops channel before publishing.", severity: "advisory", scope: "domain",
+    });
+    if (local.species !== "rule") throw new Error("unreachable");
+    expect(local.binding.circle).toBe("circle-a");
+
+    const home = c.stageLookup({ stage: "publish or send externally", circle: "circle-a" });
+    expect(home.rules.map((r) => r.conceptId)).toEqual([local.conceptId]);
+    // THE KEY IS ABSENT, not undefined-valued: absence is what carries "homed where you asked
+    // from", so a present key would have to be read before it could be dismissed — the resident
+    // cost this field is shaped to avoid. `not.toHaveProperty` is the only form that can tell the
+    // two apart.
+    expect(home.rules[0]!).not.toHaveProperty("homeCircle");
+    c.close();
+  });
+
+  /**
+   * THE SAME OMISSION ON THE MOMENTLESS LAYER (#127). A skeleton member reaching another circle by
+   * global breadth carried `breadth` and nothing else — and `breadth` says how it was DELIVERED,
+   * never where it LIVES, so a global member homed elsewhere and one homed here were byte-identical
+   * on the surface an agent reads at session start. `homeCircle` closes that, on exactly the terms
+   * #122 settled for rules: only for the members that actually have a different one.
+   */
+  it("a breadth skeleton member delivered into another circle names the circle it is homed in (#127)", async () => {
+    const c = core({ circle: "circle-a" });
+    const globalPrinciple = await c.declare({
+      circle: BREADTH_CIRCLE, species: "principle",
+      content: "Make the smallest change that meets the request.",
+    });
+    if (globalPrinciple.species !== "principle") throw new Error("unreachable");
+    // The divergence this field exists to report: the DELIVERY reaches everywhere, the CONCEPT stays
+    // filed in the circle it was declared from. Asserted so the fixture cannot silently stop
+    // producing a cross-circle member and leave the assertion below passing for the wrong reason.
+    expect(raw(c).prepare(`SELECT circle, skeleton_breadth FROM concepts WHERE id = ?`).get(globalPrinciple.conceptId))
+      .toEqual({ circle: "circle-a", skeleton_breadth: "global" });
+
+    const elsewhere = c.skeleton("circle-b");
+    expect(elsewhere.map((entry) => entry.conceptId)).toEqual([globalPrinciple.conceptId]);
+    expect(elsewhere[0]!.homeCircle).toBe("circle-a");
+    // And `breadth` is asserted alongside it, because it is what could NOT have answered this: it
+    // reads "global" here and "global" for a member homed in the asking circle too.
+    expect(elsewhere[0]!.breadth).toBe("global");
+    c.close();
+  });
+
+  it("a skeleton member homed in the circle that asked carries no homeCircle at all (#127)", async () => {
+    const c = core({ circle: "circle-a" });
+    const local = await c.declare({
+      species: "principle", content: "Batch questions: collect what needs asking and ask once.",
+    });
+    if (local.species !== "principle") throw new Error("unreachable");
+
+    const home = c.skeleton("circle-a");
+    expect(home.map((entry) => entry.conceptId)).toEqual([local.conceptId]);
+    // THE KEY IS ABSENT, not undefined-valued: absence is what carries "homed where you asked
+    // from", so a present key would have to be read before it could be dismissed — the resident
+    // cost this field is shaped to avoid. `not.toHaveProperty` is the only form that can tell the
+    // two apart.
+    expect(home[0]!).not.toHaveProperty("homeCircle");
+    c.close();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -9393,6 +9486,127 @@ describe("MCP surface", () => {
     const rule = (lookup.json.rules as Array<Record<string, unknown>>)[0]!;
     expect(rule.reason).toBe("\t\n "); // non-null — the derivability trap
     expect(rule.reasonMissing).toBe(true); // ...but reasonMissing says so anyway
+    await client.close();
+    c.close();
+  });
+
+  it("stage_lookup wire carries homeCircle when the rule is homed outside the asking circle (#122)", async () => {
+    const c = core({ circle: "circle-a" });
+    const { call, client } = await harness(c);
+    const globalDeny = await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "publish or send externally",
+      content: "Never publish without the owner's go-ahead.", severity: "blocking",
+      reason: "a published mistake cannot be recalled", scope: "domain",
+    });
+    if (globalDeny.species !== "rule") throw new Error("unreachable");
+
+    const lookup = await call("stage_lookup", { stage: "publish or send externally", circle: "circle-b" });
+    expect(lookup.isError).toBe(false);
+    // The response's own top-level circle is the ASKING circle — which is exactly why the rule has
+    // to carry its own (#122): read alone, this says the rule belongs to "circle-b".
+    expect(lookup.json.circle).toBe("circle-b");
+    const rule = (lookup.json.rules as Array<Record<string, unknown>>)[0]!;
+    expect(rule.conceptId).toBe(globalDeny.conceptId);
+    expect(rule.homeCircle).toBe("circle-a");
+    await client.close();
+    c.close();
+  });
+
+  it("stage_lookup wire omits homeCircle for a rule homed in the asking circle (#122)", async () => {
+    const c = core({ circle: "circle-a" });
+    const { call, client } = await harness(c);
+    const local = await c.declare({
+      species: "rule", stage: "publish or send externally",
+      content: "Announce in the ops channel before publishing.", severity: "advisory", scope: "domain",
+    });
+    if (local.species !== "rule") throw new Error("unreachable");
+
+    const lookup = await call("stage_lookup", { stage: "publish or send externally", circle: "circle-a" });
+    expect(lookup.isError).toBe(false);
+    const rule = (lookup.json.rules as Array<Record<string, unknown>>)[0]!;
+    expect(rule.conceptId).toBe(local.conceptId);
+    // Asserted on the PARSED WIRE OBJECT, so this pins what is actually serialized: the key never
+    // reaches JSON in the ordinary case, rather than reaching it as an explicit null.
+    expect(rule).not.toHaveProperty("homeCircle");
+    await client.close();
+    c.close();
+  });
+
+  it("agent_context wire carries homeCircle when the skeleton member is homed outside the asking circle (#127)", async () => {
+    const c = core({ circle: "circle-a" });
+    const { call, client } = await harness(c);
+    const globalPrinciple = await c.declare({
+      circle: BREADTH_CIRCLE, species: "principle",
+      content: "Make the smallest change that meets the request.",
+    });
+    if (globalPrinciple.species !== "principle") throw new Error("unreachable");
+
+    const context = await call("agent_context", { circle: "circle-b" });
+    expect(context.isError).toBe(false);
+    // The response's own top-level circle is the ASKING circle — which is exactly why the member has
+    // to carry its own (#127): read alone, this says the member belongs to "circle-b".
+    expect(context.json.circle).toBe("circle-b");
+    const member = (context.json.skeleton as Array<Record<string, unknown>>)[0]!;
+    expect(member.conceptId).toBe(globalPrinciple.conceptId);
+    expect(member.homeCircle).toBe("circle-a");
+    await client.close();
+    c.close();
+  });
+
+  it("agent_context wire omits homeCircle for a skeleton member homed in the asking circle (#127)", async () => {
+    const c = core({ circle: "circle-a" });
+    const { call, client } = await harness(c);
+    const local = await c.declare({
+      species: "principle", content: "Batch questions: collect what needs asking and ask once.",
+    });
+    if (local.species !== "principle") throw new Error("unreachable");
+
+    const context = await call("agent_context", { circle: "circle-a" });
+    expect(context.isError).toBe(false);
+    const member = (context.json.skeleton as Array<Record<string, unknown>>)[0]!;
+    expect(member.conceptId).toBe(local.conceptId);
+    // Asserted on the PARSED WIRE OBJECT, so this pins what is actually serialized: the key never
+    // reaches JSON in the ordinary case, rather than reaching it as an explicit null.
+    expect(member).not.toHaveProperty("homeCircle");
+    await client.close();
+    c.close();
+  });
+
+  it("memory_overview wire carries homeCircle for a skeleton member homed outside the asking circle (#127)", async () => {
+    const c = core({ circle: "circle-a" });
+    const { call, client } = await harness(c);
+    const globalPrinciple = await c.declare({
+      circle: BREADTH_CIRCLE, species: "principle",
+      content: "Make the smallest change that meets the request.",
+    });
+    if (globalPrinciple.species !== "principle") throw new Error("unreachable");
+
+    // The CURATION surface, asserted separately from agent_context rather than assumed from it:
+    // SkeletonCurationEntry extends SkeletonEntry, so the field arrives by inheritance — and a
+    // second mapper written here later is exactly what would break that silently.
+    const overview = await call("memory_overview", { circle: "circle-b" });
+    expect(overview.isError).toBe(false);
+    expect(overview.json.circle).toBe("circle-b");
+    const member = (overview.json.skeleton as Array<Record<string, unknown>>)[0]!;
+    expect(member.conceptId).toBe(globalPrinciple.conceptId);
+    expect(member.homeCircle).toBe("circle-a");
+    await client.close();
+    c.close();
+  });
+
+  it("memory_overview wire omits homeCircle for a skeleton member homed in the asking circle (#127)", async () => {
+    const c = core({ circle: "circle-a" });
+    const { call, client } = await harness(c);
+    const local = await c.declare({
+      species: "principle", content: "Batch questions: collect what needs asking and ask once.",
+    });
+    if (local.species !== "principle") throw new Error("unreachable");
+
+    const overview = await call("memory_overview", { circle: "circle-a" });
+    expect(overview.isError).toBe(false);
+    const member = (overview.json.skeleton as Array<Record<string, unknown>>)[0]!;
+    expect(member.conceptId).toBe(local.conceptId);
+    expect(member).not.toHaveProperty("homeCircle");
     await client.close();
     c.close();
   });

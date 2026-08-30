@@ -1632,6 +1632,28 @@ export interface SkeletonEntry {
   content: string;
   /** Where this member delivers; its home remains the concept's ordinary circle either way. */
   breadth: SkeletonBreadth;
+  /**
+   * THE CIRCLE THIS MEMBER IS HOMED IN — present ONLY when that is not the circle that asked (#127).
+   *
+   * OMITTED IN THE ORDINARY CASE, and absence is a positive statement, not a gap: the delivery
+   * predicate is `c.circle = ? OR c.skeleton_breadth = 'global'`, so a member that did NOT arrive by
+   * breadth is homed in the circle asked about by construction. Restating that on every member of
+   * every session-start payload would be resident cost with none of the signal — the same residency
+   * discipline `content` above is held to, for the same reason.
+   *
+   * COMPARED AGAINST THE ASKING CIRCLE, NEVER INFERRED FROM `breadth === "global"`. Breadth is the
+   * only reason a member is ALLOWED to reach a circle it is not homed in, but that is an invariant
+   * of the local write paths, and this read also serves rows grafted from a peer store. Computing
+   * the field from the two actual values makes a row that broke the invariant SAY so; deriving it
+   * from the breadth marker would encode the invariant as a premise and hide exactly the row worth
+   * seeing.
+   *
+   * `breadth` DOES NOT ALREADY ANSWER THIS. It says how the member was delivered, never where it
+   * lives — the field above says so itself. Without this one, a global member homed elsewhere and a
+   * global member homed here arrive byte-identical, and the payload's own top-level `circle` names
+   * the asking circle, so a foreign member quietly reads as local.
+   */
+  homeCircle?: string;
   ratifiedBy: string | null;
   when: number;
 }
@@ -1649,6 +1671,11 @@ interface SkeletonMemberRow {
   kind: string;
   body: string;
   breadth: SkeletonBreadth;
+  /** The member CONCEPT's own circle (`c.circle`), carried so the mapper can compare it with the
+   *  circle that asked; see `SkeletonEntry.homeCircle` for why the comparison is on these two
+   *  values rather than on the breadth marker. Non-nullable: `concepts.circle` is declared
+   *  `TEXT NOT NULL DEFAULT 'default'`. */
+  home_circle: string;
   ratified_by: string | null;
   ratified_at: number;
   /** From the latest ratification (monet-core#142). NULL on rows written before the column existed. */
@@ -1699,7 +1726,7 @@ export interface SkeletonCurationEntry extends SkeletonEntry {
  */
 const CURATION_EVIDENCE_REF_MAX_CHARS = 120;
 
-function toSkeletonCurationEntry(row: SkeletonMemberRow): SkeletonCurationEntry {
+function toSkeletonCurationEntry(row: SkeletonMemberRow, askingCircle: string): SkeletonCurationEntry {
   let battery: BatteryVerdict[] | undefined;
   if (typeof row.battery === "string") {
     try {
@@ -1719,15 +1746,26 @@ function toSkeletonCurationEntry(row: SkeletonMemberRow): SkeletonCurationEntry 
       // An unreadable battery is left absent rather than surfaced as a broken one.
     }
   }
-  return { ...toSkeletonEntry(row), entrance: row.entrance, ...(battery === undefined ? {} : { battery }) };
+  // The asking circle is THREADED, not re-derived: this spreads the base mapper, so `homeCircle`
+  // arrives here by inheritance and there is exactly one place the comparison is made.
+  return { ...toSkeletonEntry(row, askingCircle), entrance: row.entrance, ...(battery === undefined ? {} : { battery }) };
 }
 
-function toSkeletonEntry(row: SkeletonMemberRow): SkeletonEntry {
+/**
+ * `askingCircle` is a PARAMETER because the row cannot supply it: `c.circle` is the member's answer,
+ * not the caller's question, and the delivery predicate admits a global member homed in ANY circle.
+ * Only the caller knows which RESOLVED circle delivery was scoped to, so only the caller can say
+ * when the two differ.
+ */
+function toSkeletonEntry(row: SkeletonMemberRow, askingCircle: string): SkeletonEntry {
   return {
     conceptId: row.concept_id,
     species: row.kind as "principle" | "preference",
     content: firstLine(row.body),
     breadth: row.breadth,
+    // PRESENT ONLY WHEN THE HOME DIFFERS — see SkeletonEntry.homeCircle for why absence is the
+    // ordinary case and why this reads the two circles rather than the breadth marker.
+    ...(row.home_circle !== askingCircle ? { homeCircle: row.home_circle } : {}),
     ratifiedBy: row.ratified_by,
     when: row.ratified_at,
   };
@@ -6448,7 +6486,10 @@ export class MonetCore {
       ...(stageIndexResult.total !== undefined ? { stageIndexTotal: stageIndexResult.total } : {}),
     };
     const skeletonRows = this.skeletonMemberRows(resolved);
-    const skeleton = skeletonRows.map(toSkeletonEntry);
+    // `resolved` is the SAME value handed to skeletonMemberRows above — delivery scope and the
+    // provenance comparison must read one circle, or a member could be selected as local and then
+    // labelled foreign.
+    const skeleton = skeletonRows.map((row) => toSkeletonEntry(row, resolved));
     const mirror = inspectSkeletonMirrors(
       this.storeHome,
       resolved,
@@ -9264,6 +9305,11 @@ export class MonetCore {
       } : {}),
       possibleDuplicates: this.getPossibleDuplicatePairs(circle),
       extractionCandidates: this.getExtractionCandidatePairs(circle),
+      // Entries travel VERBATIM from toSkeletonEntry, `homeCircle` (#127) included, and that is
+      // deliberate here rather than merely inherited: curation is where a member's home is acted
+      // on. `ratify()` refuses a candidate whose circle is not the resolved one (see its own
+      // guard), so without the home a curator meets that refusal naming a circle this surface never
+      // showed them.
       skeleton: skeletonMembers.slice(0, OVERVIEW_SKELETON_CAP),
       ...(legacyStarConcepts > 0 ? { legacyStarConcepts } : {}),
       ...(resolvedFrom !== undefined ? { resolvedFrom } : {}),
@@ -11658,7 +11704,10 @@ export class MonetCore {
    * end, which is correct — its membership is only as old as the ruling that granted it.
    */
   skeleton(circle?: string): SkeletonEntry[] {
-    return this.skeletonMemberRows(this.resolveCircle(circle ?? this.defaultCircle)).map(toSkeletonEntry);
+    // Resolved ONCE and read twice — the scope of delivery and the circle `homeCircle` is compared
+    // against are the same fact, and resolving twice would let an alias change between them.
+    const resolved = this.resolveCircle(circle ?? this.defaultCircle);
+    return this.skeletonMemberRows(resolved).map((row) => toSkeletonEntry(row, resolved));
   }
 
   /**
@@ -11675,7 +11724,9 @@ export class MonetCore {
    * not reach the always-on delivery path.
    */
   skeletonForCuration(circle?: string): SkeletonCurationEntry[] {
-    return this.skeletonMemberRows(this.resolveCircle(circle ?? this.defaultCircle)).map(toSkeletonCurationEntry);
+    // Same single resolution as skeleton() above, for the same reason.
+    const resolved = this.resolveCircle(circle ?? this.defaultCircle);
+    return this.skeletonMemberRows(resolved).map((row) => toSkeletonCurationEntry(row, resolved));
   }
 
   /**
@@ -11710,6 +11761,12 @@ export class MonetCore {
       .prepare(
         `SELECT c.id AS concept_id, c.kind AS kind, c.body AS body,
                 c.skeleton_breadth AS breadth,
+                -- c.circle, NOT the WHERE's parameter. The predicate below admits a member either
+                -- because it is homed here OR because its breadth is global, so the parameter is
+                -- the QUESTION (which circle asked) and this column is the ANSWER (where the member
+                -- lives). SkeletonEntry.homeCircle reports the two only when they differ, which is
+                -- why both have to reach the mapper.
+                c.circle AS home_circle,
                 lr.ratified_by AS ratified_by, lr.created_at AS ratified_at, lr.entrance AS entrance,
           lr.battery AS battery
            FROM concepts c
