@@ -90,7 +90,13 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   if (overview.skeleton.length > 0) {
     lines.push(bold("SKELETON") + (overview.counts.skeleton > overview.skeleton.length ? dim(` · showing ${overview.skeleton.length} of ${overview.counts.skeleton}`) : ""));
     for (const member of overview.skeleton) {
-      lines.push(truncate(`  ${member.species} · ${member.content}${member.ratifiedBy ? ` · ${member.ratifiedBy}` : ""}`, width));
+      // THE HOME COMES BEFORE THE CONTENT, not beside ratifiedBy where the rest of the provenance
+      // sits (Codex round 1). `content` is the only unbounded field on this line, so anything after
+      // it is what `truncate` eats first — and a foreign member losing its home to truncation is
+      // exactly the failure this field exists to prevent. Omitted when absent, matching the wire:
+      // no home means the member is homed in the circle this render's header already names.
+      const home = member.homeCircle !== undefined ? ` · from ${member.homeCircle}` : "";
+      lines.push(truncate(`  ${member.species}${home} · ${member.content}${member.ratifiedBy ? ` · ${member.ratifiedBy}` : ""}`, width));
     }
     lines.push("");
   }
