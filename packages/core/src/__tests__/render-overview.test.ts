@@ -6,6 +6,7 @@
 import { describe, it, expect } from "vitest";
 import { MonetCore } from "../engine";
 import { renderOverview } from "../render-overview";
+import { BREADTH_CIRCLE } from "../gates";
 
 const ESC = String.fromCharCode(27);
 const stripAnsi = (s: string): string => s.replace(new RegExp(`${ESC}\\[[0-9;]*m`, "g"), "");
@@ -91,6 +92,31 @@ describe("renderOverview", () => {
     expect(out).toContain(`[${shortB}]`);
 
     expect(out).toContain(pd.score.toFixed(3));
+    c.close();
+  });
+
+  it("SKELETON names a member's home circle when it is not the circle being rendered (#127, Codex round 1)", async () => {
+    // The rendered workbench is the surface a human READS the overview on, so shipping homeCircle
+    // in the JSON alone leaves a foreign member and a local one identical to the person who has to
+    // act on the difference — memory_ratify refuses a candidate not homed in the circle passed.
+    const c = new MonetCore(":memory:", { defaultCircle: "circle-a", tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await c.declare({ circle: BREADTH_CIRCLE, species: "principle", content: "Make the smallest change that meets the request." });
+
+    const out = stripAnsi(renderOverview(c.overview("circle-b"), { color: false, width: 200 }));
+    expect(out).toContain("SKELETON");
+    expect(out).toContain("from circle-a");
+    // Before the content, so a long principle cannot truncate the home away.
+    expect(out.indexOf("from circle-a")).toBeLessThan(out.indexOf("Make the smallest change"));
+    c.close();
+  });
+
+  it("SKELETON says nothing about the home when the member is homed in the circle being rendered (#127)", async () => {
+    const c = new MonetCore(":memory:", { defaultCircle: "circle-a", tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await c.declare({ species: "principle", content: "Make the smallest change that meets the request." });
+
+    const out = stripAnsi(renderOverview(c.overview("circle-a"), { color: false, width: 200 }));
+    expect(out).toContain("Make the smallest change");
+    expect(out).not.toContain("from circle-a");
     c.close();
   });
 
