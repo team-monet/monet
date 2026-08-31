@@ -160,13 +160,14 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
 const MOMENT_ID_MAX_CHARS = 36;
 
 /**
- * How many owed moments one ask signal may name.
+ * How many outstanding moments one ask signal may name.
  *
  * A DELIVERY BOUND, NOT A THRESHOLD ON THE BACKLOG. Nothing has measured how often a real store
  * accumulates unasked moments, so no number here could say when a backlog is "too large" — and this
  * one does not try. It bounds what reaches a model's context (8 ids is roughly 300 characters);
- * the TRUE total is reported by the conformance counts, which are not capped. If more are owed than
- * this names, the rest are named by the next signal.
+ * the TRUE total is reported by the conformance counts, which are not capped. If more are outstanding
+ * than this names, the rest are named by the next signal — subject to #147, since the list is
+ * oldest-first and an entry nobody can honestly clear never leaves it.
  */
 const ASK_SIGNAL_MAX_MOMENTS = 8;
 
@@ -176,14 +177,15 @@ const ASK_SIGNAL_MAX_MOMENTS = 8;
  *
  * WHO CONSUMES IT — the agent, and nobody else. ON WHICH TURN — every `stage_lookup` that returns a
  * `momentId`, including the first of a session. WHAT BREAKS WITHOUT IT — the response hands over a
- * key with nothing saying what to do with it. The ask signal cannot cover this: it fires only once a
- * moment already owes a question, so a first lookup carries the key and no instruction at all, and
+ * key with nothing saying what to do with it. The ask signal cannot cover this: it fires only once an
+ * earlier moment is outstanding, so a first lookup carries the key and no instruction at all, and
  * no standing text mentions this loop either.
  *
- * UNCONDITIONAL, WHICH THE SIGNAL IS NOT. The signal is debt-driven and names ids; this says what
- * the ids are for. That split is why the two do not overlap — the signal states a fact (these
- * moments still owe the question), this states the instruction (what asking and recording means),
- * and neither repeats the other.
+ * UNCONDITIONAL, WHICH THE SIGNAL IS NOT. The signal is backlog-driven and names ids; this says what
+ * the ids are for. That split is why the two do not overlap — the signal states a fact (no question
+ * was put at these moments), this states the instruction (what asking and recording means), and
+ * neither repeats the other. Note the fact and not more: whether an action followed any of them is
+ * unrecorded, so they are candidates rather than mandatory asks.
  *
  * IT ASKS WHETHER THE ACTION FOLLOWED THE RULE, never whether the rule CAUSED it — causation is
  * unobservable and is not what this measures. Same discipline as the ask signal's own wording.
@@ -945,7 +947,7 @@ export function registerMonetCoreTools(
    * outcome has landed, and a call's outcome is written after its handler has already returned — so
    * a `stage_lookup` moment is never named on its own response, only on the next one. That is
    * acceptable BECAUSE the response now carries its own `momentId`: the agent holds the key from
-   * the first turn, and this signal is the backstop for a debt it did not clear, not the only way
+   * the first turn, and this signal is the backstop for a moment it did not close, not the only way
    * it learns the key.
    *
    * IT NAMES MOMENTS; IT NEVER CARRIES THEIR CONTENT. Ids, and the fact that they are outstanding —
@@ -1049,7 +1051,7 @@ export function registerMonetCoreTools(
     //
     // AND ON THE SAME CONDITION AS THE KEY (review fix — Codex round 2). The two halves were split
     // deliberately: the response's `instruction` says what asking means and names the two tools that
-    // take a momentId, and this says WHICH earlier moments still owe it. That split is what keeps
+    // take a momentId, and this says WHICH earlier moments have no question put. That split is what keeps
     // either from being the other's duplicate — and it is exactly what stops either from standing
     // alone. Once the key and its instruction became conditional on this lookup actually delivering
     // a rule, a lookup that delivered none carried the id half with the what-to-do half missing:
@@ -1057,11 +1059,12 @@ export function registerMonetCoreTools(
     // standing text, names `conformance_ask`.
     //
     // WITHHELD RATHER THAN MADE SELF-CONTAINED, and that is the choice. Restating the tool names
-    // here would pay context on EVERY debt-bearing response — the common case, where the
+    // here would pay context on EVERY response carrying a backlog — the common case, where the
     // instruction is already present and would now say the same thing twice — to cover the rare one
     // where it is absent. It would also contradict this surface's own reason for existing: the
     // reminder belongs where the agent is being handed rules, and a lookup that handed over none is
-    // precisely not that moment. Nothing is lost by waiting: the debt clears only by asking, so the
+    // precisely not that moment. Nothing is lost by waiting: an entry leaves only by being asked
+    // about, so the
     // next lookup that does deliver a rule names it again, beside the line that explains it.
     const askBlock = toolName === "stage_lookup" && carriesConformanceKey === true ? askSignalBlock() : "";
     if (prewarmBlock === "" && askBlock === "") return result;
