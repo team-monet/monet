@@ -330,6 +330,12 @@ which the Phase 3 configuration does not set.
   the user's standing files do not already cover.* Reason: an unseeded circle costs the user
   months of re-explaining the same norms on every new project.
 
+These six also live as data in `starter-pack.json` beside this file, with the arguments above
+attached to each entry. That copy is what a test runs against a real store: the pack's rule half was
+broken three separate ways and every one of them was in the prose saying *how* to declare, which a
+test reading only this list could not have caught. Edit both — the test fails if they disagree, in
+either direction.
+
 Breadth is what makes the last entry work at all — its whole subject is a circle that does
 not exist yet, so a binding confined to the install circle would never be delivered there,
 and it would fail silently, since the stage simply would not appear in that circle's index.
