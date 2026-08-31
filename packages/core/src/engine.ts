@@ -2506,8 +2506,17 @@ export interface RetirementOutcome {
  * `withdrawn` IS THE POST-STATE, on `RetirementOutcome`'s own reasoning: an already-retired
  * declared rule answers `withdrawn` too, because that is the state the caller asked for. The other
  * three members mean exactly what they mean there — `blocked` carries the findings to render (the
- * declaration one excluded: that is the authority being withdrawn), `not-in-circle` is the scope
- * gate, and `blockers` is empty except under `blocked`.
+ * declaration one excluded: that is the authority being withdrawn) and `not-in-circle` is the scope
+ * gate.
+ *
+ * `blockers` IS ALSO POPULATED UNDER `not-declared`, which is where it differs from
+ * `RetirementOutcome` (Codex round 2 on #131). The decline has to name an exit that ACTUALLY WORKS
+ * for the concept in front of it, and a concept with no declaration binding may still be a skeleton
+ * member, carry an open contradiction, or carry a pair flag — in which case `memory_retire`, the
+ * ordinary exit, refuses it in turn. Sending a caller from one refusal to another is the shape #118
+ * exists to remove. Read here rather than at the tool surface so the findings are a snapshot of the
+ * SAME reservation that decided the decline, not a second read a competing writer can have moved
+ * under. Empty under `withdrawn` and `not-in-circle`.
  */
 export interface DeclarationWithdrawalOutcome {
   outcome: "withdrawn" | "not-declared" | "blocked" | "not-in-circle";
@@ -7736,7 +7745,10 @@ export class MonetCore {
       // short-circuit below — otherwise an ordinary retired fact would come back `withdrawn`, and
       // the caller would read that as this tool having withdrawn a declaration it never touched.
       const binding = this.ruleBinding(id);
-      if (!binding || binding.origin !== "declaration") return { outcome: "not-declared", blockers: [] };
+      // THE STANDING FINDINGS TRAVEL WITH THE DECLINE, so the tool surface can redirect to an exit
+      // that is actually open — see this outcome type's own comment. `declaration` can never be
+      // among them here: that blocker counts exactly the binding this branch just found absent.
+      if (!binding || binding.origin !== "declaration") return { outcome: "not-declared", blockers: this.retirementBlockers(id) };
       // ALREADY RETIRED IS SUCCESS — `retireIfUnblocked`'s own paragraph, and it applies more often
       // here: the origin is deliberately preserved, so a re-issued withdrawal still sees a declared
       // binding and would otherwise re-run a blocker pass against a memory that has already left.

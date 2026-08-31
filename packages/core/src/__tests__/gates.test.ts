@@ -10884,13 +10884,16 @@ describe("MCP surface", () => {
     })).json.conceptId as string;
     expect(c.ruleBinding(agentRule)!.origin).toBe("correction");
     // 3. A DECLARED PRINCIPLE: declaration-born, momentless, and carrying no rule binding — the
-    //    input most likely to be mistaken for this verb's subject. Its exit is memory_ratify's
-    //    "retire" verdict, which is what memory_retire already names.
+    //    input most likely to be mistaken for this verb's subject. It gets a DIFFERENT decline,
+    //    because declaring it also ratified it: see the dedicated test below for why naming
+    //    memory_retire there is a dead end pointing at a dead end (#131 round 2).
     const principle = (await call("memory_declare", {
       species: "principle", content: "Prefer the smallest reversible step.",
     })).json.conceptId as string;
 
-    for (const id of [fact, agentRule, principle]) {
+    // NOTHING ELSE STANDS IN THE WAY OF THESE TWO, so the ordinary exit is the honest redirect.
+    for (const id of [fact, agentRule]) {
+      expect(c.retirementBlockers(id)).toEqual([]); // the premise the sentence below rests on
       const declined = await call("memory_declare", { withdraw: id });
       expect(declined.isError).toBe(true);
       expect(declined.text).toBe(
@@ -10902,8 +10905,110 @@ describe("MCP surface", () => {
       expect((await call("memory_fetch", { id })).isError).toBe(false);
       expect((await call("memory_fetch", { id })).json.status).not.toBe("retired");
     }
-    // …and the ordinary exit still works for the two that have one.
+    // THE PRINCIPLE IS DECLINED TOO — same finding, different redirect, and equally untouched.
+    const declinedPrinciple = await call("memory_declare", { withdraw: principle });
+    expect(declinedPrinciple.isError).toBe(true);
+    expect(declinedPrinciple.text).toContain("it carries no declaration binding");
+    expect((await call("memory_fetch", { id: principle })).json.status).not.toBe("retired");
+
+    // …and the ordinary exit really does work for the one the redirect named.
     expect((await call("memory_retire", { id: agentRule })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * A DEAD END MUST NOT POINT AT ANOTHER DEAD END — Codex round 2 on PR #131 (P2).
+   *
+   * Declaring a principle or preference records an APPROVED ratification of its own (`declare()`'s
+   * `skeletonEntry: { verdict: "approve", entrance: "declaration" }`), so the concept is a current
+   * skeleton member from birth. It carries no RULE BINDING, so `withdraw` declines it — and the
+   * decline used to send the caller to `memory_retire`, which refuses it in turn on the ratification
+   * blocker. That is the exact shape #118 exists to remove, shipped inside #118's own fix.
+   *
+   * THE REMEDY IS PARSED AND REPLAYED, not matched: a decline that names a tool without the
+   * arguments that tool needs is the same defect one layer down, and the ratification blocker's own
+   * `withdrawVia` names neither the candidate nor the circle. Only a call that actually runs proves
+   * the exit is real.
+   *
+   * `withdraw` KEEPS DECLINING, deliberately. A principle's exit is `memory_ratify`; this verb's
+   * subject is the declaration BINDING, and widening it to "anything declaration-born" would make it
+   * a second skeleton surface.
+   */
+  it("the decline for a declared PRINCIPLE names an exit that works, and replaying it ends the membership", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const declared = await call("memory_declare", { species: "principle", content: "Prefer the smallest reversible step." });
+    expect(declared.isError).toBe(false);
+    const id = declared.json.conceptId as string;
+    // THE PREMISE, MEASURED: declaring it made it a member, and that membership is what memory_retire
+    // refuses on — so the old redirect could never have worked.
+    expect(c.skeleton("default").some((entry) => entry.conceptId === id)).toBe(true);
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["ratification"]);
+
+    const declined = await call("memory_declare", { withdraw: id });
+    expect(declined.isError).toBe(true);
+    // IT MUST NOT NAME THE TOOL THAT WOULD REFUSE. memory_retire is the exit for a memory with no
+    // authority left to withdraw; this concept has one, and naming it here is the dead-end chain.
+    expect(declined.text, declined.text).not.toContain("memory_retire(");
+    expect(declined.text).toContain("memory_ratify");
+
+    const args: Record<string, unknown> = {};
+    for (const [, key, serialized] of declined.text.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) {
+      args[key] = JSON.parse(serialized) as unknown;
+    }
+    expect(args, declined.text).toEqual({ candidateId: id, verdict: "retire", circle: "default" });
+
+    // THE REPLAY IS THE ASSERTION — the advertised exit, followed verbatim, really ends the membership.
+    const ratified = await call("memory_ratify", args);
+    expect(ratified.isError, ratified.text).toBe(false);
+    expect(c.skeleton("default").some((entry) => entry.conceptId === id)).toBe(false);
+    expect(c.retirementBlockers(id)).toEqual([]);
+    // …and now the ordinary exit really is open, which is what the chain was supposed to lead to.
+    expect((await call("memory_retire", { id })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * RATIFICATION IS NOT THE ONLY BLOCKER THAT CAN STAND ON A NO-DECLARATION CONCEPT, so the redirect
+   * is driven by the blocker pass rather than by the concept's kind (#131 round 2).
+   *
+   * Of the five codes, `declaration` is impossible here by construction — that blocker counts
+   * exactly the binding the decline just found absent — and `connector-owned` has no push site in
+   * `retirementBlockers` at all. That leaves ratification (the test above), open-contradiction and
+   * open-pair-flag, both of which any ordinary concept can carry. This is the pair-flag one.
+   *
+   * AND THE RATIFICATION CLAUSE IS ABSENT HERE, which is the assertion that proves the redirect
+   * reads the findings instead of always appending the same tail: memory_ratify is not this
+   * concept's exit, so it is not named.
+   */
+  it("the decline redirects to memory_resolve, not memory_retire, when the undeclared concept carries a pair flag", async () => {
+    const c = flaggingCore();
+    const { call, client } = await harness(c);
+    const aId = (await call("memory_store", { content: PAIR_A })).json.conceptId as string;
+    const bId = (await call("memory_store", { content: PAIR_B })).json.conceptId as string;
+    expect(aId).not.toBe(bId); // forked, not merged — the fixture's premise
+    expect(c.ruleBinding(aId)).toBeNull(); // …and it is genuinely undeclared
+    expect(c.retirementBlockers(aId).map((blocker) => blocker.code)).toEqual(["open-pair-flag"]);
+
+    const declined = await call("memory_declare", { withdraw: aId });
+    expect(declined.isError).toBe(true);
+    expect(declined.text).toContain("it carries no declaration binding");
+    // NOT THE TOOL THAT WOULD REFUSE, and this is the same dead-end chain the ratified case had:
+    // memory_retire refuses an undismissed pair flag exactly as it refuses a skeleton member.
+    expect(declined.text, declined.text).not.toContain("memory_retire(");
+    expect(declined.text).toContain("withdraw it through memory_resolve");
+    expect(declined.text).toContain(bId); // the partner the remedy needs
+    expect(declined.text).toContain('circle="default"'); // the argument the blocker itself cannot know
+    // THE RATIFICATION TAIL IS NOT APPENDED, because no ratification blocker is present.
+    expect(declined.text).not.toContain("candidateId=");
+
+    // REFUSED MEANS UNTOUCHED, and the question is still open.
+    expect((await call("memory_fetch", { id: aId })).isError).toBe(false);
+    expect(c.retirementBlockers(aId).map((blocker) => blocker.code)).toEqual(["open-pair-flag"]);
 
     await client.close();
     c.close();

@@ -467,13 +467,24 @@ const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
  * sentence they produce are byte-identical to what they were.
  */
 function retirementRefusal(id: string, blockers: readonly RetirementBlocker[], verb: "retire" | "withdraw" = "retire"): string {
-  return `cannot ${verb} ${id}: ${blockers
+  return `cannot ${verb} ${id}: ${blockerFindings(blockers)}`;
+}
+
+/**
+ * THE FINDINGS THEMSELVES, without any surface's own header — split out of `retirementRefusal` for
+ * its third caller (Codex round 2 on #131): `memory_declare(withdraw)`'s no-declaration decline has
+ * to state its OWN finding first and the standing ones after, so it cannot use a renderer that
+ * begins "cannot <verb> <id>:". Splitting keeps ONE definition of how a blocker reads; a second copy
+ * is how a refusal and the decline that redirects to it come to describe the same exit differently.
+ */
+function blockerFindings(blockers: readonly RetirementBlocker[]): string {
+  return blockers
     // THE REMEDY CLAUSE IS OMITTED, NOT FILLED IN, when no withdrawal surface exists — a blocker
     // whose `withdrawVia` is absent says so in its own `detail`. Rendering "withdraw it through
     // <nothing available>" is how a refusal starts reading as an instruction that cannot be
     // followed, which is the round-1 finding this formatter now cannot reproduce.
     .map((blocker) => (blocker.withdrawVia ? `${blocker.detail} — withdraw it through ${blocker.withdrawVia}` : blocker.detail))
-    .join("; ")}`;
+    .join("; ");
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,7 +1355,11 @@ export function registerMonetCoreTools(
       withdraw: z
         .string()
         .optional()
-        .describe("Concept id of a declared rule to withdraw. Mutually exclusive with `species`; every other field is ignored."),
+        .describe(
+          "Concept id of a declared rule to withdraw. Mutually exclusive with `species`. `circle` is " +
+          "read and must name the rule's home circle — omitting it means the session circle, and a " +
+          "rule homed elsewhere reads as not found; every other field is ignored.",
+        ),
       stage: z
         .string()
         .max(STAGE_NAME_MAX_CHARS)
@@ -1448,11 +1463,36 @@ export function registerMonetCoreTools(
           // its own (the round-3 reason `shownId` exists) and a bounded refusal outranks a perfect
           // suggestion — every id that can reach this branch is a real concept id, far under the cap.
           if (outcome.outcome === "not-declared") {
-            return err(
+            const finding =
               `cannot withdraw ${shownId}: it carries no declaration binding, so there is no declaration ` +
-              `to withdraw and nothing was changed — memory_retire(${JSON.stringify(shownId)}, ` +
-              `${JSON.stringify(homeCircle)}) is the exit for a memory that entered on the agent's own ` +
-              `authority`,
+              `to withdraw and nothing was changed`;
+            // NOTHING ELSE STANDS IN ITS WAY, so the ordinary exit really is open and is named as a
+            // replayable call, circle included (round 1's fix, unchanged).
+            if (outcome.blockers.length === 0) {
+              return err(
+                `${finding} — memory_retire(${JSON.stringify(shownId)}, ${JSON.stringify(homeCircle)}) ` +
+                `is the exit for a memory that entered on the agent's own authority`,
+              );
+            }
+            // …AND WHEN SOMETHING DOES, memory_retire IS NOT THE EXIT — it would refuse in turn. The
+            // findings come from the engine's own blocker pass and are rendered by the SAME formatter
+            // memory_retire's refusal uses, so which tool ends which authority is defined in exactly
+            // one place; this handler never decides that from the concept's kind.
+            //
+            // AND THE MISSING ARGUMENTS ARE SUPPLIED HERE, because they are what this layer knows and
+            // the blockers do not: `retirementBlockers` is a question anyone may ask about a concept
+            // from anywhere, so it cannot name the circle a caller must pass, and the ratification
+            // blocker's own remedy names neither its candidate nor that circle. Rendering it verbatim
+            // would reproduce round 1's defect one layer down — a remedy that cannot be followed.
+            // Which blocker is present is read off the blocker pass, never guessed from the species.
+            const ratified = outcome.blockers.some((blocker) => blocker.code === "ratification");
+            return err(
+              `${finding}, and memory_retire would refuse it too: ${blockerFindings(outcome.blockers)}. ` +
+              `Every call above takes circle=${JSON.stringify(homeCircle)}` +
+              (ratified
+                ? `, and memory_ratify takes candidateId=${JSON.stringify(shownId)} and verdict="retire"`
+                : "") +
+              `.`,
             );
           }
           // THE OTHER THREE BLOCKERS STILL REFUSE, rendered by the same formatter memory_retire uses
