@@ -10012,7 +10012,7 @@ describe("MCP surface", () => {
     c.close();
   });
 
-  it("memory_retire refuses a DECLARED rule and names memory_declare", async () => {
+  it("memory_retire refuses a DECLARED rule and names the withdrawal verb on memory_declare", async () => {
     const c = core();
     const { call, client } = await harness(c);
     // ADVISORY on purpose: a blocking declaration is already refused by retireConcept's own
@@ -10027,19 +10027,28 @@ describe("MCP surface", () => {
 
     const refused = await call("memory_retire", { id });
     expect(refused.isError).toBe(true);
-    // AND NAMES NO PATH, because none exists (review fix — round 1). The refusal used to send the
-    // caller to `memory_declare`, which has no retire and whose re-declaration preserves
-    // `origin='declaration'` — a loop between two tools that both refuse. Both dead ends are stated
-    // here so the message cannot quietly grow a remedy back without this assertion noticing.
-    // The remedy clause is OMITTED, not filled with a placeholder — "withdraw it through <nothing>"
-    // is itself an instruction that cannot be followed, which is the shape being refused here.
+    // AND NOW NAMES A PATH, because one exists (#118). Round 1 removed the remedy clause from this
+    // refusal precisely because the path it advertised was fiction — `memory_declare` had no retire,
+    // and re-declaring preserves `origin='declaration'`, so the caller looped between two tools that
+    // both refuse. `memory_declare(withdraw)` is the act that was missing; the round-1 rule is
+    // unchanged and still enforced by the omit-branch in `retirementRefusal`: name a path that
+    // works, or name none. Both halves are pinned — the exact sentence, and that the clause is
+    // present — so neither can drift back without this test noticing.
     expect(refused.text).toBe(
-      `cannot retire ${id}: it entered by declaration, and no surface withdraws one — ` +
-      `memory_declare has no retire, and re-declaring keeps the declaration (monet-core#200)`,
+      `cannot retire ${id}: it entered by declaration, and only the declaration surface can ` +
+      `withdraw one — withdraw it through memory_declare with withdraw="${id}" and circle="default"`,
     );
-    expect(refused.text).not.toContain("withdraw it through");
-    // …and the second dead end is a fact about this build, not a claim: re-declaring really does
-    // leave the binding declaration-born, so the refusal repeats verbatim.
+    // THE CIRCLE TRAVELS WITH THE ID (Codex round 1 on #131). An id-only remedy resolves to the
+    // caller's SESSION circle when replayed, which is "concept not found" for every declared rule
+    // homed anywhere else — see the cross-circle replay test below for the failure it produced.
+    expect(refused.text).toContain('circle="default"');
+    expect(refused.text).toContain("withdraw it through");
+    // NO PRIVATE-REPO POINTER. The sentence used to cite `monet-core#200`, a number in a repository
+    // the reader of this refusal cannot open; the public issue lives in the source comment instead.
+    expect(refused.text).not.toContain("monet-core#");
+    // …and the fact that made the OLD remedy fiction is still a fact, which is why the exit is a
+    // verb of its own rather than a re-declaration: re-declaring really does leave the binding
+    // declaration-born, so the refusal would repeat verbatim.
     const redeclared = await call("memory_declare", {
       species: "rule", stage: "opening a pr", content: "Say what changed and why.",
       severity: "advisory", scope: "domain", declaredBy: "john",
@@ -10620,6 +10629,514 @@ describe("MCP surface", () => {
       // Scope enforcement: an id outside the named circle is absent, never forbidden.
       expect((await call(tool, { id: "a", circle: "elsewhere" })).text).toBe("concept not found: a");
     }
+    await client.close();
+    c.close();
+  });
+
+  // -------------------------------------------------------------------------
+  // THE WITHDRAWAL VERB — the exit a declaration never had (#118)
+  //
+  // `memory_retire` refuses a declared rule because a memory leaves with the authority it entered
+  // on, and until now nothing ended that authority: the refusal pointed at nowhere. These tests pin
+  // the door that was added, and — more importantly — everything it is still NOT.
+  //
+  // WHAT MAKES THIS SET WORTH ITS LENGTH is the middle: not "a declared rule withdraws" and "a
+  // missing id does not", but the inputs that EXIST and are PARTIAL — a rule whose binding is not a
+  // declaration, a declared rule carrying an unanswered question, a declaration that is not a rule
+  // at all. Every one of those is a place where waiving one blocker could quietly waive the rest.
+  // -------------------------------------------------------------------------
+
+  /** A declared rule at `stage`, through the tool, in the caller's own circle. */
+  const declareRule = async (
+    call: (tool: string, args: Record<string, unknown>) => Promise<{ json: Record<string, unknown>; isError: boolean; text: string }>,
+    stage: string,
+    content: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<string> => {
+    const declared = await call("memory_declare", {
+      species: "rule", stage, content, scope: "domain", declaredBy: "john", ...extra,
+    });
+    expect(declared.isError).toBe(false);
+    return declared.json.conceptId as string;
+  };
+
+  it("memory_declare withdraw retires a declared ADVISORY rule, keeps rule_bindings.origin, and ends its delivery", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const id = await declareRule(call, "opening a pr", "Say what changed and why.", { severity: "advisory" });
+    expect(c.ruleBinding(id)!.origin).toBe("declaration");
+    expect((await call("stage_lookup", { stage: "opening a pr" })).json.rules).toHaveLength(1); // the premise
+
+    const withdrawn = await call("memory_declare", { withdraw: id });
+    expect(withdrawn.isError).toBe(false);
+    expect(withdrawn.json).toMatchObject({ circle: "default", action: "withdrawn", conceptId: id });
+
+    // BOTH HALVES, AND NEITHER ALONE IS THE TEST. An origin flip would satisfy the delivery half
+    // while falsifying the record; a no-op that reported success would satisfy the origin half while
+    // changing nothing. Only the two together describe the act that was actually ruled.
+    expect(c.ruleBinding(id)!.origin).toBe("declaration");
+    expect((await call("stage_lookup", { stage: "opening a pr" })).json.rules).toEqual([]);
+    expect(c.stageLookup({ stage: "opening a pr" }).rules.map((rule) => rule.conceptId)).not.toContain(id);
+    expect((await call("memory_fetch", { id })).isError).toBe(true);
+    // AND THE PRESERVED ORIGIN IS SAID OUT LOUD, because a caller told only "withdrawn" will read
+    // memory_retire's unchanged refusal on this same id as a bug.
+    expect(withdrawn.json.message as string).toContain('origin="declaration"');
+
+    // THE ACK'S OWN SUGGESTION, REPLAYED — the standard this file already holds every refusal and
+    // acknowledgement to: a path that is advertised is a path that works.
+    expect((await call("memory_restore", { id })).isError).toBe(false);
+    expect(c.stageLookup({ stage: "opening a pr" }).rules.map((rule) => rule.conceptId)).toContain(id);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE LIVE-DENY CHOKEPOINT STILL FIRES THROUGH THIS DOOR — the test that keeps the withdrawal from
+   * quietly becoming a cheaper way to remove a deny than to mint one.
+   *
+   * `retireConcept` refuses to retire a live blocking rule (`assertBlockingRuleMutationAllowed`,
+   * nine call sites, no exceptions), and the withdrawal calls that same `retireConcept`. Waiving it
+   * here was considered and REJECTED on owner ruling: a mint costs a blocking declaration plus a
+   * `reason`, so a one-call removal would invert the "as hard to remove as it is to mint" invariant
+   * the chokepoint's own sentence states.
+   *
+   * AND THE CALLER GETS THAT SENTENCE, not a paraphrase of it, because it is the sentence that names
+   * the next step. Rewording it here — or catching it and substituting a withdrawal-flavoured
+   * refusal — is how a caller ends up at a dead end that a working remedy was already pointing out
+   * of. Only the tool's own generic `declare failed:` prefix is added, which every engine throw out
+   * of memory_declare already carries.
+   */
+  it("refuses to withdraw a rule whose deny is still live, and hands back the chokepoint's own sentence", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const id = await declareRule(call, "rm -rf", "Never delete a directory tree unattended.", {
+      severity: "blocking", reason: "there is no undo",
+    });
+    expect(c.ruleBinding(id)!).toMatchObject({ severity: "blocking", origin: "declaration" });
+
+    const refused = await call("memory_declare", { withdraw: id });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toBe(
+      `declare failed: 'retire' would remove the blocking rule '${id}' ` +
+      // The title, not the body: derivation drops the trailing period, which is why this reads
+      // slightly differently from the declared content above.
+      `(Never delete a directory tree unattended) from the gate, and blocking severity is ` +
+      `declaration-only in both directions — as hard to remove as it is to mint. Withdraw the deny ` +
+      `first by declaring it advisory (memory_declare with severity="advisory"); this operation is ` +
+      `then free to proceed, superseding and retiring included.`,
+    );
+
+    // REFUSED MEANS UNTOUCHED, and the reservation rolled back: the deny is still live, still
+    // delivered, and the concept is still readable.
+    expect(c.ruleBinding(id)!).toMatchObject({ severity: "blocking", origin: "declaration" });
+    expect(c.stageLookup({ stage: "rm -rf" }).rules.map((rule) => rule.conceptId)).toContain(id);
+    expect((await call("memory_fetch", { id })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE SANCTIONED TWO-STEP, DRIVEN END TO END — the exit a blocking declared rule actually has.
+   *
+   * Step 1 is the act the chokepoint's message names: a severity change is not a member of
+   * `BlockingRuleOperation` (gates.ts), so declaring the rule advisory is unguarded by construction
+   * and has always worked. Step 2 is the half that did NOT exist before #118 — the downgrade leaves
+   * `origin='declaration'` on the binding, where `memory_retire` refuses all over again, which is
+   * why the two-step was not an exit until this verb existed. Both halves are exercised here so the
+   * pair cannot silently stop composing.
+   *
+   * NO SEVERITY IS TOUCHED OUTSIDE THAT DECLARATION: step 2 leaves the binding exactly as step 1
+   * left it, which is what the post-withdrawal assertions below say.
+   */
+  it("withdraws a declared BLOCKING rule through the sanctioned two-step: declare it advisory, then withdraw", async () => {
+    // RESOLVING, not the dedup-disabled `core()`: step 1 is a RE-DECLARATION, and it only downgrades
+    // the incumbent binding when the text resolves onto the SAME concept. Under core()'s disabled
+    // dedup it would mint a second rule and leave the original deny standing untouched — a fixture
+    // that would make this test pass while proving nothing.
+    const c = resolvingCore();
+    const { call, client } = await harness(c);
+    const content = "Never delete a directory tree unattended.";
+    const id = await declareRule(call, "rm -rf", content, { severity: "blocking", reason: "there is no undo" });
+    expect(c.ruleBinding(id)!).toMatchObject({ severity: "blocking", origin: "declaration" });
+
+    // STEP 1 — THE DENY IS GIVEN UP, on the record. The disclosure is asserted because a removed deny
+    // is never allowed to be something the user finds out later, and this path must keep saying so.
+    const downgraded = await call("memory_declare", {
+      species: "rule", stage: "rm -rf", content, severity: "advisory", scope: "domain", declaredBy: "john",
+    });
+    expect(downgraded.isError).toBe(false);
+    expect(downgraded.json.conceptId).toBe(id); // the SAME rule re-declared, not a second one
+    expect(downgraded.json.guidance as string).toContain("DENY REMOVED");
+    expect(c.ruleBinding(id)!.severity).toBe("advisory");
+
+    // …AND THE RULE IS STILL STUCK, which is the whole reason step 2 had to be built: the downgrade
+    // preserves the declaration, so memory_retire refuses exactly as before.
+    expect((await call("memory_retire", { id })).isError).toBe(true);
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["declaration"]);
+
+    // STEP 2 — THE HALF THAT DID NOT EXIST.
+    const withdrawn = await call("memory_declare", { withdraw: id });
+    expect(withdrawn.isError).toBe(false);
+    expect(withdrawn.json).toMatchObject({ action: "withdrawn", conceptId: id });
+
+    // THE ORIGIN SURVIVES THE WHOLE SEQUENCE, and the severity is whatever step 1 declared it —
+    // nothing in step 2 wrote to the binding at all.
+    expect(c.ruleBinding(id)!).toMatchObject({ severity: "advisory", origin: "declaration" });
+    expect((await call("stage_lookup", { stage: "rm -rf" })).json.rules).toEqual([]);
+    expect(c.stageLookup({ stage: "rm -rf" }).rules.map((rule) => rule.conceptId)).not.toContain(id);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE OTHER THREE BLOCKERS ARE NOT WAIVED — the assertion the whole design turns on.
+   *
+   * Each of them guards an UNANSWERED QUESTION that retiring would erase rather than answer, and
+   * withdrawing a declaration says nothing about any of them. A waiver written as "skip the blocker
+   * pass" or "drop the first blocker" would pass every other test in this file and fail here.
+   *
+   * The fixture is the ambiguous band `5-B: extraction-candidate flagging` uses, driven through the
+   * DECLARATION entrance: two near-matching rules at different stages fork rather than merge, and
+   * the second birth records the pair flag.
+   */
+  it("refuses a declared rule carrying an undismissed pair flag — the declaration is waived, the open question is not", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
+    const { call, client } = await harness(c);
+    const firstId = await declareRule(call, "docker build", "Verify the built artifact after the source changes.");
+    const secondId = await declareRule(call, "npm install", "After the source changes, verify the artifact itself.");
+    expect(secondId).not.toBe(firstId); // forked, not merged — the fixture's premise
+    expect(c.ruleBinding(secondId)!.origin).toBe("declaration");
+    expect(c.retirementBlockers(secondId).map((blocker) => blocker.code)).toEqual(["declaration", "open-pair-flag"]);
+
+    const refused = await call("memory_declare", { withdraw: secondId });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain(`cannot withdraw ${secondId}:`);
+    expect(refused.text).toContain("undismissed pair flag(s)");
+    expect(refused.text).toContain(firstId); // the partner the remedy needs
+    expect(refused.text).toContain("withdraw it through memory_resolve");
+    // THE DECLARATION REALLY WAS WAIVED, not merely outvoted: its finding is absent from the refusal
+    // while the pair flag's is present. Without this, a withdrawal that waived NOTHING would pass.
+    expect(refused.text).not.toContain("entered by declaration");
+    // REFUSED MEANS UNTOUCHED.
+    expect((await call("memory_fetch", { id: secondId })).isError).toBe(false);
+    expect(c.stageLookup({ stage: "npm install" }).rules.map((rule) => rule.conceptId)).toContain(secondId);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE SAME NARROWNESS, ON THE RATIFICATION BLOCKER — and the fixture is written in SQL on purpose.
+   *
+   * `ratify()` refuses any candidate that is not kind 'principle' or 'preference', so no public
+   * surface can make a RULE a current skeleton member: "declared rule that is also ratified" is
+   * unreachable through the tools today. That is exactly why the row is inserted directly. The
+   * subject under test is not how a rule gets ratified — it is that the waiver is scoped to ONE
+   * blocker CODE rather than to "the first one" or "all of them", and this is the only way to put a
+   * second authority-class blocker in front of it. If rules ever do become ratifiable, this test is
+   * already standing where it needs to be.
+   */
+  it("refuses a declared rule that is also a current skeleton member — the ratification is not the declarer's to withdraw", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const id = await declareRule(call, "opening a pr", "Say what changed and why.");
+    const now = Date.now();
+    raw(c).prepare(
+      `INSERT INTO ratifications (id, subject_concept_id, verdict, ratified_by, circle, created_at, sync_updated_at)
+       VALUES ('forced-membership', ?, 'approve', 'john', 'default', ?, ?)`,
+    ).run(id, now, now);
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["declaration", "ratification"]);
+
+    const refused = await call("memory_declare", { withdraw: id });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toBe(
+      `cannot withdraw ${id}: it is a current skeleton member by ratification — withdraw it through ` +
+      `memory_ratify with verdict "retire"`,
+    );
+    expect(c.stageLookup({ stage: "opening a pr" }).rules.map((rule) => rule.conceptId)).toContain(id);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * NO DECLARATION BINDING, NO WITHDRAWAL — the verb's whole subject, stated as a refusal.
+   *
+   * Retiring these anyway would make the sovereignty surface a second `memory_retire` that skips
+   * every refusal by construction: a concept with no declaration has no `declaration` blocker, so
+   * the waiver would have nothing to remove and the retirement would simply proceed. All three
+   * inputs below EXIST and are partial in a different way, which is the class this set is here for
+   * — a missing id is the easy case and is covered by the scope gate below.
+   */
+  it("declines a concept that carries no declaration binding, and changes nothing", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    // 1. AN ORDINARY FACT: no binding at all.
+    const fact = (await call("memory_store", { content: "The staging cron ran at 04:00." })).json.conceptId as string;
+    // 2. A RULE THE AGENT STORED ITSELF: a real rule with a real binding whose origin is
+    //    'correction' — the tier #182 exists to keep retiring freely, through memory_retire.
+    const agentRule = (await call("memory_store", {
+      content: "Run the typecheck before handing a diff back.",
+      kind: "rule", rule: { stage: "handing back a diff", scope: "domain" },
+    })).json.conceptId as string;
+    expect(c.ruleBinding(agentRule)!.origin).toBe("correction");
+    // 3. A DECLARED PRINCIPLE: declaration-born, momentless, and carrying no rule binding — the
+    //    input most likely to be mistaken for this verb's subject. It gets a DIFFERENT decline,
+    //    because declaring it also ratified it: see the dedicated test below for why naming
+    //    memory_retire there is a dead end pointing at a dead end (#131 round 2).
+    const principle = (await call("memory_declare", {
+      species: "principle", content: "Prefer the smallest reversible step.",
+    })).json.conceptId as string;
+
+    // NOTHING ELSE STANDS IN THE WAY OF THESE TWO, so the ordinary exit is the honest redirect.
+    for (const id of [fact, agentRule]) {
+      expect(c.retirementBlockers(id)).toEqual([]); // the premise the sentence below rests on
+      const declined = await call("memory_declare", { withdraw: id });
+      expect(declined.isError).toBe(true);
+      expect(declined.text).toBe(
+        `cannot withdraw ${id}: it carries no declaration binding, so there is no declaration to ` +
+        `withdraw and nothing was changed — memory_retire("${id}", "default") is the exit for a ` +
+        `memory that entered on the agent's own authority`,
+      );
+      // NOTHING CHANGED — the sentence the refusal makes, asserted rather than trusted.
+      expect((await call("memory_fetch", { id })).isError).toBe(false);
+      expect((await call("memory_fetch", { id })).json.status).not.toBe("retired");
+    }
+    // THE PRINCIPLE IS DECLINED TOO — same finding, different redirect, and equally untouched.
+    const declinedPrinciple = await call("memory_declare", { withdraw: principle });
+    expect(declinedPrinciple.isError).toBe(true);
+    expect(declinedPrinciple.text).toContain("it carries no declaration binding");
+    expect((await call("memory_fetch", { id: principle })).json.status).not.toBe("retired");
+
+    // …and the ordinary exit really does work for the one the redirect named.
+    expect((await call("memory_retire", { id: agentRule })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * A DEAD END MUST NOT POINT AT ANOTHER DEAD END — Codex round 2 on PR #131 (P2).
+   *
+   * Declaring a principle or preference records an APPROVED ratification of its own (`declare()`'s
+   * `skeletonEntry: { verdict: "approve", entrance: "declaration" }`), so the concept is a current
+   * skeleton member from birth. It carries no RULE BINDING, so `withdraw` declines it — and the
+   * decline used to send the caller to `memory_retire`, which refuses it in turn on the ratification
+   * blocker. That is the exact shape #118 exists to remove, shipped inside #118's own fix.
+   *
+   * THE REMEDY IS PARSED AND REPLAYED, not matched: a decline that names a tool without the
+   * arguments that tool needs is the same defect one layer down, and the ratification blocker's own
+   * `withdrawVia` names neither the candidate nor the circle. Only a call that actually runs proves
+   * the exit is real.
+   *
+   * `withdraw` KEEPS DECLINING, deliberately. A principle's exit is `memory_ratify`; this verb's
+   * subject is the declaration BINDING, and widening it to "anything declaration-born" would make it
+   * a second skeleton surface.
+   */
+  it("the decline for a declared PRINCIPLE names an exit that works, and replaying it ends the membership", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const declared = await call("memory_declare", { species: "principle", content: "Prefer the smallest reversible step." });
+    expect(declared.isError).toBe(false);
+    const id = declared.json.conceptId as string;
+    // THE PREMISE, MEASURED: declaring it made it a member, and that membership is what memory_retire
+    // refuses on — so the old redirect could never have worked.
+    expect(c.skeleton("default").some((entry) => entry.conceptId === id)).toBe(true);
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["ratification"]);
+
+    const declined = await call("memory_declare", { withdraw: id });
+    expect(declined.isError).toBe(true);
+    // IT MUST NOT NAME THE TOOL THAT WOULD REFUSE. memory_retire is the exit for a memory with no
+    // authority left to withdraw; this concept has one, and naming it here is the dead-end chain.
+    expect(declined.text, declined.text).not.toContain("memory_retire(");
+    expect(declined.text).toContain("memory_ratify");
+
+    const args: Record<string, unknown> = {};
+    for (const [, key, serialized] of declined.text.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) {
+      args[key] = JSON.parse(serialized) as unknown;
+    }
+    expect(args, declined.text).toEqual({ candidateId: id, verdict: "retire", circle: "default" });
+
+    // THE REPLAY IS THE ASSERTION — the advertised exit, followed verbatim, really ends the membership.
+    const ratified = await call("memory_ratify", args);
+    expect(ratified.isError, ratified.text).toBe(false);
+    expect(c.skeleton("default").some((entry) => entry.conceptId === id)).toBe(false);
+    expect(c.retirementBlockers(id)).toEqual([]);
+    // …and now the ordinary exit really is open, which is what the chain was supposed to lead to.
+    expect((await call("memory_retire", { id })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * RATIFICATION IS NOT THE ONLY BLOCKER THAT CAN STAND ON A NO-DECLARATION CONCEPT, so the redirect
+   * is driven by the blocker pass rather than by the concept's kind (#131 round 2).
+   *
+   * Of the five codes, `declaration` is impossible here by construction — that blocker counts
+   * exactly the binding the decline just found absent — and `connector-owned` has no push site in
+   * `retirementBlockers` at all. That leaves ratification (the test above), open-contradiction and
+   * open-pair-flag, both of which any ordinary concept can carry. This is the pair-flag one.
+   *
+   * AND THE RATIFICATION CLAUSE IS ABSENT HERE, which is the assertion that proves the redirect
+   * reads the findings instead of always appending the same tail: memory_ratify is not this
+   * concept's exit, so it is not named.
+   */
+  it("the decline redirects to memory_resolve, not memory_retire, when the undeclared concept carries a pair flag", async () => {
+    const c = flaggingCore();
+    const { call, client } = await harness(c);
+    const aId = (await call("memory_store", { content: PAIR_A })).json.conceptId as string;
+    const bId = (await call("memory_store", { content: PAIR_B })).json.conceptId as string;
+    expect(aId).not.toBe(bId); // forked, not merged — the fixture's premise
+    expect(c.ruleBinding(aId)).toBeNull(); // …and it is genuinely undeclared
+    expect(c.retirementBlockers(aId).map((blocker) => blocker.code)).toEqual(["open-pair-flag"]);
+
+    const declined = await call("memory_declare", { withdraw: aId });
+    expect(declined.isError).toBe(true);
+    expect(declined.text).toContain("it carries no declaration binding");
+    // NOT THE TOOL THAT WOULD REFUSE, and this is the same dead-end chain the ratified case had:
+    // memory_retire refuses an undismissed pair flag exactly as it refuses a skeleton member.
+    expect(declined.text, declined.text).not.toContain("memory_retire(");
+    expect(declined.text).toContain("withdraw it through memory_resolve");
+    expect(declined.text).toContain(bId); // the partner the remedy needs
+    expect(declined.text).toContain('circle="default"'); // the argument the blocker itself cannot know
+    // THE RATIFICATION TAIL IS NOT APPENDED, because no ratification blocker is present.
+    expect(declined.text).not.toContain("candidateId=");
+
+    // REFUSED MEANS UNTOUCHED, and the question is still open.
+    expect((await call("memory_fetch", { id: aId })).isError).toBe(false);
+    expect(c.retirementBlockers(aId).map((blocker) => blocker.code)).toEqual(["open-pair-flag"]);
+
+    await client.close();
+    c.close();
+  });
+
+  it("refuses a withdrawal for a concept outside the circle the caller named, and reads as absent rather than forbidden", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const id = await declareRule(call, "opening a pr", "Say what changed and why.");
+
+    const refused = await call("memory_declare", { withdraw: id, circle: "elsewhere" });
+    expect(refused.isError).toBe(true);
+    // memory_retire's own sentence, word for word: the scope gate must not let this surface be used
+    // to probe for concepts in circles the caller did not name.
+    expect(refused.text).toBe(`concept not found: ${id}`);
+    expect((await call("memory_declare", { withdraw: "no-such-concept" })).text).toBe("concept not found: no-such-concept");
+    expect(c.stageLookup({ stage: "opening a pr" }).rules.map((rule) => rule.conceptId)).toContain(id);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE REMEDY IS FOLLOWED VERBATIM, ACROSS CIRCLES — Codex round 1 on PR #131 (P2).
+   *
+   * `retirementBlockers` renders the withdrawal path from the concept id alone, and the withdrawal
+   * handler defaults an omitted `circle` to the SESSION circle. So for a declared rule homed
+   * anywhere but the caller's own circle, a caller who did exactly what the refusal said hit
+   * `concept not found` — the scope gate answering about a circle the remedy never mentioned. Same
+   * defect family as #122/#127: a payload naming an id without saying which circle it belongs to.
+   *
+   * THE ARGUMENTS ARE PARSED OUT OF THE SENTENCE, NOT HAND-WRITTEN. A test that constructs the call
+   * itself is testing the tool, not the remedy — it passes on a sentence that names nothing at all.
+   * Every `key=<serialized value>` pair the refusal offers becomes an argument, and whatever the
+   * refusal omits is simply absent from the call, exactly as it would be for a reader.
+   *
+   * THE CONCEPT'S OWN CIRCLE IS THE ONE THAT MATTERS, deliberately not the binding's: the scope gate
+   * compares `circleOf(id)` (`concepts.circle`), and a rule's binding may legally carry `'*'` while
+   * its concept lives in an ordinary circle. Naming the binding's breadth marker here would produce
+   * a remedy that resolves to the session circle and fails all over again.
+   */
+  it("the declaration refusal's remedy can be replayed verbatim for a rule homed OUTSIDE the session circle", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    // Homed in another circle; the session circle stays "default" throughout.
+    const declared = await call("memory_declare", {
+      species: "rule", stage: "opening a pr", content: "Say what changed and why.",
+      scope: "domain", declaredBy: "john", circle: "project-a",
+    });
+    expect(declared.isError).toBe(false);
+    const id = declared.json.conceptId as string;
+    expect(c.circleOf(id)).toBe("project-a"); // the premise
+    // …and the caller's own session circle is somewhere else: the default, which is what an omitted
+    // `circle` on the replayed call below resolves to.
+    expect(c.overview("default").counts.concepts).toBe(0);
+
+    const refused = await call("memory_retire", { id, circle: "project-a" });
+    expect(refused.isError).toBe(true);
+    const remedy = /withdraw it through memory_declare (.*)$/.exec(refused.text)?.[1];
+    expect(remedy, refused.text).toBeDefined();
+
+    const args: Record<string, unknown> = {};
+    for (const [, key, serialized] of remedy!.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) {
+      args[key] = JSON.parse(serialized) as unknown;
+    }
+    // THE REPLAY IS THE ASSERTION. On a remedy that names no circle this is `concept not found`.
+    const replayed = await call("memory_declare", args);
+    expect(replayed.isError, `remedy "${remedy}" replayed as ${JSON.stringify(args)} -> ${replayed.text}`).toBe(false);
+    expect(replayed.json).toMatchObject({ circle: "project-a", action: "withdrawn", conceptId: id });
+
+    // …and the remedy really did carry both halves, rather than working by accident.
+    expect(args).toEqual({ withdraw: id, circle: "project-a" });
+    expect(c.ruleBinding(id)!.origin).toBe("declaration");
+    expect(c.stageLookup({ stage: "opening a pr", circle: "project-a" }).rules.map((rule) => rule.conceptId)).not.toContain(id);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE REMEDY IS A CALL, SO IT MUST PARSE AS ONE FOR EVERY NAME THE TOOL ACCEPTS — the companion to
+   * the replay above, and the same promise `memory_restore`'s own suggestion already makes (its
+   * round-2 fix). `circle` is `z.string().max(CIRCLE_NAME_MAX_CHARS)` and nothing anywhere restricts
+   * its characters, so interpolating one between quotes produces a remedy that ends where the name's
+   * own quote falls — unparseable for exactly the caller who cannot guess the escaping either.
+   */
+  it("the declaration remedy stays well-formed for a circle name carrying a quote and a backslash", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const circle = `pro"ject\\x`;
+    const declared = await call("memory_declare", {
+      species: "rule", stage: "opening a pr", content: "Say what changed and why.",
+      scope: "domain", declaredBy: "john", circle,
+    });
+    expect(declared.isError).toBe(false); // the name is ACCEPTED — measured, not assumed
+    const id = declared.json.conceptId as string;
+
+    const refused = await call("memory_retire", { id, circle });
+    const remedy = /withdraw it through memory_declare with (.*)$/.exec(refused.text)?.[1];
+    expect(remedy, refused.text).toBeDefined();
+    // WELL-FORMEDNESS ASSERTED BY PARSING, not by matching the string this method happens to build:
+    // the interpolated version throws here, or silently parses to the truncated name.
+    const args: Record<string, unknown> = {};
+    for (const [, key, serialized] of remedy!.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) {
+      args[key] = JSON.parse(serialized) as unknown;
+    }
+    expect(args).toEqual({ withdraw: id, circle });
+
+    // …and REPLAYED, because a remedy that parses but does not work is the same dead end.
+    const withdrawn = await call("memory_declare", args);
+    expect(withdrawn.isError, withdrawn.text).toBe(false);
+    expect(withdrawn.json).toMatchObject({ circle, action: "withdrawn", conceptId: id });
+
+    await client.close();
+    c.close();
+  });
+
+  it("memory_declare requires exactly one of species or withdraw", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    expect((await call("memory_declare", {})).text).toBe("provide exactly one of `species` or `withdraw`");
+    // BOTH IS AN ERROR, NOT A PREFERENCE. Silently favouring `species` would have a caller who meant
+    // to withdraw DECLARE A NEW RULE instead — an unintended write through the one surface where it
+    // is least recoverable.
+    expect((await call("memory_declare", { species: "principle", content: "x", withdraw: "some-id" })).text)
+      .toBe("provide exactly one of `species` or `withdraw`, not both");
+    expect(c.overview("default").counts.concepts).toBe(0);
+
     await client.close();
     c.close();
   });

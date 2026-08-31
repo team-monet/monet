@@ -459,15 +459,32 @@ const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
  * naming its own withdrawal path, because a caller that fixes one and retries into the next has
  * been told the truth twice and helped once. One formatter, shared by the single and batch paths of
  * memory_retire, so the two can never disagree about what a refusal says.
+ *
+ * `verb` IS THE CALLER'S OWN WORD FOR THE ACT, and the third caller is why it exists (#118):
+ * `memory_declare(withdraw)` refuses on the SAME findings, minus the declaration it is there to
+ * withdraw, and a refusal that says "cannot retire" to a caller who asked to withdraw sends them
+ * looking for a tool they did not use. Defaulted, so memory_retire's two call sites and every
+ * sentence they produce are byte-identical to what they were.
  */
-function retirementRefusal(id: string, blockers: readonly RetirementBlocker[]): string {
-  return `cannot retire ${id}: ${blockers
+function retirementRefusal(id: string, blockers: readonly RetirementBlocker[], verb: "retire" | "withdraw" = "retire"): string {
+  return `cannot ${verb} ${id}: ${blockerFindings(blockers)}`;
+}
+
+/**
+ * THE FINDINGS THEMSELVES, without any surface's own header — split out of `retirementRefusal` for
+ * its third caller (Codex round 2 on #131): `memory_declare(withdraw)`'s no-declaration decline has
+ * to state its OWN finding first and the standing ones after, so it cannot use a renderer that
+ * begins "cannot <verb> <id>:". Splitting keeps ONE definition of how a blocker reads; a second copy
+ * is how a refusal and the decline that redirects to it come to describe the same exit differently.
+ */
+function blockerFindings(blockers: readonly RetirementBlocker[]): string {
+  return blockers
     // THE REMEDY CLAUSE IS OMITTED, NOT FILLED IN, when no withdrawal surface exists — a blocker
     // whose `withdrawVia` is absent says so in its own `detail`. Rendering "withdraw it through
     // <nothing available>" is how a refusal starts reading as an instruction that cannot be
     // followed, which is the round-1 finding this formatter now cannot reproduce.
     .map((blocker) => (blocker.withdrawVia ? `${blocker.detail} — withdraw it through ${blocker.withdrawVia}` : blocker.detail))
-    .join("; ")}`;
+    .join("; ");
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,11 +1342,24 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_declare",
-    'Declare a user-authorized rule, stage, principle, or preference. Never call on agent initiative. This is the only tool that may create blocking rules or replace a rule binding. A stage is a named moment; rules bind content to stages. Principles and preferences enter the always-on skeleton without stage or severity; mechanical concerns return as non-blocking `advisories`. Skeleton changes include `instruction` only when a registered standing surface became stale. A permissive standing grant is a rule, not another species.',
+    'Declare a user-authorized rule, stage, principle, or preference, or withdraw a declared rule. Never call on agent initiative. This is the only tool that may create blocking rules, replace a rule binding, or end a declaration. A stage is a named moment; rules bind content to stages. Principles and preferences enter the always-on skeleton without stage or severity; mechanical concerns return as non-blocking `advisories`. Skeleton changes include `instruction` only when a registered standing surface became stale. A permissive standing grant is a rule, not another species. `withdraw` retires a declared rule so no stage delivers it; a rule whose deny is still live must be declared advisory first, and one carrying an open question is refused until the question is answered. memory_restore brings a withdrawn rule back.',
     {
       species: z
         .enum(["rule", "stage", "principle", "preference"])
-        .describe('"stage" registers a named moment; "rule" binds to a stage; "principle"/"preference" enter the momentless skeleton.'),
+        .optional()
+        .describe('"stage" registers a named moment; "rule" binds to a stage; "principle"/"preference" enter the momentless skeleton. Omit only when withdrawing.'),
+      // THE EXIT A DECLARATION NEVER HAD (#118). `memory_retire` refuses a declared rule — a memory
+      // leaves with the authority it entered on — and until now nothing ended that authority, so the
+      // refusal pointed at nowhere. It lands HERE because the declaration surface is the one the
+      // user authorizes: the same sovereignty that mints a deny is what may give it up.
+      withdraw: z
+        .string()
+        .optional()
+        .describe(
+          "Concept id of a declared rule to withdraw. Mutually exclusive with `species`. `circle` is " +
+          "read and must name the rule's home circle — omitting it means the session circle, and a " +
+          "rule homed elsewhere reads as not found; every other field is ignored.",
+        ),
       stage: z
         .string()
         .max(STAGE_NAME_MAX_CHARS)
@@ -1363,7 +1393,7 @@ export function registerMonetCoreTools(
         ),
       sourceRefs: z.array(z.string()).optional(),
     },
-    async ({ species, stage, content, exitsEvidence, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs }) => {
+    async ({ species, withdraw, stage, content, exitsEvidence, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs }) => {
       // RAW, UNDISTORTED — memory_declare-scoped (review fix — Codex round 2, item 1). declare()
       // itself must be able to tell "the caller said nothing about circle" (`undefined` — preserves
       // an existing binding's circle, including breadth) from "the caller explicitly named the
@@ -1390,6 +1420,106 @@ export function registerMonetCoreTools(
       const homeCircle = circle === undefined || circle === BREADTH_CIRCLE ? scope() : scope(circle);
       const capturedBlock = capturePrewarmSnapshot(homeCircle);
       try {
+        // THE WITHDRAWAL VERB (#118), AND IT IS A DIFFERENT ACT FROM EVERY OTHER FIELD HERE — which
+        // is why `species` and `withdraw` are exclusive rather than a fifth species. A species says
+        // WHAT to declare and reads `stage`, `content`, `severity`, `scope`, `circle`; a withdrawal
+        // names an EXISTING concept and reads none of them. Folding it into the enum would put a
+        // dozen inapplicable fields in front of every withdrawal and make "declared a rule" and
+        // "ended one" the same call shape in the record.
+        //
+        // BOTH AND NEITHER ARE BOTH ERRORS, each naming which. Silently preferring one over the
+        // other would let a caller who meant to withdraw declare a NEW rule instead — a mutation
+        // through the one surface where an unintended write is least recoverable.
+        //
+        // THE CIRCLE IS `homeCircle`, NOT `declareCircle`: a concept always lives at a real circle
+        // and never at the breadth marker (see that constant's own comment above), and this is a
+        // lookup of an existing concept, never a ruling about delivery breadth.
+        if (withdraw !== undefined) {
+          if (species !== undefined) return err("provide exactly one of `species` or `withdraw`, not both");
+          // THE SAME CEILING memory_retire's own single-id path uses, and the same reason (its
+          // round-3 review fix): `err()` has no size ceiling of its own the way `ok()` does, so an
+          // unbounded caller-supplied id echoed verbatim produces a result past the host's limit —
+          // the caller gets an unusable response instead of the refusal. The constant is declared
+          // further down in this same registration function; every handler here runs long after
+          // registration returns, so it is always initialized by the time this reads it.
+          const shownId = clip(withdraw, LIFECYCLE_ERROR_ID_MAX_CHARS).text;
+          const outcome = core.withdrawDeclaredRule(withdraw, homeCircle);
+          // THE SCOPE GATE'S ANSWER IS memory_retire's, WORD FOR WORD: an id outside the caller's
+          // circle reads as absent rather than forbidden, so this surface cannot be used to probe
+          // for the existence of concepts in circles the caller did not name.
+          if (outcome.outcome === "not-in-circle") return err(`concept not found: ${shownId}`);
+          // NOT A NO-OP AND NOT A SUCCESS. This verb's subject is the declaration itself, so a
+          // concept carrying none is told exactly that — retiring it anyway would make the
+          // sovereignty surface a second `memory_retire` that skips every refusal by construction.
+          //
+          // AND THE REDIRECT IS A CALL, CIRCLE INCLUDED (Codex round 1 on #131, P2 — its sibling).
+          // This used to name the tool alone, and `memory_retire` scopes by circle exactly as this
+          // does: a caller who followed it with a bare `memory_retire(id)` for a concept homed
+          // outside their session circle got "concept not found" one step later. Weaker than the
+          // blocker's own remedy — reaching this branch means the scope gate already passed, so the
+          // caller has just named the right circle — but it is the same trap, and repeating the pair
+          // costs a serialization. Both arguments serialized for the retire acknowledgement's own
+          // round-2 reason; the id is the CLIPPED one, because `err()` carries no size ceiling of
+          // its own (the round-3 reason `shownId` exists) and a bounded refusal outranks a perfect
+          // suggestion — every id that can reach this branch is a real concept id, far under the cap.
+          if (outcome.outcome === "not-declared") {
+            const finding =
+              `cannot withdraw ${shownId}: it carries no declaration binding, so there is no declaration ` +
+              `to withdraw and nothing was changed`;
+            // NOTHING ELSE STANDS IN ITS WAY, so the ordinary exit really is open and is named as a
+            // replayable call, circle included (round 1's fix, unchanged).
+            if (outcome.blockers.length === 0) {
+              return err(
+                `${finding} — memory_retire(${JSON.stringify(shownId)}, ${JSON.stringify(homeCircle)}) ` +
+                `is the exit for a memory that entered on the agent's own authority`,
+              );
+            }
+            // …AND WHEN SOMETHING DOES, memory_retire IS NOT THE EXIT — it would refuse in turn. The
+            // findings come from the engine's own blocker pass and are rendered by the SAME formatter
+            // memory_retire's refusal uses, so which tool ends which authority is defined in exactly
+            // one place; this handler never decides that from the concept's kind.
+            //
+            // AND THE MISSING ARGUMENTS ARE SUPPLIED HERE, because they are what this layer knows and
+            // the blockers do not: `retirementBlockers` is a question anyone may ask about a concept
+            // from anywhere, so it cannot name the circle a caller must pass, and the ratification
+            // blocker's own remedy names neither its candidate nor that circle. Rendering it verbatim
+            // would reproduce round 1's defect one layer down — a remedy that cannot be followed.
+            // Which blocker is present is read off the blocker pass, never guessed from the species.
+            const ratified = outcome.blockers.some((blocker) => blocker.code === "ratification");
+            return err(
+              `${finding}, and memory_retire would refuse it too: ${blockerFindings(outcome.blockers)}. ` +
+              `Every call above takes circle=${JSON.stringify(homeCircle)}` +
+              (ratified
+                ? `, and memory_ratify takes candidateId=${JSON.stringify(shownId)} and verdict="retire"`
+                : "") +
+              `.`,
+            );
+          }
+          // THE OTHER THREE BLOCKERS STILL REFUSE, rendered by the same formatter memory_retire uses
+          // so the two surfaces cannot come to describe one finding differently.
+          if (outcome.outcome === "blocked") return err(retirementRefusal(shownId, outcome.blockers, "withdraw"));
+          return mutOk(
+            {
+              circle: homeCircle,
+              action: "withdrawn",
+              conceptId: withdraw,
+              // THE PRESERVED ORIGIN IS PART OF THE ACKNOWLEDGEMENT, not an implementation detail
+              // left for a reader to discover: a caller who is told only "withdrawn" will assume the
+              // declaration was erased, and then read `memory_retire`'s unchanged refusal on the same
+              // id as a bug. Serialized arguments in the restore suggestion for memory_retire's own
+              // round-2 reason — a circle name carrying a quote or newline must still replay.
+              message:
+                `Withdrawn. The rule is retired: no stage delivers it, and it is out of memory_search, ` +
+                `memory_fetch, memory_list and the overview counts. Its binding still records ` +
+                `origin="declaration" — it really did enter that way, and the withdrawal ends its delivery ` +
+                `rather than falsifying that record. ` +
+                `memory_restore(${JSON.stringify(withdraw)}, ${JSON.stringify(homeCircle)}) brings it back.`,
+            },
+            "memory_declare",
+            capturedBlock,
+          );
+        }
+        if (species === undefined) return err("provide exactly one of `species` or `withdraw`");
         const r = await core.declare({
           species, stage, content, exitsEvidence, severity, scope: ruleScope,
           // LIVE, not the closure-captured `defaultModelTag` — same review-fix reasoning as

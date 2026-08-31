@@ -2462,10 +2462,15 @@ export interface RetirementBlocker {
   /**
    * The tool that ends that authority. Never a way to force the retirement.
    *
-   * ABSENT WHEN NO SUCH SURFACE EXISTS, which is the honest record rather than a verdict — a
-   * declared rule has no withdrawal act today (#200), and naming one anyway is what the round-1
-   * review caught: a caller was sent between two tools that both refuse. A renderer must omit the
-   * remedy clause entirely when this is absent, not print a sentence that reads as one.
+   * ABSENT WHEN NO SUCH SURFACE EXISTS, which is the honest record rather than a verdict — naming
+   * one anyway is what the round-1 review caught: a caller was sent between two tools that both
+   * refuse. A renderer must omit the remedy clause entirely when this is absent, not print a
+   * sentence that reads as one.
+   *
+   * STILL OPTIONAL THOUGH EVERY BLOCKER NOW FILLS IT IN. The declared-rule case was the one that
+   * could not (#200, now public as #118), and `memory_declare(withdraw)` closed it — so the absent
+   * branch is currently unexercised, and it stays because the CONTRACT is what protects the next
+   * blocker: a finding whose remedy does not exist must say so by omission, not by inventing one.
    */
   withdrawVia?: string;
 }
@@ -2484,6 +2489,37 @@ export interface RetirementBlocker {
  */
 export interface RetirementOutcome {
   outcome: "retired" | "blocked" | "not-in-circle";
+  blockers: RetirementBlocker[];
+}
+
+/**
+ * What one reserved DECLARATION WITHDRAWAL did — `RetirementOutcome` plus the one answer that is
+ * this verb's alone.
+ *
+ * `not-declared` IS THE WHOLE POINT OF THE FOURTH MEMBER (#118). The withdrawal exists to end the
+ * authority a declaration put on a rule, so a concept carrying no declaration binding has nothing
+ * here to withdraw — and retiring it anyway would turn the sovereignty surface into a second,
+ * unguarded `memory_retire` for ordinary memories. A no-op that reports success is the failure
+ * mode this member exists to make impossible; the caller is told what it asked about, and nothing
+ * changed.
+ *
+ * `withdrawn` IS THE POST-STATE, on `RetirementOutcome`'s own reasoning: an already-retired
+ * declared rule answers `withdrawn` too, because that is the state the caller asked for. The other
+ * three members mean exactly what they mean there — `blocked` carries the findings to render (the
+ * declaration one excluded: that is the authority being withdrawn) and `not-in-circle` is the scope
+ * gate.
+ *
+ * `blockers` IS ALSO POPULATED UNDER `not-declared`, which is where it differs from
+ * `RetirementOutcome` (Codex round 2 on #131). The decline has to name an exit that ACTUALLY WORKS
+ * for the concept in front of it, and a concept with no declaration binding may still be a skeleton
+ * member, carry an open contradiction, or carry a pair flag — in which case `memory_retire`, the
+ * ordinary exit, refuses it in turn. Sending a caller from one refusal to another is the shape #118
+ * exists to remove. Read here rather than at the tool surface so the findings are a snapshot of the
+ * SAME reservation that decided the decline, not a second read a competing writer can have moved
+ * under. Empty under `withdrawn` and `not-in-circle`.
+ */
+export interface DeclarationWithdrawalOutcome {
+  outcome: "withdrawn" | "not-declared" | "blocked" | "not-in-circle";
   blockers: RetirementBlocker[];
 }
 
@@ -7445,18 +7481,52 @@ export class MonetCore {
     // when it is, "whose authority does a grafted row carry" is the sync slice's own question
     // (#195), not a marker to approximate from the stage.
     if (marks.declaredBinding > 0) {
-      // NO WITHDRAWAL SURFACE EXISTS FOR THIS ONE, and the refusal now says so (review fix — round
-      // 1). It used to name `memory_declare`, which is fiction: that tool has no retire or withdraw
-      // operation, and re-declaring the same rule preserves `origin='declaration'` on its binding —
-      // so the advertised remedy left a caller circling between two tools that both refuse. What a
-      // declared rule actually needs is a withdrawal act that does not exist yet; until it does, the
-      // honest answer is that this memory cannot be retired here, and both dead ends are named so
-      // nobody spends a turn discovering them.
+      // THE WITHDRAWAL SURFACE NOW EXISTS, so this blocker names it like the other three (#118).
+      // Round 1 removed a REMEDY THAT WAS FICTION — it sent the caller to `memory_declare`, which
+      // had no retire, and whose re-declaration preserves `origin='declaration'` — leaving the only
+      // honest answer "nowhere to go". `memory_declare(withdraw)` is that missing act, and the
+      // remedy clause is filled in again only because a caller who follows it now actually gets the
+      // retirement. The round-1 rule is unchanged: name a path or name none, never a placeholder.
+      //
+      // AND THE ISSUE NUMBER IS GONE FROM THE SENTENCE, deliberately. It cited `monet-core#200`, a
+      // PRIVATE repository's number, so every reader who hit this refusal was handed a pointer they
+      // could not open. Nothing replaces it: the public issue (#118) belongs in this comment, where
+      // a reader of the source can use it, and a working remedy needs no issue link beside it.
+      //
+      // WHAT THE WITHDRAWAL DOES NOT DO, because the next reader will assume the opposite: it does
+      // NOT clear `origin`. The binding keeps `origin='declaration'` — the rule DID enter that way,
+      // and falsifying history to achieve a removal is the wrong trade — so re-asking this method
+      // AFTER a successful withdrawal still reports this blocker, exactly as it does for any other
+      // already-retired concept (see `retireIfUnblocked`'s already-retired short-circuit, which is
+      // why that costs nobody anything).
+      //
+      // AND IT NAMES THE CIRCLE, UNCONDITIONALLY (Codex round 1 on #131, P2). The withdrawal handler
+      // defaults an omitted `circle` to the SESSION circle, and its scope gate then answers
+      // `not-in-circle` — rendered as "concept not found" — so an id-only remedy failed outright for
+      // any declared rule homed outside the caller's own circle, which is the ordinary arrangement in
+      // a real store. Same defect family as #122/#127, and the same fix `memory_retire`'s own
+      // `memory_restore(...)` suggestion already carries: the pair travels together.
+      //
+      // NOT "ONLY WHEN IT DIFFERS": this method cannot see the caller's session circle — it is a
+      // question about a concept, asked from anywhere — so a conditional would have to GUESS which
+      // circle the reader is sitting in and would omit the half that matters exactly when it is
+      // wrong. The restore precedent is unconditional for the same reason.
+      //
+      // THE CONCEPT'S CIRCLE, NEVER THE BINDING'S. The gate compares `circleOf(id)`, which reads
+      // `concepts.circle`; a rule's binding may legally carry the breadth marker '*' while its
+      // concept lives in an ordinary circle (RuleBindingRow.circle), and a remedy naming '*' would
+      // resolve straight back to the session circle and fail again.
+      //
+      // BOTH ARGUMENTS SERIALIZED, NEVER INTERPOLATED — `memory_retire`'s own round-2 fix, applied
+      // to the same kind of sentence. A circle name is only length-bounded (CIRCLE_NAME_MAX_CHARS)
+      // and no charset rule anywhere accepts or rejects one, so a name carrying a quote or a
+      // backslash rendered a remedy that ends where the name's own quote falls — unparseable for
+      // exactly the caller who cannot guess the escaping either. For a plain uuid and a plain circle
+      // name this is byte-identical to the interpolation it replaces.
       blockers.push({
         code: "declaration",
-        detail:
-          "it entered by declaration, and no surface withdraws one — memory_declare has no retire, " +
-          "and re-declaring keeps the declaration (monet-core#200)",
+        detail: "it entered by declaration, and only the declaration surface can withdraw one",
+        withdrawVia: `memory_declare with withdraw=${JSON.stringify(conceptId)} and circle=${JSON.stringify(row.circle)}`,
       });
     }
     // THE CURRENT VERDICT, NEVER THE HISTORY (review fix — round 1). This used to COUNT
@@ -7603,6 +7673,90 @@ export class MonetCore {
       return { outcome: this.retireConcept(id) !== null ? "retired" : "not-in-circle", blockers: [] };
     })();
     return outcome;
+  }
+
+  /**
+   * WITHDRAW A DECLARED RULE — the exit a declaration never had (#118), under the authority that
+   * created it. `memory_declare` is the only caller; `memory_retire` keeps refusing exactly as it
+   * did, and now names this as the path.
+   *
+   * THE CONCEPT IS RETIRED AND `rule_bindings.origin` IS LEFT ALONE. That is the whole design
+   * decision, and it is the one a later reader is most likely to try to "simplify" away, so the
+   * reasoning is here rather than in a commit message:
+   *
+   *   FALSIFYING THE ORIGIN WOULD BE A LIE ABOUT HISTORY. The rule DID enter by declaration. An
+   *   origin flip buys a removal by making the record disagree with what happened, and this column
+   *   is the only trace of whose authority admitted the rule — the thing #182's whole tier turns on.
+   *
+   *   AND IT IS NOT EVEN A LOCAL EDIT. `rule_bindings.origin` has readers all over `graftRows`'
+   *   sync/peer-merge path, whose UPSERT carries `origin = excluded.origin` — so a peer still
+   *   holding the row as declared would RESURRECT the local withdrawal on the next merge, and the
+   *   withdrawal would be undone by a mechanism nobody involved was thinking about.
+   *
+   *   AND THE SCHEMA REFUSES IT OUTRIGHT for one whole class. `rule_bindings`' own
+   *   `CHECK (severity != 'blocking' OR origin = 'declaration')` (gates.ts) means a bare origin flip
+   *   on a BLOCKING rule fails the write.
+   *
+   *   RETIREMENT IS ALREADY SUFFICIENT. `RULE_LIVENESS_WHERE` requires `c.status = 'active'`, so a
+   *   retired rule drops out of every delivery path (gate, `stage_lookup`, the stage index) with no
+   *   new mechanism at all — and `memory_restore` still brings it back, which an origin flip could
+   *   not offer.
+   *
+   * A LIVE DENY IS NOT WITHDRAWN HERE — IT IS DECLARED ADVISORY FIRST, and this door changes nothing
+   * about that. `retireConcept`'s live-deny chokepoint (`assertBlockingRuleMutationAllowed`) fires
+   * through this path exactly as through every other one, and its throw reaches the caller unaltered
+   * rather than being caught and reworded: it already names the step to take, and that step is an
+   * ACT ("declaring it advisory"), not merely this tool. So a blocking declared rule leaves in TWO
+   * declarations — downgrade, then withdraw — and only the second was ever missing. The first has
+   * always worked: a severity change is not a `BlockingRuleOperation` (gates.ts) and is unguarded by
+   * construction.
+   *
+   * WAIVING THAT CHOKEPOINT HERE WAS CONSIDERED AND REJECTED (owner ruling, #118). Collapsing the
+   * two steps into one would make removing a deny CHEAPER than minting one — a mint costs a blocking
+   * declaration plus a `reason` — which inverts the very invariant the chokepoint's sentence states,
+   * and it would be the first exception carved into a guard with nine call sites, for convenience
+   * rather than necessity.
+   *
+   * ONLY THE `declaration` BLOCKER IS WAIVED. The other three are not about the declaration and are
+   * not the declarer's to answer: a skeleton membership, an open contradiction and an undismissed
+   * pair flag each guard a question that retiring would ERASE rather than answer (see
+   * `retirementBlockers`), and withdrawing a declaration says nothing about any of them. So this is
+   * a filter over the same public blocker pass, never a second copy of it and never a bypass.
+   *
+   * A DECLARATION BINDING IS REQUIRED, AND ITS ABSENCE IS AN ANSWER (`not-declared`). Without this
+   * the verb would be a second retire door for ordinary memories — one that skips `memory_retire`'s
+   * refusals by construction, since a concept with no declaration has no `declaration` blocker to
+   * waive. The binding's OWN origin is read, deliberately not the stage's, for `retirementBlockers`'
+   * reason exactly: the address is not the authority.
+   *
+   * ONE RESERVATION, for `retireIfUnblocked`'s reason — the binding read, the blocker pass and the
+   * retirement decide and commit together, so no competing writer can ratify, dispute or re-declare
+   * inside a gap and leave the act standing on a finding that was already false.
+   */
+  withdrawDeclaredRule(id: string, expectedCircle: string): DeclarationWithdrawalOutcome {
+    return this.db.immediateTransaction((): DeclarationWithdrawalOutcome => {
+      // SCOPE FIRST, the same gate and the same sentence as `retireIfUnblocked`: everything below is
+      // a finding about a concept the caller must own to ask about.
+      if (this.circleOf(id) !== expectedCircle) return { outcome: "not-in-circle", blockers: [] };
+      const row = this.getRow(id);
+      if (!row) return { outcome: "not-in-circle", blockers: [] }; // narrows the type; `circleOf` just matched
+      // THE SUBJECT BEFORE THE STATE. A concept with no declaration binding is not something this
+      // verb has an opinion about in any status, so it is answered before the already-retired
+      // short-circuit below — otherwise an ordinary retired fact would come back `withdrawn`, and
+      // the caller would read that as this tool having withdrawn a declaration it never touched.
+      const binding = this.ruleBinding(id);
+      // THE STANDING FINDINGS TRAVEL WITH THE DECLINE, so the tool surface can redirect to an exit
+      // that is actually open — see this outcome type's own comment. `declaration` can never be
+      // among them here: that blocker counts exactly the binding this branch just found absent.
+      if (!binding || binding.origin !== "declaration") return { outcome: "not-declared", blockers: this.retirementBlockers(id) };
+      // ALREADY RETIRED IS SUCCESS — `retireIfUnblocked`'s own paragraph, and it applies more often
+      // here: the origin is deliberately preserved, so a re-issued withdrawal still sees a declared
+      // binding and would otherwise re-run a blocker pass against a memory that has already left.
+      if (row.status === "retired") return { outcome: "withdrawn", blockers: [] };
+      const blockers = this.retirementBlockers(id).filter((blocker) => blocker.code !== "declaration");
+      if (blockers.length > 0) return { outcome: "blocked", blockers };
+      return { outcome: this.retireConcept(id) !== null ? "withdrawn" : "not-in-circle", blockers: [] };
+    })();
   }
 
   /**
