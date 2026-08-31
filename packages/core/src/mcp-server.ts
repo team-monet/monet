@@ -1783,9 +1783,11 @@ export function registerMonetCoreTools(
           includeDirty,
           includeStale,
         });
-        // THE FOUR CONFORMANCE STATES, on the surface curation already reads. `unanswered` and
+        // THE CONFORMANCE STATES, on the surface curation already reads. `unanswered` and
         // `notAsked` are reported SEPARATELY and never summed: one is a queue owed to the user, the
-        // other is an agent defect, and they have different owners and different remedies. No
+        // other is rules read with no question put — not by itself a defect, since whether an action
+        // followed is unrecorded since #85, with `notAskedWithAction` naming the subset the record
+        // can speak for. They have different owners and different remedies. No
         // threshold says when a backlog is too large — nothing has measured that — so these are
         // counts and nothing more. `followed` means the action followed the rule; it does not say
         // the rule caused it, which is unobservable.

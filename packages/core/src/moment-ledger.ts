@@ -838,14 +838,21 @@ export function observedMomentLosses(db: StoragePort, spoolPath: string): Moment
 /**
  * THE FOUR CONFORMANCE STATES, and the two that must never be one number.
  *
- * `unanswered` is a QUEUE OWED TO THE USER — the agent did its part and is waiting. `notAsked` is an
- * AGENT DEFECT — the rule was read, the action happened, and no question was ever put. They have
- * different owners and different remedies, and collapsing them into one "pending" bucket is the
- * exact failure this design exists to prevent.
+ * `unanswered` is a QUEUE OWED TO THE USER — the agent did its part and is waiting. `notAsked` is
+ * rules read with no question put. They have different owners and different remedies, and
+ * collapsing them into one "pending" bucket is the exact failure this design exists to prevent.
  *
- * `notAsked` IS DERIVED, NOT STORED: a moment with at least one read, an outcome, and no `asked_at`.
- * That derivation is the whole payoff of making the ask an event — the agent's failure to ask
- * becomes mechanically detectable instead of being something only the agent could report.
+ * `notAsked` IS NOT BY ITSELF A DEFECT, and this said it was. It claimed "the action happened",
+ * which the record cannot support: #85 retired interception, so nothing written since 2026-08-22
+ * carries an action, and a lookup made to READ rules sits in the population beside one that
+ * governed a real act. `notAskedWithAction` is the subset the record CAN speak for — a stored
+ * action, and no question put — and that subset is genuine outstanding work. The split is the
+ * point: a store upgraded across #85 holds both kinds, and reporting one number for both either
+ * accuses the agent over an inventory sweep or prints an all-clear over real debt.
+ *
+ * Both ARE DERIVED, NOT STORED: a moment with at least one read, an outcome, and no `asked_at`.
+ * That derivation is the whole payoff of making the ask an event — a missing question becomes
+ * mechanically detectable instead of being something only the agent could report.
  *
  * WHAT THESE NUMBERS DO NOT SAY. `followed` means the action followed the rule. It does NOT mean the
  * rule caused it: what the agent would have done without the rule is unobservable, and nothing here
@@ -859,16 +866,26 @@ export interface MomentConformance {
   /** Asked, no answer yet. A queue, not a defect. Owned by the user. */
   unanswered: number;
   /**
-   * Rules were read; no question was put.
+   * Rules were read; no question was put. The WHOLE population, of which `notAskedWithAction`
+   * is the part the record can speak for.
    *
    * NOT BY ITSELF A DEFECT, and it used to say it was. Whether an action followed is not
-   * recorded — #85 retired interception on the finding that a gate reaching the model beside
-   * the tool result is not a gate — so a lookup made to READ rules (an inventory sweep, a
-   * probe, a stage consulted out of curiosity) lands here identically to one that governed a
-   * real act and went unasked. Attributing the population to the agent picks one of those two
-   * and calls it observed. It is a population to look at, not a fault to assign.
+   * recorded for anything written since #85 retired interception — so a lookup made to READ
+   * rules (an inventory sweep, a probe, a stage consulted out of curiosity) lands here
+   * identically to one that governed a real act and went unasked. Attributing the whole
+   * population to the agent picks one of those two and calls it observed.
    */
   notAsked: number;
+  /**
+   * The subset of `notAsked` where an action IS on the record: a stored `action_sha256`, and no
+   * question put. Genuine outstanding work, and the only part of the population that is.
+   *
+   * NONZERO ONLY ON A STORE THAT PREDATES #85, or one that folded a spool written before it —
+   * nothing writes an action today. It is not therefore dead: the counts must not print an
+   * all-clear over real debt on an upgraded store, and if an interceptor returns, this is the
+   * number that returns with it.
+   */
+  notAskedWithAction: number;
   /** Reads that named no moment — the health signal for delivery naming its moment. */
   unjoinableReads: number;
   /**
@@ -921,6 +938,14 @@ export function momentConformance(db: StoragePort, spoolPath: string, circle: st
     notAsked: one(
       `SELECT COUNT(*) AS n FROM governed_moments
         WHERE ${OPENED} AND asked_at IS NULL AND answer IS NULL AND outcome_at IS NOT NULL AND ${READ}`,
+    ),
+    // THE SAME POPULATION, NARROWED TO WHAT THE RECORD CAN SPEAK FOR. `action_sha256 IS NOT NULL`
+    // is the whole difference: on these the action was observed, so a missing question is real
+    // debt rather than an unanswerable one.
+    notAskedWithAction: one(
+      `SELECT COUNT(*) AS n FROM governed_moments
+        WHERE ${OPENED} AND asked_at IS NULL AND answer IS NULL AND outcome_at IS NOT NULL AND ${READ}
+          AND action_sha256 IS NOT NULL`,
     ),
     // NEITHER a defect nor a queue: delivered, read, and unjudgeable because every read landed
     // after the act. `rule_reads = '{}'` is what makes it "no timely read".

@@ -71,6 +71,21 @@ function readAndActed(path: string, momentId: string, at = "2026-08-19T00:00:00.
   line(path, { kind: "outcome", momentId, toolUseId: null, outcomeStatus: null, outcomeAt: at, outcomeSha256: "b".repeat(64) });
 }
 
+/**
+ * A moment with rules read and NO action on the record — everything written since #85 retired
+ * interception. `readAndActed` above is the other half, and the two must not be confused: the
+ * whole correction here turns on which of them a claim is about.
+ */
+function readNoAction(path: string, momentId: string, at = "2026-08-19T00:00:00.000Z"): void {
+  line(path, {
+    kind: "interception", momentId, at, toolUseId: null, circle: "acme-widgets", sessionId: null,
+    surface: "stage_lookup", actionSha256: null, actionRendering: null, actionChars: null,
+    actionClipped: null, stageId: null, ruleIds: null, disposition: "ungoverned", deliveredRuleIds: null,
+  });
+  line(path, { kind: "read", momentId, ruleId: "rule-a", namedStageId: "stage-1", readAt: at });
+  line(path, { kind: "outcome", momentId, toolUseId: null, outcomeStatus: null, outcomeAt: at, outcomeSha256: "b".repeat(64) });
+}
+
 function coreWithSpool(spoolPath: string): MonetCore {
   const core = new MonetCore(":memory:", { momentSpoolPath: spoolPath, defaultCircle: "acme-widgets" });
   cores.push(core);
@@ -115,7 +130,10 @@ describe("the rendered workbench does not claim an action either", () => {
     const path = join(mkTmp(), "moments.jsonl");
     const core = coreWithSpool(path);
     try {
-      readAndActed(path, "never-asked-one");
+      // NO ACTION ON THE RECORD — the post-#85 shape, and the one the corrected line is about.
+      // `readAndActed` writes an `actionSha256`, so using it here would have exercised the other
+      // half and asserted the wrong sentence.
+      readNoAction(path, "never-asked-one");
       const out = renderOverview(core.overview("acme-widgets"), { color: false, width: 200 });
 
       // PRESENT FIRST, or every assertion below passes on an empty render.
@@ -281,6 +299,7 @@ describe("the ask and the answer attach to a moment that exists", () => {
     expect(core.momentConformance()).toEqual({
       followed: 0,
       notFollowed: 0,
+      notAskedWithAction: 0,
       readLate: 0,
       unanswered: 0,
       notAsked: 0,
