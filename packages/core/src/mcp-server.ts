@@ -1000,11 +1000,32 @@ export function registerMonetCoreTools(
     // the id list, never the instruction — the reverse split would lose the what-to-do entirely.
     //
     // IT NAMES WHAT WAS READ, NEVER WHAT WAS DONE. It used to say "you read a rule and then acted",
-    // which asserted an action nothing here observes: #85 retired interception, so no action reaches
-    // this record at all, and a lookup made to READ rules lands in this list identically to one that
+    // which asserted an action nothing here observes: #85 retired interception, so nothing written
+    // since carries one, and a lookup made to READ rules lands in this list identically to one that
     // governed a real act. Saying so is what stops an agent asking the user to adjudicate a
-    // non-event — the question is only worth putting where something actually followed, and the
-    // agent is the only party that knows which those are.
+    // non-event — the question is only worth putting where something actually followed.
+    //
+    // EXCEPT WHERE THE LEDGER KNOWS, and it does on a store that predates #85 or folded a spool that
+    // did. Those rows carry an `action_sha256`, `notAskedWithAction` already counts them, and on
+    // them the question is owed rather than optional. Telling the agent to decide from context there
+    // would have it skip questions the record can answer — the same over-generalisation, one surface
+    // on, that put the all-clear over real debt. Partitioned rather than qualified, because an agent
+    // meeting eight bare uuids after a compaction cannot apply a qualifier it has no context for.
+    let acted: Set<string>;
+    try {
+      acted = core.momentsWithRecordedAction(fresh);
+    } catch {
+      acted = new Set();
+    }
+    if (acted.size > 0) {
+      const withAction = fresh.filter((id) => acted.has(id));
+      const rest = fresh.filter((id) => !acted.has(id));
+      const restClause =
+        rest.length === 0
+          ? ""
+          : ` For ${rest.length} other${rest.length === 1 ? "" : "s"} (${rest.join(", ")}) whether an action followed is not recorded — ask where something did.`;
+      return `Monet: rules were read at ${fresh.length} ${noun} not yet asked about. ${withAction.length} record an action and owe the question (${withAction.join(", ")}).${restClause}`;
+    }
     return `Monet: rules were read at ${fresh.length} ${noun} not yet asked about (${ids}). Whether an action followed is not recorded — ask about the ones where something did.`;
   }
 

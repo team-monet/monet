@@ -337,6 +337,31 @@ describe("the signal that tells the agent it owes a question", () => {
       .filter((part) => part.type === "text")
       .map((part) => part.text ?? "");
 
+  it("states the gap only for moments with no action on the record", async () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const core = coreWithSpool(path);
+    await declareRuleAt(core, "git force push");
+    const { client, cleanup } = await pair(core);
+    try {
+      // THE POST-#85 SHAPE — no action written, so the ledger genuinely cannot say whether one
+      // followed, and the signal must say so rather than send the agent to ask about a non-event.
+      readNoAction(path, "unknown-one");
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
+      const signal = ((result as { content: Array<{ type: string; text?: string }> }).content ?? [])
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .find((text) => text.includes(ASK_SIGNAL_PREFIX));
+
+      expect(signal).toContain("unknown-one");
+      expect(signal).toContain("Whether an action followed is not recorded");
+      // THE OTHER HALF, and without it this passes on any wording that merely omits the claim:
+      // the owed-question phrasing belongs to action-bearing rows only.
+      expect(signal).not.toContain("owe the question");
+    } finally {
+      await cleanup();
+    }
+  });
+
   it("says nothing at all when nothing is owed", async () => {
     const path = join(mkTmp(), "moments.jsonl");
     const core = coreWithSpool(path);
@@ -407,13 +432,14 @@ describe("the signal that tells the agent it owes a question", () => {
       expect(signal).toBeDefined();
       // A signal naming a moment...
       expect(signal).toContain("owed-one");
-      // AND CLAIMING NOTHING ABOUT WHAT FOLLOWED IT. The signal used to read "you read a rule and
-      // then acted", asserting an action nothing observes — #85 retired interception, and a lookup
-      // made to READ rules reaches this list identically to one that governed a real act. Both
-      // halves are asserted: the claim is gone, AND the absence is stated rather than merely
-      // omitted, because saying nothing would leave the reader to assume the old meaning.
+      // AND SAYING WHAT THE RECORD HOLDS, WHICH DEPENDS ON THE ROW. The signal used to read "you
+      // read a rule and then acted", asserting an action nothing observes since #85 retired
+      // interception. The claim is gone either way — but this fixture is `readAndActed`, which
+      // writes an `actionSha256`, so the ledger CAN speak for it and the signal says the question is
+      // owed. The unknown-action wording is asserted on its own fixture below; asserting it here
+      // would have pinned the over-generalisation instead.
       expect(signal).not.toContain("and then acted");
-      expect(signal).toContain("Whether an action followed is not recorded");
+      expect(signal).toContain("record an action and owe the question");
       // BOTH tools are still named on this response — on the `instruction` field that now ships
       // beside the key on every lookup, rather than in the signal that used to be the only thing
       // saying either. The naming had to survive that move, not be dropped by it: the ask is its own

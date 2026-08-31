@@ -1125,6 +1125,27 @@ export function momentsOwingAQuestion(
 }
 
 /**
+ * Which of the given moments carry an action on the record.
+ *
+ * TAKES THE IDS RATHER THAN RE-QUERYING A WINDOW, deliberately. The caller already holds the
+ * oldest-N it is about to name; asking "which of THESE" cannot disagree with that list, while a
+ * second `ORDER BY at LIMIT ?` narrowed to action-bearing rows would return a different window and
+ * the two could not be partitioned against each other.
+ *
+ * EMPTY IS THE ORDINARY ANSWER. Nothing has written an action since #85 retired interception, so
+ * this is nonempty only on a store that predates it or folded a spool that did — and on exactly
+ * those, a missing question is real work rather than an unanswerable one.
+ */
+export function momentsWithRecordedAction(db: StoragePort, momentIds: string[]): Set<string> {
+  if (momentIds.length === 0) return new Set();
+  const placeholders = momentIds.map(() => "?").join(", ");
+  const rows = db
+    .prepare(`SELECT moment_id FROM governed_moments WHERE action_sha256 IS NOT NULL AND moment_id IN (${placeholders})`)
+    .all(...momentIds) as Array<{ moment_id: string }>;
+  return new Set(rows.map((row) => row.moment_id));
+}
+
+/**
  * Applies an outcome to whatever moment recorded the same host tool call.
  *
  * Returns false when no moment carries that id — which is a FINDING, not an error: the caller turns
