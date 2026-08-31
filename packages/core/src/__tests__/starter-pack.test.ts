@@ -178,10 +178,16 @@ describe("the doc and the data say the same thing", () => {
     expect(bullets.length).toBeGreaterThan(0);
     expect(bullets, "install.md and starter-pack.json hold a different number of entries").toHaveLength(pack.entries.length);
 
+    // MATCHED BULLETS ARE CONSUMED, so the pairing is one-to-one rather than merely total. A
+    // non-consuming lookup lets two identical entries both resolve to the same bullet: the counts
+    // still agree, the unmatched bullet is never examined, and the data has silently dropped one of
+    // the six the playbook is authoritative for.
+    const unmatched = [...bullets];
     for (const entry of pack.entries) {
       const content = entry.content.replace(/\s+/g, " ");
-      const bullet = bullets.find((b) => b.content === content);
-      expect(bullet, `no bullet in install.md carries: ${content.slice(0, 48)}`).toBeDefined();
+      const at = unmatched.findIndex((b) => b.content === content);
+      expect(at, `no unmatched bullet in install.md carries: ${content.slice(0, 48)}`).toBeGreaterThanOrEqual(0);
+      const [bullet] = unmatched.splice(at, 1);
       expect(bullet!.species, `species differs for: ${content.slice(0, 40)}`).toBe(entry.species);
       expect(bullet!.reason, `reason differs for: ${content.slice(0, 40)}`).toBe(entry.reason.replace(/\s+/g, " "));
       // THE PAIRING, not the multiset. Swapping two rules' stage headers changes neither the set of
@@ -189,6 +195,8 @@ describe("the doc and the data say the same thing", () => {
       expect(bullet!.stage, `stage differs for: ${content.slice(0, 40)}`).toBe(entry.stage);
       expect(bullet!.severity, `severity differs for: ${content.slice(0, 40)}`).toBe(entry.severity);
     }
+    // Every bullet spoken for. With the count equal above, this is what makes it a bijection.
+    expect(unmatched.map((b) => b.content), "install.md carries a pack entry the data does not").toEqual([]);
   });
 
   it("the arguments the prose prescribes are the ones the data carries", () => {
