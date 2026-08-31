@@ -7697,32 +7697,33 @@ export class MonetCore {
       // why no "and again for the others" clause is appended — multiplicity is the detail's job
       // here exactly as it is for the pair flag below, and the remedy stays one runnable call.
       //
-      // `decision` IS NAMED AND NEVER CHOSEN. It is a human's ruling on the dispute — no read on
-      // this store derives it — so the remedy carries the options as prose rather than as
-      // `decision="…"` pairs a parser would silently adopt (see `withdrawalRemedy`). Naming a
-      // parameter the caller must decide is not the placeholder round 1 banned: a placeholder is an
-      // argument nobody can supply, and this is the one argument only the caller can.
+      // `decision` IS NAMED AND NEVER CHOSEN, AND ITS VALUES ARE NOT ENUMERATED EITHER. The remedy
+      // supplies the ADDRESSING arguments — which contradiction, in which circle — and stops. Which
+      // verdict applies is the caller's judgment against `memory_resolve`'s own contract.
       //
-      // …AND `accept-new` IS QUALIFIED, because the three are NOT equally runnable from the two
-      // arguments above (Codex round 1). `resolveContradiction`'s ambiguous-accept-new guard throws
-      // when a real correction has SEVERAL live priors and the caller named neither a reconciled
-      // `body` nor a `contradictedObservationId`: nothing records which claim was contradicted, so
-      // superseding any of them would be a guess. Measured: on a concept with two live priors,
-      // `accept-new` with only the rendered arguments fails with "cannot resolve this contradiction
-      // with accept-new and no reconciled body", while `keep-current` and `dismiss` both succeed.
-      // An unqualified list promised a call that does not run — this branch's own defect, one round
-      // later, in the sentence it just fixed.
+      // WHY THE LIST CAME OUT, recorded because re-adding it will look like an improvement. Two
+      // review rounds each found a condition under which the enumerated verdicts do not apply, and
+      // both are state this method cannot see:
+      //   round 1 — `accept-new` on a concept with SEVERAL live priors throws unless the caller also
+      //             brings a reconciled `body` or a `contradictedObservationId`; measured failing
+      //             with "accept-new and no reconciled body" while the other two succeeded.
+      //   round 2 — a contradiction naming an observation that does not exist, belongs to another
+      //             concept, or has since been superseded is refused for `accept-new` AND
+      //             `keep-current` (the correcting-observation guard above), leaving only `dismiss`.
+      //             `flagContradiction` validates none of that — its own guard comment says so — and
+      //             `memory_flag_contradiction` passes `observationId` straight through, so the row
+      //             is reachable through the ordinary tool surface.
+      // Each round narrowed a static sentence against dynamic state, and nothing suggested round 3
+      // was the last condition. The alternative — computing the runnable set here — is worse: it
+      // would restate `resolveContradiction`'s guards as a parallel implementation of a decision
+      // this method does not drive, which drifts silently and drifts toward looking right.
       //
-      // THE BODY IS NAMED UNCONDITIONALLY rather than "when several live priors exist", and that is
-      // deliberate over-instruction rather than imprecision. `body` is accepted on EVERY accept-new
-      // — with one live prior it is optional and simply recorded — so "accept-new with a reconciled
-      // body" is a call that runs in every case, whereas a conditional would ask the caller to first
-      // count live priors, which no payload here reports. Name a path that runs.
-      //
-      // `keep-current` IS LEFT UNQUALIFIED ON PURPOSE. It supersedes the correction, which the row
-      // already names, so it needs no body at any prior count — measured above. Its own guard fires
-      // only when NO live prior predates the correction, and whether that state is reachable through
-      // the public surfaces was not established, so nothing is claimed about it here.
+      // IT IS THE SAME REASONING AS NOT WRITING `decision="…"`, carried one step: a parser must not
+      // adopt a verdict for the human, and neither must a sentence that lists the verdicts as though
+      // they were interchangeable. If we cannot choose the value, we should not enumerate the values.
+      // Naming a parameter the caller must decide is not the placeholder round 1 banned: a
+      // placeholder is an argument nobody can supply, and this is the one argument only the caller
+      // can — and `memory_resolve`'s own contract is where the conditions live and stay current.
       //
       // ABSENT RATHER THAN INVENTED if the id somehow is not there. Unreachable — the id and the
       // count come out of one statement — but the contract `withdrawVia` documents is that a
@@ -7736,7 +7737,7 @@ export class MonetCore {
               "memory_resolve",
               [["contradictionId", marks.openContradictionId]],
               row.circle,
-              `a decision of "accept-new" (with a reconciled body), "keep-current" or "dismiss"`,
+              "a decision",
             ),
       });
     }

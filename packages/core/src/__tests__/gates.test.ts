@@ -10190,11 +10190,21 @@ describe("MCP surface", () => {
     expect(refused.text).toBe(
       `cannot retire ${id}: it carries 1 open contradiction(s), which retiring would silently ` +
       `dismiss rather than answer — withdraw it through memory_resolve with ` +
-      `contradictionId="${contradictionId}", circle="default" and a decision of ` +
-      `"accept-new" (with a reconciled body), "keep-current" or "dismiss"`,
+      `contradictionId="${contradictionId}", circle="default" and a decision`,
     );
-    // NO VERDICT IS PARSEABLE OUT OF IT — the property the prose form exists for.
+    // NO VERDICT IS PARSEABLE OUT OF IT — and none is NAMED either. The remedy supplies the
+    // addressing arguments and stops; which verdict applies depends on state this blocker cannot
+    // see (two review rounds found two such conditions), so it is left to memory_resolve's own
+    // contract. Re-adding a list will look like an improvement, and these three lines are what
+    // says otherwise.
     expect(refused.text).not.toContain("decision=");
+    // Scoped to the REMEDY, not the whole refusal: the blocker's own detail legitimately contains
+    // the word "dismiss" ("which retiring would silently dismiss rather than answer"), and that is
+    // a description of what retiring would do, not an instruction naming a verdict.
+    const remedyClause = refused.text.slice(refused.text.indexOf("withdraw it through"));
+    for (const verdict of ["accept-new", "keep-current", "dismiss"]) {
+      expect(remedyClause, `remedy must not enumerate verdicts, but names "${verdict}"`).not.toContain(verdict);
+    }
     // THE POINT OF THIS ONE: retireConcept dismisses open contradictions itself, so without the
     // guard the dispute would have been closed by making its subject vanish. It is still open.
     expect(c.countOpenContradictionsForConcept(id)).toBe(1);
@@ -10279,8 +10289,7 @@ describe("MCP surface", () => {
         action: "error",
         error: `cannot retire ${disputedId}: it carries 1 open contradiction(s), which retiring would ` +
           `silently dismiss rather than answer — withdraw it through memory_resolve with ` +
-          `contradictionId="${contradictionId}", circle="default" and a decision of ` +
-          `"accept-new" (with a reconciled body), "keep-current" or "dismiss"`,
+          `contradictionId="${contradictionId}", circle="default" and a decision`,
       },
       { id: freeId, action: "retired" },
     ]);
@@ -11201,6 +11210,59 @@ describe("MCP surface", () => {
     return args;
   };
 
+  /**
+   * THE CLASS THAT ENDED THE ENUMERATION (Codex round 2 on #132).
+   *
+   * `memory_flag_contradiction` passes `observationId` straight to `flagContradiction`, which
+   * validates the CONCEPT and never the observation — its own guard comment in `resolveContradiction`
+   * says as much. So an ordinary tool call opens a contradiction naming an observation that does not
+   * exist (or belongs elsewhere, or is superseded later), and the correcting-observation guard then
+   * refuses BOTH `accept-new` and `keep-current`, leaving `dismiss` as the only verdict that applies.
+   *
+   * WHY THIS TEST EXISTS RATHER THAN A THIRD QUALIFIER. Round 1 qualified `accept-new` with a body;
+   * this row is a whole class where two of three are unavailable outright. The remedy no longer
+   * enumerates verdicts at all, so what has to be proved is that the sentence stays HONEST here —
+   * it promises the addressing arguments, and those replay — while making no claim about which
+   * verdict works. A remedy that had listed the three would be lying on this fixture.
+   */
+  it("the remedy stays honest for a contradiction where only one verdict applies — it names the address, not the verdict", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const id = (await call("memory_store", { content: "The metrics service listens on 8080.", circle: QUOTED_CIRCLE })).json.conceptId as string;
+    // AN UNVALIDATED observationId THROUGH THE ORDINARY SURFACE — accepted, which is the premise.
+    const flagged = await call("memory_flag_contradiction", {
+      conceptId: id, detail: "conflicts with the runbook", observationId: "no-such-observation", circle: QUOTED_CIRCLE,
+    });
+    expect(flagged.isError, flagged.text).toBe(false);
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["open-contradiction"]);
+
+    const refused = await call("memory_retire", { id, circle: QUOTED_CIRCLE });
+    expect(refused.isError).toBe(true);
+    const args = remedyArgs(refused.text, "memory_resolve");
+    expect(args, refused.text).toEqual({ contradictionId: flagged.json.contradictionId, circle: QUOTED_CIRCLE });
+
+    // TWO OF THE THREE ARE UNAVAILABLE ON THIS ROW — measured, and the reason a list would lie here.
+    for (const decision of ["accept-new", "keep-current"] as const) {
+      const out = await call("memory_resolve", { ...args, decision, body: "reconciled" });
+      expect(out.isError, `${decision} unexpectedly succeeded: ${out.text}`).toBe(true);
+      expect(out.text).toContain("does not belong to concept");
+    }
+    // …and the refusal never told the caller otherwise: it names no verdict at all.
+    const remedyClause = refused.text.slice(refused.text.indexOf("withdraw it through"));
+    expect(remedyClause).not.toContain("accept-new");
+    expect(remedyClause).not.toContain("keep-current");
+
+    // THE ADDRESSING ARGUMENTS STILL CARRY THE CALL — replayed with the one verdict that applies,
+    // which the caller brings from memory_resolve's contract rather than from this sentence.
+    const dismissed = await call("memory_resolve", { ...args, decision: "dismiss" });
+    expect(dismissed.isError, `remedy replayed as ${JSON.stringify(args)} -> ${dismissed.text}`).toBe(false);
+    expect(c.retirementBlockers(id)).toEqual([]);
+    expect((await call("memory_retire", { id, circle: QUOTED_CIRCLE })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
   it("the ratification refusal's remedy can be replayed verbatim for a principle homed OUTSIDE the session circle", async () => {
     const c = core();
     const { call, client } = await harness(c);
@@ -11288,9 +11350,9 @@ describe("MCP surface", () => {
     // …and it changed nothing: the dispute is still open and still blocks.
     expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["open-contradiction"]);
 
-    // THE REMEDY FOLLOWED VERBATIM — the body is what the sentence tells the caller to bring, and
-    // this is the assertion that the sentence is honest.
-    expect(refused.text).toContain('"accept-new" (with a reconciled body)');
+    // THE ADDRESSING ARGUMENTS CARRY THE CALL THROUGH — which is all the remedy promises. The
+    // verdict and the body are the caller's own, brought from memory_resolve's contract rather than
+    // from this sentence, and the replay still has to run.
     const resolved = await call("memory_resolve", {
       ...args, decision: "accept-new", body: "The metrics service listens on 9090.",
     });
