@@ -309,8 +309,16 @@ and the record should say so:
   prevents symptom patches that return.
 - **Rule at "commit changes" (advisory)** — *If a secret, key, or token is about to enter a
   file or commit, stop and say so.* Reason: prevents credential leakage into history.
+- **Rule at "onboard a new project circle" (advisory)** — *Seed a new circle's baseline in
+  one batch of grouped questions rather than one correction at a time, and store only what
+  the user's standing files do not already cover.* Reason: an unseeded circle costs the user
+  months of re-explaining the same norms on every new project.
 
-A fresh store has no stages; declaring the first rule at a moment brings its stage with it.
+The seeding entry batches a *later* moment — the user's first session in a new circle — so
+this review still runs one entry at a time.
+
+A fresh store has no stages; declaring the first rule at a moment brings its stage with it,
+which is also how that entry ships the `onboard a new project circle` stage it names.
 Principles need a delivery surface. Where the host reads a standing file, register it first —
 `monet materialize add <path> --global`, creating the file if this user never had one — then
 run `monet materialize` and confirm the `<!-- BEGIN monet:skeleton -->` block landed (same
