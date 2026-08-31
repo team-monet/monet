@@ -10036,8 +10036,12 @@ describe("MCP surface", () => {
     // present — so neither can drift back without this test noticing.
     expect(refused.text).toBe(
       `cannot retire ${id}: it entered by declaration, and only the declaration surface can ` +
-      `withdraw one — withdraw it through memory_declare with withdraw="${id}"`,
+      `withdraw one — withdraw it through memory_declare with withdraw="${id}" and circle="default"`,
     );
+    // THE CIRCLE TRAVELS WITH THE ID (Codex round 1 on #131). An id-only remedy resolves to the
+    // caller's SESSION circle when replayed, which is "concept not found" for every declared rule
+    // homed anywhere else — see the cross-circle replay test below for the failure it produced.
+    expect(refused.text).toContain('circle="default"');
     expect(refused.text).toContain("withdraw it through");
     // NO PRIVATE-REPO POINTER. The sentence used to cite `monet-core#200`, a number in a repository
     // the reader of this refusal cannot open; the public issue lives in the source comment instead.
@@ -10891,8 +10895,8 @@ describe("MCP surface", () => {
       expect(declined.isError).toBe(true);
       expect(declined.text).toBe(
         `cannot withdraw ${id}: it carries no declaration binding, so there is no declaration to ` +
-        `withdraw and nothing was changed — memory_retire is the exit for a memory that entered on ` +
-        `the agent's own authority`,
+        `withdraw and nothing was changed — memory_retire("${id}", "default") is the exit for a ` +
+        `memory that entered on the agent's own authority`,
       );
       // NOTHING CHANGED — the sentence the refusal makes, asserted rather than trusted.
       expect((await call("memory_fetch", { id })).isError).toBe(false);
@@ -10917,6 +10921,101 @@ describe("MCP surface", () => {
     expect(refused.text).toBe(`concept not found: ${id}`);
     expect((await call("memory_declare", { withdraw: "no-such-concept" })).text).toBe("concept not found: no-such-concept");
     expect(c.stageLookup({ stage: "opening a pr" }).rules.map((rule) => rule.conceptId)).toContain(id);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE REMEDY IS FOLLOWED VERBATIM, ACROSS CIRCLES — Codex round 1 on PR #131 (P2).
+   *
+   * `retirementBlockers` renders the withdrawal path from the concept id alone, and the withdrawal
+   * handler defaults an omitted `circle` to the SESSION circle. So for a declared rule homed
+   * anywhere but the caller's own circle, a caller who did exactly what the refusal said hit
+   * `concept not found` — the scope gate answering about a circle the remedy never mentioned. Same
+   * defect family as #122/#127: a payload naming an id without saying which circle it belongs to.
+   *
+   * THE ARGUMENTS ARE PARSED OUT OF THE SENTENCE, NOT HAND-WRITTEN. A test that constructs the call
+   * itself is testing the tool, not the remedy — it passes on a sentence that names nothing at all.
+   * Every `key=<serialized value>` pair the refusal offers becomes an argument, and whatever the
+   * refusal omits is simply absent from the call, exactly as it would be for a reader.
+   *
+   * THE CONCEPT'S OWN CIRCLE IS THE ONE THAT MATTERS, deliberately not the binding's: the scope gate
+   * compares `circleOf(id)` (`concepts.circle`), and a rule's binding may legally carry `'*'` while
+   * its concept lives in an ordinary circle. Naming the binding's breadth marker here would produce
+   * a remedy that resolves to the session circle and fails all over again.
+   */
+  it("the declaration refusal's remedy can be replayed verbatim for a rule homed OUTSIDE the session circle", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    // Homed in another circle; the session circle stays "default" throughout.
+    const declared = await call("memory_declare", {
+      species: "rule", stage: "opening a pr", content: "Say what changed and why.",
+      scope: "domain", declaredBy: "john", circle: "project-a",
+    });
+    expect(declared.isError).toBe(false);
+    const id = declared.json.conceptId as string;
+    expect(c.circleOf(id)).toBe("project-a"); // the premise
+    // …and the caller's own session circle is somewhere else: the default, which is what an omitted
+    // `circle` on the replayed call below resolves to.
+    expect(c.overview("default").counts.concepts).toBe(0);
+
+    const refused = await call("memory_retire", { id, circle: "project-a" });
+    expect(refused.isError).toBe(true);
+    const remedy = /withdraw it through memory_declare (.*)$/.exec(refused.text)?.[1];
+    expect(remedy, refused.text).toBeDefined();
+
+    const args: Record<string, unknown> = {};
+    for (const [, key, serialized] of remedy!.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) {
+      args[key] = JSON.parse(serialized) as unknown;
+    }
+    // THE REPLAY IS THE ASSERTION. On a remedy that names no circle this is `concept not found`.
+    const replayed = await call("memory_declare", args);
+    expect(replayed.isError, `remedy "${remedy}" replayed as ${JSON.stringify(args)} -> ${replayed.text}`).toBe(false);
+    expect(replayed.json).toMatchObject({ circle: "project-a", action: "withdrawn", conceptId: id });
+
+    // …and the remedy really did carry both halves, rather than working by accident.
+    expect(args).toEqual({ withdraw: id, circle: "project-a" });
+    expect(c.ruleBinding(id)!.origin).toBe("declaration");
+    expect(c.stageLookup({ stage: "opening a pr", circle: "project-a" }).rules.map((rule) => rule.conceptId)).not.toContain(id);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE REMEDY IS A CALL, SO IT MUST PARSE AS ONE FOR EVERY NAME THE TOOL ACCEPTS — the companion to
+   * the replay above, and the same promise `memory_restore`'s own suggestion already makes (its
+   * round-2 fix). `circle` is `z.string().max(CIRCLE_NAME_MAX_CHARS)` and nothing anywhere restricts
+   * its characters, so interpolating one between quotes produces a remedy that ends where the name's
+   * own quote falls — unparseable for exactly the caller who cannot guess the escaping either.
+   */
+  it("the declaration remedy stays well-formed for a circle name carrying a quote and a backslash", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const circle = `pro"ject\\x`;
+    const declared = await call("memory_declare", {
+      species: "rule", stage: "opening a pr", content: "Say what changed and why.",
+      scope: "domain", declaredBy: "john", circle,
+    });
+    expect(declared.isError).toBe(false); // the name is ACCEPTED — measured, not assumed
+    const id = declared.json.conceptId as string;
+
+    const refused = await call("memory_retire", { id, circle });
+    const remedy = /withdraw it through memory_declare with (.*)$/.exec(refused.text)?.[1];
+    expect(remedy, refused.text).toBeDefined();
+    // WELL-FORMEDNESS ASSERTED BY PARSING, not by matching the string this method happens to build:
+    // the interpolated version throws here, or silently parses to the truncated name.
+    const args: Record<string, unknown> = {};
+    for (const [, key, serialized] of remedy!.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) {
+      args[key] = JSON.parse(serialized) as unknown;
+    }
+    expect(args).toEqual({ withdraw: id, circle });
+
+    // …and REPLAYED, because a remedy that parses but does not work is the same dead end.
+    const withdrawn = await call("memory_declare", args);
+    expect(withdrawn.isError, withdrawn.text).toBe(false);
+    expect(withdrawn.json).toMatchObject({ circle, action: "withdrawn", conceptId: id });
 
     await client.close();
     c.close();

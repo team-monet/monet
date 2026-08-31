@@ -7490,10 +7490,34 @@ export class MonetCore {
       // AFTER a successful withdrawal still reports this blocker, exactly as it does for any other
       // already-retired concept (see `retireIfUnblocked`'s already-retired short-circuit, which is
       // why that costs nobody anything).
+      //
+      // AND IT NAMES THE CIRCLE, UNCONDITIONALLY (Codex round 1 on #131, P2). The withdrawal handler
+      // defaults an omitted `circle` to the SESSION circle, and its scope gate then answers
+      // `not-in-circle` — rendered as "concept not found" — so an id-only remedy failed outright for
+      // any declared rule homed outside the caller's own circle, which is the ordinary arrangement in
+      // a real store. Same defect family as #122/#127, and the same fix `memory_retire`'s own
+      // `memory_restore(...)` suggestion already carries: the pair travels together.
+      //
+      // NOT "ONLY WHEN IT DIFFERS": this method cannot see the caller's session circle — it is a
+      // question about a concept, asked from anywhere — so a conditional would have to GUESS which
+      // circle the reader is sitting in and would omit the half that matters exactly when it is
+      // wrong. The restore precedent is unconditional for the same reason.
+      //
+      // THE CONCEPT'S CIRCLE, NEVER THE BINDING'S. The gate compares `circleOf(id)`, which reads
+      // `concepts.circle`; a rule's binding may legally carry the breadth marker '*' while its
+      // concept lives in an ordinary circle (RuleBindingRow.circle), and a remedy naming '*' would
+      // resolve straight back to the session circle and fail again.
+      //
+      // BOTH ARGUMENTS SERIALIZED, NEVER INTERPOLATED — `memory_retire`'s own round-2 fix, applied
+      // to the same kind of sentence. A circle name is only length-bounded (CIRCLE_NAME_MAX_CHARS)
+      // and no charset rule anywhere accepts or rejects one, so a name carrying a quote or a
+      // backslash rendered a remedy that ends where the name's own quote falls — unparseable for
+      // exactly the caller who cannot guess the escaping either. For a plain uuid and a plain circle
+      // name this is byte-identical to the interpolation it replaces.
       blockers.push({
         code: "declaration",
         detail: "it entered by declaration, and only the declaration surface can withdraw one",
-        withdrawVia: `memory_declare with withdraw="${conceptId}"`,
+        withdrawVia: `memory_declare with withdraw=${JSON.stringify(conceptId)} and circle=${JSON.stringify(row.circle)}`,
       });
     }
     // THE CURRENT VERDICT, NEVER THE HISTORY (review fix — round 1). This used to COUNT

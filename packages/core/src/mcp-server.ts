@@ -1436,11 +1436,23 @@ export function registerMonetCoreTools(
           // NOT A NO-OP AND NOT A SUCCESS. This verb's subject is the declaration itself, so a
           // concept carrying none is told exactly that — retiring it anyway would make the
           // sovereignty surface a second `memory_retire` that skips every refusal by construction.
+          //
+          // AND THE REDIRECT IS A CALL, CIRCLE INCLUDED (Codex round 1 on #131, P2 — its sibling).
+          // This used to name the tool alone, and `memory_retire` scopes by circle exactly as this
+          // does: a caller who followed it with a bare `memory_retire(id)` for a concept homed
+          // outside their session circle got "concept not found" one step later. Weaker than the
+          // blocker's own remedy — reaching this branch means the scope gate already passed, so the
+          // caller has just named the right circle — but it is the same trap, and repeating the pair
+          // costs a serialization. Both arguments serialized for the retire acknowledgement's own
+          // round-2 reason; the id is the CLIPPED one, because `err()` carries no size ceiling of
+          // its own (the round-3 reason `shownId` exists) and a bounded refusal outranks a perfect
+          // suggestion — every id that can reach this branch is a real concept id, far under the cap.
           if (outcome.outcome === "not-declared") {
             return err(
               `cannot withdraw ${shownId}: it carries no declaration binding, so there is no declaration ` +
-              `to withdraw and nothing was changed — memory_retire is the exit for a memory that entered ` +
-              `on the agent's own authority`,
+              `to withdraw and nothing was changed — memory_retire(${JSON.stringify(shownId)}, ` +
+              `${JSON.stringify(homeCircle)}) is the exit for a memory that entered on the agent's own ` +
+              `authority`,
             );
           }
           // THE OTHER THREE BLOCKERS STILL REFUSE, rendered by the same formatter memory_retire uses
