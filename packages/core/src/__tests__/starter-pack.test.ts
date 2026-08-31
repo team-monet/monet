@@ -136,6 +136,12 @@ describe("the starter pack declares cleanly on a fresh install", () => {
 });
 
 describe("the doc and the data say the same thing", () => {
+  /** The run of pack bullets, between the two headings that bracket the list. */
+  function packBullets(): string[] {
+    const section = install.slice(install.indexOf("If they have nothing — offer the starter pack"), install.indexOf("## Phase 6"));
+    return section.split("\n").filter((line) => /^- \*\*(Principle|Rule at )/.test(line));
+  }
+
   it("every entry in the data appears in the playbook", () => {
     for (const entry of pack.entries) {
       // Collapse the doc's hard wrapping before matching, so a rewrap is not a failure.
@@ -145,10 +151,30 @@ describe("the doc and the data say the same thing", () => {
     }
   });
 
+  it("every rule bullet names the stage and severity the data carries", () => {
+    // THE PART THE OTHER TWO MISS. Content and reason are compared above, and the shared arguments
+    // below, but `stage` and `severity` live per-entry on the bullet's own first line. Change a
+    // stage in the data alone and everything else stays green: the behavioural tests declare
+    // happily at any stage, and nothing compares it to the prose — the same green-that-cannot-fail
+    // this whole file exists against.
+    const bullets = packBullets();
+    const fromDoc = bullets
+      .map((line) => /^- \*\*Rule at "([^"]+)" \((advisory|blocking)\)\*\*/.exec(line))
+      .filter((m): m is RegExpExecArray => m !== null)
+      .map((m) => `${m[1]}/${m[2]}`)
+      .sort();
+    const fromData = pack.entries
+      .filter((e) => e.species === "rule")
+      .map((e) => `${e.stage}/${e.severity}`)
+      .sort();
+
+    // PRESENT FIRST: an empty parse would otherwise satisfy an equality against an empty list.
+    expect(fromDoc.length).toBe(pack.entries.filter((e) => e.species === "rule").length);
+    expect(fromDoc).toEqual(fromData);
+  });
+
   it("the playbook has no pack entry the data does not carry", () => {
-    // The pack list is the run of bullets between the two headings that bracket it.
-    const section = install.slice(install.indexOf("If they have nothing — offer the starter pack"), install.indexOf("## Phase 6"));
-    const bullets = section.split("\n").filter((line) => /^- \*\*(Principle|Rule at )/.test(line));
+    const bullets = packBullets();
     expect(bullets).toHaveLength(pack.entries.length);
     // AND THE SPLIT MATCHES, not just the count — two principles and four rules, so a rule silently
     // rewritten as a principle in one file and not the other is caught.
