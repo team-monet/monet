@@ -160,13 +160,14 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
 const MOMENT_ID_MAX_CHARS = 36;
 
 /**
- * How many owed moments one ask signal may name.
+ * How many outstanding moments one ask signal may name.
  *
  * A DELIVERY BOUND, NOT A THRESHOLD ON THE BACKLOG. Nothing has measured how often a real store
  * accumulates unasked moments, so no number here could say when a backlog is "too large" — and this
  * one does not try. It bounds what reaches a model's context (8 ids is roughly 300 characters);
- * the TRUE total is reported by the conformance counts, which are not capped. If more are owed than
- * this names, the rest are named by the next signal.
+ * the TRUE total is reported by the conformance counts, which are not capped. If more are outstanding
+ * than this names, the rest are named by the next signal — subject to #147, since the list is
+ * oldest-first and an entry nobody can honestly clear never leaves it.
  */
 const ASK_SIGNAL_MAX_MOMENTS = 8;
 
@@ -176,14 +177,15 @@ const ASK_SIGNAL_MAX_MOMENTS = 8;
  *
  * WHO CONSUMES IT — the agent, and nobody else. ON WHICH TURN — every `stage_lookup` that returns a
  * `momentId`, including the first of a session. WHAT BREAKS WITHOUT IT — the response hands over a
- * key with nothing saying what to do with it. The ask signal cannot cover this: it fires only once a
- * moment already owes a question, so a first lookup carries the key and no instruction at all, and
+ * key with nothing saying what to do with it. The ask signal cannot cover this: it fires only once an
+ * earlier moment is outstanding, so a first lookup carries the key and no instruction at all, and
  * no standing text mentions this loop either.
  *
- * UNCONDITIONAL, WHICH THE SIGNAL IS NOT. The signal is debt-driven and names ids; this says what
- * the ids are for. That split is why the two do not overlap — the signal states a fact (these
- * moments still owe the question), this states the instruction (what asking and recording means),
- * and neither repeats the other.
+ * UNCONDITIONAL, WHICH THE SIGNAL IS NOT. The signal is backlog-driven and names ids; this says what
+ * the ids are for. That split is why the two do not overlap — the signal states a fact (no question
+ * was put at these moments), this states the instruction (what asking and recording means), and
+ * neither repeats the other. Note the fact and not more: whether an action followed any of them is
+ * unrecorded, so they are candidates rather than mandatory asks.
  *
  * IT ASKS WHETHER THE ACTION FOLLOWED THE RULE, never whether the rule CAUSED it — causation is
  * unobservable and is not what this measures. Same discipline as the ask signal's own wording.
@@ -922,14 +924,17 @@ export function registerMonetCoreTools(
    * demands:
    *
    *   WHO CONSUMES IT — the agent, and nobody else. It is an instruction, not data for a reader.
-   *   ON WHICH TURN — the next `stage_lookup` response after a moment was read and then acted on,
-   *     and NO OTHER TOOL'S. Not at session start (the debt does not exist yet) and not on a timer.
-   *   WHAT BREAKS WITHOUT IT — the agent cannot know it owes a question. Nothing else is in a
-   *     position to tell it: the read is recorded inside the store, and the agent's own transcript
-   *     shows it fetched rules, never that a question is outstanding. Without the signal, `not
-   *     asked` stops meaning "the agent failed to ask" and starts meaning "the agent was never
-   *     told" — one number covering a defect and an impossibility, which is the precise conflation
-   *     this whole rebuild exists to remove.
+   *   ON WHICH TURN — the next `stage_lookup` response after rules were delivered at a moment with
+   *     no question put, and NO OTHER TOOL'S. Not at session start (nothing is outstanding yet) and
+   *     not on a timer.
+   *   WHAT BREAKS WITHOUT IT — the agent cannot know a question may be outstanding. Nothing else is
+   *     in a position to tell it: the read is recorded inside the store, and the agent's own
+   *     transcript shows it fetched rules, never that a moment is still open. Without the signal,
+   *     `not asked` stops meaning "no question was put" and starts meaning "the agent was never
+   *     told" — one number covering a live candidate and an impossibility, which is the precise
+   *     conflation this whole rebuild exists to remove. What the signal does NOT settle is whether
+   *     an action followed; that is `notAskedWithAction`'s subset, and everywhere else the agent
+   *     is the only party who knows.
    *
    * ONE SURFACE, AND THAT IS THE CORRECTION THIS ROUND MAKES. It used to ride EVERY tool response,
    * which spent context on `memory_fetch` and `memory_checkpoint` replies where the agent has no
@@ -942,7 +947,7 @@ export function registerMonetCoreTools(
    * outcome has landed, and a call's outcome is written after its handler has already returned — so
    * a `stage_lookup` moment is never named on its own response, only on the next one. That is
    * acceptable BECAUSE the response now carries its own `momentId`: the agent holds the key from
-   * the first turn, and this signal is the backstop for a debt it did not clear, not the only way
+   * the first turn, and this signal is the backstop for a moment it did not close, not the only way
    * it learns the key.
    *
    * IT NAMES MOMENTS; IT NEVER CARRIES THEIR CONTENT. Ids, and the fact that they are outstanding —
@@ -960,10 +965,12 @@ export function registerMonetCoreTools(
    * an agent defect, is verbatim the conflation between "ignored the signal" and "was never told"
    * that these counts exist to remove.
    *
-   * So delivery is never assumed. The moment stays named until it stops owing a question, which the
-   * agent clears by asking. The debt is small and self-clearing by construction — only moments that
-   * were read and then acted on are ever in it — so this is a persistent notice rather than a
-   * standing banner, and it is bounded by the cap below either way.
+   * So delivery is never assumed. A moment stays named until a question is put about it, which is
+   * the only thing that removes one. CANDIDATES, NOT DEBTS: only moments that delivered rules are
+   * ever in the list, and whether an action followed any of them is unrecorded, so an entry is a
+   * question worth considering rather than one owed. It is a persistent notice rather than a
+   * standing banner, and bounded by the cap below either way — see #147 for what follows from an
+   * entry that can never be honestly cleared.
    *
    * SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so this appends nothing
    * at all on the overwhelming majority of responses.
@@ -979,7 +986,7 @@ export function registerMonetCoreTools(
     const fresh = owed.slice(0, ASK_SIGNAL_MAX_MOMENTS);
     if (fresh.length === 0) return "";
     const ids = fresh.join(", ");
-    const noun = fresh.length === 1 ? "action" : "actions";
+    const noun = fresh.length === 1 ? "moment" : "moments";
     // A FACT, NOT A SECOND COPY OF THE INSTRUCTION. It used to carry both — what is owed AND what to
     // do about it — because it was the only thing on any response that said either. The response's
     // own `instruction` field now carries the what-to-do on every lookup that has a `momentId`, so
@@ -992,8 +999,34 @@ export function registerMonetCoreTools(
     // exposes; this rides as a later content item, which some drop. The half that can go missing is
     // the id list, never the instruction — the reverse split would lose the what-to-do entirely.
     //
-    // The wording still says the action FOLLOWED a rule it read, never that the rule caused it.
-    return `Monet: you read a rule and then acted, for ${fresh.length} ${noun} (${ids}) — each still owes that question.`;
+    // IT NAMES WHAT WAS READ, NEVER WHAT WAS DONE. It used to say "you read a rule and then acted",
+    // which asserted an action nothing here observes: #85 retired interception, so nothing written
+    // since carries one, and a lookup made to READ rules lands in this list identically to one that
+    // governed a real act. Saying so is what stops an agent asking the user to adjudicate a
+    // non-event — the question is only worth putting where something actually followed.
+    //
+    // EXCEPT WHERE THE LEDGER KNOWS, and it does on a store that predates #85 or folded a spool that
+    // did. Those rows carry an `action_sha256`, `notAskedWithAction` already counts them, and on
+    // them the question is owed rather than optional. Telling the agent to decide from context there
+    // would have it skip questions the record can answer — the same over-generalisation, one surface
+    // on, that put the all-clear over real debt. Partitioned rather than qualified, because an agent
+    // meeting eight bare uuids after a compaction cannot apply a qualifier it has no context for.
+    let acted: Set<string>;
+    try {
+      acted = core.momentsWithRecordedAction(fresh);
+    } catch {
+      acted = new Set();
+    }
+    if (acted.size > 0) {
+      const withAction = fresh.filter((id) => acted.has(id));
+      const rest = fresh.filter((id) => !acted.has(id));
+      const restClause =
+        rest.length === 0
+          ? ""
+          : ` For ${rest.length} other${rest.length === 1 ? "" : "s"} (${rest.join(", ")}) whether an action followed is not recorded — ask where something did.`;
+      return `Monet: rules were read at ${fresh.length} ${noun} not yet asked about. ${withAction.length} record an action and owe the question (${withAction.join(", ")}).${restClause}`;
+    }
+    return `Monet: rules were read at ${fresh.length} ${noun} not yet asked about (${ids}). Whether an action followed is not recorded — ask about the ones where something did.`;
   }
 
   function wrapSuccess(
@@ -1039,7 +1072,7 @@ export function registerMonetCoreTools(
     //
     // AND ON THE SAME CONDITION AS THE KEY (review fix — Codex round 2). The two halves were split
     // deliberately: the response's `instruction` says what asking means and names the two tools that
-    // take a momentId, and this says WHICH earlier moments still owe it. That split is what keeps
+    // take a momentId, and this says WHICH earlier moments have no question put. That split is what keeps
     // either from being the other's duplicate — and it is exactly what stops either from standing
     // alone. Once the key and its instruction became conditional on this lookup actually delivering
     // a rule, a lookup that delivered none carried the id half with the what-to-do half missing:
@@ -1047,11 +1080,12 @@ export function registerMonetCoreTools(
     // standing text, names `conformance_ask`.
     //
     // WITHHELD RATHER THAN MADE SELF-CONTAINED, and that is the choice. Restating the tool names
-    // here would pay context on EVERY debt-bearing response — the common case, where the
+    // here would pay context on EVERY response carrying a backlog — the common case, where the
     // instruction is already present and would now say the same thing twice — to cover the rare one
     // where it is absent. It would also contradict this surface's own reason for existing: the
     // reminder belongs where the agent is being handed rules, and a lookup that handed over none is
-    // precisely not that moment. Nothing is lost by waiting: the debt clears only by asking, so the
+    // precisely not that moment. Nothing is lost by waiting: an entry leaves only by being asked
+    // about, so the
     // next lookup that does deliver a rule names it again, beside the line that explains it.
     const askBlock = toolName === "stage_lookup" && carriesConformanceKey === true ? askSignalBlock() : "";
     if (prewarmBlock === "" && askBlock === "") return result;
@@ -1778,9 +1812,11 @@ export function registerMonetCoreTools(
           includeDirty,
           includeStale,
         });
-        // THE FOUR CONFORMANCE STATES, on the surface curation already reads. `unanswered` and
+        // THE CONFORMANCE STATES, on the surface curation already reads. `unanswered` and
         // `notAsked` are reported SEPARATELY and never summed: one is a queue owed to the user, the
-        // other is an agent defect, and they have different owners and different remedies. No
+        // other is rules read with no question put — not by itself a defect, since whether an action
+        // followed is unrecorded since #85, with `notAskedWithAction` naming the subset the record
+        // can speak for. They have different owners and different remedies. No
         // threshold says when a backlog is too large — nothing has measured that — so these are
         // counts and nothing more. `followed` means the action followed the rule; it does not say
         // the rule caused it, which is unobservable.
@@ -1951,12 +1987,13 @@ export function registerMonetCoreTools(
    * TWO TOOLS, NOT ONE, because they are two events with two owners. The ASK is the agent's act and
    * the ANSWER is the user's; a single call carrying both would make the agent the author of a fact
    * it does not own, and would destroy the distinction between `unanswered` (asked, waiting on the
-   * user) and `not asked` (never asked, the agent's defect) — the one distinction this surface
-   * exists to keep.
+   * user) and `not asked` (no question put) — the one distinction this surface exists to keep. That
+   * second state is not by itself a defect: whether an action followed is unrecorded, and
+   * `notAskedWithAction` is the subset the record can speak for.
    */
   server.tool(
     "conformance_ask",
-    "Record that you asked the user whether an action followed the rule it read. Call this when you put the question, before their reply. The momentId is the one `stage_lookup` returned when it handed you that rule; a later `stage_lookup` also names any you still owe.",
+    "Record that you asked the user whether an action followed the rule it read. Call this when you put the question, before their reply. The momentId is the one `stage_lookup` returned when it handed you that rule; a later `stage_lookup` also names earlier moments with no question put — candidates, not debts, because the record does not say whether an action followed any of them. Ask where one did.",
     {
       momentId: z.string().max(MOMENT_ID_MAX_CHARS).describe("The moment you asked about."),
     },

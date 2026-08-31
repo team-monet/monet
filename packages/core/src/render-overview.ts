@@ -104,10 +104,18 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   const gates = overview.gate;
   const conformance = gates.conformance;
   const owedByUser = conformance.unanswered;
-  const owedByAgent = conformance.notAsked;
+  // TWO POPULATIONS, NOT ONE, because the record can speak for only one of them. `notAsked` is
+  // moments where rules were read and no question was put; whether an action followed is not
+  // recorded since #85 retired interception, so a lookup made to READ rules sits in it beside one
+  // that governed a real act. `notAskedWithAction` is the subset carrying a stored action — real
+  // outstanding work, and nonzero only on a store that predates #85 or folded a spool that did.
+  // Collapsing them either accuses the agent over an inventory sweep or prints the all-clear over
+  // real debt, and an upgraded store holds both kinds at once.
+  const neverAskedWithAction = conformance.notAskedWithAction;
+  const neverAskedUnknown = conformance.notAsked - neverAskedWithAction;
   if (
     gates.total > 0 || gates.retirementCandidates || gates.unexplainedDenies || gates.unreadStages ||
-    owedByUser > 0 || owedByAgent > 0 || gates.losses > 0 || gates.unopened > 0 ||
+    owedByUser > 0 || neverAskedWithAction > 0 || gates.losses > 0 || gates.unopened > 0 ||
     gates.unattributed > 0
   ) {
     lines.push(bold("GATE"));
@@ -141,8 +149,19 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     if (owedByUser > 0) {
       lines.push(truncate(`  awaiting you: ${owedByUser} asked, not yet answered`, width));
     }
-    if (owedByAgent > 0) {
-      lines.push(truncate(yellow(`  never asked: ${owedByAgent} read and acted on without asking`), width));
+    if (neverAskedWithAction > 0) {
+      // THE CLAIM THE RECORD CAN MAKE: an action is stored on these, so a missing question is real
+      // debt. In both lists, and yellow, because it is actionable while it stands.
+      lines.push(truncate(yellow(`  never asked: ${neverAskedWithAction} read, acted on, no question put`), width));
+    }
+    if (neverAskedUnknown > 0) {
+      // IN NEITHER LIST, by the rule stated at the all-clear below: a number that only grows and
+      // has a benign normal case belongs in neither. Nothing removes a moment from this population
+      // except asking about it, and a lookup made to READ rules — an inventory sweep, a probe — is
+      // the benign normal case, with no action to ask about and so no honest way to clear it. While
+      // it was `yellow` and in both lists, one such lookup retired "no curation work queued" for
+      // the life of the store: the same failure `unjoinableReads` was moved out of both lists for.
+      lines.push(truncate(dim(`  never asked: ${neverAskedUnknown} delivered rules, no question put`), width));
     }
     // READ, BUT TOO LATE TO HAVE ACTED ON IT. Dim and unactionable on purpose: a PreToolUse
     // advisory reaches the model beside the tool result on this host, so for every moment a
@@ -209,7 +228,7 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     overview.counts.dirty === 0 && overview.counts.stale === 0 && overview.counts.disputed === 0 &&
     overview.counts.possibleDuplicates === 0 && overview.counts.extractionCandidates === 0 &&
     !gates.retirementCandidates && !gates.unexplainedDenies && !gates.unreadStages &&
-    gates.conformance.notAsked === 0 && gates.conformance.unanswered === 0 && gates.losses === 0 &&
+    gates.conformance.notAskedWithAction === 0 && gates.conformance.unanswered === 0 && gates.losses === 0 &&
     // THIS LIST AND THE GATE SECTION'S OWN VISIBILITY CHECK ARE THE SAME SET. Mechanical on
     // purpose, and grep-checkable: anything that can OPEN that section must also suppress the
     // all-clear, or the page tells a human both things at once.

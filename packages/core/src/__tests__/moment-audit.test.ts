@@ -74,6 +74,19 @@ function readAndActed(path: string, momentId: string): void {
   line(path, { kind: "outcome", momentId, toolUseId: null, outcomeStatus: null, outcomeAt: "t", outcomeSha256: "b".repeat(64) });
 }
 
+/**
+ * The other half, and the distinction the all-clear now turns on: rules read with NO action on the
+ * record — everything written since #85 retired interception.
+ */
+function readNoAction(path: string, momentId: string): void {
+  interception(path, momentId, {
+    surface: "stage_lookup", actionSha256: null, actionRendering: null, actionChars: null,
+    actionClipped: null, stageId: null, ruleIds: null, disposition: "ungoverned", deliveredRuleIds: null,
+  });
+  line(path, { kind: "read", momentId, ruleId: "rule-a", namedStageId: "stage-1", readAt: "t" });
+  line(path, { kind: "outcome", momentId, toolUseId: null, outcomeStatus: null, outcomeAt: "t", outcomeSha256: "b".repeat(64) });
+}
+
 describe("F2 — an answered moment is not also an unasked one", () => {
   it("does not count one moment as both followed and notAsked", () => {
     const path = join(mkTmp(), "moments.jsonl");
@@ -240,6 +253,45 @@ describe("R2 — the all-clear does not print over a reported loss", () => {
 
 
 describe("G2 — the all-clear stays reachable", () => {
+  it("keeps the all-clear when a read moment records NO action", () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const db = mkDb();
+    seq = 0;
+    // THE SAME SHAPE AS THE UNJOINABLE-READ CASE ABOVE, and it arrived the same way. This half of
+    // `notAsked` only grows — nothing removes a moment but asking — and its benign normal case is a
+    // lookup made to READ rules, where nothing is recorded to have followed and there is nothing to
+    // ask about. While the whole population sat in the all-clear list, one such lookup retired
+    // "no curation work queued" for the life of the store, with nothing a human could act on.
+    readNoAction(path, "read-never-asked");
+    foldMomentSpool(db, path);
+    const core = new MonetCore(":memory:", { momentSpoolPath: path, defaultCircle: "acme-widgets" });
+    cores.push(core);
+    const rendered = renderOverview(core.overview("acme-widgets"), { color: false });
+
+    // BOTH HALVES. The population is still reported — dropping it from the lists must not drop it
+    // from the page — and the all-clear survives it.
+    expect(rendered).toContain("never asked: 1");
+    expect(rendered).toContain("no curation work queued");
+  });
+
+  it("SUPPRESSES the all-clear when the read moment records an action", () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const db = mkDb();
+    seq = 0;
+    // THE PAIR TO THE TEST ABOVE, and without it that one proves only that the all-clear can print.
+    // A store upgraded across #85 holds moments that DO carry an action, and on those a missing
+    // question is real debt. Dropping the whole population from the all-clear gate — rather than
+    // the unknown-action half — would print "no curation work queued" straight over it.
+    readAndActed(path, "acted-never-asked");
+    foldMomentSpool(db, path);
+    const core = new MonetCore(":memory:", { momentSpoolPath: path, defaultCircle: "acme-widgets" });
+    cores.push(core);
+    const rendered = renderOverview(core.overview("acme-widgets"), { color: false });
+
+    expect(rendered).toContain("read, acted on, no question put");
+    expect(rendered).not.toContain("no curation work queued");
+  });
+
   it("keeps the all-clear after an ordinary agent_context lookup", () => {
     const path = join(mkTmp(), "moments.jsonl");
     const db = mkDb();

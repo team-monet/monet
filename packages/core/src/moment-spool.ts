@@ -282,7 +282,9 @@ export interface MomentInterceptionFields {
    * ON THE RECORD, NOT ON THE QUERY, and that is forced rather than chosen. The spool is home-level
    * and shared, so every project's store folds every project's moments — a query cannot filter on a
    * field the record does not carry, and without this an overview for one circle reported another
-   * circle's fires, silences, deliveries and conformance debt, across project boundaries.
+   * circle's counts across project boundaries. (The example this used to give — fires, silences and
+   * deliveries — named counters removed on 2026-08-22 with the mechanical matcher; the scoping
+   * problem it illustrates is unchanged and now lands on the conformance counts.)
    *
    * `null` is a real and common value: the gate can fail before resolving a circle, and a hook with
    * no pinned circle never had one. It is never guessed at, and a reader counts those separately
@@ -546,7 +548,8 @@ export function spoolOutcome(
  *
  * Asking is itself an event, not a judgment — which is what stops the regress: nothing needs to
  * judge whether the meta-rule was obeyed, because "did it ask" is read off the record. It is also
- * what separates `unanswered` (a queue the user owes) from `not asked` (a defect the agent owes).
+ * what separates `unanswered` (a queue the user owes) from `not asked` (no question put — not by
+ * itself a defect, since whether an action followed is unrecorded).
  */
 export function spoolAsk(run: MomentRun, fields: { momentId: string; askedAt?: string }): void {
   appendMomentRecord(run, {

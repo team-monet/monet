@@ -30,6 +30,7 @@ import {
   momentLossCount,
   momentRuleReadsByStage,
   momentsOwingAQuestion,
+  momentsWithRecordedAction,
 } from "./moment-ledger";
 import type { MomentConformance, MomentCounts } from "./moment-ledger";
 import type { MomentRun } from "./moment-spool";
@@ -2318,8 +2319,10 @@ export interface MemoryOverview {
    *
    * `conformance` is the fourth fact and the only one no machine produced. `unanswered` and
    * `notAsked` are reported separately and never summed: one is a queue owed to the user, the other
-   * is an agent defect. `followed` says the action followed the rule — never that the rule caused
-   * it, which is unobservable.
+   * is rules read with no question put. That second one is NOT by itself a defect — whether an
+   * action followed is unrecorded since #85 — and `notAskedWithAction` is the subset the record can
+   * speak for. `followed` says the action followed the rule — never that the rule caused it, which
+   * is unobservable.
    *
    * `losses` is what the record knows it never received. Empty exception lists are omitted.
    */
@@ -13494,10 +13497,10 @@ export class MonetCore {
     return momentRuleReadsByStage(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }
 
-  /** The four conformance states. Folds first. Zeroes when no spool is configured. */
+  /** The conformance states. Folds first. Zeroes when no spool is configured. */
   momentConformance(circle?: string): MomentConformance {
     if (this.momentSpoolPath === null) {
-      return { followed: 0, notFollowed: 0, unanswered: 0, notAsked: 0, unjoinableReads: 0, readLate: 0 };
+      return { followed: 0, notFollowed: 0, unanswered: 0, notAsked: 0, notAskedWithAction: 0, unjoinableReads: 0, readLate: 0 };
     }
     return momentConformance(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }
@@ -13508,7 +13511,12 @@ export class MonetCore {
     return momentLossCount(this.db, this.momentSpoolPath);
   }
 
-  /** Moments that were read, acted on, and never asked about. Oldest first, bounded by the caller. */
+  /** Which of the given moments carry an action on the record. Empty unless the store predates #85. */
+  momentsWithRecordedAction(momentIds: string[]): Set<string> {
+    return momentsWithRecordedAction(this.db, momentIds);
+  }
+
+  /** Moments where rules were read and no question was put. Oldest first, bounded by the caller. */
   momentsOwingAQuestion(limit: number, circle?: string): string[] {
     if (this.momentSpoolPath === null) return [];
     return momentsOwingAQuestion(

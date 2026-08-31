@@ -7,7 +7,8 @@
  * them into one "pending" bucket is the failure this surface exists to prevent:
  *
  *   `unanswered` — asked, waiting on the user. A queue. The agent did its part.
- *   `not asked`  — read, acted, never asked. A defect. The agent did not.
+ *   `not asked`  — rules read, no question put. NOT a defect by itself: whether an action
+ *                   followed is not recorded (#85 retired interception).
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
@@ -18,6 +19,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { MonetCore } from "../engine";
 import { registerMonetCoreTools } from "../mcp-server";
+import { renderOverview } from "../render-overview";
 import { BetterSqlitePort } from "../storage";
 import type { StoragePort } from "../storage";
 import { UnknownMomentError, momentConformance, momentsOwingAQuestion } from "../moment-ledger";
@@ -69,6 +71,21 @@ function readAndActed(path: string, momentId: string, at = "2026-08-19T00:00:00.
   line(path, { kind: "outcome", momentId, toolUseId: null, outcomeStatus: null, outcomeAt: at, outcomeSha256: "b".repeat(64) });
 }
 
+/**
+ * A moment with rules read and NO action on the record — everything written since #85 retired
+ * interception. `readAndActed` above is the other half, and the two must not be confused: the
+ * whole correction here turns on which of them a claim is about.
+ */
+function readNoAction(path: string, momentId: string, at = "2026-08-19T00:00:00.000Z"): void {
+  line(path, {
+    kind: "interception", momentId, at, toolUseId: null, circle: "acme-widgets", sessionId: null,
+    surface: "stage_lookup", actionSha256: null, actionRendering: null, actionChars: null,
+    actionClipped: null, stageId: null, ruleIds: null, disposition: "ungoverned", deliveredRuleIds: null,
+  });
+  line(path, { kind: "read", momentId, ruleId: "rule-a", namedStageId: "stage-1", readAt: at });
+  line(path, { kind: "outcome", momentId, toolUseId: null, outcomeStatus: null, outcomeAt: at, outcomeSha256: "b".repeat(64) });
+}
+
 function coreWithSpool(spoolPath: string): MonetCore {
   const core = new MonetCore(":memory:", { momentSpoolPath: spoolPath, defaultCircle: "acme-widgets" });
   cores.push(core);
@@ -93,6 +110,44 @@ async function declareRuleAt(core: MonetCore, stage: string): Promise<void> {
     circle: "acme-widgets",
   });
 }
+
+/*
+ * TWO MATCHERS, AND THE SPLIT IS THE POINT. An ABSENCE assertion cannot use the exact wording:
+ * change the signal and it matches nothing, so `.toBe(false)` passes while saying nothing about
+ * whether a signal fired — a green that cannot fail, which is the exact failure these tests are
+ * written against. Proven, not assumed: with one matcher, reverting the wording failed only the
+ * two PRESENCE tests and left both absence tests green.
+ *
+ * So absence matches the family (any `Monet:` notice at all — the healthy state on these surfaces
+ * is silence, not "silence of one particular sentence"), and presence matches the sentence. A
+ * future notice worded differently trips the absence tests loudly, which is the safe direction.
+ */
+const ASK_SIGNAL_ANY = "Monet: ";
+const ASK_SIGNAL_PREFIX = "Monet: rules were read at";
+
+describe("the rendered workbench does not claim an action either", () => {
+  it("names the population without attributing an act or a fault to the agent", () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const core = coreWithSpool(path);
+    try {
+      // NO ACTION ON THE RECORD — the post-#85 shape, and the one the corrected line is about.
+      // `readAndActed` writes an `actionSha256`, so using it here would have exercised the other
+      // half and asserted the wrong sentence.
+      readNoAction(path, "never-asked-one");
+      const out = renderOverview(core.overview("acme-widgets"), { color: false, width: 200 });
+
+      // PRESENT FIRST, or every assertion below passes on an empty render.
+      expect(out).toContain("never asked: 1");
+      // The signal was corrected and this line was not, so the same false claim survived on the
+      // one surface a human actually reads. Both halves: the claim is gone, and what replaced it
+      // says what the record holds.
+      expect(out).not.toContain("acted");
+      expect(out).toContain("delivered rules, no question put");
+    } finally {
+      core.close();
+    }
+  });
+});
 
 describe("the four states, kept apart", () => {
   it("separates a queue owed to the user from a defect owed by the agent", () => {
@@ -244,6 +299,7 @@ describe("the ask and the answer attach to a moment that exists", () => {
     expect(core.momentConformance()).toEqual({
       followed: 0,
       notFollowed: 0,
+      notAskedWithAction: 0,
       readLate: 0,
       unanswered: 0,
       notAsked: 0,
@@ -281,6 +337,31 @@ describe("the signal that tells the agent it owes a question", () => {
       .filter((part) => part.type === "text")
       .map((part) => part.text ?? "");
 
+  it("states the gap only for moments with no action on the record", async () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const core = coreWithSpool(path);
+    await declareRuleAt(core, "git force push");
+    const { client, cleanup } = await pair(core);
+    try {
+      // THE POST-#85 SHAPE — no action written, so the ledger genuinely cannot say whether one
+      // followed, and the signal must say so rather than send the agent to ask about a non-event.
+      readNoAction(path, "unknown-one");
+      const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
+      const signal = ((result as { content: Array<{ type: string; text?: string }> }).content ?? [])
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .find((text) => text.includes(ASK_SIGNAL_PREFIX));
+
+      expect(signal).toContain("unknown-one");
+      expect(signal).toContain("Whether an action followed is not recorded");
+      // THE OTHER HALF, and without it this passes on any wording that merely omits the claim:
+      // the owed-question phrasing belongs to action-bearing rows only.
+      expect(signal).not.toContain("owe the question");
+    } finally {
+      await cleanup();
+    }
+  });
+
   it("says nothing at all when nothing is owed", async () => {
     const path = join(mkTmp(), "moments.jsonl");
     const core = coreWithSpool(path);
@@ -297,7 +378,7 @@ describe("the signal that tells the agent it owes a question", () => {
       const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       // SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so the ordinary
       // response carries no Monet instruction whatsoever.
-      expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
+      expect(texts(result).some((text) => text.includes(ASK_SIGNAL_ANY))).toBe(false);
     } finally {
       await cleanup();
     }
@@ -322,7 +403,7 @@ describe("the signal that tells the agent it owes a question", () => {
         { name: "memory_overview", arguments: {} },
       ]) {
         const result = await client.callTool(call);
-        expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
+        expect(texts(result).some((text) => text.includes(ASK_SIGNAL_ANY))).toBe(false);
       }
       // The same debt, on the one surface that carries it.
       const lookup = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
@@ -347,10 +428,18 @@ describe("the signal that tells the agent it owes a question", () => {
     const { client, cleanup } = await pair(core);
     try {
       const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
-      const signal = texts(result).find((text) => text.includes("Monet: you read a rule"));
+      const signal = texts(result).find((text) => text.includes(ASK_SIGNAL_PREFIX));
       expect(signal).toBeDefined();
       // A signal naming a moment...
       expect(signal).toContain("owed-one");
+      // AND SAYING WHAT THE RECORD HOLDS, WHICH DEPENDS ON THE ROW. The signal used to read "you
+      // read a rule and then acted", asserting an action nothing observes since #85 retired
+      // interception. The claim is gone either way — but this fixture is `readAndActed`, which
+      // writes an `actionSha256`, so the ledger CAN speak for it and the signal says the question is
+      // owed. The unknown-action wording is asserted on its own fixture below; asserting it here
+      // would have pinned the over-generalisation instead.
+      expect(signal).not.toContain("and then acted");
+      expect(signal).toContain("record an action and owe the question");
       // BOTH tools are still named on this response — on the `instruction` field that now ships
       // beside the key on every lookup, rather than in the signal that used to be the only thing
       // saying either. The naming had to survive that move, not be dropped by it: the ask is its own
@@ -390,7 +479,7 @@ describe("the signal that tells the agent it owes a question", () => {
       // every lookup, and the debt signal, which fires only because a moment is outstanding.
       const instruction = (JSON.parse(parts[0]) as { instruction?: string }).instruction;
       expect(instruction).toContain("conformance_ask");
-      const signal = parts.find((text) => text.includes("Monet: you read a rule"));
+      const signal = parts.find((text) => text.includes(ASK_SIGNAL_PREFIX));
       expect(signal).toContain("owed-one");
 
       // AND NEITHER IS A SECOND COPY OF THE OTHER. They carry different facts — what asking means,
