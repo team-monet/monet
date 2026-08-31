@@ -136,51 +136,59 @@ describe("the starter pack declares cleanly on a fresh install", () => {
 });
 
 describe("the doc and the data say the same thing", () => {
-  /** The run of pack bullets, between the two headings that bracket the list. */
-  function packBullets(): string[] {
+  /**
+   * The pack bullets, parsed rather than scanned.
+   *
+   * STRUCTURE, NOT OCCURRENCE. Checking that each content string appears SOMEWHERE in the document,
+   * and separately that the multiset of stage/severity pairs matches, leaves the PAIRING untested:
+   * swap two rules' stage headers and both checks still pass, while the playbook now tells a human
+   * to declare each rule at the other's moment. Each bullet is therefore read as one record and
+   * matched to its entry by content.
+   *
+   * Bullets are hard-wrapped, so continuation lines are rejoined before parsing.
+   */
+  function packBullets(): Array<{ species: string; stage?: string; severity?: string; content: string; reason: string }> {
     const section = install.slice(install.indexOf("If they have nothing — offer the starter pack"), install.indexOf("## Phase 6"));
-    return section.split("\n").filter((line) => /^- \*\*(Principle|Rule at )/.test(line));
+    const joined: string[] = [];
+    for (const line of section.split("\n")) {
+      if (/^- \*\*(Principle|Rule at )/.test(line)) joined.push(line);
+      else if (joined.length > 0 && /^ {2}\S/.test(line)) joined[joined.length - 1] += ` ${line.trim()}`;
+      else if (line.trim() === "" && joined.length > 0 && joined[joined.length - 1] !== "") joined.push("");
+    }
+    return joined
+      .filter((bullet) => bullet.startsWith("- **"))
+      .map((bullet) => {
+        const m = /^- \*\*(?:Principle|Rule at "([^"]+)" \((advisory|blocking)\))\*\* — \*(.+?)\* Reason: (.+?)\.?$/.exec(bullet);
+        // A BULLET THAT DOES NOT PARSE IS A FAILURE, never a skip: dropping it would shrink the list
+        // and quietly satisfy every per-entry check that follows.
+        if (m === null) throw new Error(`pack bullet did not parse: ${bullet.slice(0, 90)}`);
+        return {
+          species: m[1] === undefined ? "principle" : "rule",
+          ...(m[1] === undefined ? {} : { stage: m[1], severity: m[2] }),
+          content: m[3]!.replace(/\s+/g, " "),
+          reason: m[4]!.replace(/\s+/g, " "),
+        };
+      });
   }
 
-  it("every entry in the data appears in the playbook", () => {
+  it("each entry matches one bullet, field for field", () => {
+    const bullets = packBullets();
+    // PRESENT FIRST: a parser returning nothing would satisfy every per-entry check below by vacuous
+    // iteration, and the length check by comparing zero to zero.
+    expect(bullets.length).toBeGreaterThan(0);
+    expect(bullets, "install.md and starter-pack.json hold a different number of entries").toHaveLength(pack.entries.length);
+
     for (const entry of pack.entries) {
-      // Collapse the doc's hard wrapping before matching, so a rewrap is not a failure.
-      const flat = install.replace(/\s+/g, " ");
-      expect(flat, `missing from install.md: ${entry.content.slice(0, 48)}`).toContain(entry.content.replace(/\s+/g, " "));
-      expect(flat, `reason missing from install.md: ${entry.reason.slice(0, 40)}`).toContain(entry.reason.replace(/\s+/g, " "));
+      const content = entry.content.replace(/\s+/g, " ");
+      const bullet = bullets.find((b) => b.content === content);
+      expect(bullet, `no bullet in install.md carries: ${content.slice(0, 48)}`).toBeDefined();
+      expect(bullet!.species, `species differs for: ${content.slice(0, 40)}`).toBe(entry.species);
+      expect(bullet!.reason, `reason differs for: ${content.slice(0, 40)}`).toBe(entry.reason.replace(/\s+/g, " "));
+      // THE PAIRING, not the multiset. Swapping two rules' stage headers changes neither the set of
+      // stages nor the set of contents, and is caught only by holding each against its own entry.
+      expect(bullet!.stage, `stage differs for: ${content.slice(0, 40)}`).toBe(entry.stage);
+      expect(bullet!.severity, `severity differs for: ${content.slice(0, 40)}`).toBe(entry.severity);
     }
-  });
-
-  it("every rule bullet names the stage and severity the data carries", () => {
-    // THE PART THE OTHER TWO MISS. Content and reason are compared above, and the shared arguments
-    // below, but `stage` and `severity` live per-entry on the bullet's own first line. Change a
-    // stage in the data alone and everything else stays green: the behavioural tests declare
-    // happily at any stage, and nothing compares it to the prose — the same green-that-cannot-fail
-    // this whole file exists against.
-    const bullets = packBullets();
-    const fromDoc = bullets
-      .map((line) => /^- \*\*Rule at "([^"]+)" \((advisory|blocking)\)\*\*/.exec(line))
-      .filter((m): m is RegExpExecArray => m !== null)
-      .map((m) => `${m[1]}/${m[2]}`)
-      .sort();
-    const fromData = pack.entries
-      .filter((e) => e.species === "rule")
-      .map((e) => `${e.stage}/${e.severity}`)
-      .sort();
-
-    // PRESENT FIRST: an empty parse would otherwise satisfy an equality against an empty list.
-    expect(fromDoc.length).toBe(pack.entries.filter((e) => e.species === "rule").length);
-    expect(fromDoc).toEqual(fromData);
-  });
-
-  it("the playbook has no pack entry the data does not carry", () => {
-    const bullets = packBullets();
-    expect(bullets).toHaveLength(pack.entries.length);
-    // AND THE SPLIT MATCHES, not just the count — two principles and four rules, so a rule silently
-    // rewritten as a principle in one file and not the other is caught.
-    expect(bullets.filter((b) => b.startsWith("- **Principle"))).toHaveLength(
-      pack.entries.filter((e) => e.species === "principle").length,
-    );
   });
 
   it("the arguments the prose prescribes are the ones the data carries", () => {
