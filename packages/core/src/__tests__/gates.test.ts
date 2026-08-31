@@ -10106,9 +10106,12 @@ describe("MCP surface", () => {
 
     const refused = await call("memory_retire", { id });
     expect(refused.isError).toBe(true);
+    // THE ARGUMENTS THE TOOL ACTUALLY REQUIRES (#132). This used to end at `with verdict "retire"`
+    // — prose, not an assignment — so a caller replaying the sentence sent nothing at all. The
+    // cross-circle replay test below is what proves the sentence runs; this pins its exact shape.
     expect(refused.text).toBe(
       `cannot retire ${id}: it is a current skeleton member by ratification — withdraw it through ` +
-      `memory_ratify with verdict "retire"`,
+      `memory_ratify with candidateId="${id}", verdict="retire" and circle="default"`,
     );
     expect(c.skeleton("default").some((entry) => entry.conceptId === id)).toBe(true);
 
@@ -10176,12 +10179,22 @@ describe("MCP surface", () => {
     expect(correction.json.contradiction).toMatchObject({ status: "open" });
     expect((await call("memory_fetch", { id })).json.status).toBe("disputed");
 
+    const contradictionId = (correction.json.contradiction as { id: string }).id;
+
     const refused = await call("memory_retire", { id });
     expect(refused.isError).toBe(true);
+    // THE CONTRADICTION'S OWN ID, AND THE CIRCLE (#132). This used to end at the bare tool name, so
+    // replaying it was `contradictionId is required for contradiction verdicts`. `decision` is
+    // named as prose and never as `decision="…"`: it is the human's ruling, and a caller parsing
+    // `key="value"` out of the sentence must not be handed one — `dismiss` records NO CONFLICT.
     expect(refused.text).toBe(
       `cannot retire ${id}: it carries 1 open contradiction(s), which retiring would silently ` +
-      `dismiss rather than answer — withdraw it through memory_resolve`,
+      `dismiss rather than answer — withdraw it through memory_resolve with ` +
+      `contradictionId="${contradictionId}", circle="default" and a decision of ` +
+      `"accept-new", "keep-current" or "dismiss"`,
     );
+    // NO VERDICT IS PARSEABLE OUT OF IT — the property the prose form exists for.
+    expect(refused.text).not.toContain("decision=");
     // THE POINT OF THIS ONE: retireConcept dismisses open contradictions itself, so without the
     // guard the dispute would have been closed by making its subject vanish. It is still open.
     expect(c.countOpenContradictionsForConcept(id)).toBe(1);
@@ -10252,7 +10265,9 @@ describe("MCP surface", () => {
     const freeId = free.json.conceptId as string;
     const disputed = await call("memory_store", { content: "The metrics service listens on 8080." });
     const disputedId = disputed.json.conceptId as string;
-    expect((await call("memory_store", { content: "It listens on 9090 now.", kind: "correction", attachTo: disputedId })).isError).toBe(false);
+    const correction = await call("memory_store", { content: "It listens on 9090 now.", kind: "correction", attachTo: disputedId });
+    expect(correction.isError).toBe(false);
+    const contradictionId = (correction.json.contradiction as { id: string }).id;
 
     // BLOCKED ITEM FIRST, so a batch that aborted on it would leave the free one unretired.
     const batch = await call("memory_retire", { ids: [disputedId, freeId] });
@@ -10263,7 +10278,9 @@ describe("MCP surface", () => {
         id: disputedId,
         action: "error",
         error: `cannot retire ${disputedId}: it carries 1 open contradiction(s), which retiring would ` +
-          `silently dismiss rather than answer — withdraw it through memory_resolve`,
+          `silently dismiss rather than answer — withdraw it through memory_resolve with ` +
+          `contradictionId="${contradictionId}", circle="default" and a decision of ` +
+          `"accept-new", "keep-current" or "dismiss"`,
       },
       { id: freeId, action: "retired" },
     ]);
@@ -10571,7 +10588,7 @@ describe("MCP surface", () => {
       `cannot retire ${aId}: it carries 1 undismissed pair flag(s) (a duplicate or extraction ` +
       `question about it and another memory), which retiring would erase rather than answer ` +
       `— paired with ${bId} (possible_duplicate_of) — withdraw it through memory_resolve ` +
-      `with conceptAId="${aId}" and conceptBId set to a partner above`,
+      `with conceptAId="${aId}", conceptBId="${bId}" and circle="default"`,
     );
     // THE PARTNER ID IS IN THE REFUSAL, and this is the assertion that matters (review fix — round
     // 4). `memory_resolve`'s pair shape needs BOTH ids and no read on this server enumerates an
@@ -10579,6 +10596,11 @@ describe("MCP surface", () => {
     // only a count names a remedy the caller cannot follow. Both ids the next call needs are here.
     expect(refused.text).toContain(aId);
     expect(refused.text).toContain(bId);
+    // …AND IT IS IN THE CALL, NOT ONLY IN THE PROSE (#132). Round 4 put the partner in the DETAIL
+    // and left the remedy reading "conceptBId set to a partner above", which replayed as
+    // `pair-flag dismissal requires both conceptAId and conceptBId`. The circle joined it for the
+    // reason the cross-circle replay test below measures.
+    expect(refused.text).not.toContain("a partner above");
     // ONE PAIR, NOT TWO ROWS: the flag is recorded in both directions, and the count a caller reads
     // is the number of open QUESTIONS. It also names two memories, so retiring EITHER end erases it
     // — and both ends are refused.
@@ -10854,7 +10876,7 @@ describe("MCP surface", () => {
     expect(refused.isError).toBe(true);
     expect(refused.text).toBe(
       `cannot withdraw ${id}: it is a current skeleton member by ratification — withdraw it through ` +
-      `memory_ratify with verdict "retire"`,
+      `memory_ratify with candidateId="${id}", verdict="retire" and circle="default"`,
     );
     expect(c.stageLookup({ stage: "opening a pr" }).rules.map((rule) => rule.conceptId)).toContain(id);
 
@@ -10959,6 +10981,16 @@ describe("MCP surface", () => {
       args[key] = JSON.parse(serialized) as unknown;
     }
     expect(args, declined.text).toEqual({ candidateId: id, verdict: "retire", circle: "default" });
+    // EACH ARGUMENT ONCE, AND THE PARSE ABOVE CANNOT SEE THAT (#132). It folds duplicates into one
+    // key, so it passed identically while this handler appended "Every call above takes circle=…,
+    // and memory_ratify takes candidateId=… and verdict=…" after the blocker's own complete remedy.
+    // The tail is gone; these counts are what would notice it returning, and what would have
+    // noticed its removal.
+    expect(declined.text.match(/candidateId=/g), declined.text).toHaveLength(1);
+    expect(declined.text.match(/verdict="retire"/g), declined.text).toHaveLength(1);
+    expect(declined.text.match(/circle="default"/g), declined.text).toHaveLength(1);
+    // …AND THE SENTENCE ENDS AT THE REMEDY: the finding, then the blocker's own call, then nothing.
+    expect(declined.text.endsWith('circle="default"'), declined.text).toBe(true);
 
     // THE REPLAY IS THE ASSERTION — the advertised exit, followed verbatim, really ends the membership.
     const ratified = await call("memory_ratify", args);
@@ -11002,8 +11034,15 @@ describe("MCP surface", () => {
     expect(declined.text, declined.text).not.toContain("memory_retire(");
     expect(declined.text).toContain("withdraw it through memory_resolve");
     expect(declined.text).toContain(bId); // the partner the remedy needs
-    expect(declined.text).toContain('circle="default"'); // the argument the blocker itself cannot know
-    // THE RATIFICATION TAIL IS NOT APPENDED, because no ratification blocker is present.
+    // EXACTLY ONCE, WHICH IS THE ASSERTION A `toContain` COULD NOT MAKE (#132). The blocker now
+    // names the circle itself, and this handler used to append "Every call above takes circle=…" on
+    // top of it — so the circle appeared TWICE and a containment check passed in both worlds. It
+    // would have said nothing when the tail was removed, and nothing if the tail came back. The
+    // count is what pins the shape: the remedy names the circle, and nothing restates it after.
+    expect(declined.text.match(/circle="default"/g), declined.text).toHaveLength(1);
+    // …AND THE SENTENCE ENDS AT THE REMEDY, with nothing appended past its last clause.
+    expect(declined.text.endsWith('circle="default"'), declined.text).toBe(true);
+    // NO RATIFICATION ARGUMENTS ANYWHERE, because no ratification blocker is present.
     expect(declined.text).not.toContain("candidateId=");
 
     // REFUSED MEANS UNTOUCHED, and the question is still open.
@@ -11121,6 +11160,136 @@ describe("MCP surface", () => {
     const withdrawn = await call("memory_declare", args);
     expect(withdrawn.isError, withdrawn.text).toBe(false);
     expect(withdrawn.json).toMatchObject({ circle, action: "withdrawn", conceptId: id });
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE OTHER THREE REMEDIES, EACH FOLLOWED VERBATIM — #132.
+   *
+   * The declaration remedy above was fixed in #131 and the other three shipped on `main` with the
+   * identical defect: `memory_ratify with verdict "retire"` named neither candidate nor circle,
+   * `memory_resolve` named nothing but itself, and the pair-flag remedy named two ids with no
+   * circle. Every tool they name defaults an omitted `circle` to the SESSION circle and then
+   * scope-checks against it, so each one failed for any concept homed anywhere else.
+   *
+   * ONE TEST PER REMEDY, AND EACH ONE REPLAYS. A test that constructs the call itself is testing
+   * the tool, not the remedy — it passes on a sentence that names nothing, which is exactly how
+   * this class shipped twice already (the round-2 record: a decline test that looped three inputs
+   * through one asserted sentence and never followed it). Every `key=<serialized value>` pair the
+   * refusal offers becomes an argument, and whatever the refusal omits is simply absent, exactly as
+   * it would be for a reader.
+   *
+   * THE FIXTURE CIRCLE IS `pro"ject\x` IN ALL THREE, and it is carrying two properties on purpose.
+   * It is not the session circle, which is the whole defect — a same-circle fixture passes for the
+   * wrong reason, because the omitted argument defaults to the value that happens to be right. And
+   * its name needs escaping, so an interpolated remedy truncates at the name's own quote and the
+   * REPLAY fails rather than merely reading badly. Dropping the circle and interpolating instead of
+   * serializing are therefore both caught here, per remedy.
+   */
+  const QUOTED_CIRCLE = `pro"ject\\x`;
+
+  /** Pull every `key="serialized"` pair out of a refusal, the way a reader following it would. */
+  const remedyArgs = (text: string, tool: string): Record<string, unknown> => {
+    const remedy = new RegExp(`withdraw it through ${tool} with (.*)$`).exec(text)?.[1];
+    expect(remedy, text).toBeDefined();
+    const args: Record<string, unknown> = {};
+    for (const [, key, serialized] of remedy!.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)) {
+      args[key] = JSON.parse(serialized) as unknown;
+    }
+    return args;
+  };
+
+  it("the ratification refusal's remedy can be replayed verbatim for a principle homed OUTSIDE the session circle", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const declared = await call("memory_declare", {
+      species: "principle", content: "Prefer the smallest reversible step.", circle: QUOTED_CIRCLE,
+    });
+    expect(declared.isError, declared.text).toBe(false); // the name is ACCEPTED — measured, not assumed
+    const id = declared.json.conceptId as string;
+    // THE PREMISES: homed elsewhere, the session circle is `default`, and ratification is what blocks it.
+    expect(c.circleOf(id)).toBe(QUOTED_CIRCLE);
+    expect(c.overview("default").counts.concepts).toBe(0);
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["ratification"]);
+
+    const refused = await call("memory_retire", { id, circle: QUOTED_CIRCLE });
+    expect(refused.isError).toBe(true);
+    const args = remedyArgs(refused.text, "memory_ratify");
+    // The remedy carried all three, rather than working by accident on a default.
+    expect(args, refused.text).toEqual({ candidateId: id, verdict: "retire", circle: QUOTED_CIRCLE });
+
+    // THE REPLAY IS THE ASSERTION. On the old sentence this was an empty argument object and a
+    // schema rejection; with the circle dropped it is `is in circle '…', not 'default'`.
+    const ratified = await call("memory_ratify", args);
+    expect(ratified.isError, `remedy replayed as ${JSON.stringify(args)} -> ${ratified.text}`).toBe(false);
+    // …and it really ended the membership, so the exit the refusal advertised is a door.
+    expect(c.skeleton(QUOTED_CIRCLE).some((entry) => entry.conceptId === id)).toBe(false);
+    expect(c.retirementBlockers(id)).toEqual([]);
+    expect((await call("memory_retire", { id, circle: QUOTED_CIRCLE })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  it("the open-contradiction refusal's remedy can be replayed verbatim for a concept homed OUTSIDE the session circle", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const fact = await call("memory_store", { content: "The metrics service listens on 8080.", circle: QUOTED_CIRCLE });
+    const id = fact.json.conceptId as string;
+    const correction = await call("memory_store", {
+      content: "It listens on 9090 now.", kind: "correction", attachTo: id, circle: QUOTED_CIRCLE,
+    });
+    expect(correction.isError, correction.text).toBe(false);
+    expect(correction.json.contradiction).toMatchObject({ status: "open" }); // the premise
+    expect(c.circleOf(id)).toBe(QUOTED_CIRCLE);
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["open-contradiction"]);
+
+    const refused = await call("memory_retire", { id, circle: QUOTED_CIRCLE });
+    expect(refused.isError).toBe(true);
+    const args = remedyArgs(refused.text, "memory_resolve");
+    expect(args, refused.text).toEqual({
+      contradictionId: (correction.json.contradiction as { id: string }).id,
+      circle: QUOTED_CIRCLE,
+    });
+
+    // `decision` IS SUPPLIED BY THE CALLER, NOT BY THE SENTENCE — the one argument no read derives,
+    // and the reason the options are prose. If they were rendered as `decision="…"` pairs this
+    // parser would have adopted the last one silently, and `dismiss` records NO CONFLICT.
+    expect(args).not.toHaveProperty("decision");
+    const resolved = await call("memory_resolve", { ...args, decision: "dismiss" });
+    expect(resolved.isError, `remedy replayed as ${JSON.stringify(args)} -> ${resolved.text}`).toBe(false);
+    expect(c.retirementBlockers(id)).toEqual([]);
+    expect((await call("memory_retire", { id, circle: QUOTED_CIRCLE })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  it("the pair-flag refusal's remedy can be replayed verbatim for a pair homed OUTSIDE the session circle", async () => {
+    const c = flaggingCore();
+    const { call, client } = await harness(c);
+    const aId = (await call("memory_store", { content: PAIR_A, circle: QUOTED_CIRCLE })).json.conceptId as string;
+    const bId = (await call("memory_store", { content: PAIR_B, circle: QUOTED_CIRCLE })).json.conceptId as string;
+    expect(aId).not.toBe(bId); // forked, not merged — the fixture's premise
+    expect(c.circleOf(aId)).toBe(QUOTED_CIRCLE);
+    expect(c.retirementBlockers(aId).map((blocker) => blocker.code)).toEqual(["open-pair-flag"]);
+
+    const refused = await call("memory_retire", { id: aId, circle: QUOTED_CIRCLE });
+    expect(refused.isError).toBe(true);
+    const args = remedyArgs(refused.text, "memory_resolve");
+    // BOTH ENDPOINTS, NOT ONE AND A POINTER AT THE PROSE — `memory_resolve` refuses a pair
+    // dismissal carrying only `conceptAId`, so the old sentence could not be followed at all.
+    expect(args, refused.text).toEqual({ conceptAId: aId, conceptBId: bId, circle: QUOTED_CIRCLE });
+
+    // THE REPLAY. Without the circle this is `concept not found: <aId>` — a concept that plainly
+    // exists, reported as absent, which is the scope gate answering about a circle nobody named.
+    const dismissed = await call("memory_resolve", args);
+    expect(dismissed.isError, `remedy replayed as ${JSON.stringify(args)} -> ${dismissed.text}`).toBe(false);
+    expect(dismissed.json).toMatchObject({ action: "pair-flags-dismissed", rowsUpdated: 2 });
+    expect(c.retirementBlockers(aId)).toEqual([]);
+    expect((await call("memory_retire", { id: aId, circle: QUOTED_CIRCLE })).isError).toBe(false);
 
     await client.close();
     c.close();
