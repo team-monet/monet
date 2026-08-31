@@ -1479,21 +1479,19 @@ export function registerMonetCoreTools(
             // memory_retire's refusal uses, so which tool ends which authority is defined in exactly
             // one place; this handler never decides that from the concept's kind.
             //
-            // AND THE MISSING ARGUMENTS ARE SUPPLIED HERE, because they are what this layer knows and
-            // the blockers do not: `retirementBlockers` is a question anyone may ask about a concept
-            // from anywhere, so it cannot name the circle a caller must pass, and the ratification
-            // blocker's own remedy names neither its candidate nor that circle. Rendering it verbatim
-            // would reproduce round 1's defect one layer down — a remedy that cannot be followed.
-            // Which blocker is present is read off the blocker pass, never guessed from the species.
-            const ratified = outcome.blockers.some((blocker) => blocker.code === "ratification");
-            return err(
-              `${finding}, and memory_retire would refuse it too: ${blockerFindings(outcome.blockers)}. ` +
-              `Every call above takes circle=${JSON.stringify(homeCircle)}` +
-              (ratified
-                ? `, and memory_ratify takes candidateId=${JSON.stringify(shownId)} and verdict="retire"`
-                : "") +
-              `.`,
-            );
+            // NOTHING IS APPENDED, because there is nothing left to append (#132). This used to add
+            // "Every call above takes circle=…" and, when the ratification blocker was present, the
+            // `candidateId`/`verdict` pair — the arguments the blockers genuinely could not name
+            // back then. All four remedies now carry their own `circle`, and the ratification one
+            // carries its own candidate and verdict, so the tail restated what the sentence had
+            // already said. A payload with no consumer does not ship; and the comment justifying it
+            // ("`retirementBlockers` … cannot name the circle a caller must pass") had become false,
+            // which misleads the next reader worse than the repetition itself did.
+            //
+            // NO TRAILING PERIOD, matching the branch above and `retirementRefusal`: every refusal
+            // on this surface ends at its last clause, and the period existed only to close the
+            // removed tail.
+            return err(`${finding}, and memory_retire would refuse it too: ${blockerFindings(outcome.blockers)}`);
           }
           // THE OTHER THREE BLOCKERS STILL REFUSE, rendered by the same formatter memory_retire uses
           // so the two surfaces cannot come to describe one finding differently.

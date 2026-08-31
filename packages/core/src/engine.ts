@@ -300,6 +300,35 @@ const PAIR_FLAG_EDGE_TYPES_SQL = PAIR_FLAG_EDGE_TYPES.map((t) => `'${t}'`).join(
  * already reports the true total.
  */
 const RETIREMENT_PAIR_FLAG_NAMED_MAX = 3;
+/**
+ * How long any single value embedded in a `withdrawVia` remedy may be (#132, Codex round 1).
+ *
+ * WHY A BOUND AT ALL: `err()` (mcp-server.ts) returns its message VERBATIM and applies none of the
+ * `RESULT_MAX_CHARS` fitting `ok()` does, so an oversized value in a refusal produces a result past
+ * the host's limit — the caller gets an unusable response instead of the refusal. That is the exact
+ * failure `LIFECYCLE_ERROR_ID_MAX_CHARS` + `clip()` already guard for a CALLER-SUPPLIED id at two
+ * sites in mcp-server.ts; this is the same guard for the values a remedy reads out of the database.
+ *
+ * EVERY VALUE THE FOUR REMEDIES EMBED IS UNBOUNDED THROUGH ONE DOOR, which is why this is applied in
+ * `withdrawalRemedy` rather than to the one value a review happened to name. `sync-types.ts` puts no
+ * length bound on any id, and `graftRows` inserts each one straight from the payload: concept ids and
+ * `concepts.circle` (the concepts graft), `memory_edge` endpoints (the edges graft), and
+ * `contradictions.id` (the contradictions graft). A partial guard here is the shape this repo has
+ * already been bitten by.
+ *
+ * 256, NOT the 128 of `LIFECYCLE_ERROR_ID_MAX_CHARS`, and the difference is deliberate. That constant
+ * bounds an id a caller typed, which has no legitimate large form. These values include
+ * `concepts.circle`, which the MCP surface legitimately accepts up to `CIRCLE_NAME_MAX_CHARS` (256,
+ * mcp-server.ts) — clipping at 128 would truncate a real circle name and make the remedy unreplayable
+ * for a store that never did anything wrong, which is a NEW defect rather than a guard. At 256
+ * nothing any supported path can create is ever clipped: ids this engine mints are uuids (36).
+ * The two constants must move together; there is no import because mcp-server.ts imports this file.
+ *
+ * A CLIPPED VALUE IS NOT REPLAYABLE, and that is accepted for `clip()`'s own recorded reason — a
+ * bounded refusal outranks a perfect suggestion. The truncation is MARKED, never silent, so a caller
+ * can see it is not an id rather than replaying a plausible-looking prefix.
+ */
+const REMEDY_VALUE_MAX_CHARS = 256;
 // The reference class must match slugify's repertoire (Codex review, PR #189). `\w` is ASCII here,
 // so `supports: #주식-트래커` never reached resolveRef at all — giving non-Latin concepts distinct
 // slugs is worth nothing while the parser that consumes those slugs cannot read one. `_` and `:`
@@ -2467,12 +2496,83 @@ export interface RetirementBlocker {
    * refuse. A renderer must omit the remedy clause entirely when this is absent, not print a
    * sentence that reads as one.
    *
-   * STILL OPTIONAL THOUGH EVERY BLOCKER NOW FILLS IT IN. The declared-rule case was the one that
-   * could not (#200, now public as #118), and `memory_declare(withdraw)` closed it — so the absent
-   * branch is currently unexercised, and it stays because the CONTRACT is what protects the next
-   * blocker: a finding whose remedy does not exist must say so by omission, not by inventing one.
+   * STILL OPTIONAL, AND SINCE #132 IT HAS TWO REAL OMIT BRANCHES rather than none. The declared-rule
+   * case was the one that could not fill this in (#200, now public as #118), and
+   * `memory_declare(withdraw)` closed it; every blocker filled it in unconditionally after that, so
+   * the absent branch had no call site at all and survived on the contract alone. It now has two,
+   * both in `retirementBlockers`, and they are NOT equally unreachable:
+   *
+   *   - `open-contradiction`, when the contradiction id comes back null. Unreachable BY
+   *     CONSTRUCTION: the id and its count are two subqueries of ONE statement over one WHERE
+   *     clause, so "the count says 1 and the id is null" is a state that shape cannot produce.
+   *   - `open-pair-flag`, when the partner query returns no row. Unreachable on the RESERVED path —
+   *     `retireIfUnblocked` holds `BEGIN IMMEDIATE` across the whole pass — but the partner query is
+   *     a SECOND statement, not a subquery of the count, so a bare unreserved call to this public
+   *     method could in principle see a dismissal land between the two. Not exercised and not
+   *     measured; recorded as the structural difference it is, rather than as a claim either way.
+   *
+   * The contract is unchanged and is what protects the next blocker: a finding whose remedy does not
+   * exist must say so by omission, not by inventing one.
    */
   withdrawVia?: string;
+}
+
+/**
+ * ONE `withdrawVia` REMEDY, RENDERED AS A CALL A READER CAN REPLAY (#132).
+ *
+ * ONE DEFINITION RATHER THAN FOUR TEMPLATE LITERALS, because the four blockers name four different
+ * tools and every one of them needs the same two properties — and three of the four shipped without
+ * them. `memory_ratify with verdict "retire"` named no candidate and no circle; `memory_resolve`
+ * named nothing at all; the pair-flag remedy named two ids and no circle. Each was measured failing
+ * when replayed verbatim (#132). A shape that cannot be built without a circle is what keeps the
+ * fourth one from happening.
+ *
+ * `circle` IS ALWAYS PRESENT AND ALWAYS LAST. Every tool these remedies name defaults an omitted
+ * `circle` to the SESSION circle and then scope-checks against it, so an id-only remedy failed
+ * outright for any concept homed anywhere else — the ordinary arrangement in a real store, and the
+ * reason it is a required parameter here rather than one more entry in `args`.
+ *
+ * PASS THE CONCEPT'S CIRCLE, NEVER A BINDING'S (`memory_declare(withdraw)`'s own round-1 finding):
+ * a rule's binding may legally carry the breadth marker '*', and a remedy naming '*' resolves
+ * straight back to the session circle and fails all over again.
+ *
+ * EVERY VALUE IS SERIALIZED, NEVER INTERPOLATED. A circle name is length-bounded only
+ * (CIRCLE_NAME_MAX_CHARS) and no charset rule anywhere accepts or rejects one, so a name carrying a
+ * quote or a backslash renders a remedy that ends where the name's own quote falls — unparseable
+ * for exactly the caller who cannot guess the escaping either. For a plain uuid and a plain circle
+ * name the output is byte-identical to the interpolation it replaces.
+ *
+ * `trailing` IS PROSE, AND DELIBERATELY NOT AN ARGUMENT PAIR. Its one use is `memory_resolve`'s
+ * contradiction `decision`, which no read can derive because it is a human's ruling. Rendering the
+ * options as `decision="…"` pairs would let any caller parsing `key="value"` out of the sentence —
+ * the way this repo's own replay tests do — silently adopt whichever came last, and `dismiss`
+ * records NO CONFLICT. Naming the parameter without choosing a value for it is the honest form.
+ */
+function withdrawalRemedy(
+  tool: string,
+  args: ReadonlyArray<readonly [name: string, value: string]>,
+  circle: string,
+  trailing?: string,
+): string {
+  // CLIPPED BEFORE SERIALIZED, NEVER AFTER — see REMEDY_VALUE_MAX_CHARS for why a bound exists at
+  // all. Clipping the JSON instead would cut inside the quoting and produce a pair that no longer
+  // parses, which is the one thing this whole sentence exists to guarantee. The marker mirrors
+  // `clip()` in mcp-server.ts so a truncated value reads the same on both surfaces; inside a
+  // serialized string its newline renders as `\n`, so the remedy stays a single line.
+  const fit = (value: string): string =>
+    JSON.stringify(
+      value.length <= REMEDY_VALUE_MAX_CHARS
+        ? value
+        : `${value.slice(0, REMEDY_VALUE_MAX_CHARS)}\n…[truncated ${value.length - REMEDY_VALUE_MAX_CHARS} chars]`,
+    );
+  const clauses = [
+    ...args.map(([name, value]) => `${name}=${fit(value)}`),
+    `circle=${fit(circle)}`,
+    ...(trailing === undefined ? [] : [trailing]),
+  ];
+  // `circle` guarantees at least two clauses, so the "and" is never dangling.
+  const last = clauses.pop()!;
+  return `${tool} with ${clauses.join(", ")} and ${last}`;
 }
 
 /**
@@ -7414,7 +7514,7 @@ export class MonetCore {
    * pass, never the first one found: a caller has to know everything it must do before it starts.
    * An empty array means the concept retires freely.
    *
-   * ONE PRINCIPLE, FIVE INSTANCES: A MEMORY LEAVES WITH THE AUTHORITY IT ENTERED ON. That is the
+   * ONE PRINCIPLE, FOUR INSTANCES: A MEMORY LEAVES WITH THE AUTHORITY IT ENTERED ON. That is the
    * blocking-rule chokepoint's own sentence (`retireConcept` below — "declaration-only in both
    * directions — as hard to remove as it is to mint") with `severity` swapped for the thing that
    * actually varies here: who authorized the entry. So each blocker names the surface that ENDS
@@ -7423,15 +7523,22 @@ export class MonetCore {
    * THE LAST TWO VARY IT, and say so in their own comments: what retirement would take is not an
    * authority but an UNANSWERED QUESTION it would destroy rather than answer, so the surface each
    * names is the one that answers the question rather than one that withdraws a right. They are
-   * structurally identical to the first three in every other respect — same verdict object, same
+   * structurally identical to the first two in every other respect — same verdict object, same
    * "no way to force it through", same reserved evaluation.
+   *
+   * FOUR, NOT FIVE, AND THE COUNT WAS WRONG HERE UNTIL #132. `RetirementBlocker['code']` declares a
+   * fifth member, `connector-owned`, which has no push site in this method at all — nothing here
+   * ever emits it, and a connector-owned concept never reaches this pass because `circleOf` answers
+   * null for one and the tool surface's scope gate turns that into "concept not found" first. The
+   * union member is what made "five" look right; the emitted set is four. Recorded rather than
+   * silently renumbered so the next reader does not count the union and change it back.
    *
    * A VERDICT OBJECT RATHER THAN A THROW, modelled on `blockingRuleMutationGuard` (gates.ts) for
    * the reason that guard states: every caller renders the finding into its own sentence, and the
    * tool surface must be able to report one blocked item without aborting the batch around it.
    *
    * A QUESTION, NOT A GATE. `retireConcept` is unchanged and still carries the one refusal that is
-   * its own (the live-deny chokepoint); these five live at the TOOL surface, which is why nothing
+   * its own (the live-deny chokepoint); these four live at the TOOL surface, which is why nothing
    * that retires today stops retiring.
    *
    * WHAT IS DELIBERATELY NOT HERE: `origin='correction'` and `origin='projection'` bindings — the
@@ -7452,6 +7559,14 @@ export class MonetCore {
         `SELECT
            (SELECT COUNT(*) FROM rule_bindings b WHERE b.concept_id = ? AND b.origin = 'declaration') AS declaredBinding,
            (SELECT COUNT(*) FROM contradictions k WHERE k.concept_id = ? AND k.status = 'open') AS openContradictions,
+           -- THE ID BESIDE ITS OWN COUNT, IN ONE STATEMENT (#132). memory_resolve needs a
+           -- contradictionId and the blocker used to name only the tool, so the remedy could not
+           -- be followed at all. Read here rather than in a second SELECT so the count and the id
+           -- cannot disagree: "the count says 1 and the id came back NULL" is a state this shape
+           -- cannot reach. Oldest first, so a caller working through several meets them in the
+           -- order they were detected.
+           (SELECT k.id FROM contradictions k WHERE k.concept_id = ? AND k.status = 'open'
+             ORDER BY k.detected_at ASC, k.id ASC LIMIT 1) AS openContradictionId,
            -- PAIRS, NOT ROWS. upsertEdgeBoth records a pair flag in both directions, so counting
            -- memory_edge rows would report one open question as two. DISTINCT over (type, the OTHER
            -- endpoint) is the count a human recognizes: how many questions are still unanswered.
@@ -7464,8 +7579,8 @@ export class MonetCore {
                  AND e.dismissed_at IS NULL AND (e.src_id = ? OR e.dst_id = ?)
             )) AS openPairFlags`,
       )
-      .get(conceptId, conceptId, conceptId, row.circle, conceptId, conceptId) as
-        { declaredBinding: number; openContradictions: number; openPairFlags: number };
+      .get(conceptId, conceptId, conceptId, conceptId, row.circle, conceptId, conceptId) as
+        { declaredBinding: number; openContradictions: number; openContradictionId: string | null; openPairFlags: number };
     const blockers: RetirementBlocker[] = [];
     // THE BINDING'S OWN ORIGIN, AND DELIBERATELY NOT THE STAGE'S. The principle is the authority
     // THIS MEMORY entered on, not the authority that minted its address, and the two come apart in
@@ -7526,7 +7641,10 @@ export class MonetCore {
       blockers.push({
         code: "declaration",
         detail: "it entered by declaration, and only the declaration surface can withdraw one",
-        withdrawVia: `memory_declare with withdraw=${JSON.stringify(conceptId)} and circle=${JSON.stringify(row.circle)}`,
+        // THE SENTENCE IS UNCHANGED, only its construction: `withdrawalRemedy` renders exactly what
+        // this literal did, byte for byte, and #132 routes all four blockers through it so the two
+        // paragraphs above are one definition instead of four copies that can drift apart.
+        withdrawVia: withdrawalRemedy("memory_declare", [["withdraw", conceptId]], row.circle),
       });
     }
     // THE CURRENT VERDICT, NEVER THE HISTORY (review fix — round 1). This used to COUNT
@@ -7544,10 +7662,20 @@ export class MonetCore {
     // has merely paused. Nothing is reachable through the gap regardless: a disputed concept carries
     // the open contradiction that the last blocker below refuses on anyway.
     if (this.isCurrentSkeletonMember(conceptId)) {
+      // AND IT NAMES THE CALL, NOT THE VERDICT (#132). This read `memory_ratify with verdict
+      // "retire"` — no `candidateId`, no `circle`, and `verdict "retire"` is prose rather than an
+      // assignment, so a caller replaying the sentence sent an EMPTY argument object and got a
+      // schema rejection. Supplying the two obvious arguments by hand got one hop further and still
+      // failed: `candidateId '<id>' is in circle 'project-a', not 'default'`.
+      //
+      // BOTH ARGUMENTS ARE THE BLOCKER'S OWN. `candidateId` is the concept this method was asked
+      // about, and the circle is `concepts.circle` — the same row the declaration remedy above
+      // reads. Nothing here needs the caller's session circle, which is the reason the tool layer's
+      // own completion (`memory_declare(withdraw)`'s decline) was never the right home for it.
       blockers.push({
         code: "ratification",
         detail: "it is a current skeleton member by ratification",
-        withdrawVia: 'memory_ratify with verdict "retire"',
+        withdrawVia: withdrawalRemedy("memory_ratify", [["candidateId", conceptId], ["verdict", "retire"]], row.circle),
       });
     }
     // ITS OWN REASON, AND NOT ABOUT AUTHORITY. `retireConcept` dismisses every open contradiction
@@ -7556,10 +7684,61 @@ export class MonetCore {
     // blocker is what makes that statement dead for tool-initiated retires, which is the intent:
     // resolve first, and then the retirement is ordinary.
     if (marks.openContradictions > 0) {
+      // A BARE TOOL NAME IS NOT A REMEDY (#132). This was `memory_resolve` and nothing else, so a
+      // caller replaying it got `contradictionId is required for contradiction verdicts` — the same
+      // "remedy that cannot be followed" the pair-flag blocker's own round-4 comment describes,
+      // one blocker over. The id is read beside its count in the `marks` query above; the circle is
+      // the concept's, and it is the right one by construction because `circleOfContradiction`
+      // resolves a contradiction's circle through `concepts.circle`.
+      //
+      // ONE ID, NOT A LISTING, for the reason RETIREMENT_PAIR_FLAG_NAMED_MAX exists: an error
+      // string is not an enumeration, and the `detail` beside it already reports the true total. A
+      // caller who resolves the named one and retries meets the next in a fresh refusal, which is
+      // why no "and again for the others" clause is appended — multiplicity is the detail's job
+      // here exactly as it is for the pair flag below, and the remedy stays one runnable call.
+      //
+      // `decision` IS NAMED AND NEVER CHOSEN, AND ITS VALUES ARE NOT ENUMERATED EITHER. The remedy
+      // supplies the ADDRESSING arguments — which contradiction, in which circle — and stops. Which
+      // verdict applies is the caller's judgment against `memory_resolve`'s own contract.
+      //
+      // WHY THE LIST CAME OUT, recorded because re-adding it will look like an improvement. Two
+      // review rounds each found a condition under which the enumerated verdicts do not apply, and
+      // both are state this method cannot see:
+      //   round 1 — `accept-new` on a concept with SEVERAL live priors throws unless the caller also
+      //             brings a reconciled `body` or a `contradictedObservationId`; measured failing
+      //             with "accept-new and no reconciled body" while the other two succeeded.
+      //   round 2 — a contradiction naming an observation that does not exist, belongs to another
+      //             concept, or has since been superseded is refused for `accept-new` AND
+      //             `keep-current` (the correcting-observation guard above), leaving only `dismiss`.
+      //             `flagContradiction` validates none of that — its own guard comment says so — and
+      //             `memory_flag_contradiction` passes `observationId` straight through, so the row
+      //             is reachable through the ordinary tool surface.
+      // Each round narrowed a static sentence against dynamic state, and nothing suggested round 3
+      // was the last condition. The alternative — computing the runnable set here — is worse: it
+      // would restate `resolveContradiction`'s guards as a parallel implementation of a decision
+      // this method does not drive, which drifts silently and drifts toward looking right.
+      //
+      // IT IS THE SAME REASONING AS NOT WRITING `decision="…"`, carried one step: a parser must not
+      // adopt a verdict for the human, and neither must a sentence that lists the verdicts as though
+      // they were interchangeable. If we cannot choose the value, we should not enumerate the values.
+      // Naming a parameter the caller must decide is not the placeholder round 1 banned: a
+      // placeholder is an argument nobody can supply, and this is the one argument only the caller
+      // can — and `memory_resolve`'s own contract is where the conditions live and stay current.
+      //
+      // ABSENT RATHER THAN INVENTED if the id somehow is not there. Unreachable — the id and the
+      // count come out of one statement — but the contract `withdrawVia` documents is that a
+      // finding whose remedy does not exist says so by omission.
       blockers.push({
         code: "open-contradiction",
         detail: `it carries ${marks.openContradictions} open contradiction(s), which retiring would silently dismiss rather than answer`,
-        withdrawVia: "memory_resolve",
+        withdrawVia: marks.openContradictionId === null
+          ? undefined
+          : withdrawalRemedy(
+              "memory_resolve",
+              [["contradictionId", marks.openContradictionId]],
+              row.circle,
+              "a decision",
+            ),
       });
     }
     // THE SAME REASON, ONE SUBSTRATE OVER (review fix — round 3). `retireConcept` calls
@@ -7613,7 +7792,27 @@ export class MonetCore {
           `it carries ${marks.openPairFlags} undismissed pair flag(s) (a duplicate or extraction ` +
           `question about it and another memory), which retiring would erase rather than answer` +
           (named ? ` — paired with ${named}${unnamed > 0 ? `, and ${unnamed} more` : ""}` : ""),
-        withdrawVia: `memory_resolve with conceptAId="${conceptId}" and conceptBId set to a partner above`,
+        // AND THE PARTNER IS NAMED IN THE CALL, not left as "a partner above" (#132). Round 4 put
+        // the ids in the DETAIL and stopped there, so the remedy still read
+        // `conceptAId="<id>" and conceptBId set to a partner above` — replayed, that is
+        // `pair-flag dismissal requires both conceptAId and conceptBId`. Supplying the partner by
+        // hand did not save it either: with no circle the scope gate answered
+        // `concept not found: <id>` about a concept that plainly exists, which is worse than
+        // incomplete — it reports the caller's memory as gone.
+        //
+        // THE FIRST PARTNER, in the query's own (type, partner) order, and one call rather than a
+        // listing: the detail above already names up to RETIREMENT_PAIR_FLAG_NAMED_MAX partners and
+        // reports the true total, and a caller who dismisses the named pair and retries meets the
+        // next in a fresh refusal. Absent rather than invented when nothing came back —
+        // unreachable while this query and the count share their WHERE clause, and the contract
+        // `withdrawVia` documents holds regardless.
+        withdrawVia: partners.length === 0
+          ? undefined
+          : withdrawalRemedy(
+              "memory_resolve",
+              [["conceptAId", conceptId], ["conceptBId", partners[0].partner]],
+              row.circle,
+            ),
       });
     }
     return blockers;
