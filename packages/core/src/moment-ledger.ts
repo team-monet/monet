@@ -1082,6 +1082,13 @@ export function momentRuleReadsByStage(db: StoragePort, spoolPath: string, circl
 /**
  * The moments where rules were read and no question has been put.
  *
+ * NOTHING IN THE PRODUCT READS THIS TODAY, and that is deliberate rather than an oversight. The ask
+ * signal did, until #147 removed it: the list is oldest-first and bounded, a moment leaves only by
+ * being asked about, and moments that can never be honestly asked about — a lookup made to READ
+ * rules, or one whose session has ended — filled the bound permanently. It is kept as a query
+ * because it is exported API and is the list form of the population `notAsked` counts. Wiring it
+ * back into a delivered payload reintroduces that, so read #147 before doing so.
+ *
  * WHAT THIS ESTABLISHES, AND WHAT IT DOES NOT. `outcome_at IS NOT NULL` says the call finished;
  * a non-empty `rule_reads` says rules reached the agent. Neither says an action followed, and
  * since #85 nothing records one. Under that design `stage_lookup` IS the moment a rule reaches
@@ -1122,27 +1129,6 @@ export function momentsOwingAQuestion(
     )
     .all(circle, limit) as Array<{ moment_id: string }>;
   return rows.map((row) => row.moment_id);
-}
-
-/**
- * Which of the given moments carry an action on the record.
- *
- * TAKES THE IDS RATHER THAN RE-QUERYING A WINDOW, deliberately. The caller already holds the
- * oldest-N it is about to name; asking "which of THESE" cannot disagree with that list, while a
- * second `ORDER BY at LIMIT ?` narrowed to action-bearing rows would return a different window and
- * the two could not be partitioned against each other.
- *
- * EMPTY IS THE ORDINARY ANSWER. Nothing has written an action since #85 retired interception, so
- * this is nonempty only on a store that predates it or folded a spool that did — and on exactly
- * those, a missing question is real work rather than an unanswerable one.
- */
-export function momentsWithRecordedAction(db: StoragePort, momentIds: string[]): Set<string> {
-  if (momentIds.length === 0) return new Set();
-  const placeholders = momentIds.map(() => "?").join(", ");
-  const rows = db
-    .prepare(`SELECT moment_id FROM governed_moments WHERE action_sha256 IS NOT NULL AND moment_id IN (${placeholders})`)
-    .all(...momentIds) as Array<{ moment_id: string }>;
-  return new Set(rows.map((row) => row.moment_id));
 }
 
 /**
