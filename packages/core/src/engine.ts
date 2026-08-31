@@ -300,6 +300,35 @@ const PAIR_FLAG_EDGE_TYPES_SQL = PAIR_FLAG_EDGE_TYPES.map((t) => `'${t}'`).join(
  * already reports the true total.
  */
 const RETIREMENT_PAIR_FLAG_NAMED_MAX = 3;
+/**
+ * How long any single value embedded in a `withdrawVia` remedy may be (#132, Codex round 1).
+ *
+ * WHY A BOUND AT ALL: `err()` (mcp-server.ts) returns its message VERBATIM and applies none of the
+ * `RESULT_MAX_CHARS` fitting `ok()` does, so an oversized value in a refusal produces a result past
+ * the host's limit — the caller gets an unusable response instead of the refusal. That is the exact
+ * failure `LIFECYCLE_ERROR_ID_MAX_CHARS` + `clip()` already guard for a CALLER-SUPPLIED id at two
+ * sites in mcp-server.ts; this is the same guard for the values a remedy reads out of the database.
+ *
+ * EVERY VALUE THE FOUR REMEDIES EMBED IS UNBOUNDED THROUGH ONE DOOR, which is why this is applied in
+ * `withdrawalRemedy` rather than to the one value a review happened to name. `sync-types.ts` puts no
+ * length bound on any id, and `graftRows` inserts each one straight from the payload: concept ids and
+ * `concepts.circle` (the concepts graft), `memory_edge` endpoints (the edges graft), and
+ * `contradictions.id` (the contradictions graft). A partial guard here is the shape this repo has
+ * already been bitten by.
+ *
+ * 256, NOT the 128 of `LIFECYCLE_ERROR_ID_MAX_CHARS`, and the difference is deliberate. That constant
+ * bounds an id a caller typed, which has no legitimate large form. These values include
+ * `concepts.circle`, which the MCP surface legitimately accepts up to `CIRCLE_NAME_MAX_CHARS` (256,
+ * mcp-server.ts) — clipping at 128 would truncate a real circle name and make the remedy unreplayable
+ * for a store that never did anything wrong, which is a NEW defect rather than a guard. At 256
+ * nothing any supported path can create is ever clipped: ids this engine mints are uuids (36).
+ * The two constants must move together; there is no import because mcp-server.ts imports this file.
+ *
+ * A CLIPPED VALUE IS NOT REPLAYABLE, and that is accepted for `clip()`'s own recorded reason — a
+ * bounded refusal outranks a perfect suggestion. The truncation is MARKED, never silent, so a caller
+ * can see it is not an id rather than replaying a plausible-looking prefix.
+ */
+const REMEDY_VALUE_MAX_CHARS = 256;
 // The reference class must match slugify's repertoire (Codex review, PR #189). `\w` is ASCII here,
 // so `supports: #주식-트래커` never reached resolveRef at all — giving non-Latin concepts distinct
 // slugs is worth nothing while the parser that consumes those slugs cannot read one. `_` and `:`
@@ -2525,9 +2554,20 @@ function withdrawalRemedy(
   circle: string,
   trailing?: string,
 ): string {
+  // CLIPPED BEFORE SERIALIZED, NEVER AFTER — see REMEDY_VALUE_MAX_CHARS for why a bound exists at
+  // all. Clipping the JSON instead would cut inside the quoting and produce a pair that no longer
+  // parses, which is the one thing this whole sentence exists to guarantee. The marker mirrors
+  // `clip()` in mcp-server.ts so a truncated value reads the same on both surfaces; inside a
+  // serialized string its newline renders as `\n`, so the remedy stays a single line.
+  const fit = (value: string): string =>
+    JSON.stringify(
+      value.length <= REMEDY_VALUE_MAX_CHARS
+        ? value
+        : `${value.slice(0, REMEDY_VALUE_MAX_CHARS)}\n…[truncated ${value.length - REMEDY_VALUE_MAX_CHARS} chars]`,
+    );
   const clauses = [
-    ...args.map(([name, value]) => `${name}=${JSON.stringify(value)}`),
-    `circle=${JSON.stringify(circle)}`,
+    ...args.map(([name, value]) => `${name}=${fit(value)}`),
+    `circle=${fit(circle)}`,
     ...(trailing === undefined ? [] : [trailing]),
   ];
   // `circle` guarantees at least two clauses, so the "and" is never dangling.
@@ -7663,6 +7703,27 @@ export class MonetCore {
       // parameter the caller must decide is not the placeholder round 1 banned: a placeholder is an
       // argument nobody can supply, and this is the one argument only the caller can.
       //
+      // …AND `accept-new` IS QUALIFIED, because the three are NOT equally runnable from the two
+      // arguments above (Codex round 1). `resolveContradiction`'s ambiguous-accept-new guard throws
+      // when a real correction has SEVERAL live priors and the caller named neither a reconciled
+      // `body` nor a `contradictedObservationId`: nothing records which claim was contradicted, so
+      // superseding any of them would be a guess. Measured: on a concept with two live priors,
+      // `accept-new` with only the rendered arguments fails with "cannot resolve this contradiction
+      // with accept-new and no reconciled body", while `keep-current` and `dismiss` both succeed.
+      // An unqualified list promised a call that does not run — this branch's own defect, one round
+      // later, in the sentence it just fixed.
+      //
+      // THE BODY IS NAMED UNCONDITIONALLY rather than "when several live priors exist", and that is
+      // deliberate over-instruction rather than imprecision. `body` is accepted on EVERY accept-new
+      // — with one live prior it is optional and simply recorded — so "accept-new with a reconciled
+      // body" is a call that runs in every case, whereas a conditional would ask the caller to first
+      // count live priors, which no payload here reports. Name a path that runs.
+      //
+      // `keep-current` IS LEFT UNQUALIFIED ON PURPOSE. It supersedes the correction, which the row
+      // already names, so it needs no body at any prior count — measured above. Its own guard fires
+      // only when NO live prior predates the correction, and whether that state is reachable through
+      // the public surfaces was not established, so nothing is claimed about it here.
+      //
       // ABSENT RATHER THAN INVENTED if the id somehow is not there. Unreachable — the id and the
       // count come out of one statement — but the contract `withdrawVia` documents is that a
       // finding whose remedy does not exist says so by omission.
@@ -7675,7 +7736,7 @@ export class MonetCore {
               "memory_resolve",
               [["contradictionId", marks.openContradictionId]],
               row.circle,
-              `a decision of "accept-new", "keep-current" or "dismiss"`,
+              `a decision of "accept-new" (with a reconciled body), "keep-current" or "dismiss"`,
             ),
       });
     }

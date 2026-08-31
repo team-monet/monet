@@ -10191,7 +10191,7 @@ describe("MCP surface", () => {
       `cannot retire ${id}: it carries 1 open contradiction(s), which retiring would silently ` +
       `dismiss rather than answer — withdraw it through memory_resolve with ` +
       `contradictionId="${contradictionId}", circle="default" and a decision of ` +
-      `"accept-new", "keep-current" or "dismiss"`,
+      `"accept-new" (with a reconciled body), "keep-current" or "dismiss"`,
     );
     // NO VERDICT IS PARSEABLE OUT OF IT — the property the prose form exists for.
     expect(refused.text).not.toContain("decision=");
@@ -10280,7 +10280,7 @@ describe("MCP surface", () => {
         error: `cannot retire ${disputedId}: it carries 1 open contradiction(s), which retiring would ` +
           `silently dismiss rather than answer — withdraw it through memory_resolve with ` +
           `contradictionId="${contradictionId}", circle="default" and a decision of ` +
-          `"accept-new", "keep-current" or "dismiss"`,
+          `"accept-new" (with a reconciled body), "keep-current" or "dismiss"`,
       },
       { id: freeId, action: "retired" },
     ]);
@@ -11233,11 +11233,31 @@ describe("MCP surface", () => {
     c.close();
   });
 
-  it("the open-contradiction refusal's remedy can be replayed verbatim for a concept homed OUTSIDE the session circle", async () => {
+  /**
+   * THE MIDDLE CASE, NOT THE EASY END (Codex round 1 on #132).
+   *
+   * The first version of this test replayed with `dismiss` — the ONE decision that needs nothing but
+   * the two rendered arguments — so it went green on a remedy that was wrong for `accept-new`. The
+   * recurring miss on this branch is exactly that: cover the normal input and the absent input, skip
+   * the one that EXISTS BUT IS PARTIAL. So the fixture here is deliberately the partial one: a
+   * concept with SEVERAL live prior observations, where `resolveContradiction`'s ambiguous-accept-new
+   * guard fires and nothing but a reconciled `body` gets the caller through.
+   *
+   * BOTH HALVES ARE DRIVEN. First the bare call is proved to FAIL — that is what makes the fixture
+   * the middle case rather than an assertion that it is — and then the remedy's own instruction is
+   * followed and must succeed. A test that only did the second half would pass on the single-prior
+   * fixture too, where `accept-new` never needed a body at all.
+   */
+  it("the open-contradiction remedy replays with accept-new on a concept with SEVERAL live priors — the case a bare decision cannot resolve", async () => {
     const c = core();
     const { call, client } = await harness(c);
     const fact = await call("memory_store", { content: "The metrics service listens on 8080.", circle: QUOTED_CIRCLE });
     const id = fact.json.conceptId as string;
+    // THE SECOND LIVE PRIOR — what makes accept-new ambiguous. Without it the guard never fires and
+    // this test degrades into the easy end it exists to replace.
+    expect((await call("memory_store", {
+      content: "It is deployed in the eu-west cluster.", attachTo: id, circle: QUOTED_CIRCLE,
+    })).isError).toBe(false);
     const correction = await call("memory_store", {
       content: "It listens on 9090 now.", kind: "correction", attachTo: id, circle: QUOTED_CIRCLE,
     });
@@ -11253,13 +11273,28 @@ describe("MCP surface", () => {
       contradictionId: (correction.json.contradiction as { id: string }).id,
       circle: QUOTED_CIRCLE,
     });
-
     // `decision` IS SUPPLIED BY THE CALLER, NOT BY THE SENTENCE — the one argument no read derives,
     // and the reason the options are prose. If they were rendered as `decision="…"` pairs this
     // parser would have adopted the last one silently, and `dismiss` records NO CONFLICT.
     expect(args).not.toHaveProperty("decision");
-    const resolved = await call("memory_resolve", { ...args, decision: "dismiss" });
-    expect(resolved.isError, `remedy replayed as ${JSON.stringify(args)} -> ${resolved.text}`).toBe(false);
+
+    // THE FIXTURE IS THE PARTIAL CASE, MEASURED THROUGH THE GUARD ITSELF rather than by counting
+    // observations: the rendered arguments plus a bare accept-new are refused, and the refusal names
+    // the missing input. This is the call the unqualified sentence used to promise.
+    const bare = await call("memory_resolve", { ...args, decision: "accept-new" });
+    expect(bare.isError, bare.text).toBe(true);
+    expect(bare.text).toContain("accept-new and no reconciled body");
+    expect(bare.text).toContain("2 live prior observations");
+    // …and it changed nothing: the dispute is still open and still blocks.
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["open-contradiction"]);
+
+    // THE REMEDY FOLLOWED VERBATIM — the body is what the sentence tells the caller to bring, and
+    // this is the assertion that the sentence is honest.
+    expect(refused.text).toContain('"accept-new" (with a reconciled body)');
+    const resolved = await call("memory_resolve", {
+      ...args, decision: "accept-new", body: "The metrics service listens on 9090.",
+    });
+    expect(resolved.isError, `remedy replayed as ${JSON.stringify(args)} + body -> ${resolved.text}`).toBe(false);
     expect(c.retirementBlockers(id)).toEqual([]);
     expect((await call("memory_retire", { id, circle: QUOTED_CIRCLE })).isError).toBe(false);
 
@@ -11290,6 +11325,82 @@ describe("MCP surface", () => {
     expect(dismissed.json).toMatchObject({ action: "pair-flags-dismissed", rowsUpdated: 2 });
     expect(c.retirementBlockers(aId)).toEqual([]);
     expect((await call("memory_retire", { id: aId, circle: QUOTED_CIRCLE })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * AN OVERSIZED VALUE IS BOUNDED, AND THE BOUND IS ON THE VALUES THE DATABASE HANDS BACK (Codex
+   * round 1 on #132). `err()` returns its message verbatim and applies none of the RESULT_MAX_CHARS
+   * fitting `ok()` does, so a pathological value in a refusal produces a response past the host's
+   * limit — the caller gets nothing usable instead of the refusal. `LIFECYCLE_ERROR_ID_MAX_CHARS` +
+   * `clip()` already guard a CALLER-SUPPLIED id at two sites; the values a remedy reads out of the
+   * store had no such guard.
+   *
+   * THE OVERSIZED ID IS WRITTEN DIRECTLY, and that is the honest fixture rather than a shortcut:
+   * `sync-types.ts` puts no length bound on any id and `graftRows` inserts `contradictions.id`
+   * straight from the payload (engine.ts's contradictions graft), so a relayed row really can carry
+   * one. No public local surface mints an id, so raw SQL is the only way to stand where sync stands.
+   */
+  it("an oversized contradiction id is clipped in the refusal, marked as truncated, and the remedy still parses", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const id = (await call("memory_store", { content: "The metrics service listens on 8080." })).json.conceptId as string;
+    const correction = await call("memory_store", { content: "It listens on 9090 now.", kind: "correction", attachTo: id });
+    const realId = (correction.json.contradiction as { id: string }).id;
+    const oversized = "k".repeat(5_000);
+    raw(c).prepare(`UPDATE contradictions SET id = ? WHERE id = ?`).run(oversized, realId);
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["open-contradiction"]);
+
+    const refused = await call("memory_retire", { id });
+    expect(refused.isError).toBe(true);
+    // BOUNDED. Unguarded this was 5 283 characters, the id verbatim inside it.
+    expect(refused.text).not.toContain(oversized);
+    expect(refused.text.length, refused.text.slice(0, 200)).toBeLessThan(1_000);
+    // MARKED, NEVER SILENT — a caller must be able to see this is not an id rather than replaying a
+    // plausible-looking prefix.
+    expect(refused.text).toContain("[truncated 4744 chars]");
+    // AND STILL A PARSEABLE CALL: the clip happens before serialization, so the pair survives.
+    const args = remedyArgs(refused.text, "memory_resolve");
+    expect(Object.keys(args).sort()).toEqual(["circle", "contradictionId"]);
+    expect(args.circle).toBe("default");
+    expect((args.contradictionId as string).startsWith("kkkk")).toBe(true);
+    expect((args.contradictionId as string).length).toBeLessThan(400);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE OTHER SIDE OF THE SAME BOUND, and the reason it is 256 rather than the 128 of
+   * `LIFECYCLE_ERROR_ID_MAX_CHARS`. That constant bounds an id a caller typed, which has no
+   * legitimate large form; these values include `concepts.circle`, which this very surface accepts up
+   * to CIRCLE_NAME_MAX_CHARS (256). Clipping at 128 would truncate a circle name a supported path
+   * created and make the remedy unreplayable for a store that did nothing wrong — a new defect
+   * wearing a guard's clothes. A name at the full legitimate length must survive intact and REPLAY.
+   */
+  it("a circle name at the full legitimate length is not clipped, and its remedy still replays", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const circle = `c${"o".repeat(254)}e`; // exactly CIRCLE_NAME_MAX_CHARS
+    expect(circle).toHaveLength(256);
+    const declared = await call("memory_declare", { species: "principle", content: "Prefer the smallest reversible step.", circle });
+    expect(declared.isError, declared.text).toBe(false); // ACCEPTED — measured, not assumed
+    const id = declared.json.conceptId as string;
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["ratification"]);
+
+    const refused = await call("memory_retire", { id, circle });
+    const args = remedyArgs(refused.text, "memory_ratify");
+    // INTACT, not truncated — the assertion the 128 bound would fail.
+    expect(refused.text).not.toContain("truncated");
+    expect(args, refused.text).toEqual({ candidateId: id, verdict: "retire", circle });
+
+    // AND IT RUNS. A clipped circle is `concept not found` here, which is what makes this a replay
+    // test rather than a string-length assertion.
+    const ratified = await call("memory_ratify", args);
+    expect(ratified.isError, `remedy replayed as ${JSON.stringify(args).slice(0, 200)} -> ${ratified.text}`).toBe(false);
+    expect(c.retirementBlockers(id)).toEqual([]);
 
     await client.close();
     c.close();
