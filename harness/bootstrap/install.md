@@ -320,6 +320,8 @@ That entry alone carries `circle: "*"`. Both rule delivery and the stage index s
 bindings whose circle is the current one or `*` (`packages/core/src/gates.ts:1797`), so a
 binding made in whatever circle the install runs in would never reach the new circle this
 rule exists to seed — and it would fail silently, since the stage simply would not appear.
+Breadth reaches every circle in *this* store; it cannot cross a per-repo `MONET_STORAGE_DIR`
+split, where each repository opens its own store and is seeded by its own install.
 It also batches a *later* moment — the user's first session in a new circle — so this review
 still runs one entry at a time.
 
