@@ -297,9 +297,14 @@ silently. The dumping-ground law applies to defaults too.
 
 Present each entry, one at a time, and declare only what they approve — `memory_declare`,
 then `memory_ratify` with `entrance: "declaration"`, because their yes is what admitted it
-and the record should say so. Declare every rule entry with `scope: "domain"`: these are
-product defaults, not compensations for one model, and the default `agent` scope is refused
-outright without a `MONET_MODEL_TAG`, which the Phase 3 configuration does not set.
+and the record should say so. Two arguments apply to the whole pack. Declare **every** entry
+with `circle: "*"` — a default that reaches one project is not a default, and this is the one
+argument that sets breadth for both species: a rule is delivered where its binding circle is
+the current one or `*` (`packages/core/src/gates.ts:1797`), a principle where its own circle
+matches or `skeleton_breadth` is global (`packages/core/src/engine.ts:1668`). Declare every
+**rule** entry with `scope: "domain"` as well: these are product defaults, not compensations
+for one model, and the default `agent` scope is refused outright without a `MONET_MODEL_TAG`,
+which the Phase 3 configuration does not set.
 
 - **Principle** — *Make the smallest change that meets the request; improvements outside it
   are proposals, not edits.* Reason: unrequested changes cost more to review than they save.
@@ -311,19 +316,20 @@ outright without a `MONET_MODEL_TAG`, which the Phase 3 configuration does not s
   prevents symptom patches that return.
 - **Rule at "commit changes" (advisory)** — *If a secret, key, or token is about to enter a
   file or commit, stop and say so.* Reason: prevents credential leakage into history.
-- **Rule at "onboard a new project circle" (advisory, `circle: "*"`)** — *Seed a new
-  circle's baseline in one batch of grouped questions rather than one correction at a time,
-  and store only what the user's standing files do not already cover.* Reason: an unseeded
-  circle costs the user months of re-explaining the same norms on every new project.
+- **Rule at "onboard a new project circle" (advisory)** — *Seed a new circle's baseline in
+  one batch of grouped questions rather than one correction at a time, and store only what
+  the user's standing files do not already cover.* Reason: an unseeded circle costs the user
+  months of re-explaining the same norms on every new project.
 
-That entry alone carries `circle: "*"`. Both rule delivery and the stage index select only
-bindings whose circle is the current one or `*` (`packages/core/src/gates.ts:1797`), so a
-binding made in whatever circle the install runs in would never reach the new circle this
-rule exists to seed — and it would fail silently, since the stage simply would not appear.
-Breadth reaches every circle in *this* store; it cannot cross a per-repo `MONET_STORAGE_DIR`
-split, where each repository opens its own store and is seeded by its own install.
-It also batches a *later* moment — the user's first session in a new circle — so this review
-still runs one entry at a time.
+Breadth is what makes the last entry work at all — its whole subject is a circle that does
+not exist yet, so a binding confined to the install circle would never be delivered there,
+and it would fail silently, since the stage simply would not appear in that circle's index.
+The other five degrade less visibly but in the same direction. What breadth cannot do is
+cross a per-repo `MONET_STORAGE_DIR` split: it reaches every circle in *this* store, and
+under that layout each repository opens its own store and is seeded by its own install.
+
+That last entry also batches a *later* moment — the user's first session in a new circle —
+so this review still runs one entry at a time.
 
 A fresh store has no stages; declaring the first rule at a moment brings its stage with it,
 which is also how that entry ships the `onboard a new project circle` stage it names.
