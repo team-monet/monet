@@ -302,7 +302,8 @@ describe("the conformance loop, end to end", () => {
 
   it("withholds the backlog on the one response that cannot explain it, and names it again on the next that can", async () => {
     // THE TWO HALVES ONLY WORK TOGETHER. The response's `instruction` says what asking means and
-    // which two tools take the key; the appended backlog says WHICH earlier moments still owe it.
+    // which two tools take the key; the appended backlog says WHICH earlier moments had no question
+    // put. Candidates, not debts — the record does not say whether an action followed any of them.
     // Neither is a copy of the other, which is exactly why neither stands alone: a bare list of
     // uuids, on a response whose instruction was deliberately withheld, is not a reminder the agent
     // can act on — nothing on it, or anywhere else, names a tool that takes them.

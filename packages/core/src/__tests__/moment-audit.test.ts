@@ -240,6 +240,27 @@ describe("R2 — the all-clear does not print over a reported loss", () => {
 
 
 describe("G2 — the all-clear stays reachable", () => {
+  it("keeps the all-clear when a moment was read and never asked about", () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const db = mkDb();
+    seq = 0;
+    // THE SAME SHAPE AS THE UNJOINABLE-READ CASE ABOVE, and it arrived the same way. `notAsked`
+    // only grows — nothing removes a moment but asking — and its benign normal case is a lookup
+    // made to READ rules, where no action followed and there is nothing to ask about. While it sat
+    // in the all-clear list, one such lookup retired "no curation work queued" for the life of the
+    // store, with nothing a human could act on.
+    readAndActed(path, "read-never-asked");
+    foldMomentSpool(db, path);
+    const core = new MonetCore(":memory:", { momentSpoolPath: path, defaultCircle: "acme-widgets" });
+    cores.push(core);
+    const rendered = renderOverview(core.overview("acme-widgets"), { color: false });
+
+    // BOTH HALVES. The population is still reported — dropping it from the lists must not drop it
+    // from the page — and the all-clear survives it.
+    expect(rendered).toContain("never asked: 1");
+    expect(rendered).toContain("no curation work queued");
+  });
+
   it("keeps the all-clear after an ordinary agent_context lookup", () => {
     const path = join(mkTmp(), "moments.jsonl");
     const db = mkDb();

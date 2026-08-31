@@ -1961,7 +1961,7 @@ export function registerMonetCoreTools(
    */
   server.tool(
     "conformance_ask",
-    "Record that you asked the user whether an action followed the rule it read. Call this when you put the question, before their reply. The momentId is the one `stage_lookup` returned when it handed you that rule; a later `stage_lookup` also names any you still owe.",
+    "Record that you asked the user whether an action followed the rule it read. Call this when you put the question, before their reply. The momentId is the one `stage_lookup` returned when it handed you that rule; a later `stage_lookup` also names earlier moments with no question put — candidates, not debts, because the record does not say whether an action followed any of them. Ask where one did.",
     {
       momentId: z.string().max(MOMENT_ID_MAX_CHARS).describe("The moment you asked about."),
     },

@@ -111,7 +111,7 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   const neverAsked = conformance.notAsked;
   if (
     gates.total > 0 || gates.retirementCandidates || gates.unexplainedDenies || gates.unreadStages ||
-    owedByUser > 0 || neverAsked > 0 || gates.losses > 0 || gates.unopened > 0 ||
+    owedByUser > 0 || gates.losses > 0 || gates.unopened > 0 ||
     gates.unattributed > 0
   ) {
     lines.push(bold("GATE"));
@@ -146,7 +146,13 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
       lines.push(truncate(`  awaiting you: ${owedByUser} asked, not yet answered`, width));
     }
     if (neverAsked > 0) {
-      lines.push(truncate(yellow(`  never asked: ${neverAsked} delivered rules, no question put`), width));
+      // IN NEITHER LIST, by the rule stated at the all-clear below: a number that only grows and
+      // has a benign normal case belongs in neither. Nothing removes a moment from this population
+      // except asking about it, and a lookup made to READ rules — an inventory sweep, a probe — is
+      // the benign normal case, with no action to ask about and so no honest way to clear it. It
+      // was `yellow` and in both lists, so one such lookup retired "no curation work queued" for
+      // the life of the store: the same failure `unjoinableReads` was moved out of both lists for.
+      lines.push(truncate(dim(`  never asked: ${neverAsked} delivered rules, no question put`), width));
     }
     // READ, BUT TOO LATE TO HAVE ACTED ON IT. Dim and unactionable on purpose: a PreToolUse
     // advisory reaches the model beside the tool result on this host, so for every moment a
@@ -213,7 +219,7 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     overview.counts.dirty === 0 && overview.counts.stale === 0 && overview.counts.disputed === 0 &&
     overview.counts.possibleDuplicates === 0 && overview.counts.extractionCandidates === 0 &&
     !gates.retirementCandidates && !gates.unexplainedDenies && !gates.unreadStages &&
-    gates.conformance.notAsked === 0 && gates.conformance.unanswered === 0 && gates.losses === 0 &&
+    gates.conformance.unanswered === 0 && gates.losses === 0 &&
     // THIS LIST AND THE GATE SECTION'S OWN VISIBILITY CHECK ARE THE SAME SET. Mechanical on
     // purpose, and grep-checkable: anything that can OPEN that section must also suppress the
     // all-clear, or the page tells a human both things at once.
