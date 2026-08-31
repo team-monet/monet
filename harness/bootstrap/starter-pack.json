@@ -1,0 +1,71 @@
+{
+  "$comment": [
+    "THE STARTER PACK, AS DATA. Phase 5 of install.md presents these entries and declares what the",
+    "user approves; this file is the same set with the arguments that prose could not be tested for.",
+    "",
+    "WHY IT EXISTS. The pack's rule half was broken three independent ways and every one was found by",
+    "review rather than by a test: `scope` defaulted to agent and the declaration was refused outright,",
+    "breadth confined every entry to the install circle, and `memory_ratify` throws on a rule id. All",
+    "three lived in the prose saying HOW to declare, so a test that parsed the entry list and chose the",
+    "arguments itself would have passed however wrong the playbook was.",
+    "",
+    "THE PROSE STAYS AUTHORITATIVE FOR A HUMAN; this is authoritative for the machine, and",
+    "starter-pack.test.ts fails if the two disagree in either direction."
+  ],
+  "entries": [
+    {
+      "species": "principle",
+      "circle": "*",
+      "ratify": true,
+      "content": "Make the smallest change that meets the request; improvements outside it are proposals, not edits.",
+      "reason": "unrequested changes cost more to review than they save"
+    },
+    {
+      "species": "principle",
+      "circle": "*",
+      "ratify": true,
+      "content": "Batch questions: collect what needs asking and ask once.",
+      "reason": "drip-fed questions interrupt more than they resolve"
+    },
+    {
+      "species": "rule",
+      "circle": "*",
+      "scope": "domain",
+      "severity": "advisory",
+      "stage": "declare work complete",
+      "ratify": false,
+      "content": "A claim of done carries the evidence that proves it: the command, the output, the diff.",
+      "reason": "prevents done-by-assertion"
+    },
+    {
+      "species": "rule",
+      "circle": "*",
+      "scope": "domain",
+      "severity": "advisory",
+      "stage": "fix a bug",
+      "ratify": false,
+      "content": "Name the cause before shipping the fix.",
+      "reason": "prevents symptom patches that return"
+    },
+    {
+      "species": "rule",
+      "circle": "*",
+      "scope": "domain",
+      "severity": "advisory",
+      "stage": "commit changes",
+      "ratify": false,
+      "content": "If a secret, key, or token is about to enter a file or commit, stop and say so.",
+      "reason": "prevents credential leakage into history"
+    },
+    {
+      "species": "rule",
+      "circle": "*",
+      "scope": "domain",
+      "severity": "advisory",
+      "stage": "onboard a new project circle",
+      "ratify": false,
+      "content": "Seed a new circle's baseline in one batch of grouped questions rather than one correction at a time, and store only what the user's standing files do not already cover.",
+      "reason": "an unseeded circle costs the user months of re-explaining the same norms on every new project"
+    }
+  ]
+}

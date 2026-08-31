@@ -82,8 +82,15 @@ jobs:
           if echo "$changed" | grep -q '^packages/cli/'; then
             cli=true
           fi
-          # harness/ intentionally matches nothing: it has no build, no tests and no dependencies,
-          # and is not a workspace member. There is no gate for it to run.
+          # harness/ still matches nothing in general — no build, no tests, no dependencies, and not a
+          # workspace member — but TWO FILES IN IT ARE NOW READ BY A CORE TEST. starter-pack.test.ts
+          # runs the starter pack's declarations against a scratch store and checks the pack data
+          # against the playbook prose, so a change to either can break the core gate while touching
+          # no package. Narrow on purpose: the exception is those two paths, not harness/.
+          if echo "$changed" | grep -qE '^harness/bootstrap/(starter-pack\.json|install\.md)$'; then
+            core=true
+            cli=true
+          fi
           echo "core=$core" >> "$GITHUB_OUTPUT"
           echo "cli=$cli" >> "$GITHUB_OUTPUT"
 
