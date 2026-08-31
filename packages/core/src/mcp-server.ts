@@ -922,14 +922,17 @@ export function registerMonetCoreTools(
    * demands:
    *
    *   WHO CONSUMES IT — the agent, and nobody else. It is an instruction, not data for a reader.
-   *   ON WHICH TURN — the next `stage_lookup` response after a moment was read and then acted on,
-   *     and NO OTHER TOOL'S. Not at session start (the debt does not exist yet) and not on a timer.
-   *   WHAT BREAKS WITHOUT IT — the agent cannot know it owes a question. Nothing else is in a
-   *     position to tell it: the read is recorded inside the store, and the agent's own transcript
-   *     shows it fetched rules, never that a question is outstanding. Without the signal, `not
-   *     asked` stops meaning "the agent failed to ask" and starts meaning "the agent was never
-   *     told" — one number covering a defect and an impossibility, which is the precise conflation
-   *     this whole rebuild exists to remove.
+   *   ON WHICH TURN — the next `stage_lookup` response after rules were delivered at a moment with
+   *     no question put, and NO OTHER TOOL'S. Not at session start (nothing is outstanding yet) and
+   *     not on a timer.
+   *   WHAT BREAKS WITHOUT IT — the agent cannot know a question may be outstanding. Nothing else is
+   *     in a position to tell it: the read is recorded inside the store, and the agent's own
+   *     transcript shows it fetched rules, never that a moment is still open. Without the signal,
+   *     `not asked` stops meaning "no question was put" and starts meaning "the agent was never
+   *     told" — one number covering a live candidate and an impossibility, which is the precise
+   *     conflation this whole rebuild exists to remove. What the signal does NOT settle is whether
+   *     an action followed; that is `notAskedWithAction`'s subset, and everywhere else the agent
+   *     is the only party who knows.
    *
    * ONE SURFACE, AND THAT IS THE CORRECTION THIS ROUND MAKES. It used to ride EVERY tool response,
    * which spent context on `memory_fetch` and `memory_checkpoint` replies where the agent has no
@@ -960,10 +963,12 @@ export function registerMonetCoreTools(
    * an agent defect, is verbatim the conflation between "ignored the signal" and "was never told"
    * that these counts exist to remove.
    *
-   * So delivery is never assumed. The moment stays named until it stops owing a question, which the
-   * agent clears by asking. The debt is small and self-clearing by construction — only moments that
-   * delivered rules are ever in it, and one leaves the moment it is asked about — so this is a
-   * persistent notice rather than a standing banner, and it is bounded by the cap below either way.
+   * So delivery is never assumed. A moment stays named until a question is put about it, which is
+   * the only thing that removes one. CANDIDATES, NOT DEBTS: only moments that delivered rules are
+   * ever in the list, and whether an action followed any of them is unrecorded, so an entry is a
+   * question worth considering rather than one owed. It is a persistent notice rather than a
+   * standing banner, and bounded by the cap below either way — see #147 for what follows from an
+   * entry that can never be honestly cleared.
    *
    * SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so this appends nothing
    * at all on the overwhelming majority of responses.
@@ -1958,8 +1963,9 @@ export function registerMonetCoreTools(
    * TWO TOOLS, NOT ONE, because they are two events with two owners. The ASK is the agent's act and
    * the ANSWER is the user's; a single call carrying both would make the agent the author of a fact
    * it does not own, and would destroy the distinction between `unanswered` (asked, waiting on the
-   * user) and `not asked` (never asked, the agent's defect) — the one distinction this surface
-   * exists to keep.
+   * user) and `not asked` (no question put) — the one distinction this surface exists to keep. That
+   * second state is not by itself a defect: whether an action followed is unrecorded, and
+   * `notAskedWithAction` is the subset the record can speak for.
    */
   server.tool(
     "conformance_ask",

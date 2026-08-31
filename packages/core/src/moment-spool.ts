@@ -546,7 +546,8 @@ export function spoolOutcome(
  *
  * Asking is itself an event, not a judgment — which is what stops the regress: nothing needs to
  * judge whether the meta-rule was obeyed, because "did it ask" is read off the record. It is also
- * what separates `unanswered` (a queue the user owes) from `not asked` (a defect the agent owes).
+ * what separates `unanswered` (a queue the user owes) from `not asked` (no question put — not by
+ * itself a defect, since whether an action followed is unrecorded).
  */
 export function spoolAsk(run: MomentRun, fields: { momentId: string; askedAt?: string }): void {
   appendMomentRecord(run, {

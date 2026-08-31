@@ -145,7 +145,9 @@ export const MOMENT_SCHEMA_SQL = `
     -- indistinguishable, including to a user being asked whether it followed the rule.
     outcome_status TEXT CHECK (outcome_status IS NULL OR outcome_status IN ('ok', 'failed')),
     -- Written when the agent asks, and when the user answers. asked_at NULL with a read and an
-    -- outcome present is the 'not asked' state: an agent defect, not a queue.
+    -- outcome present is the 'not asked' state: no question was put. Not a queue, and not by itself
+    -- a defect: whether an action followed is unrecorded, and notAskedWithAction is the subset
+    -- carrying a stored action, which is the part that is.
     asked_at TEXT,
     answer TEXT CHECK (answer IS NULL OR answer IN ('followed', 'not-followed')),
     answered_at TEXT
