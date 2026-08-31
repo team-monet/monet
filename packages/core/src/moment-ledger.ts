@@ -858,7 +858,16 @@ export interface MomentConformance {
   notFollowed: number;
   /** Asked, no answer yet. A queue, not a defect. Owned by the user. */
   unanswered: number;
-  /** Read and acted on, never asked. A defect, not a queue. Owned by the agent. */
+  /**
+   * Rules were read; no question was put.
+   *
+   * NOT BY ITSELF A DEFECT, and it used to say it was. Whether an action followed is not
+   * recorded — #85 retired interception on the finding that a gate reaching the model beside
+   * the tool result is not a gate — so a lookup made to READ rules (an inventory sweep, a
+   * probe, a stage consulted out of curiosity) lands here identically to one that governed a
+   * real act and went unasked. Attributing the population to the agent picks one of those two
+   * and calls it observed. It is a population to look at, not a fault to assign.
+   */
   notAsked: number;
   /** Reads that named no moment — the health signal for delivery naming its moment. */
   unjoinableReads: number;
@@ -1044,7 +1053,13 @@ export function momentRuleReadsByStage(db: StoragePort, spoolPath: string, circl
 }
 
 /**
- * The moments that owe the user a question: read, acted on, never asked.
+ * The moments where rules were read and no question has been put.
+ *
+ * WHAT THIS ESTABLISHES, AND WHAT IT DOES NOT. `outcome_at IS NOT NULL` says the call finished;
+ * a non-empty `rule_reads` says rules reached the agent. Neither says an action followed, and
+ * since #85 nothing records one. Under that design `stage_lookup` IS the moment a rule reaches
+ * an agent, so this is the right population to surface — but a caller rendering it must not
+ * describe these as actions.
  *
  * BOUNDED BY THE CALLER, because this feeds a signal that reaches a model's context and an unbounded
  * list there is a payload. Oldest first, so a backlog is worked from its head rather than its tail

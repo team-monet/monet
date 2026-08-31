@@ -962,8 +962,8 @@ export function registerMonetCoreTools(
    *
    * So delivery is never assumed. The moment stays named until it stops owing a question, which the
    * agent clears by asking. The debt is small and self-clearing by construction — only moments that
-   * were read and then acted on are ever in it — so this is a persistent notice rather than a
-   * standing banner, and it is bounded by the cap below either way.
+   * delivered rules are ever in it, and one leaves the moment it is asked about — so this is a
+   * persistent notice rather than a standing banner, and it is bounded by the cap below either way.
    *
    * SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so this appends nothing
    * at all on the overwhelming majority of responses.
@@ -979,7 +979,7 @@ export function registerMonetCoreTools(
     const fresh = owed.slice(0, ASK_SIGNAL_MAX_MOMENTS);
     if (fresh.length === 0) return "";
     const ids = fresh.join(", ");
-    const noun = fresh.length === 1 ? "action" : "actions";
+    const noun = fresh.length === 1 ? "moment" : "moments";
     // A FACT, NOT A SECOND COPY OF THE INSTRUCTION. It used to carry both — what is owed AND what to
     // do about it — because it was the only thing on any response that said either. The response's
     // own `instruction` field now carries the what-to-do on every lookup that has a `momentId`, so
@@ -992,8 +992,13 @@ export function registerMonetCoreTools(
     // exposes; this rides as a later content item, which some drop. The half that can go missing is
     // the id list, never the instruction — the reverse split would lose the what-to-do entirely.
     //
-    // The wording still says the action FOLLOWED a rule it read, never that the rule caused it.
-    return `Monet: you read a rule and then acted, for ${fresh.length} ${noun} (${ids}) — each still owes that question.`;
+    // IT NAMES WHAT WAS READ, NEVER WHAT WAS DONE. It used to say "you read a rule and then acted",
+    // which asserted an action nothing here observes: #85 retired interception, so no action reaches
+    // this record at all, and a lookup made to READ rules lands in this list identically to one that
+    // governed a real act. Saying so is what stops an agent asking the user to adjudicate a
+    // non-event — the question is only worth putting where something actually followed, and the
+    // agent is the only party that knows which those are.
+    return `Monet: rules were read at ${fresh.length} ${noun} not yet asked about (${ids}). Whether an action followed is not recorded — ask about the ones where something did.`;
   }
 
   function wrapSuccess(

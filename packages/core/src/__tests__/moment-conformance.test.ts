@@ -94,6 +94,20 @@ async function declareRuleAt(core: MonetCore, stage: string): Promise<void> {
   });
 }
 
+/*
+ * TWO MATCHERS, AND THE SPLIT IS THE POINT. An ABSENCE assertion cannot use the exact wording:
+ * change the signal and it matches nothing, so `.toBe(false)` passes while saying nothing about
+ * whether a signal fired — a green that cannot fail, which is the exact failure these tests are
+ * written against. Proven, not assumed: with one matcher, reverting the wording failed only the
+ * two PRESENCE tests and left both absence tests green.
+ *
+ * So absence matches the family (any `Monet:` notice at all — the healthy state on these surfaces
+ * is silence, not "silence of one particular sentence"), and presence matches the sentence. A
+ * future notice worded differently trips the absence tests loudly, which is the safe direction.
+ */
+const ASK_SIGNAL_ANY = "Monet: ";
+const ASK_SIGNAL_PREFIX = "Monet: rules were read at";
+
 describe("the four states, kept apart", () => {
   it("separates a queue owed to the user from a defect owed by the agent", () => {
     const path = join(mkTmp(), "moments.jsonl");
@@ -297,7 +311,7 @@ describe("the signal that tells the agent it owes a question", () => {
       const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
       // SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so the ordinary
       // response carries no Monet instruction whatsoever.
-      expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
+      expect(texts(result).some((text) => text.includes(ASK_SIGNAL_ANY))).toBe(false);
     } finally {
       await cleanup();
     }
@@ -322,7 +336,7 @@ describe("the signal that tells the agent it owes a question", () => {
         { name: "memory_overview", arguments: {} },
       ]) {
         const result = await client.callTool(call);
-        expect(texts(result).some((text) => text.includes("Monet: you read a rule"))).toBe(false);
+        expect(texts(result).some((text) => text.includes(ASK_SIGNAL_ANY))).toBe(false);
       }
       // The same debt, on the one surface that carries it.
       const lookup = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
@@ -347,10 +361,17 @@ describe("the signal that tells the agent it owes a question", () => {
     const { client, cleanup } = await pair(core);
     try {
       const result = await client.callTool({ name: "stage_lookup", arguments: { stage: "git force push" } });
-      const signal = texts(result).find((text) => text.includes("Monet: you read a rule"));
+      const signal = texts(result).find((text) => text.includes(ASK_SIGNAL_PREFIX));
       expect(signal).toBeDefined();
       // A signal naming a moment...
       expect(signal).toContain("owed-one");
+      // AND CLAIMING NOTHING ABOUT WHAT FOLLOWED IT. The signal used to read "you read a rule and
+      // then acted", asserting an action nothing observes — #85 retired interception, and a lookup
+      // made to READ rules reaches this list identically to one that governed a real act. Both
+      // halves are asserted: the claim is gone, AND the absence is stated rather than merely
+      // omitted, because saying nothing would leave the reader to assume the old meaning.
+      expect(signal).not.toContain("and then acted");
+      expect(signal).toContain("Whether an action followed is not recorded");
       // BOTH tools are still named on this response — on the `instruction` field that now ships
       // beside the key on every lookup, rather than in the signal that used to be the only thing
       // saying either. The naming had to survive that move, not be dropped by it: the ask is its own
@@ -390,7 +411,7 @@ describe("the signal that tells the agent it owes a question", () => {
       // every lookup, and the debt signal, which fires only because a moment is outstanding.
       const instruction = (JSON.parse(parts[0]) as { instruction?: string }).instruction;
       expect(instruction).toContain("conformance_ask");
-      const signal = parts.find((text) => text.includes("Monet: you read a rule"));
+      const signal = parts.find((text) => text.includes(ASK_SIGNAL_PREFIX));
       expect(signal).toContain("owed-one");
 
       // AND NEITHER IS A SECOND COPY OF THE OTHER. They carry different facts — what asking means,
