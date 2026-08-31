@@ -300,34 +300,9 @@ describe("the conformance loop, end to end", () => {
     expect(l.core.momentsOwingAQuestion(50)).toEqual([]);
   });
 
-  it("withholds the backlog on the one response that cannot explain it, and names it again on the next that can", async () => {
-    // THE TWO HALVES ONLY WORK TOGETHER. The response's `instruction` says what asking means and
-    // which two tools take the key; the appended backlog says WHICH earlier moments had no question
-    // put. Candidates, not debts — the record does not say whether an action followed any of them.
-    // Neither is a copy of the other, which is exactly why neither stands alone: a bare list of
-    // uuids, on a response whose instruction was deliberately withheld, is not a reminder the agent
-    // can act on — nothing on it, or anywhere else, names a tool that takes them.
-    const l = await loop();
-    const ruleIds = await declareStageWithRules(l.client);
-    const owed = await lookupAndAssert(l, ruleIds);
-    expect(l.core.momentsOwingAQuestion(50)).toContain(owed);
-
-    // A LOOKUP THAT DELIVERS NO RULE. The key and its instruction are withheld here by design (a
-    // conformance_ask against it is guaranteed to be refused), and that is the condition.
-    const miss = await l.client.callTool({ name: "stage_lookup", arguments: { stage: "a moment nobody ever declared" } });
-    expectOk(miss, "stage_lookup(miss)");
-    expect(payload(miss)).not.toHaveProperty("momentId");
-    expect(payload(miss)).not.toHaveProperty("instruction");
-    // Asserted over EVERY content item, not just the payload: the backlog rides as a later text
-    // item precisely so it survives beside the JSON, so checking content[0] alone would prove
-    // nothing about it.
-    expect(texts(miss).join("\n")).not.toContain(owed);
-
-    // AND NOT LOST. The debt is persistent and clears only by asking, so the next lookup that DOES
-    // hand over rules names it again — beside the instruction that says what to do with it.
-    const hit = await l.client.callTool({ name: "stage_lookup", arguments: { stage: STAGE } });
-    expectOk(hit, "stage_lookup(hit)");
-    expect(payload(hit).instruction).toContain("conformance_ask");
-    expect(texts(hit).join("\n")).toContain(owed);
-  });
+  // THE BACKLOG-SIGNAL CASE THAT SAT HERE IS GONE WITH THE SIGNAL (#147). It asserted that a
+  // lookup delivering no rule withheld the id list, and that the next lookup that did deliver one
+  // named it again — behaviour that only made sense while a payload named earlier moments. What
+  // it was protecting, that the key and its instruction ride together and never separately, is
+  // still covered by the cases above.
 });

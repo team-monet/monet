@@ -30,7 +30,6 @@ import {
   momentLossCount,
   momentRuleReadsByStage,
   momentsOwingAQuestion,
-  momentsWithRecordedAction,
 } from "./moment-ledger";
 import type { MomentConformance, MomentCounts } from "./moment-ledger";
 import type { MomentRun } from "./moment-spool";
@@ -13509,11 +13508,6 @@ export class MonetCore {
   momentLossCount(): number {
     if (this.momentSpoolPath === null) return 0;
     return momentLossCount(this.db, this.momentSpoolPath);
-  }
-
-  /** Which of the given moments carry an action on the record. Empty unless the store predates #85. */
-  momentsWithRecordedAction(momentIds: string[]): Set<string> {
-    return momentsWithRecordedAction(this.db, momentIds);
   }
 
   /** Moments where rules were read and no question was put. Oldest first, bounded by the caller. */

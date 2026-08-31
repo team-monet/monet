@@ -160,18 +160,6 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
 const MOMENT_ID_MAX_CHARS = 36;
 
 /**
- * How many outstanding moments one ask signal may name.
- *
- * A DELIVERY BOUND, NOT A THRESHOLD ON THE BACKLOG. Nothing has measured how often a real store
- * accumulates unasked moments, so no number here could say when a backlog is "too large" — and this
- * one does not try. It bounds what reaches a model's context (8 ids is roughly 300 characters);
- * the TRUE total is reported by the conformance counts, which are not capped. If more are outstanding
- * than this names, the rest are named by the next signal — subject to #147, since the list is
- * oldest-first and an entry nobody can honestly clear never leaves it.
- */
-const ASK_SIGNAL_MAX_MOMENTS = 8;
-
-/**
  * WHAT THE KEY IS FOR — the one line that rides beside `momentId` on every `stage_lookup` response
  * that has one.
  *
@@ -918,118 +906,7 @@ export function registerMonetCoreTools(
    *   the caller is agent_context (which handles its own lifecycle) or autoPrewarm is off. When
    *   non-null, consumePrewarmSnapshot() is called here and the block (if non-empty) is attached.
    */
-  /**
-   * THE ASK SIGNAL — the one thing in this design that reaches a model's context, and therefore the
-   * one that faces the strictest form of the minimization test. Answering it, as the question
-   * demands:
-   *
-   *   WHO CONSUMES IT — the agent, and nobody else. It is an instruction, not data for a reader.
-   *   ON WHICH TURN — the next `stage_lookup` response after rules were delivered at a moment with
-   *     no question put, and NO OTHER TOOL'S. Not at session start (nothing is outstanding yet) and
-   *     not on a timer.
-   *   WHAT BREAKS WITHOUT IT — the agent cannot know a question may be outstanding. Nothing else is
-   *     in a position to tell it: the read is recorded inside the store, and the agent's own
-   *     transcript shows it fetched rules, never that a moment is still open. Without the signal,
-   *     `not asked` stops meaning "no question was put" and starts meaning "the agent was never
-   *     told" — one number covering a live candidate and an impossibility, which is the precise
-   *     conflation this whole rebuild exists to remove. What the signal does NOT settle is whether
-   *     an action followed; that is `notAskedWithAction`'s subset, and everywhere else the agent
-   *     is the only party who knows.
-   *
-   * ONE SURFACE, AND THAT IS THE CORRECTION THIS ROUND MAKES. It used to ride EVERY tool response,
-   * which spent context on `memory_fetch` and `memory_checkpoint` replies where the agent has no
-   * rule in front of it and the instruction is an interruption with nothing to attach to. The agent
-   * is told to collect confirmations at the moment it is being handed rules, and nowhere else —
-   * `stage_lookup` is the one response where the reminder lands in the context that explains it,
-   * beside the very key (`momentId`) the conformance tools take.
-   *
-   * THE COST IS A LATER REMINDER, NOT A LOST ONE. A moment only enters this backlog once its
-   * outcome has landed, and a call's outcome is written after its handler has already returned — so
-   * a `stage_lookup` moment is never named on its own response, only on the next one. That is
-   * acceptable BECAUSE the response now carries its own `momentId`: the agent holds the key from
-   * the first turn, and this signal is the backstop for a moment it did not close, not the only way
-   * it learns the key.
-   *
-   * IT NAMES MOMENTS; IT NEVER CARRIES THEIR CONTENT. Ids, and the fact that they are outstanding —
-   * the what-to-do lives in the response's own `instruction` field (see CONFORMANCE_INSTRUCTION),
-   * which ships on every lookup that has a `momentId`, so this no longer restates it. The agent
-   * already has the action in its own transcript — re-sending a rendering of it would be paying
-   * context to tell the model what it just did.
-   *
-   * REPEATED WHILE THE DEBT STANDS, and that is a correction. This used to announce each moment
-   * exactly once, reasoning that a banner reappearing every turn is standing text by another name
-   * and that an ignored signal still surfaces as `notAsked`. Both halves rested on an assumption
-   * nothing here can check: that the agent SAW it. The signal rides as a secondary `content` item,
-   * and a host that exposes only `content[0]` — a degradation this file's own lifecycle code
-   * anticipates — shows it to nobody. Marking it delivered anyway, and then counting the silence as
-   * an agent defect, is verbatim the conflation between "ignored the signal" and "was never told"
-   * that these counts exist to remove.
-   *
-   * So delivery is never assumed. A moment stays named until a question is put about it, which is
-   * the only thing that removes one. CANDIDATES, NOT DEBTS: only moments that delivered rules are
-   * ever in the list, and whether an action followed any of them is unrecorded, so an entry is a
-   * question worth considering rather than one owed. It is a persistent notice rather than a
-   * standing banner, and bounded by the cap below either way — see #147 for what follows from an
-   * entry that can never be honestly cleared.
-   *
-   * SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so this appends nothing
-   * at all on the overwhelming majority of responses.
-   */
-  function askSignalBlock(): string {
-    let owed: string[];
-    try {
-      owed = core.momentsOwingAQuestion(ASK_SIGNAL_MAX_MOMENTS);
-    } catch {
-      // A signal that cannot be computed must never fail the tool call that carried it.
-      return "";
-    }
-    const fresh = owed.slice(0, ASK_SIGNAL_MAX_MOMENTS);
-    if (fresh.length === 0) return "";
-    const ids = fresh.join(", ");
-    const noun = fresh.length === 1 ? "moment" : "moments";
-    // A FACT, NOT A SECOND COPY OF THE INSTRUCTION. It used to carry both — what is owed AND what to
-    // do about it — because it was the only thing on any response that said either. The response's
-    // own `instruction` field now carries the what-to-do on every lookup that has a `momentId`, so
-    // repeating it here would say the same thing twice in one payload. What is left is the half only
-    // this can know: WHICH earlier moments are still outstanding. The two compose — content[0] says
-    // what asking means, this says which ids still need it — and neither is readable as the other's
-    // duplicate.
-    //
-    // THE ORDER SURVIVES A DEGRADED HOST. The instruction rides in content[0], which every host
-    // exposes; this rides as a later content item, which some drop. The half that can go missing is
-    // the id list, never the instruction — the reverse split would lose the what-to-do entirely.
-    //
-    // IT NAMES WHAT WAS READ, NEVER WHAT WAS DONE. It used to say "you read a rule and then acted",
-    // which asserted an action nothing here observes: #85 retired interception, so nothing written
-    // since carries one, and a lookup made to READ rules lands in this list identically to one that
-    // governed a real act. Saying so is what stops an agent asking the user to adjudicate a
-    // non-event — the question is only worth putting where something actually followed.
-    //
-    // EXCEPT WHERE THE LEDGER KNOWS, and it does on a store that predates #85 or folded a spool that
-    // did. Those rows carry an `action_sha256`, `notAskedWithAction` already counts them, and on
-    // them the question is owed rather than optional. Telling the agent to decide from context there
-    // would have it skip questions the record can answer — the same over-generalisation, one surface
-    // on, that put the all-clear over real debt. Partitioned rather than qualified, because an agent
-    // meeting eight bare uuids after a compaction cannot apply a qualifier it has no context for.
-    let acted: Set<string>;
-    try {
-      acted = core.momentsWithRecordedAction(fresh);
-    } catch {
-      acted = new Set();
-    }
-    if (acted.size > 0) {
-      const withAction = fresh.filter((id) => acted.has(id));
-      const rest = fresh.filter((id) => !acted.has(id));
-      const restClause =
-        rest.length === 0
-          ? ""
-          : ` For ${rest.length} other${rest.length === 1 ? "" : "s"} (${rest.join(", ")}) whether an action followed is not recorded — ask where something did.`;
-      return `Monet: rules were read at ${fresh.length} ${noun} not yet asked about. ${withAction.length} record an action and owe the question (${withAction.join(", ")}).${restClause}`;
-    }
-    return `Monet: rules were read at ${fresh.length} ${noun} not yet asked about (${ids}). Whether an action followed is not recorded — ask about the ones where something did.`;
-  }
-
-  function wrapSuccess(
+    function wrapSuccess(
     result: CallToolResult,
     {
       toolName,
@@ -1065,35 +942,22 @@ export function registerMonetCoreTools(
     }
 
     // --- ask signal ---
-    // ONE SURFACE ONLY. See askSignalBlock's own header for why: the agent collects confirmations
-    // at the moment it is handed rules, so the reminder belongs on the response that hands them
-    // over and on no other. Gated HERE rather than inside the block builder so every other tool
-    // response skips the `momentsOwingAQuestion` query — and its fold — outright.
+    // NO ASK SIGNAL HERE ANY MORE (#147). A block used to name up to eight earlier moments with no
+    // question put. A moment left that list only by being asked about, the order was oldest-first
+    // and the cap was eight, so eight that would never be asked filled it permanently and nothing
+    // newer was ever named — observed running four days unchanged on a live store. They could not
+    // be cleared: some were lookups made to READ rules with nothing following, the rest belonged to
+    // sessions whose transcript was gone, and the agent may not write the user's answer itself.
     //
-    // AND ON THE SAME CONDITION AS THE KEY (review fix — Codex round 2). The two halves were split
-    // deliberately: the response's `instruction` says what asking means and names the two tools that
-    // take a momentId, and this says WHICH earlier moments have no question put. That split is what keeps
-    // either from being the other's duplicate — and it is exactly what stops either from standing
-    // alone. Once the key and its instruction became conditional on this lookup actually delivering
-    // a rule, a lookup that delivered none carried the id half with the what-to-do half missing:
-    // uuids the agent has no surviving text to act on, since nothing else on the response, and no
-    // standing text, names `conformance_ask`.
-    //
-    // WITHHELD RATHER THAN MADE SELF-CONTAINED, and that is the choice. Restating the tool names
-    // here would pay context on EVERY response carrying a backlog — the common case, where the
-    // instruction is already present and would now say the same thing twice — to cover the rare one
-    // where it is absent. It would also contradict this surface's own reason for existing: the
-    // reminder belongs where the agent is being handed rules, and a lookup that handed over none is
-    // precisely not that moment. Nothing is lost by waiting: an entry leaves only by being asked
-    // about, so the
-    // next lookup that does deliver a rule names it again, beside the line that explains it.
-    const askBlock = toolName === "stage_lookup" && carriesConformanceKey === true ? askSignalBlock() : "";
-    if (prewarmBlock === "" && askBlock === "") return result;
+    // The block's own minimization note asked what breaks without it and answered "the agent cannot
+    // know a question may be outstanding". It can know. What it cannot do is tell WHICH ids deserve
+    // one, because the record does not say whether an action followed — so this was a payload its
+    // consumer could not act on. `momentId` and its instruction still ride on every lookup that
+    // returns rules, which was always the primary mechanism, and `notAsked` /
+    // `notAskedWithAction` still report the population to a human on `memory_overview`.
+    if (prewarmBlock === "") return result;
 
-    const appended = [
-      ...(prewarmBlock === "" ? [] : [{ type: "text" as const, text: prewarmBlock }]),
-      ...(askBlock === "" ? [] : [{ type: "text" as const, text: askBlock }]),
-    ];
+    const appended = [{ type: "text" as const, text: prewarmBlock }];
     return {
       ...result,
       content: [result.content[0], ...result.content.slice(1), ...appended],
