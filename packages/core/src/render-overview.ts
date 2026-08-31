@@ -104,10 +104,14 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   const gates = overview.gate;
   const conformance = gates.conformance;
   const owedByUser = conformance.unanswered;
-  const owedByAgent = conformance.notAsked;
+  // NOT "owed by the agent", and the name used to say it was. `notAsked` is moments where rules
+  // were read and no question was put; whether an action followed is not recorded (#85 retired
+  // interception), so a lookup made to READ rules sits here beside one that governed a real act.
+  // Attributing the population to the agent picks one of those and calls it observed.
+  const neverAsked = conformance.notAsked;
   if (
     gates.total > 0 || gates.retirementCandidates || gates.unexplainedDenies || gates.unreadStages ||
-    owedByUser > 0 || owedByAgent > 0 || gates.losses > 0 || gates.unopened > 0 ||
+    owedByUser > 0 || neverAsked > 0 || gates.losses > 0 || gates.unopened > 0 ||
     gates.unattributed > 0
   ) {
     lines.push(bold("GATE"));
@@ -141,8 +145,8 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     if (owedByUser > 0) {
       lines.push(truncate(`  awaiting you: ${owedByUser} asked, not yet answered`, width));
     }
-    if (owedByAgent > 0) {
-      lines.push(truncate(yellow(`  never asked: ${owedByAgent} read and acted on without asking`), width));
+    if (neverAsked > 0) {
+      lines.push(truncate(yellow(`  never asked: ${neverAsked} delivered rules, no question put`), width));
     }
     // READ, BUT TOO LATE TO HAVE ACTED ON IT. Dim and unactionable on purpose: a PreToolUse
     // advisory reaches the model beside the tool result on this host, so for every moment a

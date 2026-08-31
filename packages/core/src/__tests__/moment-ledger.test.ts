@@ -310,7 +310,8 @@ describe("an answer attaches; it never creates", () => {
     const db = mkDb();
     const run = openMoment(path, db);
     const readAndActed = readGovernedMoment(db, path, "m1");
-    // Read, acted, never asked: an agent defect. Distinct from asked-and-waiting below.
+    // Rules read, no question put. Distinct from asked-and-waiting below — and not a defect on
+    // its own: whether an action followed is not recorded.
     expect(readAndActed).toMatchObject({ askedAt: null, answer: null });
     expect(Object.keys(readAndActed?.ruleReads ?? {})).toEqual(["r1"]);
     expect(readAndActed?.outcomeAt).not.toBeNull();

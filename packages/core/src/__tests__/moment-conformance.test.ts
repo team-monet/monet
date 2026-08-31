@@ -7,7 +7,8 @@
  * them into one "pending" bucket is the failure this surface exists to prevent:
  *
  *   `unanswered` — asked, waiting on the user. A queue. The agent did its part.
- *   `not asked`  — read, acted, never asked. A defect. The agent did not.
+ *   `not asked`  — rules read, no question put. NOT a defect by itself: whether an action
+ *                   followed is not recorded (#85 retired interception).
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
@@ -18,6 +19,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { MonetCore } from "../engine";
 import { registerMonetCoreTools } from "../mcp-server";
+import { renderOverview } from "../render-overview";
 import { BetterSqlitePort } from "../storage";
 import type { StoragePort } from "../storage";
 import { UnknownMomentError, momentConformance, momentsOwingAQuestion } from "../moment-ledger";
@@ -107,6 +109,27 @@ async function declareRuleAt(core: MonetCore, stage: string): Promise<void> {
  */
 const ASK_SIGNAL_ANY = "Monet: ";
 const ASK_SIGNAL_PREFIX = "Monet: rules were read at";
+
+describe("the rendered workbench does not claim an action either", () => {
+  it("names the population without attributing an act or a fault to the agent", () => {
+    const path = join(mkTmp(), "moments.jsonl");
+    const core = coreWithSpool(path);
+    try {
+      readAndActed(path, "never-asked-one");
+      const out = renderOverview(core.overview("acme-widgets"), { color: false, width: 200 });
+
+      // PRESENT FIRST, or every assertion below passes on an empty render.
+      expect(out).toContain("never asked: 1");
+      // The signal was corrected and this line was not, so the same false claim survived on the
+      // one surface a human actually reads. Both halves: the claim is gone, and what replaced it
+      // says what the record holds.
+      expect(out).not.toContain("acted");
+      expect(out).toContain("delivered rules, no question put");
+    } finally {
+      core.close();
+    }
+  });
+});
 
 describe("the four states, kept apart", () => {
   it("separates a queue owed to the user from a defect owed by the agent", () => {
