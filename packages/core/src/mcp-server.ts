@@ -1880,7 +1880,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "conformance_answer",
-    "Record whether the action followed the rules read at that moment: 'followed' or 'not-followed'. No question is put to the user first — record your own reading, and record what the user says whenever they say it. This says the action followed the rule; it never says the rule caused it.",
+    "Record whether the action followed the rules read at that moment: 'followed' or 'not-followed'. No question is put first — record your own reading. FIRST WRITE WINS: the same answer again is accepted, a differing one is refused, so a later correction does not land here — when a rule turns out not to have been followed, the destination is that rule's own record. This says the action followed the rule; it never says the rule caused it.",
     {
       momentId: z.string().max(MOMENT_ID_MAX_CHARS).describe("The moment being recorded."),
       answer: z.enum(["followed", "not-followed"]).describe("Whether the action followed the rules read at that moment."),

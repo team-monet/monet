@@ -137,12 +137,12 @@ describe("the rendered workbench does not claim an action either", () => {
       const out = renderOverview(core.overview("acme-widgets"), { color: false, width: 200 });
 
       // PRESENT FIRST, or every assertion below passes on an empty render.
-      expect(out).toContain("never asked: 1");
+      expect(out).toContain("not recorded: 1");
       // The signal was corrected and this line was not, so the same false claim survived on the
       // one surface a human actually reads. Both halves: the claim is gone, and what replaced it
       // says what the record holds.
       expect(out).not.toContain("acted");
-      expect(out).toContain("delivered rules, no question put");
+      expect(out).toContain("delivered rules, nothing recorded");
     } finally {
       core.close();
     }

@@ -270,7 +270,7 @@ describe("G2 — the all-clear stays reachable", () => {
 
     // BOTH HALVES. The population is still reported — dropping it from the lists must not drop it
     // from the page — and the all-clear survives it.
-    expect(rendered).toContain("never asked: 1");
+    expect(rendered).toContain("not recorded: 1");
     expect(rendered).toContain("no curation work queued");
   });
 
@@ -288,7 +288,7 @@ describe("G2 — the all-clear stays reachable", () => {
     cores.push(core);
     const rendered = renderOverview(core.overview("acme-widgets"), { color: false });
 
-    expect(rendered).toContain("read, acted on, no question put");
+    expect(rendered).toContain("read, acted on, nothing recorded");
     expect(rendered).not.toContain("no curation work queued");
   });
 
