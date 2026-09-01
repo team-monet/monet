@@ -144,7 +144,7 @@ export const MOMENT_SCHEMA_SQL = `
     -- meaning: without this, a command that landed and the same command the remote rejected are
     -- indistinguishable, including to a user being asked whether it followed the rule.
     outcome_status TEXT CHECK (outcome_status IS NULL OR outcome_status IN ('ok', 'failed')),
-    -- Written when the agent asks, and when the user answers. asked_at NULL with a read and an
+    -- Written when a question is put, and when the answer is recorded. asked_at NULL with a read and an
     -- outcome present is the 'not asked' state: no question was put. Not a queue, and not by itself
     -- a defect: whether an action followed is unrecorded, and notAskedWithAction is the subset
     -- carrying a stored action, which is the part that is.
@@ -861,9 +861,9 @@ export function observedMomentLosses(db: StoragePort, spoolPath: string): Moment
  * measures it. Any surface rendering these counts must not imply otherwise.
  */
 export interface MomentConformance {
-  /** The user answered: the action followed the rule. */
+  /** Recorded: the action followed the rule. */
   followed: number;
-  /** The user answered: the rule was read and still not followed. */
+  /** Recorded: the rule was read and still not followed. */
   notFollowed: number;
   /** Asked, no answer yet. A queue, not a defect. Owned by the user. */
   unanswered: number;

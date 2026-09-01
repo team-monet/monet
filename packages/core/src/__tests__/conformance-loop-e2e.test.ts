@@ -160,9 +160,10 @@ async function lookupAndAssert(loopUnderTest: Loop, ruleIds: readonly string[]):
   expect(typeof body.momentId, "stage_lookup returned no momentId — the chain stops here").toBe("string");
   expect(body.momentId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 
-  // WHAT THE KEY IS FOR. Both tools named — naming only the answer leaves an obedient agent's
-  // `asked_at` null and counts it as a defect it did not commit.
-  expect(body.instruction).toContain("conformance_ask");
+  // WHAT THE KEY IS FOR. One tool named (#150): no question is put, so the line names only where
+  // the record goes. A null `asked_at` beside a recorded answer is not a defect — `notAsked`
+  // requires `answer IS NULL`, so an answered moment is never counted as a question nobody put.
+  expect(body.instruction).not.toContain("conformance_ask");
   expect(body.instruction).toContain("conformance_answer");
   expect(body.instruction).toContain("followed these rules");
   // It asks whether the action FOLLOWED the rule, never whether the rule CAUSED it.

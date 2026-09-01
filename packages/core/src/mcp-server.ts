@@ -175,15 +175,20 @@ const MOMENT_ID_MAX_CHARS = 36;
  * neither repeats the other. Note the fact and not more: whether an action followed any of them is
  * unrecorded, so they are candidates rather than mandatory asks.
  *
- * IT ASKS WHETHER THE ACTION FOLLOWED THE RULE, never whether the rule CAUSED it — causation is
+ * IT RECORDS WHETHER THE ACTION FOLLOWED THE RULE, never whether the rule CAUSED it — causation is
  * unobservable and is not what this measures. Same discipline as the ask signal's own wording.
  *
- * ONE LINE, AND BOTH TOOLS NAMED. It ships on every lookup, so every word is paid for repeatedly:
- * what to do, the two tools, the key they take, and nothing else. Naming only `conformance_answer`
- * would leave an obedient agent's `asked_at` null and count it as a defect it did not commit.
+ * ONE LINE, ONE TOOL. It ships on every lookup, so every word is paid for repeatedly: what to do,
+ * the tool, the key it takes, and nothing else.
+ *
+ * NO QUESTION IS PUT (#150). The owner ruled the ask out: he answered every question it ever
+ * produced without weighing the action against the rule, so the turn bought nothing the agent
+ * could not record itself. Naming `conformance_answer` alone leaves `asked_at` null, and that
+ * costs nothing — `notAsked` already requires `answer IS NULL` (moment-ledger F2), so a recorded
+ * answer is never counted as a question nobody put.
  */
 const CONFORMANCE_INSTRUCTION =
-  "After you act, ask the user whether the action followed these rules — conformance_ask with this momentId when you put the question, then conformance_answer with their reply.";
+  "After you act, record whether the action followed these rules — conformance_answer with this momentId.";
 
 /**
  * WHERE A `not-followed` GOES NEXT — the one line that rides on `conformance_answer` and only when
@@ -203,9 +208,9 @@ const CONFORMANCE_INSTRUCTION =
  * answer has nothing to follow up, and asking anyway is pure context cost on the arm that is
  * supposed to be silent. Minimization: the signal's absence is itself the signal.
  *
- * IT ASKS WHICH RULE, IT DOES NOT GUESS. A moment's `rule_reads` normally holds several rules, so
- * neither this response nor the agent can tell which one the user meant; recording against all of
- * them would manufacture a verdict against rules that were followed. The user names it.
+ * IT NAMES ONE RULE, IT DOES NOT SPREAD. A moment's `rule_reads` normally holds several rules, and
+ * recording against all of them would manufacture a verdict against rules that were followed. The
+ * agent names the one the action did not follow.
  *
  * THE WORDING KEEPS THE SAME DISCIPLINE as `CONFORMANCE_INSTRUCTION`: it says the action did not
  * follow the rule, never that the rule failed to cause it — causation is unobservable and is not
@@ -222,7 +227,7 @@ const CONFORMANCE_INSTRUCTION =
  * hundred characters against RESULT_MAX_CHARS (40 000) and cannot grow with the store.
  */
 const NOT_FOLLOWED_INSTRUCTION =
-  "Ask the user which of the rules read at this moment was not followed, and record what comes of that — a change to the rule, or its retirement — on that rule's own record.";
+  "Name which of the rules read at this moment was not followed, and record what comes of that — a change to the rule, or its retirement — on that rule's own record.";
 
 const RESULT_TRUNCATE_NOTE = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
 const RECALL_EMPTY_LINE = "Nothing matched.";
@@ -1848,11 +1853,11 @@ export function registerMonetCoreTools(
    * followed the rule is a judgement about the act, and the user is the one who makes it. Nothing
    * in this system infers it, and these two tools are the only way it enters the record.
    *
-   * TWO TOOLS, NOT ONE, because they are two events with two owners. The ASK is the agent's act and
-   * the ANSWER is the user's; a single call carrying both would make the agent the author of a fact
-   * it does not own, and would destroy the distinction between `unanswered` (asked, waiting on the
-   * user) and `not asked` (no question put) — the one distinction this surface exists to keep. That
-   * second state is not by itself a defect: whether an action followed is unrecorded, and
+   * TWO TOOLS STILL, THOUGH ONLY ONE IS INSTRUCTED (#150). `conformance_answer` is the agent's own
+   * record now and no question precedes it, so nothing routine writes `asked_at`. `conformance_ask`
+   * stays for the case that still has a question in it — a user actually asked — which keeps
+   * `unanswered` (asked, waiting on the user) meaningful where it happens. Not asking is not by
+   * itself a defect: whether an action followed is unrecorded until something records it, and
    * `notAskedWithAction` is the subset the record can speak for.
    */
   server.tool(
@@ -1875,10 +1880,10 @@ export function registerMonetCoreTools(
 
   server.tool(
     "conformance_answer",
-    "Record the user's reply to that question: 'followed' or 'not-followed'. Their answer only — never your own assessment. This says the action followed the rule; it never says the rule caused it.",
+    "Record whether the action followed the rules read at that moment: 'followed' or 'not-followed'. No question is put first — record your own reading. FIRST WRITE WINS: the same answer again is accepted, a differing one is refused, so a later correction does not land here — when a rule turns out not to have been followed, the destination is that rule's own record. This says the action followed the rule; it never says the rule caused it.",
     {
-      momentId: z.string().max(MOMENT_ID_MAX_CHARS).describe("The moment the user answered about."),
-      answer: z.enum(["followed", "not-followed"]).describe("The user's answer, verbatim in meaning."),
+      momentId: z.string().max(MOMENT_ID_MAX_CHARS).describe("The moment being recorded."),
+      answer: z.enum(["followed", "not-followed"]).describe("Whether the action followed the rules read at that moment."),
     },
     async ({ momentId, answer }) => {
       try {

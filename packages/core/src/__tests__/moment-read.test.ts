@@ -333,10 +333,11 @@ describe("a stage_lookup carries its own moment through the whole chain", () => 
 
     const instruction = response.instruction as string;
     expect(instruction).toEqual(expect.any(String));
-    // BOTH tools named. Naming only `conformance_answer` would leave an obedient agent's `asked_at`
-    // null and count it as a defect it never committed — the ask is its own event with its own owner.
-    expect(instruction).toContain("conformance_ask");
+    // ONE tool named (#150). No question is put, so the line names only where the record goes; a
+    // null `asked_at` beside a recorded answer costs nothing, because `notAsked` requires
+    // `answer IS NULL` and so never counts an answered moment as a question nobody put.
     expect(instruction).toContain("conformance_answer");
+    expect(instruction).not.toContain("conformance_ask");
     // ...and it names the key it ships beside, so the agent knows which id those calls take.
     expect(instruction).toContain("momentId");
     // WHETHER THE ACTION FOLLOWED THE RULE — never whether the rule caused it. Causation is
@@ -355,8 +356,8 @@ describe("a stage_lookup carries its own moment through the whole chain", () => 
   /**
    * THE KEY AND ITS INSTRUCTION DO NOT SHIP ON A LOOKUP THAT DELIVERED NOTHING.
    *
-   * The instruction tells the agent to ask the user whether the action followed "these rules" and
-   * to record it with `conformance_ask`. On an empty lookup there are no such rules, and the call
+   * The instruction tells the agent to record whether the action followed "these rules" with
+   * `conformance_answer`. On an empty lookup there are no such rules, and the call
    * it names cannot succeed: `recordRuleReads` spools `ruleId: null` for an empty rule set
    * (engine.ts), `foldMomentSpool` drops exactly that record instead of writing a rule read
    * (`if (record.ruleId === null) return`), and `requireObservedMoment` refuses any moment whose

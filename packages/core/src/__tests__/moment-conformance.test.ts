@@ -97,7 +97,7 @@ function coreWithSpool(spoolPath: string): MonetCore {
  *
  * The key and its instruction ship only on a response that actually carried a rule (mcp-server.ts),
  * so a test asserting on either has to look up a stage that has one. The rule's own wording stays
- * clear of every needle the assertions count — `conformance_ask`, `followed these rules` — because
+ * clear of every needle the assertions count — `conformance_answer`, `followed these rules` — because
  * one of them counts occurrences across the whole payload, and rule text lands in that payload.
  */
 async function declareRuleAt(core: MonetCore, stage: string): Promise<void> {
@@ -137,12 +137,12 @@ describe("the rendered workbench does not claim an action either", () => {
       const out = renderOverview(core.overview("acme-widgets"), { color: false, width: 200 });
 
       // PRESENT FIRST, or every assertion below passes on an empty render.
-      expect(out).toContain("never asked: 1");
+      expect(out).toContain("not recorded: 1");
       // The signal was corrected and this line was not, so the same false claim survived on the
       // one surface a human actually reads. Both halves: the claim is gone, and what replaced it
       // says what the record holds.
       expect(out).not.toContain("acted");
-      expect(out).toContain("delivered rules, no question put");
+      expect(out).toContain("delivered rules, nothing recorded");
     } finally {
       core.close();
     }
@@ -355,7 +355,10 @@ describe("the ask signal is gone, and stays gone (#147)", () => {
       // untouched: the key and its instruction still ride on every lookup that returns rules.
       const body = JSON.parse(parts[0]) as { momentId?: string; instruction?: string };
       expect(body.momentId).toBeDefined();
-      expect(body.instruction).toContain("conformance_ask");
+      expect(body.instruction).toContain("conformance_answer");
+      // AND NAMES NO ASK. Without this the assertion above passes under the pre-#150 instruction
+      // too — it also contained `conformance_answer` — so it would guard nothing it appears to.
+      expect(body.instruction).not.toContain("conformance_ask");
 
       // AND NOTHING NAMES THE BACKLOG. Asserted three ways, because one alone is weak: no `Monet:`
       // notice at all, no moment id from the backlog anywhere in the payload, and no extra content

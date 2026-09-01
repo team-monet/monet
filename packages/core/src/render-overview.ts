@@ -139,11 +139,16 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     }
 
     // THE TWO PENDING STATES, ON SEPARATE LINES AND NEVER SUMMED. They have different owners and
-    // different remedies: one is a queue the user owes an answer to, the other is the agent failing
-    // to ask. A single "pending" line would be the exact collapse this record exists to prevent.
+    // different remedies: one is a queue the user owes an answer to, the other is the agent not
+    // recording. A single "pending" line would be the exact collapse this record exists to prevent.
+    //
+    // "recorded", NOT "answered", AND "not recorded", NOT "never asked" (#150). Nothing asks now:
+    // the agent records its own reading, so question-and-answer wording described a flow that no
+    // longer runs and made every unrecorded moment read as an unasked question. `awaiting you`
+    // keeps its wording — it counts only moments where `conformance_ask` really did put one.
     if (conformance.followed > 0 || conformance.notFollowed > 0) {
       lines.push(truncate(dim(
-        `  answered: ${conformance.followed} followed · ${conformance.notFollowed} not followed`,
+        `  recorded: ${conformance.followed} followed · ${conformance.notFollowed} not followed`,
       ), width));
     }
     if (owedByUser > 0) {
@@ -152,7 +157,7 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     if (neverAskedWithAction > 0) {
       // THE CLAIM THE RECORD CAN MAKE: an action is stored on these, so a missing question is real
       // debt. In both lists, and yellow, because it is actionable while it stands.
-      lines.push(truncate(yellow(`  never asked: ${neverAskedWithAction} read, acted on, no question put`), width));
+      lines.push(truncate(yellow(`  not recorded: ${neverAskedWithAction} read, acted on, nothing recorded`), width));
     }
     if (neverAskedUnknown > 0) {
       // IN NEITHER LIST, by the rule stated at the all-clear below: a number that only grows and
@@ -161,7 +166,7 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
       // the benign normal case, with no action to ask about and so no honest way to clear it. While
       // it was `yellow` and in both lists, one such lookup retired "no curation work queued" for
       // the life of the store: the same failure `unjoinableReads` was moved out of both lists for.
-      lines.push(truncate(dim(`  never asked: ${neverAskedUnknown} delivered rules, no question put`), width));
+      lines.push(truncate(dim(`  not recorded: ${neverAskedUnknown} delivered rules, nothing recorded`), width));
     }
     // READ, BUT TOO LATE TO HAVE ACTED ON IT. Dim and unactionable on purpose: a PreToolUse
     // advisory reaches the model beside the tool result on this host, so for every moment a
