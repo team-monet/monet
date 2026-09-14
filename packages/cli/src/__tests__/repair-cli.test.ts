@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import {
   BetterSqlitePort,
   HashingEmbeddingProvider,
+  MONET_SCHEMA_VERSION,
   MonetCore,
   inspectStoredEmbedderState,
   instantiateEmbedderForPin,
@@ -203,6 +204,33 @@ describe("doctor and repair CLI", () => {
     expect(dependencies.createPort).not.toHaveBeenCalled();
     expect(dependencies.createCore).not.toHaveBeenCalled();
     expect(dependencies.exits).toEqual([]);
+  });
+
+  it("reports a newer-than-supported real store without constructing MonetCore", async () => {
+    const dbPath = tempDbPath("monet-doctor-newer-schema-");
+    const db = new Database(dbPath);
+    db.pragma(`user_version = ${MONET_SCHEMA_VERSION + 1}`);
+    db.close();
+    const exits: number[] = [];
+    const dependencies: RecoveryCliDependencies = {
+      ...defaultRecoveryDependencies(),
+      dbPath: () => dbPath,
+      createPort: vi.fn(() => { throw new Error("doctor should not open a write port"); }),
+      createCore: vi.fn(() => { throw new Error("doctor should not construct MonetCore"); }),
+      setExitCode: (code) => exits.push(code),
+    };
+
+    const output = await run(["doctor", "--json"], dependencies);
+    const result = JSON.parse(output.stdout);
+
+    expect(result).toMatchObject({
+      command: "doctor",
+      schemaVersion: MONET_SCHEMA_VERSION + 1,
+      supportedSchemaVersion: MONET_SCHEMA_VERSION,
+    });
+    expect(dependencies.createPort).not.toHaveBeenCalled();
+    expect(dependencies.createCore).not.toHaveBeenCalled();
+    expect(exits).toEqual([2]);
   });
 
   it("carries no-startup-failure through doctor JSON when inspection fails", async () => {

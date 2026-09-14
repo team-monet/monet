@@ -797,6 +797,29 @@ export function readStoredEmbedderPin(dbPath: string): string | null {
 }
 
 /**
+ * Read only the SQLite `user_version` without constructing a MonetCore. Used by MonetCore's own
+ * startup ceiling before the normal BetterSqlitePort open runs its WAL setup or any schema DDL.
+ * `0` includes a missing path or `:memory:`; `null` means the existing file could not be inspected
+ * cheaply, so callers can fall back to their normal open path and its existing errors.
+ *
+ * Like readStoredVectorPresence, this peeks at the live path without changing journal mode. The
+ * probe's timeout is zero because startup already has deliberate contention handling; this check
+ * must not add a second wait in front of it.
+ */
+export function readStoredSchemaVersion(dbPath: string): number | null {
+  if (dbPath === ":memory:" || !existsSync(dbPath)) return 0;
+  let db: Database.Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 0 });
+    return db.pragma("user_version", { simple: true }) as number;
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
+/**
  * Read-only startup peek for whether a store has committed any semantic vector. `false` includes a
  * nonexistent file and a valid SQLite file with neither vector table yet; `null` means the existing
  * file could not be inspected, so callers must conservatively preserve legacy startup behavior

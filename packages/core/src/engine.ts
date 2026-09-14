@@ -19,7 +19,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { StoragePort, BetterSqlitePort, StorageExclusiveLockError, schemaRegionContentionError, type Statement } from "./storage";
+import { StoragePort, BetterSqlitePort, StorageExclusiveLockError, readStoredSchemaVersion, schemaRegionContentionError, type Statement } from "./storage";
 import { mintMomentId, spoolInterception, spoolOutcome, spoolRuleRead, startMomentRun } from "./moment-spool";
 import type { MomentAnswer } from "./moment-spool";
 import {
@@ -2950,6 +2950,24 @@ export class MonetCore {
     // port's public surface — for a StoragePort the interface still has no path member — to save one
     // `resolve` call on a string this constructor already holds.
     const dbPath = typeof db === "string" ? (db === ":memory:" ? db : resolve(db)) : null;
+    // STORE-LEVEL CEILING, BEFORE THE SCHEMA REGION WRITES ANYTHING (#107). `migrate()`'s ladder
+    // rungs are floor-and-ceiling gated, so a `user_version` above MONET_SCHEMA_VERSION matches no
+    // rung at all; without this guard an older build can still run `init()` and the repair passes
+    // against a file whose newer tables or columns it cannot name. This is the on-disk analogue of
+    // SYNC_PAYLOAD_PROTOCOL_VERSION's transport-boundary refusal: a receiver must be able to say
+    // "this is newer than I understand" instead of silently dropping what it cannot name. The CLI
+    // already applies the same stance at repair boundaries (`ensureInspectableForRepair` and
+    // retire-source); the engine constructor owns the same refusal so MCP startup, status,
+    // materialize, circle ops, and direct harness opens all share one ceiling.
+    const storedSchemaVersion = typeof db === "string"
+      ? readStoredSchemaVersion(dbPath!)
+      : db.pragma("user_version", { simple: true }) as number;
+    if (storedSchemaVersion !== null && storedSchemaVersion > MONET_SCHEMA_VERSION) {
+      throw new Error(
+        `Store schema ${storedSchemaVersion} is newer than supported schema ${MONET_SCHEMA_VERSION}; ` +
+          `refusing to open. Upgrade Monet first.`,
+      );
+    }
     this.db = typeof db === "string" ? new BetterSqlitePort(db) : db;
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
     this.embedderLoader = opts.embedderLoader ?? instantiateEmbedderForPin;
