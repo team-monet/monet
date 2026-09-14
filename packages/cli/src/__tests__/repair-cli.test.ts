@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
@@ -9,6 +9,8 @@ import {
   MonetCore,
   inspectStoredEmbedderState,
   instantiateEmbedderForPin,
+  recordStartupFailure,
+  startupFailurePath,
   type EmbeddingProvider,
   type StoredEmbedderStateInspection,
 } from "@team-monet/core";
@@ -124,8 +126,55 @@ async function run(
   }
 }
 
+const DOCTOR_SUCCESS_JSON_KEYS = [
+  "schema",
+  "command",
+  "ok",
+  "dbPath",
+  "schemaVersion",
+  "supportedSchemaVersion",
+  "integrity",
+  "pin",
+  "populations",
+  "migration",
+  "nonLatin",
+  "assessment",
+  "rawAssessment",
+  "provider",
+  "startupFailure",
+  "nextCommands",
+];
+
+const DOCTOR_FAILURE_JSON_KEYS = [
+  "schema",
+  "command",
+  "ok",
+  "dbPath",
+  "error",
+  "inspection",
+  "provider",
+  "startupFailure",
+  "nextCommands",
+  "backup",
+  "report",
+];
+
+function failingDoctorDependencies(dbPath: string): RecoveryCliDependencies & { exits: number[] } {
+  const dependencies = fakeDependencies(inspection({ dbPath }));
+  vi.mocked(dependencies.inspect).mockImplementation(() => {
+    throw new Error("store inspection failed");
+  });
+  return dependencies;
+}
+
 describe("doctor and repair CLI", () => {
   const dirs: string[] = [];
+
+  function tempDbPath(prefix: string): string {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    dirs.push(dir);
+    return join(dir, "monet.db");
+  }
 
   afterEach(() => {
     vi.restoreAllMocks();
@@ -133,12 +182,13 @@ describe("doctor and repair CLI", () => {
   });
 
   it("reports healthy raw diagnostics without constructing a provider, port, or core", async () => {
-    const state = inspection();
+    const state = inspection({ dbPath: tempDbPath("monet-doctor-success-") });
     const dependencies = fakeDependencies(state);
     const output = await run(["doctor", "--json"], dependencies);
 
     expect(output.stderr).toBe(`store: ${state.dbPath}\n`);
     const result = JSON.parse(output.stdout);
+    expect(Object.keys(result)).toEqual(DOCTOR_SUCCESS_JSON_KEYS);
     expect(result).toMatchObject({
       schema: "monet.recovery.v1",
       command: "doctor",
@@ -146,12 +196,79 @@ describe("doctor and repair CLI", () => {
       dbPath: state.dbPath,
       assessment: "safe",
       provider: { loadStatus: "not-checked" },
+      startupFailure: { status: "none" },
     });
     expect(result.populations).toEqual(state.populations);
     expect(dependencies.instantiate).not.toHaveBeenCalled();
     expect(dependencies.createPort).not.toHaveBeenCalled();
     expect(dependencies.createCore).not.toHaveBeenCalled();
     expect(dependencies.exits).toEqual([]);
+  });
+
+  it("carries no-startup-failure through doctor JSON when inspection fails", async () => {
+    const dbPath = tempDbPath("monet-doctor-failure-none-");
+    const dependencies = failingDoctorDependencies(dbPath);
+
+    const output = await run(["doctor", "--json"], dependencies);
+
+    const result = JSON.parse(output.stdout);
+    expect(Object.keys(result)).toEqual(DOCTOR_FAILURE_JSON_KEYS);
+    expect(result).toMatchObject({
+      schema: "monet.recovery.v1",
+      command: "doctor",
+      ok: false,
+      dbPath,
+      startupFailure: { status: "none" },
+    });
+    expect(dependencies.exits).toEqual([1]);
+  });
+
+  it("carries a recorded startup failure through doctor JSON when inspection fails", async () => {
+    const dbPath = tempDbPath("monet-doctor-failure-found-");
+    const at = new Date("2026-07-22T01:02:03.004Z");
+    const startupError = Object.assign(new Error("startup store open failed"), {
+      name: "StartupStoreOpenError",
+      code: "SQLITE_CANTOPEN",
+    });
+    expect(recordStartupFailure({ store: dbPath, error: startupError, fallbackPhase: "store-open", now: () => at })).toBe(
+      startupFailurePath(dbPath),
+    );
+    const dependencies = failingDoctorDependencies(dbPath);
+
+    const output = await run(["doctor", "--json"], dependencies);
+
+    const result = JSON.parse(output.stdout);
+    expect(Object.keys(result)).toEqual(DOCTOR_FAILURE_JSON_KEYS);
+    expect(result.ok).toBe(false);
+    expect(result.startupFailure).toMatchObject({
+      status: "found",
+      record: {
+        at: at.toISOString(),
+        pid: process.pid,
+        phase: "store-open",
+        error: {
+          name: "StartupStoreOpenError",
+          message: "startup store open failed",
+          code: "SQLITE_CANTOPEN",
+        },
+      },
+    });
+    expect(dependencies.exits).toEqual([1]);
+  });
+
+  it("carries an unreadable startup failure through doctor JSON when inspection fails", async () => {
+    const dbPath = tempDbPath("monet-doctor-failure-unreadable-");
+    writeFileSync(startupFailurePath(dbPath), JSON.stringify({ at: "2026-07-22T01:02:03.004Z" }));
+    const dependencies = failingDoctorDependencies(dbPath);
+
+    const output = await run(["doctor", "--json"], dependencies);
+
+    const result = JSON.parse(output.stdout);
+    expect(Object.keys(result)).toEqual(DOCTOR_FAILURE_JSON_KEYS);
+    expect(result.ok).toBe(false);
+    expect(result.startupFailure).toMatchObject({ status: "unreadable", reason: expect.any(String) });
+    expect(result.startupFailure.reason).not.toBe("");
+    expect(dependencies.exits).toEqual([1]);
   });
 
   it("uses exit 2 for completed diagnosis that needs recovery or provider action", async () => {

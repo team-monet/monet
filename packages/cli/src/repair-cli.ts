@@ -82,6 +82,10 @@ interface RepairFailureContext {
   backup?: VerifiedBackupResult;
 }
 
+interface RepairFailureExtras {
+  startupFailure?: StartupFailureRead;
+}
+
 class RepairOperationError extends Error {
   constructor(message: string, readonly context: RepairFailureContext, options?: ErrorOptions) {
     super(message, options);
@@ -563,7 +567,7 @@ async function runDoctor(options: DoctorOptions, dependencies: RecoveryCliDepend
     }
     if (assessment !== "safe" || providerNeedsAction(provider)) dependencies.setExitCode(2);
   } catch (error) {
-    printRecoveryError("doctor", options.json ?? false, error, { dbPath });
+    printRecoveryError("doctor", options.json ?? false, error, { dbPath }, { startupFailure });
     dependencies.setExitCode(1);
   }
 }
@@ -1147,6 +1151,7 @@ function printRecoveryError(
   json: boolean,
   error: unknown,
   fallback: RepairFailureContext,
+  extras: RepairFailureExtras = {},
 ): void {
   const context = error instanceof RepairOperationError ? error.context : fallback;
   const message = messageFrom(error);
@@ -1161,6 +1166,9 @@ function printRecoveryError(
       error: { name: error instanceof Error ? error.name : "Error", message },
       inspection: context.inspection ?? null,
       provider: context.provider ?? { loadStatus: "not-checked" },
+      // Doctor reads this before opening the store, so it is still knowable when inspection fails.
+      // Keep the same three-state value in the failure JSON instead of making machines infer it (#120).
+      ...(extras.startupFailure !== undefined ? { startupFailure: extras.startupFailure } : {}),
       nextCommands: context.nextCommands ?? [],
       backup: context.backup ?? null,
       report: null,
