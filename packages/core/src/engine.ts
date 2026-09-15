@@ -2969,6 +2969,18 @@ export class MonetCore {
       );
     }
     this.db = typeof db === "string" ? new BetterSqlitePort(db) : db;
+    // The cheap peek can be inconclusive under store contention; the live connection is the
+    // authoritative boundary before this constructor performs any schema work.
+    const liveSchemaVersion = this.db.pragma("user_version", { simple: true }) as number;
+    if (liveSchemaVersion > MONET_SCHEMA_VERSION) {
+      try {
+        this.db.close();
+      } catch { /* the schema refusal is the caller-visible error */ }
+      throw new Error(
+        `Store schema ${liveSchemaVersion} is newer than supported schema ${MONET_SCHEMA_VERSION}; ` +
+          `refusing to open. Upgrade Monet first.`,
+      );
+    }
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
     this.embedderLoader = opts.embedderLoader ?? instantiateEmbedderForPin;
     this.deferCreatedPin = opts.deferCreatedPin ?? false;

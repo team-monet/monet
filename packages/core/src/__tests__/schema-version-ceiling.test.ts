@@ -1,6 +1,8 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
+import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore } from "../engine";
@@ -23,9 +25,28 @@ function withStore(run: (dbPath: string) => void): void {
   }
 }
 
+async function withStoreAsync(run: (dbPath: string) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "monet-schema-ceiling-"));
+  try {
+    await run(join(dir, "monet.db"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 function stampUserVersion(dbPath: string, version: number): void {
   const db = new Database(dbPath);
   try {
+    db.pragma(`user_version = ${version}`);
+  } finally {
+    db.close();
+  }
+}
+
+function stampRollbackJournalUserVersion(dbPath: string, version: number): void {
+  const db = new Database(dbPath);
+  try {
+    db.pragma("journal_mode = DELETE");
     db.pragma(`user_version = ${version}`);
   } finally {
     db.close();
@@ -54,6 +75,93 @@ function captureOpenError(db: string | BetterSqlitePort): Error {
     throw new Error(`MonetCore threw a non-Error value: ${String(error)}`);
   }
   throw new Error("MonetCore unexpectedly opened an unsupported schema");
+}
+
+function spawnExclusiveLockHolder(dbPath: string): ReturnType<typeof spawn> {
+  const betterSqlitePath = createRequire(import.meta.url).resolve("better-sqlite3");
+  const script = `
+const Database = require(process.argv[1]);
+const db = new Database(process.argv[2]);
+let closed = false;
+function finish(exitCode) {
+  if (closed) process.exit(exitCode);
+  try {
+    db.exec("COMMIT");
+  } finally {
+    closed = true;
+    db.close();
+  }
+  process.exit(exitCode);
+}
+process.on("SIGTERM", () => finish(0));
+try {
+  db.exec("BEGIN EXCLUSIVE");
+  process.stdout.write("LOCKED\\n");
+  setTimeout(() => finish(0), 500);
+} catch (error) {
+  try {
+    db.close();
+  } catch {}
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exit(1);
+}
+`;
+  return spawn(process.execPath, ["-e", script, betterSqlitePath, dbPath], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+function waitForLock(child: ReturnType<typeof spawn>): Promise<void> {
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      child.stdout?.off("data", onStdout);
+      child.stderr?.off("data", onStderr);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn();
+    };
+    const onStdout = (chunk: string) => {
+      stdout += chunk;
+      if (stdout.includes("LOCKED\n")) settle(resolve);
+    };
+    const onStderr = (chunk: string) => {
+      stderr += chunk;
+    };
+    const onError = (error: Error) => settle(() => reject(error));
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      const detail = stderr.trim() === "" ? "no stderr" : stderr.trim();
+      settle(() => reject(new Error(`Lock holder exited before ready (${code ?? signal}): ${detail}`)));
+    };
+
+    child.stdout?.on("data", onStdout);
+    child.stderr?.on("data", onStderr);
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+}
+
+function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    child.once("exit", () => resolve());
+  });
+}
+
+async function stopChild(child: ReturnType<typeof spawn>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill();
+  await waitForExit(child);
 }
 
 describe("MonetCore schema-version ceiling", () => {
@@ -118,6 +226,27 @@ describe("MonetCore schema-version ceiling", () => {
       const error = captureOpenError(dbPath);
       expect(error.message).toContain(refusal());
       expect(error.message).not.toMatch(/locked|SQLITE_BUSY|busy/i);
+    });
+  });
+
+  it("refuses when the store's version is not readable at peek time but visible on the open port", async () => {
+    await withStoreAsync(async (dbPath) => {
+      stampRollbackJournalUserVersion(dbPath, unsupportedSchemaVersion);
+      const lockHolder = spawnExclusiveLockHolder(dbPath);
+      try {
+        await waitForLock(lockHolder);
+
+        const error = captureOpenError(dbPath);
+        expect(error.message).toMatch(/newer than supported schema/);
+        expect(error.message).toContain(String(unsupportedSchemaVersion));
+
+        await waitForExit(lockHolder);
+        const state = readState(dbPath);
+        expect(state.userVersion).toBe(unsupportedSchemaVersion);
+        expect(state.tables).toHaveLength(0);
+      } finally {
+        await stopChild(lockHolder);
+      }
     });
   });
 
