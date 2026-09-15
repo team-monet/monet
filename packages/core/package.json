@@ -46,7 +46,7 @@
     "tsup": "^8.5.1",
     "tsx": "^4",
     "typescript": "^5.7",
-    "vitest": "^3"
+    "vitest": "^4"
   },
   "repository": {
     "type": "git",
