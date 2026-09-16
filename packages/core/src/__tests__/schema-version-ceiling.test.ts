@@ -1,13 +1,13 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { MonetCore } from "../engine";
 import { MONET_SCHEMA_VERSION } from "../schema-version";
-import { BetterSqlitePort } from "../storage";
+import { BetterSqlitePort, readStoredSchemaVersion } from "../storage";
 
 const unsupportedSchemaVersion = MONET_SCHEMA_VERSION + 1;
 
@@ -53,6 +53,20 @@ function stampRollbackJournalUserVersion(dbPath: string, version: number): void 
   }
 }
 
+function seedCleanlyClosedWalStore(dbPath: string, version: number): void {
+  const db = new Database(dbPath);
+  try {
+    db.pragma("journal_mode = WAL");
+    db.pragma(`user_version = ${version}`);
+  } finally {
+    db.close();
+  }
+}
+
+function storeFiles(dbPath: string): string[] {
+  return readdirSync(dirname(dbPath)).sort();
+}
+
 function readState(dbPath: string): { tables: string[]; userVersion: number } {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
@@ -64,6 +78,23 @@ function readState(dbPath: string): { tables: string[]; userVersion: number } {
   } finally {
     db.close();
   }
+}
+
+function readStateFromMainFileCopy(dbPath: string): { tables: string[]; userVersion: number } {
+  const dir = mkdtempSync(join(tmpdir(), "monet-schema-ceiling-copy-"));
+  const copyPath = join(dir, "monet.db");
+  try {
+    copyFileSync(dbPath, copyPath);
+    return readState(copyPath);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function readMainFileHeaderUserVersion(dbPath: string): number | null {
+  const bytes = readFileSync(dbPath);
+  if (bytes.length < 100) return null;
+  return bytes.subarray(0, 16).equals(Buffer.from("SQLite format 3\0")) ? bytes.readUInt32BE(60) : null;
 }
 
 function captureOpenError(db: string | BetterSqlitePort): Error {
@@ -208,6 +239,54 @@ describe("MonetCore schema-version ceiling", () => {
     });
   });
 
+  it("reads a cleanly closed WAL store without creating sidecars", () => {
+    withStore((dbPath) => {
+      seedCleanlyClosedWalStore(dbPath, MONET_SCHEMA_VERSION);
+      expect(storeFiles(dbPath)).toEqual(["monet.db"]);
+
+      expect(readStoredSchemaVersion(dbPath)).toBe(MONET_SCHEMA_VERSION);
+      expect(storeFiles(dbPath)).toEqual(["monet.db"]);
+    });
+  });
+
+  it("refuses a cleanly closed WAL store above this build's schema without touching it", () => {
+    withStore((dbPath) => {
+      seedCleanlyClosedWalStore(dbPath, unsupportedSchemaVersion);
+      const bytesBefore = readFileSync(dbPath);
+
+      expect(() => new MonetCore(dbPath)).toThrow(/newer than supported/);
+      expect(readFileSync(dbPath).equals(bytesBefore)).toBe(true);
+      expect(storeFiles(dbPath)).toEqual(["monet.db"]);
+      expect(readStateFromMainFileCopy(dbPath)).toEqual({
+        tables: [],
+        userVersion: unsupportedSchemaVersion,
+      });
+    });
+  });
+
+  it("refuses a live WAL store whose elevated schema version is still in WAL frames", () => {
+    withStore((dbPath) => {
+      const writer = new Database(dbPath);
+      try {
+        writer.pragma("journal_mode = WAL");
+        writer.pragma(`user_version = ${unsupportedSchemaVersion}`);
+        const mainFileHeaderUserVersion = readMainFileHeaderUserVersion(dbPath);
+        // The elevated version lives only in the uncheckpointed WAL frames: a header-only read of
+        // the main file would conclude "0, not above this build's ceiling", so the `-wal`/`-shm`
+        // branch is load-bearing rather than an optimization. Some SQLite builds may checkpoint the
+        // pragma before the writer closes, so the header gap is asserted only when observable.
+        if (mainFileHeaderUserVersion !== unsupportedSchemaVersion) {
+          expect(mainFileHeaderUserVersion).toBe(0);
+        }
+        expect(readStoredSchemaVersion(dbPath)).toBe(unsupportedSchemaVersion);
+
+        expect(() => new MonetCore(dbPath)).toThrow(/newer than supported/);
+      } finally {
+        writer.close();
+      }
+    });
+  });
+
   it("opens a fresh store and migrates user_version 0 to this build's schema version", () => {
     withStore((dbPath) => {
       stampUserVersion(dbPath, 0);
@@ -229,7 +308,7 @@ describe("MonetCore schema-version ceiling", () => {
     });
   });
 
-  it("refuses when the store's version is not readable at peek time but visible on the open port", async () => {
+  it("refuses a lock-held store when the main-file header already shows an unsupported schema", async () => {
     await withStoreAsync(async (dbPath) => {
       stampRollbackJournalUserVersion(dbPath, unsupportedSchemaVersion);
       const lockHolder = spawnExclusiveLockHolder(dbPath);

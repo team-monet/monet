@@ -2955,10 +2955,10 @@ export class MonetCore {
     // rung at all; without this guard an older build can still run `init()` and the repair passes
     // against a file whose newer tables or columns it cannot name. This is the on-disk analogue of
     // SYNC_PAYLOAD_PROTOCOL_VERSION's transport-boundary refusal: a receiver must be able to say
-    // "this is newer than I understand" instead of silently dropping what it cannot name. The CLI
-    // already applies the same stance at repair boundaries (`ensureInspectableForRepair` and
-    // retire-source); the engine constructor owns the same refusal so MCP startup, status,
-    // materialize, circle ops, and direct harness opens all share one ceiling.
+    // "this is newer than I understand" instead of silently dropping what it cannot name. Every path
+    // that constructs MonetCore shares this ceiling. The CLI's pre-engine circle resolution still
+    // opens the store raw before this constructor can check it; that separate gap is tracked as
+    // #156.
     const storedSchemaVersion = typeof db === "string"
       ? readStoredSchemaVersion(dbPath!)
       : db.pragma("user_version", { simple: true }) as number;

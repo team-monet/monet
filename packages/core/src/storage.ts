@@ -17,7 +17,7 @@
  */
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync } from "node:fs";
 import { chmod, link, lstat, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { createStatementTracer, readInflightStatements, statementTraceEnabled } from "./statement-trace";
@@ -798,16 +798,54 @@ export function readStoredEmbedderPin(dbPath: string): string | null {
 
 /**
  * Read only the SQLite `user_version` without constructing a MonetCore. Used by MonetCore's own
- * startup ceiling before the normal BetterSqlitePort open runs its WAL setup or any schema DDL.
- * `0` includes a missing path or `:memory:`; `null` means the existing file could not be inspected
- * cheaply, so callers can fall back to their normal open path and its existing errors.
+ * startup ceiling before the normal BetterSqlitePort open runs any schema DDL. `0` includes a
+ * missing path or `:memory:`; `null` means the existing file could not be inspected conclusively,
+ * so callers can fall back to their normal open path and its existing errors.
  *
- * Like readStoredVectorPresence, this peeks at the live path without changing journal mode. The
- * probe's timeout is zero because startup already has deliberate contention handling; this check
- * must not add a second wait in front of it.
+ * A cleanly closed store has no `-wal`, `-shm`, or `-journal` sidecars, so the committed
+ * `user_version` is read straight from the SQLite file header without opening a SQLite connection
+ * and without creating sidecars. A live `-wal`/`-shm` pair may hold uncheckpointed frames, so that
+ * shape uses the existing readonly connection peek with a zero timeout. Every other sidecar or
+ * malformed-file shape is inconclusive and leaves the live port to decide.
  */
 export function readStoredSchemaVersion(dbPath: string): number | null {
   if (dbPath === ":memory:" || !existsSync(dbPath)) return 0;
+  const hasWal = existsSync(`${dbPath}-wal`);
+  const hasShm = existsSync(`${dbPath}-shm`);
+  const hasJournal = existsSync(`${dbPath}-journal`);
+
+  if (!hasWal && !hasShm && !hasJournal) return readSchemaVersionFromSqliteHeader(dbPath);
+  if (hasWal && hasShm && !hasJournal) return readSchemaVersionFromReadonlyConnection(dbPath);
+  return null;
+}
+
+const SQLITE_HEADER_BYTES = 100;
+const SQLITE_HEADER_USER_VERSION_OFFSET = 60;
+const SQLITE_MAGIC = Buffer.from("SQLite format 3\0");
+
+function readSchemaVersionFromSqliteHeader(dbPath: string): number | null {
+  const header = Buffer.alloc(SQLITE_HEADER_BYTES);
+  let fd: number | undefined;
+  try {
+    fd = openSync(dbPath, "r");
+    const bytesRead = readSync(fd, header, 0, SQLITE_HEADER_BYTES, 0);
+    if (bytesRead < SQLITE_HEADER_BYTES) return null;
+    if (!header.subarray(0, SQLITE_MAGIC.length).equals(SQLITE_MAGIC)) return null;
+    return header.readUInt32BE(SQLITE_HEADER_USER_VERSION_OFFSET);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* an inconclusive peek must not replace the live port's own result */
+      }
+    }
+  }
+}
+
+function readSchemaVersionFromReadonlyConnection(dbPath: string): number | null {
   let db: Database.Database | undefined;
   try {
     db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 0 });
@@ -815,7 +853,11 @@ export function readStoredSchemaVersion(dbPath: string): number | null {
   } catch {
     return null;
   } finally {
-    db?.close();
+    try {
+      db?.close();
+    } catch {
+      /* an inconclusive peek must not replace the live port's own result */
+    }
   }
 }
 
