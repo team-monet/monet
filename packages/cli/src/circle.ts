@@ -228,21 +228,22 @@ function openMapStore(storeDir: string): Database.Database {
   // judged once, before anyone opens it for writing.
   //
   // The refusal is deliberately left to travel: deriveCircle's own caller degrades to the folder-hash
-  // slug (no map write, no store write) and the engine refuses the store a moment later with the same
-  // message, so nothing downstream needs a new error path.
+  // slug (no map write, no store write) and, for an above-ceiling store, the engine refuses the store
+  // a moment later with the same message, so nothing downstream needs a new error path.
   //
-  // A `null` is not a version this build can trust either (review round 1, P3-b): it means the file is
-  // there but could not be read from outside — a `-wal` a peer is holding past the budget, a file that
-  // is not SQLite, a header too short to carry a version. `null` never means "missing" (`0` is that,
-  // and it falls through to create the store below), so opening it for writing is the same class of
-  // write the check above exists to prevent, with the version unknown instead of above the ceiling.
-  // Refuse to write, let the degradation path handle it, and let the engine judge the store itself
-  // when it opens it.
+  // A `null` is not a version this build can trust either (#158 review round 1, P3-b): it means the
+  // file is there but names no version this reader can see — a `-wal` a peer is holding past the
+  // budget, a file that is not SQLite, a header too short to carry a version. `null` never means
+  // "missing", and it never covers the zero-length file SQLite opens as an empty database: both of
+  // those answer `0` (the second one since #158 review round 2, P1) and fall through to create the
+  // store below. Every `null` here is therefore a store the engine will not open for writing either.
+  // Refuse to write, let the degradation path handle it, and let the engine report the store's own
+  // error when it opens it.
   const storedSchemaVersion = readStoredSchemaVersion(dbPath);
   if (storedSchemaVersion === null) {
     throw new Error(
       `Store at ${dbPath} could not be read before opening it for writing; refusing to write. ` +
-        `Retry once whatever holds the store has released it.`,
+        `The engine reports this store's own error when it opens it.`,
     );
   }
   if (storedSchemaVersion > MONET_SCHEMA_VERSION) {

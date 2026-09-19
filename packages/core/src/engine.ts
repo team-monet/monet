@@ -2958,7 +2958,9 @@ export class MonetCore {
     // "this is newer than I understand" instead of silently dropping what it cannot name. Every path
     // that constructs MonetCore shares this ceiling — the same `readStoredSchemaVersion` decision
     // and the same `storeSchemaCeilingError` refusal are also what the CLI's pre-engine circle
-    // resolution uses, so the store is judged once, before anyone opens it for writing (#156).
+    // resolution uses, so every store that NAMES a version above this build's ceiling is decided
+    // before anyone opens it for writing (#156) — an inconclusive read (`null`) is still decided by
+    // the live re-check below, inside the port this constructor has already opened for writing.
     const storedSchemaVersion = typeof db === "string"
       ? readStoredSchemaVersion(dbPath!)
       : db.pragma("user_version", { simple: true }) as number;

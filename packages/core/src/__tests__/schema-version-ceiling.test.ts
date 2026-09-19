@@ -373,6 +373,20 @@ describe("MonetCore schema-version ceiling", () => {
     });
   });
 
+  it("reports 0 (a fresh store) for the zero-length file SQLite itself opens as an empty database", () => {
+    withStore((dbPath) => {
+      // SQLite treats a zero-length file as a valid EMPTY database: `new Database()` on one creates
+      // the schema, so the engine's own open path is the create path. A reader that cannot name a
+      // version in it is therefore looking at a store with no version at all, not at an unreadable
+      // one — and the difference is load-bearing for the CLI's pre-engine circle resolution (#156):
+      // on `null` it degrades to the path-coupled folder slug and stops writing, so a fresh project's
+      // circle would be pinned to that slug in the store's own map, while the engine goes on to
+      // create schema v13 in the very same file (#158 review round 2, P1).
+      writeFileSync(dbPath, Buffer.alloc(0));
+      expect(readStoredSchemaVersion(dbPath)).toBe(0);
+    });
+  });
+
   it("refuses an above-ceiling store behind a held `-journal` without opening it for writing", () => {
     withStore((dbPath) => {
       stampRollbackJournalUserVersion(dbPath, unsupportedSchemaVersion);

@@ -12,7 +12,7 @@ import {
   deriveProjectId,
   DEFAULT_CALLER_ID,
 } from "../circle";
-import { MonetCore, deriveCircle as coreDeriveCircle, MONET_SCHEMA_VERSION, storeSchemaCeilingError } from "@team-monet/core";
+import { MonetCore, deriveCircle as coreDeriveCircle, MONET_SCHEMA_VERSION, readStoredSchemaVersion, storeSchemaCeilingError } from "@team-monet/core";
 
 // A self-contained temp HOME so getDbPath() resolves under it, never touching the real ~/.monet.
 let tmpHome: string;
@@ -720,20 +720,42 @@ describe("deriveCallerId / deriveProjectId — source-authorization context", ()
     );
   });
 
-  it("never writes to a store whose version cannot be read from outside, not just to one above the ceiling (#156 residual)", () => {
-    const repo = makeRepo("git@github.com:acme/unreadable-store.git", "unreadable-store");
+  it("treats a zero-length store as the fresh store SQLite does, keeping the remote-derived circle (#156 residual, review round 2 P1)", () => {
+    const repo = makeRepo("git@github.com:acme/fresh-store.git", "fresh-store");
     const storePath = join(tmpStorage, "monet.db");
-    // An EXISTING store file the pre-write reader cannot name — here a zero-length one, the same
-    // `null` a `-wal` a peer holds past the budget produces. `null` is not "missing" (`0` is that, and
-    // it still creates the store below), so the map open must not make it a WAL database and write the
-    // map DDL into it before the engine has judged it. Pre-fix this path wrote both.
-    writeFileSync(storePath, "");
+    // A zero-length file is NOT an unreadable store: SQLite opens it as an EMPTY database, so the
+    // pre-engine read answers `0` — the same answer a missing file gets — and the map open below
+    // proceeds, exactly like it does when the store dir is empty. Reporting `null` here instead
+    // (round 2) made this path refuse, degrade to the path-coupled folder-hash slug, and never touch
+    // the store: the project's own `remote_circle_map` then got the slug written into it by the
+    // engine's later resolution, while the engine went on to create schema v13 in the same file.
+    writeFileSync(storePath, Buffer.alloc(0));
+    expect(readStoredSchemaVersion(storePath)).toBe(0);
+
+    const derived = deriveCircle(repo);
+
+    // The remote-derived name, not the folder-hash fallback (`-<8 hex>`).
+    expect(derived).toBe("github.com-acme-fresh-store");
+    expect(derived).not.toMatch(/-[0-9a-f]{8}$/);
+    // …and the map open really did run: SQLite wrote a real store header where the zero-length file
+    // was. That write is the one the round-2 refusal suppressed on a store the engine creates anyway.
+    expect(readFileSync(storePath).byteLength).toBeGreaterThan(0);
+  });
+
+  it("still refuses to write an existing store it cannot read and the engine will not open (#156 residual, review round 2 P1)", () => {
+    const repo = makeRepo("git@github.com:acme/garbage-store.git", "garbage-store");
+    const storePath = join(tmpStorage, "monet.db");
+    // The other side of the round-2 P1 boundary: bytes that are not a SQLite header name no version
+    // and SQLite itself refuses the file ("file is not a database"), so the pre-engine map open keeps
+    // its hands off — no header rewrite, no `-wal`/`-shm`, no map DDL — and the caller degrades to the
+    // folder-hash slug. `null` is reserved for shapes like this one, not for a fresh store.
+    writeFileSync(storePath, Buffer.from("this is not a SQLite store"));
     const bytesBefore = readFileSync(storePath);
     const filesBefore = readdirSync(tmpStorage).sort();
 
     const derived = deriveCircle(repo);
 
-    expect(derived).toBe(coreDeriveCircle(repo));
+    expect(derived).toMatch(/-[0-9a-f]{8}$/);
     expect(readFileSync(storePath).equals(bytesBefore)).toBe(true);
     expect(readdirSync(tmpStorage).sort()).toEqual(filesBefore);
   });

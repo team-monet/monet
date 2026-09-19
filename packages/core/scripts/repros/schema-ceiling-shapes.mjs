@@ -112,6 +112,21 @@ const buildStore = (dbPath, { journalMode = "DELETE", version = ABOVE, commit = 
   record("missing file", join(dir, "monet.db"), dir);
 }
 
+// 0b. an EXISTING store file that is zero bytes: the shape an interrupted create leaves behind
+//     (`new Database()` creates the file and `journal_mode = WAL` follows it), and the shape the
+//     engine itself OPENS and creates a schema in. The pre-engine decision has to agree with that
+//     verdict — `0` (a fresh store), not `null` (unreadable). `null` here made the CLI refuse to
+//     write the store's own circle map and pin the project's circle to a path slug (#158 review
+//     round 2, P1).
+{
+  const dir = freshDir("empty-file");
+  const p = join(dir, "monet.db");
+  writeFileSync(p, "");
+  record("zero-length main file (interrupted create)", p, dir, {
+    note: "a fresh store, not an unreadable one: the decision must match the engine's OPENED verdict",
+  });
+}
+
 // 1. cleanly closed store, no sidecars
 {
   const dir = freshDir("file-only");
