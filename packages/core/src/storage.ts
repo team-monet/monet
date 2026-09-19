@@ -17,9 +17,10 @@
  */
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, openSync, readSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { chmod, link, lstat, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { MONET_SCHEMA_VERSION } from "./schema-version";
 import { createStatementTracer, readInflightStatements, statementTraceEnabled } from "./statement-trace";
 import type { InflightStatement, StatementMethod, StatementTracer } from "./statement-trace";
 
@@ -797,26 +798,126 @@ export function readStoredEmbedderPin(dbPath: string): string | null {
 }
 
 /**
- * Read only the SQLite `user_version` without constructing a MonetCore. Used by MonetCore's own
- * startup ceiling before the normal BetterSqlitePort open runs any schema DDL. `0` includes a
- * missing path or `:memory:`; `null` means the existing file could not be inspected conclusively,
- * so callers can fall back to their normal open path and its existing errors.
+ * Read only the SQLite `user_version` without constructing a MonetCore and without opening the
+ * store for writing. Used by every store-opening path that can see a store before the engine
+ * fences it: MonetCore's own startup ceiling, ahead of the normal BetterSqlitePort open and its
+ * schema DDL (#107), and the CLI's pre-engine circle resolution, which runs before a MonetCore
+ * exists at all (#156). `0` includes a missing path or `:memory:`; `null` means the existing file
+ * could not be inspected conclusively, so callers fall back to their normal open path and its
+ * existing errors, with MonetCore's live re-check still standing between them and the schema region.
  *
- * A cleanly closed store has no `-wal`, `-shm`, or `-journal` sidecars, so the committed
- * `user_version` is read straight from the SQLite file header without opening a SQLite connection
- * and without creating sidecars. A live `-wal`/`-shm` pair may hold uncheckpointed frames, so that
- * shape uses the existing readonly connection peek with a zero timeout. Every other sidecar or
- * malformed-file shape is inconclusive and leaves the live port to decide.
+ * ORDER OF PREFERENCE — decided without writing, on every shape (#158):
+ * - No `-wal` frames: the committed `user_version` is read straight from the SQLite file header,
+ *   with no SQLite connection and therefore no sidecar creation. That is every shape except a
+ *   frames-bearing `-wal`, including a lone `-shm` and a `-journal`.
+ * - A `-wal` that holds frames: a readonly connection peek, because only SQLite combines
+ *   uncheckpointed frames with the header correctly. The peek is deliberately NOT used on a shape
+ *   the header can answer: it answers wrong there (a lone `-shm` makes it report 0 on a store whose
+ *   header says 14 — measured, `packages/core/scripts/repros/schema-ceiling-shapes.mjs`) and it
+ *   touches the store it is judging (a readonly open of a WAL-mode store creates sidecars). Keeping
+ *   the header wherever it is trustworthy is also what keeps a cleanly closed store byte-identical.
+ * - The peek gets ONE retry at `STORE_BUSY_TIMEOUT_MS`, because a zero timeout reports the first
+ *   busy moment as inconclusive — which is exactly what a peer holding the store produces. The wait
+ *   can only convert "inconclusive" into a refusal-before-write; it never converts a refusal into an
+ *   open. It is NOT free, and the budget is not shared with the open it precedes: on a store a peer
+ *   holds past the budget the ladder waits and the open then waits again (measured, review round 1:
+ *   11.6s ladder + 11.5s open, against 11.1s for the plain contended open on the merge base — 2.04x).
+ *   That is the deliberate price of deciding before writing on the one shape where the decision is
+ *   otherwise unavailable; every shape the header answers pays nothing.
+ *
+ * The peek is deliberately allowed to be CONSERVATIVE and never PERMISSIVE: an inconclusive `null`
+ * keeps the live port in charge, and a version it does report is refused before any write. A
+ * zero-length store FILE is neither of those: SQLite opens it as an EMPTY database and the create
+ * path is the right one, so it answers `0` like a missing file — not `null` (#158 review round 2,
+ * P1). A `-journal` shape is read as the main file currently stands, so a store whose interrupted
+ * transaction was itself a schema bump can refuse here where a post-recovery read might not — a
+ * refusal the user resolves by upgrading Monet, which is what the error says, and never a mutation.
  */
 export function readStoredSchemaVersion(dbPath: string): number | null {
   if (dbPath === ":memory:" || !existsSync(dbPath)) return 0;
-  const hasWal = existsSync(`${dbPath}-wal`);
-  const hasShm = existsSync(`${dbPath}-shm`);
-  const hasJournal = existsSync(`${dbPath}-journal`);
+  const walPath = `${dbPath}-wal`;
+  // WHAT THIS PREDICATE IS, AND WHAT IT IS NOT (#158 review round 2, P2): `walHasBytes` is a LENGTH
+  // test on the log. It cannot tell committed frames from a garbage or aborted frame set, and it does
+  // not need to — it chooses WHICH READER answers, and the reader it chooses answers the version
+  // (correctly, on every non-empty shape in the measured table). What it must never do is route a
+  // zero-length or vanished log away from the header, which is where a version no frames carry lives.
+  // A log WITH BYTES is the one shape whose committed frames can carry a `user_version` the main
+  // file's header does not; every other shape is answered by the header alone:
+  //  - a `-shm` is an index for a log that is gone, and a `-journal` holds pre-images of a
+  //    transaction that has NOT committed (SQLite rolls it back when it opens the store). Neither
+  //    can name a version NEWER than the header — only an older or absent one. Measured (#158 shape
+  //    table, `packages/core/scripts/repros/schema-ceiling-shapes.mjs`): a lone `-shm` makes a
+  //    readonly peek report 0 on a store whose header says 14, which is exactly how an above-ceiling
+  //    store got opened by a build that cannot name it.
+  //  - a zero-length `-wal` holds no frames by definition, so the header is still the whole truth.
+  // See the probe's own comment for why a vanished log means "no frames", not "unknown".
+  if (!walHasBytes(walPath)) {
+    // A ZERO-LENGTH FILE IS A FRESH STORE, NOT AN UNREADABLE ONE (#158 review round 2, P1). SQLite
+    // treats a zero-length file as a valid EMPTY database — `new Database()` on one creates the
+    // schema — so a build that reads no version out of it is looking at a store with no version at
+    // all, not at a store it must refuse. The distinction is load-bearing for the pre-engine CLI
+    // resolution (#156): on `null` that caller degrades to the path-coupled folder slug, which would
+    // pin a fresh project's circle to that slug in the store's own map, while the engine opens the
+    // very same file and creates schema v13 in it. Answered as `0` — the answer a missing file gets.
+    if (isEmptyStoreFile(dbPath)) return 0;
+    return readSchemaVersionFromSqliteHeader(dbPath);
+  }
+  return (
+    readSchemaVersionFromReadonlyConnection(dbPath, 0) ??
+    readSchemaVersionFromReadonlyConnection(dbPath, STORE_BUSY_TIMEOUT_MS)
+  );
+}
 
-  if (!hasWal && !hasShm && !hasJournal) return readSchemaVersionFromSqliteHeader(dbPath);
-  if (hasWal && hasShm && !hasJournal) return readSchemaVersionFromReadonlyConnection(dbPath);
-  return null;
+/**
+ * Does this `-wal` have bytes in it? A LENGTH TEST, deliberately (#158 review round 2, P2): a garbage
+ * or aborted frame set of non-zero size routes to the peek exactly like a committed one, and the peek
+ * is what answers the version. The predicate's only job is to keep the ZERO-LENGTH and VANISHED cases
+ * on the header path — where a version that no frames carry always lives.
+ *
+ * AN UNREADABLE OR VANISHED LOG MEANS NO BYTES (#158 review round 1, P1): SQLite unlinks `-wal`/`-shm`
+ * when the last connection to a WAL store closes, so a store one process is handing off while another
+ * starts — the topology this repo's own contention message names as supported — can have the file
+ * disappear between the `existsSync` and the `stat`. Every other failure in `readStoredSchemaVersion`
+ * collapses to a `null` the live port still gets to act on, and a raw `fs` error must not be the one
+ * thing that escapes it: `new MonetCore` calls this with no `try`/`catch`, so an `ENOENT` raised here
+ * would replace the store's own version or refusal with a filesystem error the caller has no answer
+ * for. Collapsing to `false` is also the base's own behaviour: with the log gone, the header is the
+ * whole truth.
+ */
+function walHasBytes(walPath: string): boolean {
+  try {
+    return statSync(walPath).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Is this store file the zero-length file SQLite opens — and creates the schema in — as an EMPTY
+ * database? Only that one short file is a fresh store (#158 review round 2, P1); every other short
+ * file (garbage bytes, a truncated header) stays a `null` read, because the engine will not open it.
+ */
+function isEmptyStoreFile(dbPath: string): boolean {
+  try {
+    return statSync(dbPath).size === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * THE CEILING REFUSAL ITSELF (#158, the one port-ownership rule): every store-opening path that
+ * finds an on-disk `user_version` above this build's ceiling throws this exact error — the CLI's
+ * pre-engine circle resolution (#156), MonetCore's pre-open decision, and MonetCore's live
+ * re-check after the port opens. One definition rather than three string literals, so a caller can
+ * grep a single string to find every owner of the decision, and a test's user-facing assertion does
+ * not depend on which layer happened to refuse first.
+ */
+export function storeSchemaCeilingError(storedSchemaVersion: number): Error {
+  return new Error(
+    `Store schema ${storedSchemaVersion} is newer than supported schema ${MONET_SCHEMA_VERSION}; ` +
+      `refusing to open. Upgrade Monet first.`,
+  );
 }
 
 const SQLITE_HEADER_BYTES = 100;
@@ -845,10 +946,10 @@ function readSchemaVersionFromSqliteHeader(dbPath: string): number | null {
   }
 }
 
-function readSchemaVersionFromReadonlyConnection(dbPath: string): number | null {
+function readSchemaVersionFromReadonlyConnection(dbPath: string, timeoutMs = 0): number | null {
   let db: Database.Database | undefined;
   try {
-    db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 0 });
+    db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: timeoutMs });
     return db.pragma("user_version", { simple: true }) as number;
   } catch {
     return null;

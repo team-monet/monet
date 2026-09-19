@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, copyFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, copyFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -12,7 +12,7 @@ import {
   deriveProjectId,
   DEFAULT_CALLER_ID,
 } from "../circle";
-import { MonetCore, deriveCircle as coreDeriveCircle } from "@team-monet/core";
+import { MonetCore, deriveCircle as coreDeriveCircle, MONET_SCHEMA_VERSION, readStoredSchemaVersion, storeSchemaCeilingError } from "@team-monet/core";
 
 // A self-contained temp HOME so getDbPath() resolves under it, never touching the real ~/.monet.
 let tmpHome: string;
@@ -693,5 +693,70 @@ describe("deriveCallerId / deriveProjectId — source-authorization context", ()
       db.close();
       expect(hasTable).toBeUndefined();
     });
+  });
+
+  it("never writes to a store the engine refuses: the pre-engine map open decides first (#156)", () => {
+    const repo = makeRepo("git@github.com:acme/ceiling-store.git", "ceiling-store");
+    const storePath = join(tmpStorage, "monet.db");
+    const seed = new Database(storePath);
+    seed.pragma(`user_version = ${MONET_SCHEMA_VERSION + 1}`);
+    seed.close();
+    const bytesBefore = readFileSync(storePath);
+    const filesBefore = readdirSync(tmpStorage).sort();
+
+    // deriveCircle runs BEFORE `new MonetCore(...)`, and its map store used to be opened for writing
+    // on the way past: `journal_mode = WAL` rewrites the main file's header bytes and creates
+    // `-wal`/`-shm`, and the map table DDL writes a schema object — after which the engine refused
+    // the store anyway. The store must be judged before anyone opens it for writing, so the map
+    // resolution degrades to the same folder-hash fallback it uses for any other store failure, and
+    // the bytes, the sidecar set, and the version all stay exactly as the newer Monet left them.
+    const derived = deriveCircle(repo);
+
+    expect(derived).toBe(coreDeriveCircle(repo));
+    expect(readFileSync(storePath).equals(bytesBefore)).toBe(true);
+    expect(readdirSync(tmpStorage).sort()).toEqual(filesBefore);
+    expect(() => new MonetCore(storePath)).toThrow(
+      storeSchemaCeilingError(MONET_SCHEMA_VERSION + 1).message,
+    );
+  });
+
+  it("treats a zero-length store as the fresh store SQLite does, keeping the remote-derived circle (#156 residual, review round 2 P1)", () => {
+    const repo = makeRepo("git@github.com:acme/fresh-store.git", "fresh-store");
+    const storePath = join(tmpStorage, "monet.db");
+    // A zero-length file is NOT an unreadable store: SQLite opens it as an EMPTY database, so the
+    // pre-engine read answers `0` — the same answer a missing file gets — and the map open below
+    // proceeds, exactly like it does when the store dir is empty. Reporting `null` here instead
+    // (round 2) made this path refuse, degrade to the path-coupled folder-hash slug, and never touch
+    // the store: the project's own `remote_circle_map` then got the slug written into it by the
+    // engine's later resolution, while the engine went on to create schema v13 in the same file.
+    writeFileSync(storePath, Buffer.alloc(0));
+    expect(readStoredSchemaVersion(storePath)).toBe(0);
+
+    const derived = deriveCircle(repo);
+
+    // The remote-derived name, not the folder-hash fallback (`-<8 hex>`).
+    expect(derived).toBe("github.com-acme-fresh-store");
+    expect(derived).not.toMatch(/-[0-9a-f]{8}$/);
+    // …and the map open really did run: SQLite wrote a real store header where the zero-length file
+    // was. That write is the one the round-2 refusal suppressed on a store the engine creates anyway.
+    expect(readFileSync(storePath).byteLength).toBeGreaterThan(0);
+  });
+
+  it("still refuses to write an existing store it cannot read and the engine will not open (#156 residual, review round 2 P1)", () => {
+    const repo = makeRepo("git@github.com:acme/garbage-store.git", "garbage-store");
+    const storePath = join(tmpStorage, "monet.db");
+    // The other side of the round-2 P1 boundary: bytes that are not a SQLite header name no version
+    // and SQLite itself refuses the file ("file is not a database"), so the pre-engine map open keeps
+    // its hands off — no header rewrite, no `-wal`/`-shm`, no map DDL — and the caller degrades to the
+    // folder-hash slug. `null` is reserved for shapes like this one, not for a fresh store.
+    writeFileSync(storePath, Buffer.from("this is not a SQLite store"));
+    const bytesBefore = readFileSync(storePath);
+    const filesBefore = readdirSync(tmpStorage).sort();
+
+    const derived = deriveCircle(repo);
+
+    expect(derived).toMatch(/-[0-9a-f]{8}$/);
+    expect(readFileSync(storePath).equals(bytesBefore)).toBe(true);
+    expect(readdirSync(tmpStorage).sort()).toEqual(filesBefore);
   });
 });
