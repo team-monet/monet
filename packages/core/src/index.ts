@@ -82,6 +82,8 @@ export {
   VerifiedBackupVerificationError,
   readStoredEmbedderPin,
   readStoredVectorPresence,
+  readStoredSchemaVersion,
+  storeSchemaCeilingError,
 } from "./storage";
 export type { VerifiedBackupResult } from "./storage";
 export {

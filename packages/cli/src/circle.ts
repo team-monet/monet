@@ -1,5 +1,10 @@
 import Database from "better-sqlite3";
-import { deriveCircle as deriveFolderCircle } from "@team-monet/core";
+import {
+  deriveCircle as deriveFolderCircle,
+  MONET_SCHEMA_VERSION,
+  readStoredSchemaVersion,
+  storeSchemaCeilingError,
+} from "@team-monet/core";
 import { getDbPath } from "./db/index.js";
 import { canonicalRemoteKey, defaultNameFromRemote, getOriginRemote } from "./remote-circle.js";
 
@@ -212,7 +217,26 @@ export function deriveCircle(projectDir: string): string {
  * not only the ones that route through `deriveCircle`.
  */
 function openMapStore(storeDir: string): Database.Database {
-  const db = new Database(getDbPath(storeDir));
+  const dbPath = getDbPath(storeDir);
+  // #156 — STOP WRITING TO A STORE THE ENGINE WILL REFUSE. This map store is opened BEFORE
+  // `new MonetCore(...)`, and opening it for writing is not a read: `journal_mode = WAL` on the next
+  // line rewrites the main file's header bytes 18/19 and creates `-wal`/`-shm` beside it, and the
+  // CREATE TABLE below writes a schema object — all of it before the engine has had its say. On a
+  // store whose `user_version` is above this build's ceiling the engine then refuses the store
+  // (`storeSchemaCeilingError`), so every one of those writes landed on a store this build cannot
+  // name. Decide first, with the same reader and the same refusal the engine uses, so the store is
+  // judged once, before anyone opens it for writing.
+  //
+  // The refusal is deliberately left to travel: deriveCircle's own caller degrades to the folder-hash
+  // slug (no map write, no store write) and the engine refuses the store a moment later with the same
+  // message, so nothing downstream needs a new error path. A `null` (inconclusive pre-write read — a
+  // store this reader cannot see from outside) is NOT a refusal: it keeps today's behaviour, and the
+  // engine's live re-check stays the authority.
+  const storedSchemaVersion = readStoredSchemaVersion(dbPath);
+  if (storedSchemaVersion !== null && storedSchemaVersion > MONET_SCHEMA_VERSION) {
+    throw storeSchemaCeilingError(storedSchemaVersion);
+  }
+  const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
   // Client-owned metadata table. The engine never reads or writes this; it lives in the same

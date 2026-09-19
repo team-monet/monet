@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, copyFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, copyFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -12,7 +12,7 @@ import {
   deriveProjectId,
   DEFAULT_CALLER_ID,
 } from "../circle";
-import { MonetCore, deriveCircle as coreDeriveCircle } from "@team-monet/core";
+import { MonetCore, deriveCircle as coreDeriveCircle, MONET_SCHEMA_VERSION, storeSchemaCeilingError } from "@team-monet/core";
 
 // A self-contained temp HOME so getDbPath() resolves under it, never touching the real ~/.monet.
 let tmpHome: string;
@@ -693,5 +693,30 @@ describe("deriveCallerId / deriveProjectId — source-authorization context", ()
       db.close();
       expect(hasTable).toBeUndefined();
     });
+  });
+
+  it("never writes to a store the engine refuses: the pre-engine map open decides first (#156)", () => {
+    const repo = makeRepo("git@github.com:acme/ceiling-store.git", "ceiling-store");
+    const storePath = join(tmpStorage, "monet.db");
+    const seed = new Database(storePath);
+    seed.pragma(`user_version = ${MONET_SCHEMA_VERSION + 1}`);
+    seed.close();
+    const bytesBefore = readFileSync(storePath);
+    const filesBefore = readdirSync(tmpStorage).sort();
+
+    // deriveCircle runs BEFORE `new MonetCore(...)`, and its map store used to be opened for writing
+    // on the way past: `journal_mode = WAL` rewrites the main file's header bytes and creates
+    // `-wal`/`-shm`, and the map table DDL writes a schema object — after which the engine refused
+    // the store anyway. The store must be judged before anyone opens it for writing, so the map
+    // resolution degrades to the same folder-hash fallback it uses for any other store failure, and
+    // the bytes, the sidecar set, and the version all stay exactly as the newer Monet left them.
+    const derived = deriveCircle(repo);
+
+    expect(derived).toBe(coreDeriveCircle(repo));
+    expect(readFileSync(storePath).equals(bytesBefore)).toBe(true);
+    expect(readdirSync(tmpStorage).sort()).toEqual(filesBefore);
+    expect(() => new MonetCore(storePath)).toThrow(
+      storeSchemaCeilingError(MONET_SCHEMA_VERSION + 1).message,
+    );
   });
 });
