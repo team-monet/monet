@@ -229,11 +229,23 @@ function openMapStore(storeDir: string): Database.Database {
   //
   // The refusal is deliberately left to travel: deriveCircle's own caller degrades to the folder-hash
   // slug (no map write, no store write) and the engine refuses the store a moment later with the same
-  // message, so nothing downstream needs a new error path. A `null` (inconclusive pre-write read — a
-  // store this reader cannot see from outside) is NOT a refusal: it keeps today's behaviour, and the
-  // engine's live re-check stays the authority.
+  // message, so nothing downstream needs a new error path.
+  //
+  // A `null` is not a version this build can trust either (review round 1, P3-b): it means the file is
+  // there but could not be read from outside — a `-wal` a peer is holding past the budget, a file that
+  // is not SQLite, a header too short to carry a version. `null` never means "missing" (`0` is that,
+  // and it falls through to create the store below), so opening it for writing is the same class of
+  // write the check above exists to prevent, with the version unknown instead of above the ceiling.
+  // Refuse to write, let the degradation path handle it, and let the engine judge the store itself
+  // when it opens it.
   const storedSchemaVersion = readStoredSchemaVersion(dbPath);
-  if (storedSchemaVersion !== null && storedSchemaVersion > MONET_SCHEMA_VERSION) {
+  if (storedSchemaVersion === null) {
+    throw new Error(
+      `Store at ${dbPath} could not be read before opening it for writing; refusing to write. ` +
+        `Retry once whatever holds the store has released it.`,
+    );
+  }
+  if (storedSchemaVersion > MONET_SCHEMA_VERSION) {
     throw storeSchemaCeilingError(storedSchemaVersion);
   }
   const db = new Database(dbPath);

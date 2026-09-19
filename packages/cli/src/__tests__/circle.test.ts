@@ -719,4 +719,22 @@ describe("deriveCallerId / deriveProjectId — source-authorization context", ()
       storeSchemaCeilingError(MONET_SCHEMA_VERSION + 1).message,
     );
   });
+
+  it("never writes to a store whose version cannot be read from outside, not just to one above the ceiling (#156 residual)", () => {
+    const repo = makeRepo("git@github.com:acme/unreadable-store.git", "unreadable-store");
+    const storePath = join(tmpStorage, "monet.db");
+    // An EXISTING store file the pre-write reader cannot name — here a zero-length one, the same
+    // `null` a `-wal` a peer holds past the budget produces. `null` is not "missing" (`0` is that, and
+    // it still creates the store below), so the map open must not make it a WAL database and write the
+    // map DDL into it before the engine has judged it. Pre-fix this path wrote both.
+    writeFileSync(storePath, "");
+    const bytesBefore = readFileSync(storePath);
+    const filesBefore = readdirSync(tmpStorage).sort();
+
+    const derived = deriveCircle(repo);
+
+    expect(derived).toBe(coreDeriveCircle(repo));
+    expect(readFileSync(storePath).equals(bytesBefore)).toBe(true);
+    expect(readdirSync(tmpStorage).sort()).toEqual(filesBefore);
+  });
 });

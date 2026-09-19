@@ -470,6 +470,63 @@ describe("MonetCore schema-version ceiling", () => {
     });
   });
 
+  it("decides from WAL frames the header does not show, without opening the store for writing or consuming the log", () => {
+    withStore((dbPath) => {
+      const holder = seedCheckpointedWalStore(dbPath, MONET_SCHEMA_VERSION);
+      try {
+        // The ceiling is raised ONLY in the log: the committed header still reads this build's
+        // version, so the header alone cannot answer this store. Nothing checkpoints the frame away
+        // because this connection stays open for the length of the test.
+        holder.prepare(`PRAGMA user_version = ${unsupportedSchemaVersion}`).run();
+        const shape = copyStoreShape(dbPath, ["-wal", "-shm"]);
+        try {
+          expect(readMainFileHeaderUserVersion(shape.dbPath)).toBe(MONET_SCHEMA_VERSION);
+          expect(statSync(`${shape.dbPath}-wal`).size).toBeGreaterThan(0);
+
+          // Decided BEFORE anything opens it for writing — the whole point of #158 — and decided from
+          // the frames, which a header read cannot see. A lock-held variant of this shape is what the
+          // ladder's single retry exists for; it is not unit-pinned, because a WAL writer's frames
+          // land at commit and a reader with a valid `-shm` is not blocked by a WAL writer, so the
+          // busy moment cannot be constructed on a shape that still has frames to read.
+          expect(readStoredSchemaVersion(shape.dbPath)).toBe(unsupportedSchemaVersion);
+          expect(captureOpenError(shape.dbPath).message).toBe(refusal());
+
+          // Side effects: the log is still there with its frames, and the header still says what it
+          // said. A checkpoint inside the peek, or a header-first fallback, shows up right here.
+          expect(statSync(`${shape.dbPath}-wal`).size).toBeGreaterThan(0);
+          expect(readMainFileHeaderUserVersion(shape.dbPath)).toBe(MONET_SCHEMA_VERSION);
+        } finally {
+          rmSync(shape.dir, { recursive: true, force: true });
+        }
+      } finally {
+        holder.close();
+      }
+    });
+  });
+
+  it("refuses an above-ceiling store whose lone zero-length `-wal` has no `-shm` beside it, and creates none", () => {
+    withStore((dbPath) => {
+      seedCleanlyClosedWalStore(dbPath, unsupportedSchemaVersion);
+      // Closed cleanly, so the log was unlinked and only the copy below carries a `-wal`: an empty
+      // one, which is the shape a writer leaves when it truncates its log without unlinking it. A
+      // peek on this shape answers from a store it also creates a `-shm` in; the header answers from
+      // the bytes that are already there.
+      const shape = copyStoreShape(dbPath, []);
+      writeFileSync(`${shape.dbPath}-wal`, "");
+      try {
+        expect(storeFiles(shape.dbPath)).toEqual(["monet.db", "monet.db-wal"]);
+        expect(readMainFileHeaderUserVersion(shape.dbPath)).toBe(unsupportedSchemaVersion);
+        const bytesBefore = readFileSync(shape.dbPath);
+
+        expect(captureOpenError(shape.dbPath).message).toBe(refusal());
+        expect(readFileSync(shape.dbPath).equals(bytesBefore)).toBe(true);
+        expect(storeFiles(shape.dbPath)).toEqual(["monet.db", "monet.db-wal"]);
+      } finally {
+        rmSync(shape.dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("refuses through the live re-check when no pre-write decision is available, leaving the caller's port open", () => {
     withStore((dbPath) => {
       stampUserVersion(dbPath, MONET_SCHEMA_VERSION);

@@ -807,19 +807,23 @@ export function readStoredEmbedderPin(dbPath: string): string | null {
  * existing errors, with MonetCore's live re-check still standing between them and the schema region.
  *
  * ORDER OF PREFERENCE — decided without writing, on every shape (#158):
- * - No sidecars at all: the committed `user_version` is read straight from the SQLite file header,
- *   with no SQLite connection and therefore no sidecar creation.
- * - Any sidecar — a live `-wal`/`-shm` pair, a lone `-wal` after a crash, or a `-journal`: a
- *   readonly connection peek, because only SQLite combines uncheckpointed frames with the header
- *   correctly. A readonly open of a WAL-mode store with no sidecars can create them (measured:
- *   `packages/core/scripts/repros/schema-ceiling-shapes.mjs`), but it never rewrites a page and
- *   never rolls back a `-journal` — which is the mutation this order exists to prevent. Preferring
- *   the header where it is trustworthy is also what keeps a cleanly closed store byte-identical.
- * - The peek gets ONE retry at `STORE_BUSY_TIMEOUT_MS`: a zero timeout reports the first busy
- *   moment as inconclusive, which on a rollback-journal store is exactly what a peer's exclusive
- *   lock produces (measured: same script). The wait can only convert "inconclusive" into a
- *   refusal-before-write; it never converts a refusal into an open, so the worst case is spending
- *   the same budget the open this check may prevent would itself have spent.
+ * - No `-wal` frames: the committed `user_version` is read straight from the SQLite file header,
+ *   with no SQLite connection and therefore no sidecar creation. That is every shape except a
+ *   frames-bearing `-wal`, including a lone `-shm` and a `-journal`.
+ * - A `-wal` that holds frames: a readonly connection peek, because only SQLite combines
+ *   uncheckpointed frames with the header correctly. The peek is deliberately NOT used on a shape
+ *   the header can answer: it answers wrong there (a lone `-shm` makes it report 0 on a store whose
+ *   header says 14 — measured, `packages/core/scripts/repros/schema-ceiling-shapes.mjs`) and it
+ *   touches the store it is judging (a readonly open of a WAL-mode store creates sidecars). Keeping
+ *   the header wherever it is trustworthy is also what keeps a cleanly closed store byte-identical.
+ * - The peek gets ONE retry at `STORE_BUSY_TIMEOUT_MS`, because a zero timeout reports the first
+ *   busy moment as inconclusive — which is exactly what a peer holding the store produces. The wait
+ *   can only convert "inconclusive" into a refusal-before-write; it never converts a refusal into an
+ *   open. It is NOT free, and the budget is not shared with the open it precedes: on a store a peer
+ *   holds past the budget the ladder waits and the open then waits again (measured, review round 1:
+ *   11.6s ladder + 11.5s open, against 11.1s for the plain contended open on the merge base — 2.04x).
+ *   That is the deliberate price of deciding before writing on the one shape where the decision is
+ *   otherwise unavailable; every shape the header answers pays nothing.
  *
  * The peek is deliberately allowed to be CONSERVATIVE and never PERMISSIVE: an inconclusive `null`
  * keeps the live port in charge, and a version it does report is refused before any write. A
@@ -841,12 +845,33 @@ export function readStoredSchemaVersion(dbPath: string): number | null {
   //  - a zero-length `-wal` holds no frames by definition, so the header is still the whole truth.
   // So the header is the tool whenever there are no `-wal` frames, and the peek is reserved for the
   // one shape that needs it: a non-empty `-wal` whose committed frames the header does not reflect.
-  const walFrames = existsSync(walPath) && statSync(walPath).size > 0;
-  if (!walFrames) return readSchemaVersionFromSqliteHeader(dbPath);
+  // A `-wal` THAT HOLDS FRAMES is the one shape whose answer lives in the peek; everything else —
+  // including a lone `-shm` and a `-journal` — is answered by the header alone. See the probe's own
+  // comment for why a vanished log means "no frames", not "unknown".
+  if (!walHasFrames(walPath)) return readSchemaVersionFromSqliteHeader(dbPath);
   return (
     readSchemaVersionFromReadonlyConnection(dbPath, 0) ??
     readSchemaVersionFromReadonlyConnection(dbPath, STORE_BUSY_TIMEOUT_MS)
   );
+}
+
+/**
+ * Does this `-wal` actually hold frames? An UNREADABLE OR VANISHED LOG MEANS NO FRAMES (#158 review
+ * round 1, P1): SQLite unlinks `-wal`/`-shm` when the last connection to a WAL store closes, so a
+ * store one process is handing off while another starts — the topology this repo's own contention
+ * message names as supported — can have the file disappear between the `existsSync` and the `stat`.
+ * Every other failure in `readStoredSchemaVersion` collapses to a `null` the live port still gets to
+ * act on, and a raw `fs` error must not be the one thing that escapes it: `new MonetCore` calls this
+ * with no `try`/`catch`, so an `ENOENT` raised here would replace the store's own version or refusal
+ * with a filesystem error the caller has no answer for. Collapsing to `false` is also the base's own
+ * behaviour: with the log gone, the header is the whole truth.
+ */
+function walHasFrames(walPath: string): boolean {
+  try {
+    return statSync(walPath).size > 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
