@@ -26,6 +26,15 @@ import { slugify as realSlugify } from "../engine";
 // @ts-expect-error — plain .mjs mirror, no type declarations; imported for its exported pure function only.
 import { slugify as mirroredSlugify } from "../db-slugify.mjs";
 
+describe("slugify is a fixed point at the cap (#117)", () => {
+  it("does not leave a hyphen at the 60-character cut, because resolveRef re-slugifies what it looks up", () => {
+    const title = "Layout Height Collapse: Svelte mounts App.svelte at the root of the page";
+    const slug = realSlugify(title);
+    expect(slug).toBe("layout-height-collapse-svelte-mounts-app-svelte-at-the-root");
+    expect(realSlugify(slug)).toBe(slug);
+  });
+});
+
 describe("db-slugify.mjs's slugify mirror — byte-identical to engine.ts's real slugify", () => {
   const cases: string[] = [
     "",
@@ -38,6 +47,7 @@ describe("db-slugify.mjs's slugify mirror — byte-identical to engine.ts's real
     "a string exactly sixty characters long, padded out to hit that exact bound!!",
     "a string that is definitely, certainly, and unambiguously longer than sixty characters by a wide margin so the slice(0,60) boundary is exercised for real",
     "!!!___...leading and trailing punctuation-only noise...___!!!",
+    "Layout Height Collapse: Svelte mounts App.svelte at the root of the page",
     "unicode-adjacent: café, naïve, — em dash, “curly quotes”",
     "multiple    consecutive     whitespace   runs",
     "a.b.c.d.e.f.g dotted identifier chain",

@@ -152,9 +152,9 @@ function downgradeToPreClockModeV8(path: string): string {
  * truncation boundary landed after it). This fixture places the path and the secret-shaped key at
  * the START of their respective input strings specifically so their title DOES retain the
  * scrubbable substring (needed for a real, non-zero titleHits assertion below) — the email case is
- * deliberately positioned mid-sentence instead, since a leading-email phrasing was ALSO probed and
- * still truncated before the "@" boundary; the email's scrub coverage is verified via body/
- * observations content instead, which is the honest, verified-not-assumed way to cover it.
+ * deliberately positioned mid-sentence instead, since firstLine() masks an address in a title
+ * (#117); the email's scrub coverage is verified via body/observations content instead, which is
+ * the honest, verified-not-assumed way to cover it.
  */
 async function buildFixtureDb(path: string): Promise<{ conceptIds: string[] }> {
   const core = new MonetCore(path);
@@ -577,7 +577,7 @@ describe("scrubConceptSlugs — round 3, F2 fix: regenerate concepts.slug from t
     let conceptId: string;
     try {
       const r = await core.store(
-        "/Users/dev/secret-notes.txt has the details — contact jane.doe@example.com about " +
+        "/Users/dev/secret-notes. /Users/dev/secret-notes.txt has the details — contact jane.doe@example.com about " +
           "/Users/dev/secret-notes.txt for questions.",
         { circle: SAMPLED_CIRCLE },
       );
@@ -633,9 +633,9 @@ describe("scrubConceptSlugs — round 3, F2 fix: regenerate concepts.slug from t
       // Two DISTINCT concepts (divergent bodies/kinds so the engine's own dedup does not merge
       // them — verified empirically elsewhere in this suite's sibling fixtures that near-identical
       // bodies DO get merged by the engine's dedup, which would defeat this collision test) whose
-      // titles both truncate to "jane" (before the "@") and therefore both slugify to "jane".
+      // titles both end at the sentence "jane" and therefore both slugify to "jane".
       const a = await core.store(
-        "jane.doe@example.com is the person to contact — this note is entirely about database " +
+        "jane. jane.doe@example.com is the person to contact — this note is entirely about database " +
           "indexing strategy and B-tree page splits under heavy write load, a topic unrelated to " +
           "the second note, distinct enough that dedup should not merge them. " +
           "a".repeat(200),
@@ -643,7 +643,7 @@ describe("scrubConceptSlugs — round 3, F2 fix: regenerate concepts.slug from t
       );
       idA = a.conceptId!;
       const b = await core.store(
-        "jane.doe@example.com is the person to contact — this second note is entirely about OAuth " +
+        "jane. jane.doe@example.com is the person to contact — this second note is entirely about OAuth " +
           "token refresh race conditions in the auth service, again unrelated to the first note, " +
           "distinct enough that dedup should not merge them. " +
           "b".repeat(200),
@@ -710,7 +710,7 @@ describe("scrubConceptSlugs — round 3, F2 fix: regenerate concepts.slug from t
     let idB2: string;
     try {
       const a = await core2.store(
-        "jane.doe@example.com is the person to contact — this note is entirely about database " +
+        "jane. jane.doe@example.com is the person to contact — this note is entirely about database " +
           "indexing strategy and B-tree page splits under heavy write load, a topic unrelated to " +
           "the second note, distinct enough that dedup should not merge them. " +
           "a".repeat(200),
@@ -718,7 +718,7 @@ describe("scrubConceptSlugs — round 3, F2 fix: regenerate concepts.slug from t
       );
       idA2 = a.conceptId!;
       const b = await core2.store(
-        "jane.doe@example.com is the person to contact — this second note is entirely about OAuth " +
+        "jane. jane.doe@example.com is the person to contact — this second note is entirely about OAuth " +
           "token refresh race conditions in the auth service, again unrelated to the first note, " +
           "distinct enough that dedup should not merge them. " +
           "b".repeat(200),
@@ -800,14 +800,14 @@ describe("scrubConceptSlugs — round 3, F2 fix: regenerate concepts.slug from t
       let idB: string;
       let idC: string;
       try {
-        // A and B collide on base slug "jane" (both truncate to "jane.doe@..." before the "@").
+        // A and B collide on base slug "jane" (both titles end at the sentence "jane").
         // idB is returned by a LATER store() call than idA, so idA < idB is guaranteed by the
         // generator's monotonicity — idB (the SECOND-processed row under `ORDER BY id`) is
         // deterministically the one scrubConceptSlugs disambiguates, matching the
         // base-slug-collision test's own established "the SECOND one gets suffixed" behavior, but
         // now BY CONSTRUCTION rather than by chance.
         const a = await core.store(
-          "jane.doe@example.com is the person to contact — this note is entirely about database " +
+          "jane. jane.doe@example.com is the person to contact — this note is entirely about database " +
             "indexing strategy and B-tree page splits under heavy write load, a topic unrelated to " +
             "the other notes, distinct enough that dedup should not merge them. " +
             "a".repeat(200),
@@ -815,7 +815,7 @@ describe("scrubConceptSlugs — round 3, F2 fix: regenerate concepts.slug from t
         );
         idA = a.conceptId!;
         const b = await core.store(
-          "jane.doe@example.com is the person to contact — this second note is entirely about OAuth " +
+          "jane. jane.doe@example.com is the person to contact — this second note is entirely about OAuth " +
             "token refresh race conditions in the auth service, again unrelated to the other notes, " +
             "distinct enough that dedup should not merge them. " +
             "b".repeat(200),
@@ -825,9 +825,8 @@ describe("scrubConceptSlugs — round 3, F2 fix: regenerate concepts.slug from t
         expect(idA < idB).toBe(true); // non-vacuity: confirm the deterministic ordering this test's design depends on
 
         // The THIRD concept's scrubbed title is engineered to slugify EXACTLY to idB's own
-        // future-disambiguated slug, "jane-${idB.slice(0,8)}" — a period placed immediately after
-        // the fragment (matching firstLine()'s "split on first period not adjacent to a digit"
-        // rule) makes the title truncate to EXACTLY this string. idC, returned by a store() call
+        // future-disambiguated slug, "jane-${idB.slice(0,8)}" — a sentence-ending period placed
+        // immediately after the fragment makes the title truncate to EXACTLY this string. idC, returned by a store() call
         // AFTER idB's, is guaranteed by the generator's monotonicity to sort AFTER idB — the exact
         // "later concept collides with an EARLIER disambiguated slug" case this fix targets, with
         // zero dependence on random id values or a retry loop.
@@ -1092,17 +1091,15 @@ describe("rewriteAssertedSlugRefsInDb — round 5, J1 fix: stale `#<old-slug>` a
     try {
       // A concept whose title leads with a sensitive /Users/ path — the SAME proven fixture
       // phrasing scrubConceptSlugs' own "regenerates the slug..." test above uses (path placed at
-      // the very START of the string survives firstLine()'s truncation whole, verified there:
-      // produces title "/Users/dev/secret-notes", RAW slug "users-dev-secret-notes"). A
-      // literal EMAIL cannot play this role in a firstLine()-truncated title (verified directly,
-      // separately from this suite): the "." inside "jane.doe@..." is itself a firstLine() split
-      // point, so an email-LED title always truncates to just "jane" before the dot — the PR
-      // comment's `#jane-doe-example-com` example is illustrative of the LEAK SHAPE (a slugified
-      // sensitive fragment surviving in ref text), not a claim that titles preserve raw email
-      // strings whole; a path-derived leaky slug is the equally-valid, empirically-correct fixture
-      // for exercising the identical rewrite mechanism.
+      // the very START of the string survives firstLine() whole, verified there: produces title
+      // "/Users/dev/secret-notes", RAW slug "users-dev-secret-notes"). A literal EMAIL cannot play
+      // this role: firstLine() masks an address before deriving the title (#117) — the PR comment's
+      // `#jane-doe-example-com` example is illustrative of the LEAK SHAPE (a slugified sensitive
+      // fragment surviving in ref text), not a claim that titles preserve raw email strings whole;
+      // a path-derived leaky slug is the equally-valid, empirically-correct fixture for exercising
+      // the identical rewrite mechanism.
       const sensitive = await core.store(
-        "/Users/dev/secret-notes.txt has the details — contact jane.doe@example.com about " +
+        "/Users/dev/secret-notes. /Users/dev/secret-notes.txt has the details — contact jane.doe@example.com about " +
           "/Users/dev/secret-notes.txt for questions.",
         { circle: SAMPLED_CIRCLE },
       );
@@ -1182,9 +1179,10 @@ describe("rewriteAssertedSlugRefsInDb — round 5, J1 fix: stale `#<old-slug>` a
     let oldSlug: string;
     try {
       // Same proven-working "path-led title" fixture as the sibling test above (a literal email
-      // cannot survive whole into a firstLine()-truncated title — see that test's own doc comment
-      // for the verified reason).
-      const sensitive = await core.store("/Users/dev/runbook-notes.txt owns this runbook — contact jane.doe@example.com.", {
+      // cannot survive into a firstLine() title — see that test's own doc comment for the reason).
+      // The short title keeps the fresh note below from attaching to this concept: a long slug
+      // repeated in its body makes the two lexically close enough to merge.
+      const sensitive = await core.store("/Users/dev/runbook-notes. /Users/dev/runbook-notes.txt owns this runbook — contact jane.doe@example.com.", {
         circle: SAMPLED_CIRCLE,
       });
       sensitiveId = sensitive.conceptId!;

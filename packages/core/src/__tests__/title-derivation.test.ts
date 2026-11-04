@@ -1,9 +1,10 @@
 /**
  * Title/slug derivation from a concept body's first line/sentence (firstLine in engine.ts).
  *
- * Regression: a period BETWEEN digits is not a sentence boundary. Version numbers like
- * "0.5.0" or "v0.6.0" mid-sentence previously truncated the title at the first dot
- * ("Librarian layer design (engine 0.5.0 ...)" derived "Librarian layer design (engine 0").
+ * Regression: a period inside a token is not a sentence boundary. Version numbers like "0.5.0" or
+ * "v0.6.0" mid-sentence previously truncated the title at the first dot ("Librarian layer design
+ * (engine 0.5.0 ...)" derived "Librarian layer design (engine 0"), and filenames, domains and
+ * abbreviations kept doing so until #117.
  * Normal sentence splitting, newline splitting, and the 80-char truncation rule are unchanged.
  */
 import { describe, it, expect } from "vitest";
@@ -44,6 +45,115 @@ describe("title derivation — version numbers are not sentence boundaries", () 
     expect(r.concept.title).toBe(body.slice(0, 77) + "…");
     expect(r.concept.title.length).toBe(78);
     core.close();
+  });
+});
+
+describe("title derivation — a period only ends a title at a sentence end (#117)", () => {
+  const titleOf = async (body: string) => {
+    const core = new MonetCore(":memory:");
+    try {
+      return (await core.store(body)).concept;
+    } finally {
+      core.close();
+    }
+  };
+
+  it.each([
+    ["Updated app/card-image.ts downloadCardImage canvas exporter", "Updated app/card-image.ts downloadCardImage canvas exporter"],
+    ["Bump vite.config.ts target to es2022", "Bump vite.config.ts target to es2022"],
+    ["Layout Height Collapse: Svelte mounts App.svelte at the root", "Layout Height Collapse: Svelte mounts App.svelte at the root"],
+    ["The docs live at example.ai and acme.dev now", "The docs live at example.ai and acme.dev now"],
+    ["Use e.g. a lexicon entry instead of patching text", "Use e.g. a lexicon entry instead of patching text"],
+    ["The U.S. region stays on the old pricing", "The U.S. region stays on the old pricing"],
+    ["monet-core 0.6.0 ships the temporal layer", "monet-core 0.6.0 ships the temporal layer"],
+  ])("keeps %s whole", async (body, title) => {
+    expect((await titleOf(body)).title).toBe(title);
+  });
+
+  it.each([
+    ["Bump vite.config.ts. The target moves to es2022.", "Bump vite.config.ts"],
+    ["Ship it.", "Ship it"],
+    ["We chose option A. The other one failed under load.", "We chose option A"],
+    ["Fix the crash in main.c. The build failed on arm64.", "Fix the crash in main.c"],
+    ["Node 22.x. Older versions are untested.", "Node 22.x"],
+    ["Loading...", "Loading"],
+    ["Wait... then it worked", "Wait"],
+    ["이 결정은 유지한다. 다음 단계로 간다.", "이 결정은 유지한다"],
+    ["가. 나는 간다.", "가"],
+    ["플랜B. 다음 단계로 간다.", "플랜B"],
+  ])("ends %s at its sentence end", async (body, title) => {
+    expect((await titleOf(body)).title).toBe(title);
+  });
+});
+
+describe("title derivation — an email address is masked on the card and the slug (#117)", () => {
+  const conceptOf = async (body: string) => {
+    const core = new MonetCore(":memory:");
+    try {
+      return (await core.store(body)).concept;
+    } finally {
+      core.close();
+    }
+  };
+
+  it("masks an address that leads the title", async () => {
+    const concept = await conceptOf("jane.doe@example.com reported the crash on startup");
+    expect(concept.title).toBe("[redacted-email] reported the crash on startup");
+    expect(concept.slug).toBe("redacted-email-reported-the-crash-on-startup");
+  });
+
+  it("masks an address inside the title, and one that ends the sentence", async () => {
+    expect((await conceptOf("Ask jane+ops@mail.example.co.uk about the rollout plan")).title).toBe("Ask [redacted-email] about the rollout plan");
+    expect((await conceptOf("The rollout owner is jane@example.com. She is out until May.")).title).toBe("The rollout owner is [redacted-email]");
+  });
+
+  it.each([
+    ["jane@bücher.de reported the crash"],
+    ["jöhn@example.com reported the crash"],
+    ["jo\u0308hn@example.com reported the crash"],
+    ["jane@例え.jp reported the crash"],
+    ["jane%ops@example.com reported the crash"],
+    ["jane@163.com reported the crash"],
+    ["git@example.com reported the crash"],
+  ])("masks %s whole", async (body) => {
+    expect((await conceptOf(body)).title).toBe("[redacted-email] reported the crash");
+  });
+
+  it.each([
+    ["담당자이메일jane@example.com으로문의바랍니다", "담당자이메일[redacted-email]으로문의바랍니다"],
+    ["연락처는 jane@example.com입니다. 다음 문장.", "연락처는 [redacted-email]입니다"],
+    ["jane@example.com에게 문의하세요", "[redacted-email]에게 문의하세요"],
+    ["担当者のメールはjane@example.comです", "担当者のメールは[redacted-email]です"],
+    ["请联系jane@example.com获取详情", "请联系[redacted-email]获取详情"],
+    ["Reply to git@example.com:", "Reply to [redacted-email]:"],
+  ])("masks only the address in %s", async (body, title) => {
+    expect((await conceptOf(body)).title).toBe(title);
+  });
+
+  it("masks every address, and masks before the title is cut", async () => {
+    expect((await conceptOf("Email a@example.com, b@example.org and c@example.net about it")).title)
+      .toBe("Email [redacted-email], [redacted-email] and [redacted-email] about it");
+    // Raw, this address straddles the 77-character cut, so masking after the cut would keep "jane.".
+    const title = (await conceptOf(`${"x ".repeat(36)}jane.doe@example.com reported it`)).title;
+    expect(title).toBe(`${"x ".repeat(36)}[reda…`);
+  });
+
+  it.each([
+    ["Pin vitest@4.1.11 in the workspace catalog"],
+    ["Pack team-monet-monet@1.11.0.tgz for the release"],
+    ["Install react@19.0.0-canary.next for the test"],
+    ["vitest@4.1.11を固定する"],
+    ["값@섹션.항목 형식으로 쓴다"],
+    ["The remote is git@github.com:acme/repo over ssh"],
+    ["The remote is ssh://git@github.com/acme/repo over ssh"],
+    ["Import @team-monet/core@0.9.0 from the workspace"],
+  ])("leaves %s alone", async (body) => {
+    expect((await conceptOf(body)).title).toBe(body);
+  });
+
+  it("keeps the address in the body: only the derived card is masked", async () => {
+    const concept = await conceptOf("jane.doe@example.com reported the crash on startup");
+    expect(concept.body).toContain("jane.doe@example.com");
   });
 });
 
