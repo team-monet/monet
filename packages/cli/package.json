@@ -50,13 +50,13 @@
     "@team-monet/core": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "commander": "^12.1.0",
-    "zod": "^3.25.76",
+    "zod": "^4.6.6",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^25.3.3",
     "esbuild": "^0.25.12",
     "tsx": "^4",
     "typescript": "^5.7",
-    "vitest": "^4"
+    "vitest": "^5"
   },
   "publishConfig": {
     "provenance": false
