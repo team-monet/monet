@@ -472,6 +472,73 @@ describe("memory_workstreams MCP tool", () => {
     core.close();
   });
 
+  it("says which close ids the addressed workstream does not hold (#109)", async () => {
+    const core = new MonetCore(":memory:");
+    const find = await core.captureFind("an inbox item, not the workstream's");
+    const thread = (await core.saveWorkstream({ title: "Thread", open: [{ slot: "step" as const, text: "real item" }] }))!;
+    const realId = thread.payload.items[0]!.id;
+
+    await withWorkstreamServer(core, async (client) => {
+      const receipt = toolJson(await client.callTool({
+        name: "memory_checkpoint",
+        arguments: { workstream: { id: thread.id, close: [{ id: realId, as: "done" }, { id: find.itemId, as: "done" }] } },
+      }));
+      expect(receipt.workstream).toMatchObject({ closed: [realId] });
+      expect(receipt.notClosed).toEqual([find.itemId]);
+      expect(core.getWorkstreamInbox()!.payload.items.find((item) => item.id === find.itemId)!.state).toBe("open");
+
+      // The remedy the description names lands, and a clean close carries no such key.
+      const settled = toolJson(await client.callTool({
+        name: "memory_checkpoint",
+        arguments: { workstream: { id: "inbox", close: [{ id: find.itemId, as: "done" }] } },
+      }));
+      expect(settled.inbox).toMatchObject({ closed: [find.itemId] });
+      expect(settled).not.toHaveProperty("notClosed");
+
+      // An item this container holds and already closed is idempotent, not a miss.
+      const replayed = toolJson(await client.callTool({
+        name: "memory_checkpoint",
+        arguments: { workstream: { id: thread.id, close: [{ id: realId, as: "done" }] } },
+      }));
+      expect(replayed.workstream).toMatchObject({ closed: [] });
+      expect(replayed).not.toHaveProperty("notClosed");
+    });
+    core.close();
+  });
+
+  it("refuses a close id too long to echo, before it can cost the receipt (#109)", async () => {
+    const core = new MonetCore(":memory:");
+    const thread = (await core.saveWorkstream({ title: "Thread", open: [{ slot: "step" as const, text: "real item" }] }))!;
+    const before = thread.version;
+    const result = await withWorkstreamServer(core, (client) => client.callTool({
+      name: "memory_checkpoint",
+      arguments: { workstream: { id: thread.id, close: [{ id: "x".repeat(257), as: "done" }] } },
+    })) as { isError?: boolean; content?: Array<{ text?: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content?.[0]?.text).toContain("a close id is an item id");
+    expect(core.getWorkstreamById(thread.id)!.version).toBe(before);
+
+    const longest = "x".repeat(256);
+    const echoed = await withWorkstreamServer(core, async (client) => toolJson(await client.callTool({
+      name: "memory_checkpoint",
+      arguments: { workstream: { id: thread.id, close: [{ id: longest, as: "done" }] } },
+    })));
+    expect(echoed.notClosed).toEqual([longest]);
+    core.close();
+  });
+
+  it("says a close landed nowhere when there is no container to merge it into (#109)", async () => {
+    const core = new MonetCore(":memory:");
+    const receipt = await withWorkstreamServer(core, async (client) => toolJson(await client.callTool({
+      name: "memory_checkpoint",
+      arguments: { workstream: { close: [{ id: "stale-from-another-circle", as: "done" }] } },
+    })));
+    expect(receipt).not.toHaveProperty("workstream");
+    expect(receipt.notClosed).toEqual(["stale-from-another-circle"]);
+    expect(core.getActiveWorkstreams()).toHaveLength(0);
+    core.close();
+  });
+
   it("uses detail-read affinity for a later unaddressed checkpoint and relays ambiguity plainly", async () => {
     const core = new MonetCore(":memory:");
     const alpha = (await core.saveWorkstream({ title: "Alpha", status: "active" }))!;

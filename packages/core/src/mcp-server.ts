@@ -2219,7 +2219,7 @@ export function registerMonetCoreTools(
     },
   );
 
-  const checkpointDescription = "Track work and capture finds as they happen — nothing is owed at session end. When a work directive lands, open the plan: work-level items that may outlive the session (fine-grained decomposition stays in the host's own todo). When something surfaces that is not this work, `inbox` it — one line, keep moving. Before reporting completion, settle: close what resolved, and dispose the inbox with the user — do it now, `filed` with a `ref`, `dropped`, or leave open to keep. This MERGES: `open` adds, `close` resolves by id, anything unnamed stays untouched. Address a workstream by `title` (mints if new) or `id` (exact); with neither, the one this session already touched, or the only active one — several active means refusal with the list. The receipt is only what this call did: `opened`/`closed` item ids, `status` only when this call changed it, and — only when the checkpoint landed in an archived circle — `guidance` naming that circle.";
+  const checkpointDescription = "Track work and capture finds as they happen — nothing is owed at session end. When a work directive lands, open the plan: work-level items that may outlive the session (fine-grained decomposition stays in the host's own todo). When something surfaces that is not this work, `inbox` it — one line, keep moving. Before reporting completion, settle: close what resolved, and dispose the inbox with the user — do it now, `filed` with a `ref`, `dropped`, or leave open to keep. This MERGES: `open` adds, `close` resolves by id, anything unnamed stays untouched. Address a workstream by `title` (mints if new) or `id` (exact); with neither, the one this session already touched, or the only active one — several active means refusal with the list. The receipt is only what this call did: `opened`/`closed` item ids, `status` only when this call changed it, `notClosed` only when a `close` id is not in the addressed list (it did not close; an inbox item closes under `id: \"inbox\"`), and — only when the checkpoint landed in an archived circle — `guidance` naming that circle.";
   const checkpointSchema = z.object({
     circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
     inbox: z.string().min(1).optional(),
@@ -2243,7 +2243,9 @@ export function registerMonetCoreTools(
         text: z.string().min(1),
       }).strict()).max(100, "open at most 100 items per checkpoint — split larger batches").optional(),
       close: z.array(z.object({
-        id: z.string(),
+        // Bounded for the same reason as the batch caps: `notClosed` echoes an id it did not find, so
+        // an unbounded one could cost the whole receipt to the size-fit truncation.
+        id: z.string().max(256, "a close id is an item id — 256 characters or fewer"),
         as: z.enum(["done", "dropped", "filed"]),
         // A ref is a pointer (URL, issue number), not a document: unbounded refs render verbatim
         // in includeClosed detail pages and can make an entry that no clipping fits.
@@ -2333,6 +2335,9 @@ export function registerMonetCoreTools(
         // only to match this receipt's own precedence for `circle` above; absent a mid-call rename
         // the two writers resolve to the same place, so the choice is invisible in every ordinary
         // call. A combined call therefore discloses once, not twice.
+        // PRESENT ONLY WHEN IT FIRES (#109). Top-level, because a close with no row to merge into has
+        // no `workstream` or `inbox` receipt to sit under, and that is the same silence.
+        const notClosed = saved?.notClosedItemIds ?? (engineWorkstreamInput?.close ?? []).map((entry) => entry.id);
         const archivedLanding = saved?.landedInArchivedCircle === true
           ? saved.circle
           : inboxSaved?.landedInArchivedCircle === true
@@ -2352,6 +2357,7 @@ export function registerMonetCoreTools(
             },
           } : {}),
           ...inboxReceipt,
+          ...(notClosed.length > 0 ? { notClosed } : {}),
           // PRESENT ONLY WHEN IT FIRES: a key repeating "not archived" on every ordinary checkpoint
           // is payload with no reader.
           //
