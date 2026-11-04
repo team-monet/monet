@@ -29,7 +29,7 @@ import { defineConfig } from "vitest/config";
  */
 
 /**
- * `maxThreads` on CI is a SEPARATE mechanism from the timeouts above, and neither one affects the
+ * `maxWorkers` on CI is a SEPARATE mechanism from the timeouts above, and neither one affects the
  * other. It exists because the first CI run on GitHub failed with every test passing:
  *
  *     Tests 2257 passed | 10 skipped     Errors 1 error
@@ -37,7 +37,7 @@ import { defineConfig } from "vitest/config";
  *
  * That error is not a test timeout and `testTimeout` cannot reach it. It comes from the bundled
  * birpc transport, whose `DEFAULT_TIMEOUT` is a hardcoded 60000ms that neither pool passes an
- * override for, so no vitest config option changes it in 3.2.7 — the upstream PR that would have
+ * override for, so no vitest config option changed it in 3.2.7 — the upstream PR that would have
  * made it configurable (vitest-dev/vitest#8227) was closed unmerged. `onTaskUpdate` awaits a reply,
  * unlike console forwarding, which is fire-and-forget and therefore cannot time out. The failure
  * condition is a worker thread blocked synchronously long enough that it cannot service the reply.
@@ -54,6 +54,7 @@ import { defineConfig } from "vitest/config";
  * established by a probe test that printed `worker_threads.isMainThread === true` — tests execute in
  * a child process's main thread, which the threads pool cannot produce. Source reading lost to a
  * five-line runtime probe here; if you touch this, run the probe rather than re-reading the bundle.
+ * Vitest 4 removed `poolOptions`: `maxWorkers` is now the top-level cap for whichever pool runs.
  *
  * THIS IS A MITIGATION, NOT A PROOF. It reduces the wall-clock a blocked worker accumulates; it does
  * not remove the blocking. If the error returns, the next move is to make the synchronous work
@@ -68,6 +69,6 @@ export default defineConfig({
   test: {
     testTimeout: 30_000,
     hookTimeout: 30_000,
-    ...(process.env.CI ? { poolOptions: { forks: { maxForks: 2 } } } : {}),
+    ...(process.env.CI ? { maxWorkers: 2 } : {}),
   },
 });
