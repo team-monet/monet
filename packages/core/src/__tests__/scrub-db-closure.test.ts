@@ -1062,23 +1062,22 @@ describe("raw-bytes closure — no pre-scrub text survives anywhere in the publi
     // this fixture used two near-identical bodies differing only in a trailing "one"/"two" suffix,
     // and the engine's dedup silently merged them into a SINGLE concept, which defeated the whole
     // point of this collision test; using genuinely different topics per concept, sharing only the
-    // same leading "jane.doe@example.com is the person to contact" phrase, produces two REAL,
-    // separate concept rows) whose TITLES both truncate (same content-dependent truncation this
-    // suite's sibling fixtures already document) to the identical string "jane" (before the "@") —
-    // so both scrub down to the same slug "jane" before disambiguation.
+    // same leading "jane. jane.doe@example.com is the person to contact" phrase, produces two REAL,
+    // separate concept rows) whose TITLES both end at the identical sentence "jane" — so both scrub
+    // down to the same slug "jane" before disambiguation.
     const dir = mkTmp("scrub-rawbytes-slugcollision-");
     const srcPath = join(dir, "src-monet.db");
     const core = new MonetCore(srcPath);
     try {
       await core.store(
-        "jane.doe@example.com is the person to contact — this note is entirely about database indexing " +
+        "jane. jane.doe@example.com is the person to contact — this note is entirely about database indexing " +
           "strategy and B-tree page splits under heavy write load, a topic unrelated to the second note " +
           "below, distinct enough that dedup should not merge them. " +
           "a".repeat(200),
         { circle: SAMPLED_CIRCLE, kind: "insight" },
       );
       await core.store(
-        "jane.doe@example.com is the person to contact — this second note is entirely about OAuth token " +
+        "jane. jane.doe@example.com is the person to contact — this second note is entirely about OAuth token " +
           "refresh race conditions in the auth service, again unrelated to the first note, distinct enough " +
           "that dedup should not merge them. " +
           "b".repeat(200),
