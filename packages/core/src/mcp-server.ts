@@ -2244,8 +2244,9 @@ export function registerMonetCoreTools(
       }).strict()).max(100, "open at most 100 items per checkpoint — split larger batches").optional(),
       close: z.array(z.object({
         // Bounded for the same reason as the batch caps: `notClosed` echoes an id it did not find, so
-        // an unbounded one could cost the whole receipt to the size-fit truncation.
-        id: z.string().max(256, "a close id is an item id — 256 characters or fewer"),
+        // an unbounded one could cost the whole receipt to the size-fit truncation. The character set
+        // is what makes the bound hold after JSON escaping: 100 of these always fit the receipt.
+        id: z.string().regex(/^[\w.:-]{1,256}$/, "a close id is an item id — letters, digits, and _ . : - only, 256 characters or fewer"),
         as: z.enum(["done", "dropped", "filed"]),
         // A ref is a pointer (URL, issue number), not a document: unbounded refs render verbatim
         // in includeClosed detail pages and can make an entry that no clipping fits.

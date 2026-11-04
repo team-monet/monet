@@ -518,12 +518,28 @@ describe("memory_workstreams MCP tool", () => {
     expect(result.content?.[0]?.text).toContain("a close id is an item id");
     expect(core.getWorkstreamById(thread.id)!.version).toBe(before);
 
+    // Every character of this one is escaped in JSON, so its length alone would not bound the receipt.
+    const quoted = await withWorkstreamServer(core, (client) => client.callTool({
+      name: "memory_checkpoint",
+      arguments: { workstream: { id: thread.id, close: [{ id: '"'.repeat(250), as: "done" }] } },
+    })) as { isError?: boolean };
+    expect(quoted.isError).toBe(true);
+    expect(core.getWorkstreamById(thread.id)!.version).toBe(before);
+
     const longest = "x".repeat(256);
     const echoed = await withWorkstreamServer(core, async (client) => toolJson(await client.callTool({
       name: "memory_checkpoint",
       arguments: { workstream: { id: thread.id, close: [{ id: longest, as: "done" }] } },
     })));
     expect(echoed.notClosed).toEqual([longest]);
+
+    // The worst case the schema admits still returns a whole receipt.
+    const fullBatch = Array.from({ length: 100 }, (_, i) => ({ id: `${"x".repeat(250)}-${i}`, as: "done" }));
+    const batched = await withWorkstreamServer(core, async (client) => toolJson(await client.callTool({
+      name: "memory_checkpoint",
+      arguments: { workstream: { id: thread.id, close: fullBatch } },
+    })));
+    expect(batched.notClosed).toHaveLength(100);
     core.close();
   });
 
