@@ -1,9 +1,14 @@
+import { createRequire } from "node:module";
 import path from "node:path";
 import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
 import { ensureMonetDir, getDbPath, getMomentSpoolPath } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { openServedCore } from "./bootstrap.js";
 import { reportStartupFailure } from "./startup-report.js";
+
+// Same read as cli.ts: the bundled dist/index.js sits one level under the package root.
+const _require = createRequire(import.meta.url);
+const { version } = _require("../package.json") as { version: string };
 
 // Prefer an explicit project dir over cwd — a host may spawn this server elsewhere.
 // (Claude Code sets CLAUDE_PROJECT_DIR for stdio MCP servers and discourages relying on cwd.)
@@ -62,7 +67,7 @@ async function main() {
     defaultCircle: circle,
     momentSpoolPath: getMomentSpoolPath(),
   });
-  await createMonetCoreMcpServer(core);
+  await createMonetCoreMcpServer(core, { serverVersion: version });
   transportConnected = true;
   console.error(`Monet MCP server running on stdio · ${getDbPath(projectDir)}`);
   console.error(`Circle: ${circle}`);

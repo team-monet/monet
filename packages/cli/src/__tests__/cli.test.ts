@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MonetCore, deriveCircle as coreDeriveCircle } from "@team-monet/core";
@@ -23,6 +23,42 @@ describe("CLI usage errors", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toBe(`monet ${command}: unknown option '--bogus'\n`);
   });
+});
+
+describe("MCP handshake", () => {
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The handshake is what a host's server panel shows and what a bug report quotes (#161), so it
+  // answers with the release that shipped, whichever entry point served it.
+  it.each([
+    ["monet start", ["src/cli.ts", "start"]],
+    ["the index entry", ["src/index.ts"]],
+  ])("%s serves the version in package.json", (_name, entry) => {
+    const storageDir = mkdtempSync(join(tmpdir(), "monet-handshake-"));
+    dirs.push(storageDir);
+    const { version } = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as { version: string };
+
+    const result = spawnSync(process.execPath, ["--import", "tsx", ...entry], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: { ...process.env, MONET_EMBEDDER: "hashing", MONET_STORAGE_DIR: storageDir },
+      input:
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "probe", version: "1" } },
+        }) + "\n",
+      timeout: 30_000,
+    });
+
+    const answer = result.stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line) as { id?: number; result?: { serverInfo?: unknown } });
+    expect(answer.find((message) => message.id === 1)?.result?.serverInfo).toEqual({ name: "monet-core", version });
+  }, 40_000);
 });
 
 describe("CLI store visibility", () => {

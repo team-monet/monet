@@ -134,7 +134,7 @@ program
       console.error(`Monet started`);
       console.error(`Storage: ${getDbPath(projectDir)}`);
       console.error(`Circle:  ${circle}`);
-      await createMonetCoreMcpServer(core);
+      await createMonetCoreMcpServer(core, { serverVersion: version });
       transportConnected = true;
     } catch (error) {
       reportStartupFailure(error, { projectDir, transportConnected });
