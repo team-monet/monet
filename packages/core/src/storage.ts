@@ -806,7 +806,8 @@ export function readStoredEmbedderPin(dbPath: string): string | null {
  * could not be inspected conclusively, so callers fall back to their normal open path and its
  * existing errors, with MonetCore's live re-check still standing between them and the schema region.
  *
- * ORDER OF PREFERENCE — decided without writing, on every shape (#158):
+ * ORDER OF PREFERENCE — decided without writing the main file, on every shape (#158); the peek
+ * below can create a `-shm` beside a frames-bearing `-wal` (#158 review round 3, P3):
  * - No `-wal` frames: the committed `user_version` is read straight from the SQLite file header,
  *   with no SQLite connection and therefore no sidecar creation. That is every shape except a
  *   frames-bearing `-wal`, including a lone `-shm` and a `-journal`.

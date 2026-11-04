@@ -250,18 +250,34 @@ function openMapStore(storeDir: string): Database.Database {
     throw storeSchemaCeilingError(storedSchemaVersion);
   }
   const db = new Database(dbPath);
-  db.pragma("journal_mode = WAL");
-  db.pragma("busy_timeout = 5000");
-  // Client-owned metadata table. The engine never reads or writes this; it lives in the same
-  // DB file so it syncs with the rest of the store. CREATE IF NOT EXISTS is idempotent.
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS remote_circle_map (
-      remote_url TEXT PRIMARY KEY,
-      circle     TEXT NOT NULL,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
-    );
-  `);
-  return db;
+  try {
+    // The decision above was a peek, and a newer build can migrate the store between it and this
+    // open (#158 review round 3, P2). The engine closes the same window with the same read on its
+    // own connection, so read again here, before the WAL switch and the DDL. A peer that commits a
+    // migration while this connection then waits on a lock can still land the empty, client-owned
+    // table below; the engine refuses the store right after, and nothing the newer build wrote is
+    // touched.
+    const liveSchemaVersion = db.pragma("user_version", { simple: true }) as number;
+    if (liveSchemaVersion > MONET_SCHEMA_VERSION) {
+      throw storeSchemaCeilingError(liveSchemaVersion);
+    }
+    db.pragma("journal_mode = WAL");
+    db.pragma("busy_timeout = 5000");
+    // Client-owned metadata table. The engine never reads or writes this; it lives in the same
+    // DB file so it syncs with the rest of the store. CREATE IF NOT EXISTS is idempotent.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS remote_circle_map (
+        remote_url TEXT PRIMARY KEY,
+        circle     TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+      );
+    `);
+    return db;
+  } catch (err) {
+    // deriveCircle only closes a connection this function handed back.
+    db.close();
+    throw err;
+  }
 }
 
 function readMap(db: Database.Database, key: string): string | null {

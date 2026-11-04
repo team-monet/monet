@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, copyFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,20 @@ import {
   DEFAULT_CALLER_ID,
 } from "../circle";
 import { MonetCore, deriveCircle as coreDeriveCircle, MONET_SCHEMA_VERSION, readStoredSchemaVersion, storeSchemaCeilingError } from "@team-monet/core";
+
+// Lets one test make the pre-open peek answer what it saw BEFORE a store moved. Every other test
+// sees the real reader: with no `answer` set, this delegates.
+const storePeek = vi.hoisted(() => ({ answer: null as number | null, calls: 0 }));
+vi.mock("@team-monet/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@team-monet/core")>();
+  return {
+    ...actual,
+    readStoredSchemaVersion: (dbPath: string) => {
+      storePeek.calls += 1;
+      return storePeek.answer ?? actual.readStoredSchemaVersion(dbPath);
+    },
+  };
+});
 
 // A self-contained temp HOME so getDbPath() resolves under it, never touching the real ~/.monet.
 let tmpHome: string;
@@ -30,6 +44,8 @@ beforeEach(() => {
   // Setting MONET_STORAGE_DIR is the most direct lever.
   process.env.MONET_STORAGE_DIR = tmpStorage;
   delete process.env.MONET_CIRCLE;
+  storePeek.answer = null;
+  storePeek.calls = 0;
 });
 
 afterEach(() => {
@@ -718,6 +734,31 @@ describe("deriveCallerId / deriveProjectId — source-authorization context", ()
     expect(() => new MonetCore(storePath)).toThrow(
       storeSchemaCeilingError(MONET_SCHEMA_VERSION + 1).message,
     );
+  });
+
+  it("re-reads the version on the connection it just opened, before it writes (#158 review round 3, P2)", () => {
+    const repo = makeRepo("git@github.com:acme/moved-store.git", "moved-store");
+    const storePath = join(tmpStorage, "monet.db");
+    const seed = new Database(storePath);
+    seed.pragma(`user_version = ${MONET_SCHEMA_VERSION + 1}`);
+    seed.close();
+    const bytesBefore = readFileSync(storePath);
+    const filesBefore = readdirSync(tmpStorage).sort();
+
+    // A newer build migrated this store after the peek: the peek answered a version this build can
+    // name, so only the read on the freshly opened connection can see the one on disk now.
+    storePeek.answer = MONET_SCHEMA_VERSION;
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const derived = deriveCircle(repo);
+
+    const messages = logged.mock.calls.map(([message]) => String(message));
+    logged.mockRestore();
+    expect(storePeek.calls).toBeGreaterThan(0);
+    expect(messages.some((m) => m.includes(storeSchemaCeilingError(MONET_SCHEMA_VERSION + 1).message))).toBe(true);
+    expect(derived).toBe(coreDeriveCircle(repo));
+    expect(readFileSync(storePath).equals(bytesBefore)).toBe(true);
+    expect(readdirSync(tmpStorage).sort()).toEqual(filesBefore);
   });
 
   it("treats a zero-length store as the fresh store SQLite does, keeping the remote-derived circle (#156 residual, review round 2 P1)", () => {
