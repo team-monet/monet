@@ -19,7 +19,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { StoragePort, BetterSqlitePort, StorageExclusiveLockError, readStoredSchemaVersion, schemaRegionContentionError, type Statement } from "./storage";
+import { StoragePort, BetterSqlitePort, StorageExclusiveLockError, readStoredSchemaVersion, storeSchemaCeilingError, schemaRegionContentionError, type Statement } from "./storage";
 import { mintMomentId, spoolInterception, spoolOutcome, spoolRuleRead, startMomentRun } from "./moment-spool";
 import type { MomentAnswer } from "./moment-spool";
 import {
@@ -2956,30 +2956,39 @@ export class MonetCore {
     // against a file whose newer tables or columns it cannot name. This is the on-disk analogue of
     // SYNC_PAYLOAD_PROTOCOL_VERSION's transport-boundary refusal: a receiver must be able to say
     // "this is newer than I understand" instead of silently dropping what it cannot name. Every path
-    // that constructs MonetCore shares this ceiling. The CLI's pre-engine circle resolution still
-    // opens the store raw before this constructor can check it; that separate gap is tracked as
-    // #156.
+    // that constructs MonetCore shares this ceiling — the same `readStoredSchemaVersion` decision
+    // and the same `storeSchemaCeilingError` refusal are also what the CLI's pre-engine circle
+    // resolution uses, so every store that NAMES a version above this build's ceiling is decided
+    // before anyone opens it for writing (#156) — an inconclusive read (`null`) is still decided by
+    // the live re-check below, inside the port this constructor has already opened for writing.
     const storedSchemaVersion = typeof db === "string"
       ? readStoredSchemaVersion(dbPath!)
       : db.pragma("user_version", { simple: true }) as number;
     if (storedSchemaVersion !== null && storedSchemaVersion > MONET_SCHEMA_VERSION) {
-      throw new Error(
-        `Store schema ${storedSchemaVersion} is newer than supported schema ${MONET_SCHEMA_VERSION}; ` +
-          `refusing to open. Upgrade Monet first.`,
-      );
+      throw storeSchemaCeilingError(storedSchemaVersion);
     }
-    this.db = typeof db === "string" ? new BetterSqlitePort(db) : db;
-    // The cheap peek can be inconclusive under store contention; the live connection is the
-    // authoritative boundary before this constructor performs any schema work.
+    // One port-ownership rule (#158 P3-b): remember whether THIS constructor opened the connection,
+    // because only then is closing it this constructor's business (see the live re-check below).
+    const ownsStorePort = typeof db === "string";
+    this.db = ownsStorePort ? new BetterSqlitePort(db) : db;
+    // The pre-open decision above can still be inconclusive — a store that could not be peeked, or
+    // one whose version moved between the peek and this open — so the live connection is the
+    // authoritative boundary, and it stands before this constructor performs any schema work. Here
+    // the file is already open for writing; what this buys is that no MIGRATION runs on a store
+    // this build cannot name, which is what `packages/core/src/__tests__/schema-version-ceiling.test.ts`
+    // pins with a port that reports a version above the ceiling on this second read.
     const liveSchemaVersion = this.db.pragma("user_version", { simple: true }) as number;
     if (liveSchemaVersion > MONET_SCHEMA_VERSION) {
-      try {
-        this.db.close();
-      } catch { /* the schema refusal is the caller-visible error */ }
-      throw new Error(
-        `Store schema ${liveSchemaVersion} is newer than supported schema ${MONET_SCHEMA_VERSION}; ` +
-          `refusing to open. Upgrade Monet first.`,
-      );
+      // ONE PORT-OWNERSHIP RULE (#158 P3-b): close the connection only when this constructor opened
+      // it. A caller-supplied port belongs to the caller — the refusal is this constructor's error to
+      // raise, not its licence to close a connection it did not create, and the caller may still have
+      // cleanup (or a retry after upgrading Monet) to run over the port it handed in.
+      if (ownsStorePort) {
+        try {
+          this.db.close();
+        } catch { /* the schema refusal is the caller-visible error */ }
+      }
+      throw storeSchemaCeilingError(liveSchemaVersion);
     }
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
     this.embedderLoader = opts.embedderLoader ?? instantiateEmbedderForPin;
