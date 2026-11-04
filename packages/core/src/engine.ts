@@ -2044,6 +2044,8 @@ export interface Workstream {
 export interface WorkstreamSaveResult extends Workstream {
   openedItemIds: string[];
   closedItemIds: string[];
+  /** Close ids this row holds no item for: the disposition landed nowhere (#109). */
+  notClosedItemIds: string[];
   statusChanged: boolean;
   /**
    * Did this checkpoint land in a circle the store has flagged ARCHIVED? `IngestResult` carries the
@@ -6323,6 +6325,7 @@ export class MonetCore {
       proofToken?: EmbeddingWidthProofToken;
       openedItemIds: string[];
       closedItemIds: string[];
+      notClosedItemIds: string[];
       statusChanged: boolean;
       landedInArchivedCircle: boolean;
     } | null => {
@@ -6395,6 +6398,11 @@ export class MonetCore {
       const closedItemIds = (input.close ?? [])
         .map((item) => item.id)
         .filter((id) => beforeOpenIds.has(id) && full.items.some((item) => item.id === id && item.state !== "open"));
+      // An item this row closed earlier is an idempotent replay. An id it never held is a disposition
+      // that landed nowhere, which `closedItemIds` alone cannot tell the caller (#109).
+      const notClosedItemIds = (input.close ?? [])
+        .map((item) => item.id)
+        .filter((id) => !full.items.some((item) => item.id === id));
       const statusChanged = (beforeStatus ?? "active") !== full.status;
       // `done` MUST NOT HIDE OPEN ITEMS (Codex P1 on PR #149, ruled by John 2026-08-05).
       // getActiveWorkstreams filters `status === "done"`, so a checkpoint that closed the
@@ -6446,6 +6454,7 @@ export class MonetCore {
         proofToken: this.captureEmbeddingWidthProof(emb.length),
         openedItemIds,
         closedItemIds,
+        notClosedItemIds,
         statusChanged,
         landedInArchivedCircle,
       };
@@ -6458,6 +6467,7 @@ export class MonetCore {
       ...toWorkstream(result.row),
       openedItemIds: result.openedItemIds,
       closedItemIds: result.closedItemIds,
+      notClosedItemIds: result.notClosedItemIds,
       statusChanged: result.statusChanged,
       landedInArchivedCircle: result.landedInArchivedCircle,
     };
