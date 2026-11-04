@@ -3174,6 +3174,12 @@ export function deriveOptsFromEnv(env: NodeJS.ProcessEnv = process.env): Registe
 
 export interface CreateMonetCoreMcpServerOptions {
   /**
+   * The release this server answers as in the MCP handshake, which hosts show in their server panel
+   * and bug reports quote (#161). Only the package that ships knows its release; the engine is
+   * bundled inside it. Omitted, the handshake says "unknown" rather than a version nothing shipped.
+   */
+  serverVersion?: string;
+  /**
    * Disable the automatic SIGINT/SIGTERM graceful-shutdown handlers (default: installed).
    * MUST be set to `false` on every instance but one when embedding multiple MonetCore/MCP
    * server pairs in a single process — see installProcessShutdownHandlers.
@@ -3866,7 +3872,7 @@ export async function createMonetCoreMcpServer(
   // original error (a non-enumerable symbol), so every `instanceof` check downstream is unaffected.
   await inStartupPhase("embedder-pin", () => core.ensureEmbedderPin());
   const server = new McpServer(
-    { name: "monet-core", version: "0.7.0" },
+    { name: "monet-core", version: options.serverVersion ?? "unknown" },
     {
       capabilities: { tools: {} },
       instructions: MONET_SERVER_INSTRUCTIONS,

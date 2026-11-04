@@ -18895,11 +18895,23 @@ function projectionBlockingDestinationError(ruleConceptId: string): string {
     `an advisory rule.`;
 }
 
+/**
+ * An address in a body must not reach the card or the slug derived from it (#117). The local part
+ * and the TLD are Latin-script so a match stops where the script changes: Korean, Japanese and
+ * Chinese often run straight up against an address with no space, and that text must survive. Two
+ * leading numeric labels are a version (`vitest@4.1.11`), and a git remote (`git@host:path`,
+ * `ssh://git@host/path`) names no person. An ssh target or `logo@2x.png` has an address's shape and
+ * is masked too; a local part in another script is left alone.
+ */
+const EMAIL_ADDRESS = /(?<![\p{Script=Latin}\p{N}\p{M}._%+-])(?!git@[^\s:/]+(?:\/|:\S))[\p{Script=Latin}\p{N}\p{M}._%+-]+@(?!\d+\.\d)(?:[\p{L}\p{N}\p{M}-]+\.)+\p{Script=Latin}{2,}/gu;
+
 function firstLine(content: string): string {
-  // A period BETWEEN digits is not a sentence end — version numbers like "0.5.0" or
-  // "v0.6.0" stay intact instead of truncating the title at their first dot.
-  const line = content.trim().split(/\n|(?<!\d)\.|\.(?!\d)/)[0].trim();
-  return line.length > 80 ? line.slice(0, 77) + "…" : line || content.trim().slice(0, 80);
+  // A period ends the title only where a sentence ends: before whitespace or the end of the text,
+  // so "0.5.0", "vite.config.ts" and "example.ai" stay whole (#117). "e.g." and "U.S." are the one
+  // exception: letter, period, letter, period. A run of periods ends the title as one.
+  const masked = content.trim().replace(EMAIL_ADDRESS, "[redacted-email]");
+  const line = masked.split(/\n|(?<!\b[A-Za-z]\.[A-Za-z])(?<!\.)\.+(?=\s|$)/)[0].trim();
+  return line.length > 80 ? line.slice(0, 77) + "…" : line || masked.slice(0, 80);
 }
 
 function splitLines(body: string): string[] {
@@ -18969,5 +18981,7 @@ export function slugify(s: string): string {
   // mangled on its way to or from storage and could not round-trip through resolveRef. Code points
   // rather than graphemes: this only has to keep the string well-formed, and a base character
   // separated from a trailing mark at exactly the cap is still legible and still encodes cleanly.
-  return [...cleaned].slice(0, 60).join("");
+  // STRIP AGAIN AFTER THE CUT: resolveRef re-slugifies the ref it is given, so a stored slug the cut
+  // left ending in a hyphen is not a fixed point and can never be cited (#117).
+  return [...cleaned].slice(0, 60).join("").replace(/-+$/, "");
 }

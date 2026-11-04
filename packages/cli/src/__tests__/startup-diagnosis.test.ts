@@ -351,7 +351,7 @@ describe("source regression guards: both entry points report, and know which sid
     for (const entry of [CLI_ENTRY, STDIO_ENTRY]) {
       const source = readFileSync(join(REPO_ROOT, entry), "utf8");
       expect(source).toContain("reportStartupFailure(error, { projectDir, transportConnected })");
-      const factoryAt = source.indexOf("await createMonetCoreMcpServer(core);");
+      const factoryAt = source.indexOf("await createMonetCoreMcpServer(core, { serverVersion: version });");
       const flagAt = source.indexOf("transportConnected = true;");
       expect(factoryAt).toBeGreaterThan(-1);
       expect(flagAt).toBeGreaterThan(factoryAt);

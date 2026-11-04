@@ -50,5 +50,5 @@ export function slugify(s) {
     // below counts code points rather than UTF-16 units.
     .replace(/[^\p{L}\p{N}\p{M}]+/gu, "-")
     .replace(/^-+|-+$/g, "");
-  return [...cleaned].slice(0, 60).join("");
+  return [...cleaned].slice(0, 60).join("").replace(/-+$/, "");
 }
