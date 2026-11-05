@@ -20,10 +20,11 @@ Monet is local-first. It runs on the user's machine with the user's privileges; 
 
 - **It reads the user's files.** Registered Markdown sources point at real directories and Git repositories, and the agent-driven install reads and writes agent configuration files.
 - **It runs an MCP server.** Any MCP client configured to reach it can call its tools. `monet dashboard` additionally serves a read-only HTTP view, bound to `127.0.0.1`.
+- **It runs one background process for the embedding model.** Sessions send it memory text over a Unix socket in `~/.monet/shared-model`, a directory only the owning user can reach. It opens no network port.
 - **It stores data in SQLite**, by default at `~/.monet`. That database holds whatever the user's agent has written — in practice, private notes and project detail.
 - **It clones and reads Git repositories** for managed sources, using the SSH agent the Monet process inherits.
 
-Findings that are squarely in scope: path traversal out of a registered source; anything that lets one circle read another's memory; anything that makes the dashboard write, or serve beyond loopback; credentials leaking into a stored remote URL; a tool call that escapes the store's boundaries.
+Findings that are squarely in scope: path traversal out of a registered source; anything that lets one circle read another's memory; anything that makes the dashboard write, or serve beyond loopback; anything that lets another local account reach the model socket; credentials leaking into a stored remote URL; a tool call that escapes the store's boundaries.
 
 ## By design, not a vulnerability
 

@@ -4,6 +4,7 @@ import {
   createLocalEmbedderWithProvenance,
   instantiateEmbedderForPin,
   UnsatisfiableEmbedderError,
+  type ModelHost,
 } from "./embedding-onnx";
 import { readStoredEmbedderPin, readStoredVectorPresence } from "./storage";
 
@@ -51,11 +52,14 @@ export class PinnedStoreEmbedderUnavailableError extends Error {
  * different provider compares two embedding spaces, which is wrong rather than coarse. No path here
  * accepts an implicit lexical downgrade; `MONET_EMBEDDER=hashing` remains the explicit opt-in.
  */
-export async function chooseStoreEmbedder(dbPath: string): Promise<EmbeddingProvider> {
+export async function chooseStoreEmbedder(
+  dbPath: string,
+  opts: { modelHost?: ModelHost } = {},
+): Promise<EmbeddingProvider> {
   const pin = readStoredEmbedderPin(dbPath);
   if (pin !== null) {
     try {
-      return await instantiateEmbedderForPin(pin);
+      return await instantiateEmbedderForPin(pin, opts);
     } catch (error) {
       if (!(error instanceof UnsatisfiableEmbedderError)) throw error;
       /*
@@ -69,7 +73,7 @@ export async function chooseStoreEmbedder(dbPath: string): Promise<EmbeddingProv
        */
       if (readStoredVectorPresence(dbPath) === false) {
         console.error(`[monet-core] pin '${pin}' could not be loaded (${error.message}); store is empty, deferring to engine recovery.`);
-        return createLocalEmbedder();
+        return createLocalEmbedder(opts);
       }
       throw new PinnedStoreEmbedderUnavailableError(pin, error.message);
     }
@@ -97,9 +101,9 @@ export async function chooseStoreEmbedder(dbPath: string): Promise<EmbeddingProv
    * confirmed `true` licenses the legacy path; unknown is treated like fresh, which does not refuse
    * a working semantic model, it refuses an implicit lexical one.
    */
-  if (readStoredVectorPresence(dbPath) === true) return await createLocalEmbedder();
+  if (readStoredVectorPresence(dbPath) === true) return await createLocalEmbedder(opts);
 
-  return await requireSemanticOrExplicitLexical();
+  return await requireSemanticOrExplicitLexical(opts);
 }
 
 /**
@@ -109,8 +113,8 @@ export async function chooseStoreEmbedder(dbPath: string): Promise<EmbeddingProv
  * is refused is the SILENT path: the model fails to load, a console.error goes to a stderr no MCP
  * host displays, and the store serves lexical while its vectors are semantic.
  */
-async function requireSemanticOrExplicitLexical(): Promise<EmbeddingProvider> {
-  const selected = await createLocalEmbedderWithProvenance();
+async function requireSemanticOrExplicitLexical(opts: { modelHost?: ModelHost }): Promise<EmbeddingProvider> {
+  const selected = await createLocalEmbedderWithProvenance(opts);
   if (selected.selection === "implicit-hashing-fallback") {
     throw new FreshStoreEmbedderUnavailableError();
   }

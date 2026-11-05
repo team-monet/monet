@@ -33,6 +33,7 @@ const EXTERNAL = [
 const TARGETS = {
   index: { entryPoints: ["src/index.ts"], outfile: "dist/index.js" },
   cli: { entryPoints: ["src/cli.ts"], outfile: "dist/cli.js" },
+  "model-host": { entryPoints: ["src/model-host.ts"], outfile: "dist/model-host.js" },
 };
 
 const only = process.argv[2];

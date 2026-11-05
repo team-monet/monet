@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -254,5 +255,86 @@ describe("P1-1: ensureMonetDir(baseDir) roots the CREATED directory at baseDir, 
     const indexSource = readFileSync(join(REPO_ROOT, "src/index.ts"), "utf8");
     expect(cliSource).toContain("ensureMonetDir(projectDir);");
     expect(indexSource).toContain("ensureMonetDir(projectDir);");
+  });
+});
+
+describe("sessions starting together", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(realpathSync(tmpdir()), "monet-start-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** One real `monet start`, answered through the MCP handshake the way a host would see it. */
+  function startSession(storageDir: string, home: string): Promise<{ answered: boolean; stderr: string }> {
+    return new Promise((settle) => {
+      const child = spawn(process.execPath, ["--import", "tsx", "src/cli.ts", "start"], {
+        cwd: REPO_ROOT,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, HOME: home, MONET_EMBEDDER: "hashing", MONET_STORAGE_DIR: storageDir },
+      });
+      let answered = false;
+      let stderr = "";
+      child.stderr.on("data", (chunk) => (stderr += String(chunk)));
+      child.stdout.once("data", () => {
+        answered = true;
+        child.stdin.end();
+      });
+      child.on("exit", () => settle({ answered, stderr }));
+      child.stdin.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "probe", version: "1" } },
+        }) + "\n",
+      );
+    });
+  }
+
+  it("all reach a new store, whichever of them creates it", async () => {
+    // Without the lock this fails about one start in eight, so a few rounds cannot pass by luck.
+    for (let round = 0; round < 3; round += 1) {
+      const storageDir = join(dir, `store-${round}`);
+      mkdirSync(storageDir);
+      const results = await Promise.all(Array.from({ length: 10 }, () => startSession(storageDir, dir)));
+      const failed = results.filter((result) => !result.answered);
+      expect(failed.map((result) => result.stderr.trim().split("\n").pop())).toEqual([]);
+    }
+  }, 240_000);
+
+  it("start no model process when the store never needs a model", async () => {
+    const storageDir = join(dir, "lexical");
+    mkdirSync(storageDir);
+    const result = await startSession(storageDir, dir);
+    expect(result.answered).toBe(true);
+    expect(existsSync(join(dir, ".monet", "shared-model"))).toBe(false);
+  }, 60_000);
+
+  it("still open a store whose lock cannot be taken", async () => {
+    const dbPath = join(dir, "monet.db");
+    // A directory where the lock file goes: unlockable in a way no waiting would ever cure.
+    mkdirSync(`${dbPath}.open-lock`);
+    const core = await openServedCore(
+      dbPath,
+      { scopeContext: dir, defaultCircle: "test" },
+      async () => new HashingEmbeddingProvider(),
+    );
+    expect(core.stats()).toMatchObject({ concepts: 0, observations: 0 });
+    core.close();
+  });
+
+  it("build the host entry that the session spawns", () => {
+    // bootstrap.ts finds the host by file name beside itself. A rename on one side would not fail
+    // anything loudly: every session would quietly load its own copy of the model again.
+    const build = readFileSync(join(REPO_ROOT, "build.mjs"), "utf8");
+    const bootstrap = readFileSync(join(REPO_ROOT, "src/bootstrap.ts"), "utf8");
+    expect(build).toContain('outfile: "dist/model-host.js"');
+    expect(bootstrap).toContain('"./model-host.js"');
+    expect(existsSync(join(REPO_ROOT, "src/model-host.ts"))).toBe(true);
   });
 });

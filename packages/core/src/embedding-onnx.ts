@@ -1048,6 +1048,28 @@ function removeQuietly(path: string): void {
   } catch { /* scratch only — the sweep will get it */ }
 }
 
+/** What names a loaded model: everything that changes the vectors it produces. */
+export interface ModelSpec {
+  model: string;
+  pooling: Pooling;
+  dtype?: string;
+}
+
+/**
+ * Where a provider's model actually runs, when that is not this process.
+ *
+ * The provider keeps everything that is a fact about the SPACE (identity, width, thresholds), which
+ * costs nothing and needs no load; only the three operations that need loaded files go through here.
+ * That split is why a host cannot change what a store is pinned to: the pin comes from the provider,
+ * and the selection logic above and below it (chooseStoreEmbedder, instantiateEmbedderForPin) runs
+ * unchanged, warmup and refusal included.
+ */
+export interface ModelHost {
+  embed(spec: ModelSpec, text: string): Promise<Float32Array>;
+  countTokens(spec: ModelSpec, text: string): Promise<number>;
+  inputWindow(spec: ModelSpec): Promise<number | null>;
+}
+
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly dim: number;
   /** From MODEL_PROFILES for a known checkpoint; the labelled legacy guess otherwise. */
@@ -1089,14 +1111,31 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
   private readonly dtype?: string;
   private extractor: Promise<FeatureExtractor> | null = null;
   private tokenizer: Promise<Tokenizer> | null = null;
+  private readonly modelHost?: ModelHost;
+  private readonly reportLoad?: (line: string) => void;
 
-  constructor(opts: { model?: string; dim?: number; pooling?: Pooling; dtype?: string } = {}) {
+  constructor(
+    opts: {
+      model?: string;
+      dim?: number;
+      pooling?: Pooling;
+      dtype?: string;
+      modelHost?: ModelHost;
+      /** Where load progress goes when something other than this process's stderr is waiting on it. */
+      reportLoad?: (line: string) => void;
+    } = {},
+  ) {
     this.model = opts.model ?? DEFAULT_MODEL;
     const profile = MODEL_PROFILES[this.model];
     this.checkpoint = profile?.checkpoint ?? this.model;
     this.dim = opts.dim ?? profile?.dim ?? 384;
     this.pooling = opts.pooling ?? profile?.pooling ?? "mean";
     this.dtype = opts.dtype ?? profile?.dtype;
+    this.reportLoad = opts.reportLoad;
+    // A LOCAL PATH STAYS IN THIS PROCESS. A relative one means something different from another
+    // process's working directory, and it names a model an operator is deliberately pointing one
+    // server at, which is not the many-sessions-one-model case a host exists for.
+    this.modelHost = isLocalModelPath(this.checkpoint) ? undefined : opts.modelHost;
     // Identity survives an override that AGREES with the profile — passing the value already in
     // force names the same space and is how a measurement script pins one arm explicitly — and is
     // surrendered by one that disagrees. See modelId's own note for why silence beats a wrong name.
@@ -1163,7 +1202,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
             cache_dir: cacheDir,
             ...(localOnly ? { local_files_only: true } : {}),
             ...(this.dtype ? { dtype: this.dtype } : {}),
-            progress_callback: createModelLoadReporter(),
+            progress_callback: createModelLoadReporter(this.reportLoad ? { write: this.reportLoad } : {}),
           }) as Promise<FeatureExtractor>;
 
         // A LOCAL PATH IS NOT A CACHE ENTRY, so it never goes through staging (#185). transformers.js
@@ -1182,7 +1221,12 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
     return this.extractor;
   }
 
+  private spec(): ModelSpec {
+    return { model: this.model, pooling: this.pooling, ...(this.dtype ? { dtype: this.dtype } : {}) };
+  }
+
   async embed(text: string): Promise<Float32Array> {
+    if (this.modelHost) return await this.modelHost.embed(this.spec(), text);
     const extractor = await this.load();
     const output = await extractor(text, { pooling: this.pooling, normalize: true });
     return Float32Array.from(output.data);
@@ -1226,6 +1270,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
   }
 
   async countTokens(text: string): Promise<number> {
+    if (this.modelHost) return await this.modelHost.countTokens(this.spec(), text);
     return (await this.loadTokenizer()).encode(text).length;
   }
 
@@ -1240,6 +1285,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
    * guard exists to remove.
    */
   async inputWindow(): Promise<number | null> {
+    if (this.modelHost) return await this.modelHost.inputWindow(this.spec());
     const declared = (await this.loadTokenizer()).model_max_length;
     return typeof declared === "number" && Number.isFinite(declared) && declared > 0
       ? declared
@@ -1274,7 +1320,7 @@ export interface LocalEmbedderWithProvenance {
  * distinction before a fresh store permanently records its first embedder pin.
  */
 export async function createLocalEmbedderWithProvenance(
-  opts: { model?: string } = {},
+  opts: { model?: string; modelHost?: ModelHost } = {},
 ): Promise<LocalEmbedderWithProvenance> {
   const pref = process.env.MONET_EMBEDDER?.toLowerCase();
   if (pref === "hashing" || pref === "lexical") {
@@ -1297,7 +1343,7 @@ export async function createLocalEmbedderWithProvenance(
   }
 }
 
-export async function createLocalEmbedder(opts: { model?: string } = {}): Promise<EmbeddingProvider> {
+export async function createLocalEmbedder(opts: { model?: string; modelHost?: ModelHost } = {}): Promise<EmbeddingProvider> {
   return (await createLocalEmbedderWithProvenance(opts)).provider;
 }
 
@@ -1385,7 +1431,10 @@ export class UnsatisfiableEmbedderError extends Error {
  * hashing tokenizer version, an ONNX model that won't load, a modelId this build doesn't
  * recognize — throws UnsatisfiableEmbedderError and the store must not serve.
  */
-export async function instantiateEmbedderForPin(modelId: string): Promise<EmbeddingProvider> {
+export async function instantiateEmbedderForPin(
+  modelId: string,
+  opts: { modelHost?: ModelHost } = {},
+): Promise<EmbeddingProvider> {
   const hashingPin = parseHashingEmbedderPin(modelId);
   if (hashingPin) {
     try {
@@ -1402,7 +1451,7 @@ export async function instantiateEmbedderForPin(modelId: string): Promise<Embedd
   }
 
   if (RECOGNIZED_ONNX_PIN_FORMAT.test(modelId)) {
-    const onnx = new OnnxEmbeddingProvider({ model: modelId });
+    const onnx = new OnnxEmbeddingProvider({ model: modelId, modelHost: opts.modelHost });
     let warmup: Float32Array;
     try {
       warmup = await onnx.embed("warmup"); // forces model load now, same discipline as createLocalEmbedder
@@ -1465,7 +1514,7 @@ export async function instantiateEmbedderForPin(modelId: string): Promise<Embedd
     // null) — bounded and one-time, and not a re-download: the model is already cached on disk
     // from the warmup just above, so this is a re-init of the runtime session, not a network hit.
     if (warmup.length === onnx.dim) return onnx;
-    const measured = new OnnxEmbeddingProvider({ model: modelId, dim: warmup.length });
+    const measured = new OnnxEmbeddingProvider({ model: modelId, dim: warmup.length, modelHost: opts.modelHost });
     const measuredWarmup: unknown = await measured.embed("warmup");
     validateEmbeddingProviderOutput(measured, measuredWarmup);
     return measured;
