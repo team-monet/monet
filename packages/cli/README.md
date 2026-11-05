@@ -22,6 +22,8 @@ Your agent installs Monet, wires up the MCP server, and pulls in a memory-aware 
 
 Monet keeps one local store at `~/.monet` and automatically **organizes** each project into its own *circle* — nothing to set up. Everything stays on your machine.
 
+Run as many agent sessions as you like: they share one copy of the embedding model, so another session costs tens of megabytes rather than gigabytes. The first session that needs the model starts one background process (`model-host`) to hold it. It is reachable only by your own user, never over the network, and it exits by itself after a few idle minutes; the next session that needs it starts it again. It works through one request at a time, so a very long write makes other sessions wait. If it ever stops answering, the waiting call fails after ten minutes and says which process to end.
+
 ## See your memory — `monet dashboard`
 
 Run one command to open a local web view of your Monet memory as an explorable, force-directed graph:

@@ -2641,8 +2641,9 @@ export interface MonetCoreOptions {
    * Strict pin-satisfaction loader used by ensureEmbedderPin() when the store's persisted pin
    * (sync_meta.embedder_model_id) doesn't match `embedder` above. Defaults to
    * instantiateEmbedderForPin (embedding-onnx.ts). Override only as a deterministic test seam
-   * (e.g. to satisfy an ONNX pin without a real model load) — production code should never need a
-   * different loader, since substituting one would defeat the whole point of the pin.
+   * (e.g. to satisfy an ONNX pin without a real model load), or to run that same loader against a
+   * ModelHost — production code should never need a different loader, since substituting one would
+   * defeat the whole point of the pin.
    */
   embedderLoader?: (modelId: string) => Promise<EmbeddingProvider>;
   /**

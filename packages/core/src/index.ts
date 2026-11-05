@@ -227,9 +227,12 @@ export {
   parseHashingEmbedderPin,
   knownModelProfileIds,
   UnsatisfiableEmbedderError,
+  SharedModelUnavailableError,
   LEGACY_ONNX_DEFAULT_MODEL_ID,
 } from "./embedding-onnx";
-export type { LocalEmbedderSelection, LocalEmbedderWithProvenance } from "./embedding-onnx";
+export type { LocalEmbedderSelection, LocalEmbedderWithProvenance, ModelHost, ModelSpec } from "./embedding-onnx";
+export { acquireFileLock, createSharedModelHost, serveSharedModel, LocalModelHost } from "./shared-model";
+export type { SharedModelHostOptions, SharedModelServer } from "./shared-model";
 export { DeterministicSynthesizer } from "./synthesis";
 export type { Synthesizer } from "./synthesis";
 export { createMonetCoreMcpServer } from "./mcp-server";

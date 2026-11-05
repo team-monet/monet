@@ -1,8 +1,14 @@
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import {
   MonetCore,
+  acquireFileLock,
   chooseStoreEmbedder,
+  createSharedModelHost,
   inStartupPhase,
+  instantiateEmbedderForPin,
   type EmbeddingProvider,
+  type ModelHost,
 } from "@team-monet/core";
 
 export interface ServedCoreOptions {
@@ -28,6 +34,42 @@ export interface ServedCoreOptions {
 type StoreEmbedderSelector = (dbPath: string) => Promise<EmbeddingProvider>;
 
 /**
+ * Every serving process on a machine uses one model through this. Constructing it touches nothing:
+ * a store that never embeds through a model, such as an explicitly lexical one, starts no process.
+ */
+function sharedModelHost(): ModelHost {
+  const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
+  const entry = import.meta.url.endsWith(".ts") ? "./model-host.ts" : "./model-host.js";
+  return createSharedModelHost({ version, hostEntry: fileURLToPath(new URL(entry, import.meta.url)) });
+}
+
+/** Only a schema migration holds this for long. Past it a session opens unserialized, as before the lock. */
+const STORE_OPEN_WAIT_MS = 30_000;
+
+/**
+ * ONE SESSION AT A TIME THROUGH A STORE'S SCHEMA REGION.
+ *
+ * Construction creates and migrates the schema in many separate statements, and a process cannot see
+ * that another is halfway through them: ten sessions starting on a new store failed with
+ * `UNIQUE constraint failed: sync_meta.singleton` and `trigger ... already exists`, and a migration
+ * on upgrade has the same shape. Waiting here means each session finds the region finished. Each
+ * statement stays as it was, so a lock that cannot be taken leaves things exactly as they were.
+ */
+function withStoreOpenLock<T>(dbPath: string, open: () => T): T {
+  let release: (() => void) | null = null;
+  try {
+    release = acquireFileLock(`${dbPath}.open-lock`, STORE_OPEN_WAIT_MS);
+  } catch {
+    // Unlockable here. Today's behaviour is still available: open without it.
+  }
+  try {
+    return open();
+  } finally {
+    release?.();
+  }
+}
+
+/**
  * Open a core that will be served, selecting the embedder from the store's durable pin first.
  *
  * BOTH STEPS ARE PHASE-TAGGED (#13). These are the two widest fallible regions of startup and they
@@ -41,10 +83,26 @@ type StoreEmbedderSelector = (dbPath: string) => Promise<EmbeddingProvider>;
 export async function openServedCore(
   dbPath: string,
   options: ServedCoreOptions,
-  selectEmbedder: StoreEmbedderSelector = chooseStoreEmbedder,
+  selectEmbedder?: StoreEmbedderSelector,
 ): Promise<MonetCore> {
-  const embedder = await inStartupPhase("embedder-selection", () => selectEmbedder(dbPath));
-  return await inStartupPhase("store-open", () => new MonetCore(dbPath, { ...options, embedder }));
+  const modelHost = selectEmbedder ? undefined : sharedModelHost();
+  const select = selectEmbedder ?? ((path: string) => chooseStoreEmbedder(path, { modelHost }));
+  const embedder = await inStartupPhase("embedder-selection", () => select(dbPath));
+  return await inStartupPhase(
+    "store-open",
+    () =>
+      withStoreOpenLock(
+        dbPath,
+        () =>
+          new MonetCore(dbPath, {
+            ...options,
+            embedder,
+            // The engine's own pin-swap path loads through the same host, or a swap would bring back
+            // the private copy this exists to remove.
+            ...(modelHost ? { embedderLoader: (id: string) => instantiateEmbedderForPin(id, { modelHost }) } : {}),
+          }),
+      ),
+  );
 }
 
 /** Open the non-embedding status path without allowing construction to mint a pin. */
