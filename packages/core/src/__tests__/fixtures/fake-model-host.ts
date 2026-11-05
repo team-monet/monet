@@ -18,6 +18,10 @@ const host: ModelHost = {
     if (text === "__slow__") await new Promise((resolve) => setTimeout(resolve, 1_500));
     if (text === "__tick__") await new Promise((resolve) => setTimeout(resolve, 300));
     if (text === "__hang__") await new Promise(() => {});
+    if (text === "__log_inputs__") {
+      // What the real model library does when a run fails.
+      console.error("Inputs given to model:", { input_ids: { data: [0, 581, 6, 172482] } });
+    }
     if (text === "__exact__") {
       return new Float32Array(new Uint32Array([0x7fc00001, 0x7f800000, 0x80000000, 0x00000001, 0x3f800000]).buffer);
     }

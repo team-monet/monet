@@ -33,13 +33,23 @@ setTimeout(() => finish("no answer within 30 seconds"), 30_000);
 const socketPath = `${base}.sock`;
 while (!existsSync(socketPath)) await new Promise((resolve) => setTimeout(resolve, 50));
 
-const pid = Number(readFileSync(`${base}.pid`, "utf8"));
+let pid = null;
+try {
+  pid = Number(readFileSync(`${base}.pid`, "utf8"));
+} catch (error) {
+  finish(error.message);
+}
 if (pid !== host.pid) finish(`it recorded pid ${pid}, not ${host.pid}`);
 
 const socket = connect(socketPath, () => socket.write('{"id":1,"op":"smoke"}\n'));
 socket.setEncoding("utf8");
 socket.on("error", (error) => finish(error.message));
 socket.once("data", (chunk) => {
-  const answer = JSON.parse(chunk.split("\n")[0]);
+  let answer = null;
+  try {
+    answer = JSON.parse(chunk.split("\n")[0]);
+  } catch {
+    finish(`unexpected answer ${chunk}`);
+  }
   finish(answer.id === 1 && answer.ok === false ? null : `unexpected answer ${chunk}`);
 });

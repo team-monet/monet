@@ -215,6 +215,14 @@ describe.skipIf(process.platform === "win32")("shared model host", () => {
     expect(second).not.toBe(first);
   }, 60_000);
 
+  it("a host does not idle out underneath a request it is still running", async () => {
+    process.env.FAKE_HOST_IDLE_EXIT_MS = "400";
+    const host = client();
+    const first = await hostPid(host);
+    expect(pidOf(await host.embed(SPEC, "__slow__"))).toBe(first);
+    expect(winners()).toEqual([first]);
+  }, 60_000);
+
   it("work keeps a host from idling out", async () => {
     process.env.FAKE_HOST_IDLE_EXIT_MS = "2000";
     const host = client();
@@ -279,41 +287,78 @@ describe.skipIf(process.platform === "win32")("shared model host", () => {
     expect(createFallback).not.toHaveBeenCalled();
   }, 60_000);
 
-  it("a host that is alive but answers nothing is ended, and the call lands on its replacement", async () => {
-    const host = client({ stallLimitMs: 500 });
+  it("a host that answers nothing fails the waiting call, says what to end, and is left alone", async () => {
+    const host = client({ answerLimitMs: 500 });
     const first = await hostPid(host);
     process.kill(first, "SIGSTOP");
 
-    const second = pidOf(await host.embed(SPEC, "after the freeze"));
-    started.add(second);
-    expect(second).not.toBe(first);
-    await waitUntil(() => !alive(first), "the stuck host to be gone");
+    const failure = await host.embed(SPEC, "after the freeze").catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(SharedModelUnavailableError);
+    expect((failure as Error).message).toContain(`kill -9 ${first}`);
+    expect((failure as Error).message).toContain("No other embedder was used");
+    expect(alive(first)).toBe(true);
+
+    // Following those words is the way out, for this session and for any other.
+    process.kill(first, "SIGKILL");
+    await waitUntil(() => !alive(first), "the kill");
+    expect(await hostPid(host)).not.toBe(first);
   }, 60_000);
 
-  it("a new session is not trapped by a stuck host either", async () => {
-    const first = await hostPid(client());
-    process.kill(first, "SIGSTOP");
+  it("a slow answer never costs the host its life, and it stays available to everyone", async () => {
+    // The fault this replaced: a session that took silence for a hang killed a healthy host, along
+    // with every call queued on it, and the slow write could then never finish.
+    const impatient = client({ answerLimitMs: 300 });
+    const other = client();
+    const pid = await hostPid(other);
 
-    const second = await hostPid(client({ stallLimitMs: 500 }));
-    expect(second).not.toBe(first);
+    await expect(impatient.embed(SPEC, "__slow__")).rejects.toBeInstanceOf(SharedModelUnavailableError);
+    expect(pidOf(await other.embed(SPEC, "still here"))).toBe(pid);
+    expect(winners()).toEqual([pid]);
   }, 60_000);
 
-  it("a call that wedges every host it lands on fails after its attempts, and other work resumes", async () => {
-    const host = client({ stallLimitMs: 400 });
-    started.add(await hostPid(host));
+  it("a session's own calls do not stop its clock on a host that answers nothing", async () => {
+    const host = client({ answerLimitMs: 500 });
+    const pid = await hostPid(host);
+    process.kill(pid, "SIGSTOP");
+
+    const startedAt = performance.now();
+    const waiting = host.embed(SPEC, "first").catch((error: unknown) => error);
+    const more = setInterval(() => void host.countTokens(SPEC, "again").catch(() => {}), 100);
+    try {
+      expect(await waiting).toBeInstanceOf(SharedModelUnavailableError);
+      expect(performance.now() - startedAt).toBeLessThan(5_000);
+    } finally {
+      clearInterval(more);
+    }
+  }, 60_000);
+
+  it("work behind a call that never ends fails with the same words, and the next host is fine", async () => {
+    const host = client({ answerLimitMs: 400 });
+    const first = await hostPid(host);
 
     const failure = await host.embed(SPEC, "__hang__").catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(SharedModelUnavailableError);
-    for (const pid of winners()) started.add(pid);
+    expect(alive(first)).toBe(true);
 
-    const after = await hostPid(host);
-    expect(alive(after)).toBe(true);
+    process.kill(first, "SIGKILL");
+    await waitUntil(() => !alive(first), "the kill");
+    expect(await hostPid(host)).not.toBe(first);
+  }, 60_000);
+
+  it("what a model library prints about a failed run does not reach the log on disk", async () => {
+    const host = client();
+    started.add(await hostPid(host));
+    await host.embed(SPEC, "__log_inputs__");
+
+    const log = readFileSync(`${basePath()}.log`, "utf8");
+    expect(log).toContain("Inputs given to model:");
+    expect(log).not.toContain("172482");
   }, 60_000);
 
   it("a long queue is not mistaken for a stall", async () => {
-    const stallLimitMs = 800;
-    const busy = client({ stallLimitMs });
-    const waiting = client({ stallLimitMs });
+    const answerLimitMs = 800;
+    const busy = client({ answerLimitMs });
+    const waiting = client({ answerLimitMs });
     const first = await hostPid(busy);
 
     // Six ticks ahead of it take far longer than the limit, and every one of them finishes.
@@ -322,25 +367,10 @@ describe.skipIf(process.platform === "win32")("shared model host", () => {
     const startedWaiting = performance.now();
     const answered = pidOf(await waiting.embed(SPEC, "behind the queue"));
 
-    expect(performance.now() - startedWaiting).toBeGreaterThan(stallLimitMs);
+    expect(performance.now() - startedWaiting).toBeGreaterThan(answerLimitMs);
     expect(answered).toBe(first);
     expect((await Promise.all(ticks)).map(pidOf)).toEqual(Array(6).fill(first));
     expect(winners()).toEqual([first]);
-  }, 60_000);
-
-  it("a host stuck on a call nobody is waiting for still gives its memory back", async () => {
-    process.env.FAKE_HOST_IDLE_EXIT_MS = "600";
-    const pid = await hostPid(client());
-
-    await new Promise<void>((settle) => {
-      const raw = connect(`${basePath()}.sock`, () => {
-        raw.write(`${JSON.stringify({ id: 1, op: "embed", spec: SPEC, text: "__hang__" })}\n`);
-        setTimeout(() => raw.destroy(), 100);
-      });
-      raw.on("close", () => settle());
-    });
-
-    await waitUntil(() => !alive(pid), "the wedged host to exit");
   }, 60_000);
 
   it("a host that never starts listening fails the call: no private copy, no pile of hosts", async () => {
@@ -454,7 +484,8 @@ describe.skipIf(process.platform === "win32")("shared model host", () => {
         settle(chunk);
       });
     });
-    expect(JSON.parse(unknown)).toMatchObject({ id: 7, ok: false });
+    // The first line only: a progress frame may share the read.
+    expect(JSON.parse(unknown.split("\n")[0]!)).toMatchObject({ id: 7, ok: false });
 
     expect(await hostPid(host)).toBe(pid);
   }, 60_000);
@@ -692,7 +723,7 @@ describe("the provider's seam", () => {
   describe("a channel failure is not a load failure", () => {
     const unreachable: ModelHost = {
       embed: async () => {
-        throw new SharedModelUnavailableError("the model process went away during a call", "the.log");
+        throw new SharedModelUnavailableError("The shared embedding model could not be reached.");
       },
       countTokens: async () => 0,
       inputWindow: async () => null,

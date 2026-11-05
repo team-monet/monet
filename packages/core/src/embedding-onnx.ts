@@ -1079,11 +1079,8 @@ export interface ModelHost {
  * host that keeps dying would otherwise re-pin an empty store to another embedder for good.
  */
 export class SharedModelUnavailableError extends Error {
-  constructor(reason: string, logPath: string) {
-    super(
-      `The shared embedding model could not be reached (${reason}). This call did not run and no ` +
-        `other embedder was used; the next call starts the model process again. Its log is ${logPath}.`,
-    );
+  constructor(message: string) {
+    super(message);
     this.name = "SharedModelUnavailableError";
   }
 }
