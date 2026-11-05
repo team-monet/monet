@@ -1,11 +1,28 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync, rmSync, truncateSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { connect, createServer, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { OnnxEmbeddingProvider, resolveModelCacheDir, type ModelHost, type ModelSpec } from "./embedding-onnx";
+import {
+  OnnxEmbeddingProvider,
+  resolveModelCacheDir,
+  SharedModelUnavailableError,
+  type ModelHost,
+  type ModelSpec,
+} from "./embedding-onnx";
 
 /**
  * ONE MODEL PER MACHINE, NOT ONE PER SESSION.
@@ -25,11 +42,15 @@ import { OnnxEmbeddingProvider, resolveModelCacheDir, type ModelHost, type Model
  *    it, and it is not a network address. Nothing in here logs text.
  *  - A DEAD HOST COSTS ONE CALL AT WORST. The session respawns it and retries. If that fails, the
  *    call fails loudly and the next one tries again; no session moves to another embedder.
+ *  - A STUCK HOST IS TREATED AS A DEAD ONE. Every session depends on this one process, and the lock
+ *    sends each new session back to it, so a host that is alive and answers nothing would hang them
+ *    all with restarts no help. A waiting session ends it, and the retry brings up a working one.
  */
 
 const SOCKET_SUFFIX = ".sock";
 const LOCK_SUFFIX = ".lock";
 const LOG_SUFFIX = ".log";
+const PID_SUFFIX = ".pid";
 
 /**
  * How long a host outlives the last request. Short, because the wait is cheap and the memory is not:
@@ -37,7 +58,20 @@ const LOG_SUFFIX = ".log";
  * against more than 2 GB held for nobody. An agent does not notice a second.
  */
 const DEFAULT_IDLE_EXIT_MS = 5 * 60_000;
-/** How long a session waits for a host to start listening, which happens before any model load. */
+/**
+ * How long a session waits with work in flight and no sign of life before ending the host. "No sign"
+ * means nothing finished for ANY session and no download progress, so queue depth does not count
+ * against it. What it has to outlast is the longest silence with nothing wrong, a model load: measured
+ * at 1.5 s after dropping the page cache on Linux, and 13 s with ten loads at once driving a 16 GB
+ * machine 12 GB into swap. A slower disk than either is not measured, hence the margin. Too long costs
+ * a stuck machine two minutes, and too short kills healthy hosts mid-load, which is the worse error.
+ */
+const DEFAULT_STALL_LIMIT_MS = 2 * 60_000;
+/**
+ * How long a session waits for a host to start listening, which happens before any model load and
+ * measures about 60 ms. A wait this long means a machine in no state to load a private copy either,
+ * so running out fails the call rather than falling back.
+ */
 const DEFAULT_CONNECT_DEADLINE_MS = 20_000;
 const CONNECT_RETRY_MS = 50;
 const SPAWN_INTERVAL_MS = 1_000;
@@ -55,11 +89,13 @@ interface Request {
   text?: string;
 }
 
-type Response =
+type Answer =
   | { id: number; ok: true; vector: string }
   | { id: number; ok: true; value: number | null }
-  | { id: number; ok: false; error: string }
-  | { log: string };
+  | { id: number; ok: false; error: string };
+
+/** `progress` is what a session queued behind others sees instead of mistaking the wait for a stall. */
+type Frame = Answer | { log: string } | { progress: true };
 
 function encodeVector(vector: Float32Array): string {
   return Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength).toString("base64");
@@ -172,6 +208,7 @@ export async function serveSharedModel(options: {
   // This process is the host now, so what sits at the socket path is a dead host's, and this log is
   // the only one anyone still needs.
   rmSync(socketPath, { force: true });
+  writeFileSync(options.basePath + PID_SUFFIX, String(process.pid), { mode: 0o600 });
   try {
     truncateSync(options.basePath + LOG_SUFFIX, 0);
   } catch {
@@ -179,11 +216,10 @@ export async function serveSharedModel(options: {
   }
 
   const connections = new Set<Socket>();
-  const broadcast = (response: Response): void => {
-    const frame = JSON.stringify(response) + "\n";
-    for (const connection of connections) connection.write(frame);
+  const broadcast = (frame: Frame): void => {
+    const encoded = JSON.stringify(frame) + "\n";
+    for (const connection of connections) connection.write(encoded);
   };
-  const host = options.host ?? new LocalModelHost((line) => broadcast({ log: line }));
   const idleExitMs = options.idleExitMs ?? DEFAULT_IDLE_EXIT_MS;
 
   let settleClosed!: () => void;
@@ -191,10 +227,11 @@ export async function serveSharedModel(options: {
   const server = createServer();
 
   let queue: Promise<void> = Promise.resolve();
-  let queued = 0;
   let idleTimer: NodeJS.Timeout | null = null;
+  let closing = false;
 
   const shutDown = (): void => {
+    closing = true;
     server.close();
     for (const connection of connections) connection.destroy();
     // In this order: the socket has to be gone before the lock lets a successor create its own.
@@ -202,12 +239,24 @@ export async function serveSharedModel(options: {
     releaseLock();
     settleClosed();
   };
-  const armIdleExit = (): void => {
+  /**
+   * Requests and finished work push the exit back; a request still running does not hold it off. So
+   * the same clock also ends a host stuck on a call that nobody is left waiting for, which would
+   * otherwise keep its memory until the next session came along and timed out on it.
+   */
+  const noteActivity = (): void => {
+    if (closing) return;
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = queued === 0 ? setTimeout(shutDown, idleExitMs) : null;
+    idleTimer = setTimeout(shutDown, idleExitMs);
   };
+  const host =
+    options.host ??
+    new LocalModelHost((line) => {
+      noteActivity();
+      broadcast({ log: line });
+    });
 
-  const answer = async (request: Request): Promise<Response> => {
+  const answer = async (request: Request): Promise<Answer> => {
     try {
       switch (request.op) {
         case "embed":
@@ -229,23 +278,25 @@ export async function serveSharedModel(options: {
     connection.on("close", () => connections.delete(connection));
     connection.on("error", () => connection.destroy());
     readLines(connection, (line) => {
-      let request: Request;
+      let request: Request | null;
       try {
-        request = JSON.parse(line) as Request;
+        request = JSON.parse(line) as Request | null;
       } catch {
+        request = null;
+      }
+      if (typeof request !== "object" || request === null) {
         connection.destroy();
         return;
       }
-      queued += 1;
-      armIdleExit();
+      const accepted = request;
+      noteActivity();
       queue = queue.then(async () => {
         // A session that went away while queued no longer needs this, and a model run is not cheap.
-        if (!connection.destroyed) {
-          const response = await answer(request);
-          if (!connection.destroyed) connection.write(JSON.stringify(response) + "\n");
-        }
-        queued -= 1;
-        armIdleExit();
+        if (connection.destroyed) return;
+        const response = await answer(accepted);
+        if (!connection.destroyed) connection.write(JSON.stringify(response) + "\n");
+        noteActivity();
+        broadcast({ progress: true });
       });
     });
   });
@@ -257,22 +308,14 @@ export async function serveSharedModel(options: {
       resolve();
     });
   });
-  armIdleExit();
+  noteActivity();
   return { closed };
 }
 
-/** A session cannot reach the shared model right now. Only this call failed; the next one retries. */
-export class SharedModelUnavailableError extends Error {
-  constructor(reason: string, logPath: string) {
-    super(
-      `The shared embedding model could not be reached (${reason}). This call did not run and no ` +
-        `other embedder was used; the next call starts the model process again. Its log is ${logPath}.`,
-    );
-    this.name = "SharedModelUnavailableError";
-  }
-}
-
 class ConnectionLostError extends Error {}
+
+/** Sharing cannot work on this machine at all. Unlike a host that is down, no retry changes this. */
+class CannotShareHereError extends Error {}
 
 export interface SharedModelHostOptions {
   /** The release, so a session never talks to a host running another version's model code. */
@@ -284,6 +327,7 @@ export interface SharedModelHostOptions {
   /** Where the socket lives. Defaults to a directory under the home directory, not the store. */
   runtimeDir?: string;
   connectDeadlineMs?: number;
+  stallLimitMs?: number;
   /** What a session uses when it cannot share here at all. */
   createFallback?: () => ModelHost;
 }
@@ -310,11 +354,12 @@ class SharedModelClient implements ModelHost {
   private socket: Socket | null = null;
   private connecting: Promise<Socket> | null = null;
   private fallback: ModelHost | null = null;
-  /** Once a host has answered, sharing works here, so a later failure must not load a private copy. */
+  /** Once a host has been reached, sharing works here, so a later failure must not load a private copy. */
   private everConnected = false;
   private basePath: string | null = null;
   private nextId = 1;
-  private readonly pending = new Map<number, { resolve: (response: Response) => void; reject: (error: Error) => void }>();
+  private stallTimer: NodeJS.Timeout | null = null;
+  private readonly pending = new Map<number, { resolve: (answer: Answer) => void; reject: (error: Error) => void }>();
 
   constructor(private readonly options: SharedModelHostOptions) {}
 
@@ -365,7 +410,7 @@ class SharedModelClient implements ModelHost {
   private async call<T>(
     onFallback: (fallback: ModelHost) => Promise<T>,
     request: Omit<Request, "id">,
-    read: (response: Extract<Response, { ok: true }>) => T,
+    read: (answer: Extract<Answer, { ok: true }>) => T,
   ): Promise<T> {
     if (this.fallback) return await onFallback(this.fallback);
 
@@ -375,14 +420,15 @@ class SharedModelClient implements ModelHost {
       try {
         socket = await this.connection();
       } catch (error) {
-        if (!this.everConnected) return await onFallback(this.useFallback(error));
+        if (error instanceof CannotShareHereError && !this.everConnected) {
+          return await onFallback(this.useFallback(error));
+        }
         throw new SharedModelUnavailableError(error instanceof Error ? error.message : String(error), this.logPath());
       }
       try {
-        const response = await this.send(socket, request);
-        if ("log" in response) throw new Error("A log line reached a request's answer.");
-        if (!response.ok) throw new Error(response.error);
-        return read(response);
+        const answer = await this.send(socket, request);
+        if (!answer.ok) throw new Error(answer.error);
+        return read(answer);
       } catch (error) {
         if (!(error instanceof ConnectionLostError)) throw error;
         lastError = error;
@@ -403,7 +449,7 @@ class SharedModelClient implements ModelHost {
    * session open at shutdown, and referenced during a request, because at startup a pending embed
    * can be the only thing left to keep the process alive before the transport exists.
    */
-  private send(socket: Socket, request: Omit<Request, "id">): Promise<Response> {
+  private send(socket: Socket, request: Omit<Request, "id">): Promise<Answer> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       // A socket closed before this point has already rejected everything it will ever reject.
@@ -412,10 +458,10 @@ class SharedModelClient implements ModelHost {
         return;
       }
       this.pending.set(id, {
-        resolve: (response) => {
+        resolve: (answer) => {
           this.pending.delete(id);
           if (this.pending.size === 0) socket.unref();
-          resolve(response);
+          resolve(answer);
         },
         reject: (error) => {
           this.pending.delete(id);
@@ -424,11 +470,37 @@ class SharedModelClient implements ModelHost {
       });
       socket.ref();
       socket.write(JSON.stringify({ id, ...request }) + "\n");
+      this.watchForStall(socket);
     });
   }
 
+  /** Restarted by everything the host sends, and stopped once nothing is in flight. */
+  private watchForStall(socket: Socket): void {
+    if (this.stallTimer) clearTimeout(this.stallTimer);
+    this.stallTimer =
+      this.pending.size === 0
+        ? null
+        : setTimeout(() => this.endStuckHost(socket), this.options.stallLimitMs ?? DEFAULT_STALL_LIMIT_MS);
+  }
+
+  /**
+   * The connection is still open, so the process that wrote this pid is alive and is the one holding
+   * the lock: no successor can have written it, and the pid cannot have been reused. Every waiting
+   * session may do this, and the second kill finds nothing. Destroying the socket is what ends the
+   * wait, whether or not the kill landed, so a host that cannot be killed still only costs retries.
+   */
+  private endStuckHost(socket: Socket): void {
+    try {
+      const pid = Number(readFileSync((this.basePath ?? "") + PID_SUFFIX, "utf8"));
+      if (Number.isInteger(pid) && pid > 0) process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone, or not ours to signal.
+    }
+    socket.destroy();
+  }
+
   private connection(): Promise<Socket> {
-    if (this.socket) return Promise.resolve(this.socket);
+    if (this.socket && !this.socket.destroyed) return Promise.resolve(this.socket);
     this.connecting ??= this.establish().finally(() => {
       this.connecting = null;
     });
@@ -457,10 +529,15 @@ class SharedModelClient implements ModelHost {
   }
 
   private async establish(): Promise<Socket> {
-    const basePath = this.resolveBasePath();
+    let basePath: string;
+    try {
+      basePath = this.resolveBasePath();
+    } catch (error) {
+      throw new CannotShareHereError(error instanceof Error ? error.message : String(error));
+    }
     const deadline = performance.now() + (this.options.connectDeadlineMs ?? DEFAULT_CONNECT_DEADLINE_MS);
     let lastSpawnAt = -Infinity;
-    const host: { failure: string | null } = { failure: null };
+    const host: { running: boolean; failure: string | null } = { running: false, failure: null };
     for (;;) {
       try {
         const socket = await this.dial(basePath + SOCKET_SUFFIX);
@@ -469,17 +546,26 @@ class SharedModelClient implements ModelHost {
         return socket;
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "ENOENT" && code !== "ECONNREFUSED") throw error;
+        if (code !== "ENOENT" && code !== "ECONNREFUSED") {
+          throw new CannotShareHereError(error instanceof Error ? error.message : String(error));
+        }
       }
       // A host that exited non-zero could not start, and starting another will not help. A host that
       // lost the election exits zero, and the winner is what this loop is waiting for.
-      if (host.failure !== null) throw new Error(host.failure);
+      if (host.failure !== null) throw new CannotShareHereError(host.failure);
       if (performance.now() >= deadline) throw new Error("no host started listening in time");
-      if (performance.now() - lastSpawnAt >= SPAWN_INTERVAL_MS) {
+      // One at a time: on a machine too slow to start one, more of them only make it slower.
+      if (!host.running && performance.now() - lastSpawnAt >= SPAWN_INTERVAL_MS) {
         lastSpawnAt = performance.now();
-        this.spawnHost(basePath, (reason) => {
-          host.failure = reason;
-        });
+        host.running = true;
+        try {
+          this.spawnHost(basePath, (failure) => {
+            host.running = false;
+            host.failure = failure;
+          });
+        } catch (error) {
+          throw new CannotShareHereError(error instanceof Error ? error.message : String(error));
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, CONNECT_RETRY_MS));
     }
@@ -489,17 +575,20 @@ class SharedModelClient implements ModelHost {
    * Detached, with its own output, because it must outlive the session that happened to start it and
    * must not hold that session's stderr open: a host waits for EOF on a server's pipes.
    */
-  private spawnHost(basePath: string, onFailure: (reason: string) => void): void {
+  private spawnHost(basePath: string, onExit: (failure: string | null) => void): void {
     const log = openSync(basePath + LOG_SUFFIX, "a", 0o600);
     try {
       const child = spawn(process.execPath, [...(this.options.nodeArgs ?? process.execArgv), this.options.hostEntry, basePath], {
         detached: true,
         stdio: ["ignore", log, log],
         cwd: homedir(),
+        // Resolved here because the host runs from another directory: a relative override would
+        // otherwise name one cache for this session's key and a different one for the host's load.
+        env: { ...process.env, MONET_MODEL_CACHE: resolveModelCacheDir() },
       });
-      child.once("error", (error) => onFailure(`could not start the model process: ${error.message}`));
+      child.once("error", (error) => onExit(`could not start the model process: ${error.message}`));
       child.once("exit", (code, signal) => {
-        if (code !== 0 && signal === null) onFailure(`the model process exited with code ${code}`);
+        onExit(code !== 0 && signal === null ? `the model process exited with code ${code}` : null);
       });
       child.unref();
     } finally {
@@ -524,25 +613,28 @@ class SharedModelClient implements ModelHost {
 
   private onClose(socket: Socket): void {
     if (this.socket === socket) this.socket = null;
+    if (this.stallTimer) clearTimeout(this.stallTimer);
+    this.stallTimer = null;
     for (const entry of [...this.pending.values()]) {
       entry.reject(new ConnectionLostError("the model process went away during a call"));
     }
   }
 
   private onLine(socket: Socket, line: string): void {
-    let response: Response;
+    // Throwing here would end the session over one bad frame. Dropping the connection costs a retry.
+    let frame: Frame | null;
     try {
-      response = JSON.parse(line) as Response;
+      frame = JSON.parse(line) as Frame | null;
     } catch {
-      // Throwing here would end the session over one bad frame. Dropping the connection costs a retry.
+      frame = null;
+    }
+    if (typeof frame !== "object" || frame === null) {
       socket.destroy();
       return;
     }
-    if ("log" in response) {
-      console.error(response.log);
-      return;
-    }
-    this.pending.get(response.id)?.resolve(response);
+    if ("log" in frame) console.error(frame.log);
+    else if ("id" in frame) this.pending.get(frame.id)?.resolve(frame);
+    this.watchForStall(socket);
   }
 }
 

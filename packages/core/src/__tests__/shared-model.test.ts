@@ -13,21 +13,23 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { connect } from "node:net";
+import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chooseStoreEmbedder, PinnedStoreEmbedderUnavailableError } from "../store-embedder";
 import {
   DEFAULT_MODEL,
+  createLocalEmbedderWithProvenance,
   instantiateEmbedderForPin,
   OnnxEmbeddingProvider,
+  SharedModelUnavailableError,
   UnsatisfiableEmbedderError,
   type ModelHost,
   type ModelSpec,
 } from "../embedding-onnx";
 import { MonetCore, readStoredEmbedderPin } from "../index";
-import { createSharedModelHost, LocalModelHost, SharedModelUnavailableError } from "../shared-model";
+import { createSharedModelHost, LocalModelHost } from "../shared-model";
 
 const pipelineLoads = vi.hoisted(() => ({ count: 0, fail: false }));
 const fsBehaviour = vi.hoisted(() => ({ chmodDoesNothing: false }));
@@ -214,16 +216,16 @@ describe.skipIf(process.platform === "win32")("shared model host", () => {
   }, 60_000);
 
   it("work keeps a host from idling out", async () => {
-    process.env.FAKE_HOST_IDLE_EXIT_MS = "600";
+    process.env.FAKE_HOST_IDLE_EXIT_MS = "2000";
     const host = client();
     const first = await hostPid(host);
     for (let round = 0; round < 6; round += 1) {
-      await new Promise((settle) => setTimeout(settle, 200));
+      await new Promise((settle) => setTimeout(settle, 500));
       expect(await hostPid(host)).toBe(first);
     }
   }, 60_000);
 
-  it("a session that can never start a host loads its own copy, quickly", async () => {
+  it("a host entry that does not exist means a private copy, quickly", async () => {
     mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
     const fallback: ModelHost = {
       embed: vi.fn(async () => Float32Array.of(42)),
@@ -275,6 +277,125 @@ describe.skipIf(process.platform === "win32")("shared model host", () => {
     rmSync(`${basePath()}.refuse`);
     expect(await hostPid(host)).not.toBe(first);
     expect(createFallback).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it("a host that is alive but answers nothing is ended, and the call lands on its replacement", async () => {
+    const host = client({ stallLimitMs: 500 });
+    const first = await hostPid(host);
+    process.kill(first, "SIGSTOP");
+
+    const second = pidOf(await host.embed(SPEC, "after the freeze"));
+    started.add(second);
+    expect(second).not.toBe(first);
+    await waitUntil(() => !alive(first), "the stuck host to be gone");
+  }, 60_000);
+
+  it("a new session is not trapped by a stuck host either", async () => {
+    const first = await hostPid(client());
+    process.kill(first, "SIGSTOP");
+
+    const second = await hostPid(client({ stallLimitMs: 500 }));
+    expect(second).not.toBe(first);
+  }, 60_000);
+
+  it("a call that wedges every host it lands on fails after its attempts, and other work resumes", async () => {
+    const host = client({ stallLimitMs: 400 });
+    started.add(await hostPid(host));
+
+    const failure = await host.embed(SPEC, "__hang__").catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(SharedModelUnavailableError);
+    for (const pid of winners()) started.add(pid);
+
+    const after = await hostPid(host);
+    expect(alive(after)).toBe(true);
+  }, 60_000);
+
+  it("a long queue is not mistaken for a stall", async () => {
+    const stallLimitMs = 800;
+    const busy = client({ stallLimitMs });
+    const waiting = client({ stallLimitMs });
+    const first = await hostPid(busy);
+
+    // Six ticks ahead of it take far longer than the limit, and every one of them finishes.
+    const ticks = Array.from({ length: 6 }, () => busy.embed(SPEC, "__tick__"));
+    await new Promise((settle) => setTimeout(settle, 50));
+    const startedWaiting = performance.now();
+    const answered = pidOf(await waiting.embed(SPEC, "behind the queue"));
+
+    expect(performance.now() - startedWaiting).toBeGreaterThan(stallLimitMs);
+    expect(answered).toBe(first);
+    expect((await Promise.all(ticks)).map(pidOf)).toEqual(Array(6).fill(first));
+    expect(winners()).toEqual([first]);
+  }, 60_000);
+
+  it("a host stuck on a call nobody is waiting for still gives its memory back", async () => {
+    process.env.FAKE_HOST_IDLE_EXIT_MS = "600";
+    const pid = await hostPid(client());
+
+    await new Promise<void>((settle) => {
+      const raw = connect(`${basePath()}.sock`, () => {
+        raw.write(`${JSON.stringify({ id: 1, op: "embed", spec: SPEC, text: "__hang__" })}\n`);
+        setTimeout(() => raw.destroy(), 100);
+      });
+      raw.on("close", () => settle());
+    });
+
+    await waitUntil(() => !alive(pid), "the wedged host to exit");
+  }, 60_000);
+
+  it("a host that never starts listening fails the call: no private copy, no pile of hosts", async () => {
+    // Too slow to start one host is too slow to load a private model too, and that load is the
+    // memory spike this whole mechanism exists to avoid.
+    const spawns = join(dir, "spawns");
+    const entry = join(dir, "never-listens.mjs");
+    writeFileSync(
+      entry,
+      `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(spawns)}, process.pid + "\\n");\nsetInterval(() => {}, 1000);\n`,
+    );
+    const createFallback = vi.fn<() => ModelHost>();
+    const host = client({ hostEntry: entry, nodeArgs: [], connectDeadlineMs: 2_500, createFallback });
+
+    await expect(host.embed(SPEC, "x")).rejects.toBeInstanceOf(SharedModelUnavailableError);
+    const pids = readFileSync(spawns, "utf8").trim().split("\n").map(Number);
+    for (const pid of pids) started.add(pid);
+
+    expect(createFallback).not.toHaveBeenCalled();
+    expect(pids).toHaveLength(1);
+  }, 30_000);
+
+  it("frames that are valid JSON but not messages cost a retry, not the session", async () => {
+    const host = client();
+    const pid = await hostPid(host);
+    const socketPath = `${basePath()}.sock`;
+    process.kill(pid, "SIGKILL");
+    await waitUntil(() => !alive(pid), "the kill");
+    rmSync(socketPath, { force: true });
+
+    const frames = ["null\n", "7\n"];
+    const impostor = createServer((connection) => {
+      connection.setEncoding("utf8");
+      connection.on("data", (chunk: string) => {
+        const { id } = JSON.parse(chunk) as { id: number };
+        const bad = frames.shift();
+        connection.write(bad ?? `{}\n{"progress":true}\n${JSON.stringify({ id, ok: true, value: 5 })}\n`);
+      });
+    });
+    await new Promise<void>((settle) => impostor.listen(socketPath, () => settle()));
+    try {
+      await expect(client().countTokens(SPEC, "x")).resolves.toBe(5);
+    } finally {
+      impostor.close();
+    }
+  }, 60_000);
+
+  it("a frame that is not an object closes that connection and leaves the host running", async () => {
+    const host = client();
+    const pid = await hostPid(host);
+    await new Promise<void>((settle) => {
+      const raw = connect(`${basePath()}.sock`, () => raw.write("null\n"));
+      raw.on("close", () => settle());
+    });
+    expect(await hostPid(host)).toBe(pid);
   }, 60_000);
 
   it("vectors and text cross the channel byte for byte", async () => {
@@ -349,6 +470,18 @@ describe.skipIf(process.platform === "win32")("shared model host", () => {
     expect(result.status).toBe(0);
     // Ended by itself rather than by the timeout: the idle connection did not hold it open.
     expect(result.signal).toBeNull();
+  }, 60_000);
+
+  it("hands the host the cache this session resolved, since it runs from another directory", async () => {
+    const prior = process.env.MONET_MODEL_CACHE;
+    process.env.MONET_MODEL_CACHE = "relative/cache";
+    try {
+      started.add(await hostPid(client()));
+      expect(readFileSync(`${basePath()}.cache`, "utf8")).toBe(resolve("relative/cache"));
+    } finally {
+      if (prior === undefined) delete process.env.MONET_MODEL_CACHE;
+      else process.env.MONET_MODEL_CACHE = prior;
+    }
   }, 60_000);
 
   it("different releases do not share a host", async () => {
@@ -554,5 +687,75 @@ describe("the provider's seam", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe("a channel failure is not a load failure", () => {
+    const unreachable: ModelHost = {
+      embed: async () => {
+        throw new SharedModelUnavailableError("the model process went away during a call", "the.log");
+      },
+      countTokens: async () => 0,
+      inputWindow: async () => null,
+    };
+
+    it("leaves an empty pinned store's pin alone, where a load failure would re-pin it for good", async () => {
+      const dir = mkdtempSync(join(realpathSync(tmpdir()), "msm-pin-"));
+      try {
+        const dbPath = join(dir, "monet.db");
+        // Pinned, and no vectors: every new store is in this state until its first write.
+        const seeded = new MonetCore(dbPath, { embedder: new OnnxEmbeddingProvider({ modelHost: recordingHost() }) });
+        await seeded.ensureEmbedderPin();
+        seeded.close();
+        expect(readStoredEmbedderPin(dbPath)).toBe(DEFAULT_MODEL);
+
+        await expect(chooseStoreEmbedder(dbPath, { modelHost: unreachable })).rejects.toBeInstanceOf(
+          SharedModelUnavailableError,
+        );
+        expect(readStoredEmbedderPin(dbPath)).toBe(DEFAULT_MODEL);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reaches a store with vectors as itself, not as advice to rewrite the store", async () => {
+      // `PinnedStoreEmbedderUnavailableError` tells the reader to run a one-way migration, which is
+      // wrong advice for a process that will probably be back on the next attempt.
+      const dir = mkdtempSync(join(realpathSync(tmpdir()), "msm-pin-"));
+      try {
+        const dbPath = join(dir, "monet.db");
+        const seeded = new MonetCore(dbPath, { embedder: new OnnxEmbeddingProvider({ modelHost: recordingHost() }) });
+        await seeded.store("content that gives this store vectors in the pinned space");
+        seeded.close();
+
+        await expect(instantiateEmbedderForPin(DEFAULT_MODEL, { modelHost: unreachable })).rejects.toBeInstanceOf(
+          SharedModelUnavailableError,
+        );
+        const failure = await chooseStoreEmbedder(dbPath, { modelHost: unreachable }).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(SharedModelUnavailableError);
+        expect((failure as Error).message).not.toContain("monet repair");
+        expect(readStoredEmbedderPin(dbPath)).toBe(DEFAULT_MODEL);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("never selects the lexical embedder", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      await expect(createLocalEmbedderWithProvenance({ modelHost: unreachable })).rejects.toBeInstanceOf(
+        SharedModelUnavailableError,
+      );
+    });
+
+    it("still lets a real load failure take the path it always took", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const failing: ModelHost = {
+        ...unreachable,
+        embed: async () => {
+          throw new Error("the model files are corrupt");
+        },
+      };
+      const selected = await createLocalEmbedderWithProvenance({ modelHost: failing });
+      expect(selected.selection).toBe("implicit-hashing-fallback");
+    });
   });
 });

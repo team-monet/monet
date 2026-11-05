@@ -1070,6 +1070,24 @@ export interface ModelHost {
   inputWindow(spec: ModelSpec): Promise<number | null>;
 }
 
+/**
+ * A session cannot reach its model host right now. Only this call failed; the next one retries.
+ *
+ * NOT A LOAD FAILURE, and the difference is what keeps a store in its space. A failed load is a fact
+ * about the model, and it licenses an empty store's recovery re-pin and the lexical fallback, both of
+ * which are permanent. A failed channel says nothing about the model, so it must reach neither: a
+ * host that keeps dying would otherwise re-pin an empty store to another embedder for good.
+ */
+export class SharedModelUnavailableError extends Error {
+  constructor(reason: string, logPath: string) {
+    super(
+      `The shared embedding model could not be reached (${reason}). This call did not run and no ` +
+        `other embedder was used; the next call starts the model process again. Its log is ${logPath}.`,
+    );
+    this.name = "SharedModelUnavailableError";
+  }
+}
+
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly dim: number;
   /** From MODEL_PROFILES for a known checkpoint; the labelled legacy guess otherwise. */
@@ -1335,6 +1353,7 @@ export async function createLocalEmbedderWithProvenance(
     console.error(`[monet-core] semantic embeddings ready (${onnx.modelId}, ${onnx.dim}-dim).`);
     return { provider: onnx, selection: "onnx" };
   } catch (e) {
+    if (e instanceof SharedModelUnavailableError) throw e;
     const why = e instanceof Error ? e.message : String(e);
     if (pref === "onnx") throw new Error(`MONET_EMBEDDER=onnx but ${onnx.modelId} failed to load: ${why}`);
     console.error(`[monet-core] ${onnx.modelId} unavailable (${why}); falling back to lexical embedder.`);
@@ -1456,6 +1475,7 @@ export async function instantiateEmbedderForPin(
     try {
       warmup = await onnx.embed("warmup"); // forces model load now, same discipline as createLocalEmbedder
     } catch (e) {
+      if (e instanceof SharedModelUnavailableError) throw e;
       const why = e instanceof Error ? e.message : String(e);
       throw new UnsatisfiableEmbedderError(
         modelId,

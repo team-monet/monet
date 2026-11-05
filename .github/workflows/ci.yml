@@ -166,6 +166,11 @@ jobs:
       - name: Build
         run: pnpm --filter @team-monet/monet build
 
+      # Unit tests run the host from source. If the bundle stopped starting, no test would notice,
+      # and every session would quietly fall back to a private copy of the model.
+      - name: Smoke-test the built model host
+        run: node packages/cli/scripts/smoke-model-host.mjs
+
   # The single check branch protection requires.
   #
   # It exists because `core` and `cli` are path-filtered: a pull request touching only harness/

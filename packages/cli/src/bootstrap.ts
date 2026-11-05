@@ -43,7 +43,7 @@ function sharedModelHost(): ModelHost {
   return createSharedModelHost({ version, hostEntry: fileURLToPath(new URL(entry, import.meta.url)) });
 }
 
-/** Past this a session stops waiting and opens as if unserialized. A host gives up on a server sooner. */
+/** Only a schema migration holds this for long. Past it a session opens unserialized, as before the lock. */
 const STORE_OPEN_WAIT_MS = 30_000;
 
 /**
