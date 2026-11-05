@@ -90,16 +90,40 @@ describe.skipIf(process.platform === "win32")("shared model host", () => {
     runtimeDir = join(dir, "rt");
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     for (const pid of started) {
       if (alive(pid)) process.kill(pid, "SIGKILL");
     }
     started.clear();
     if (priorEnv === undefined) delete process.env.FAKE_HOST_IDLE_EXIT_MS;
     else process.env.FAKE_HOST_IDLE_EXIT_MS = priorEnv;
-    rmSync(dir, { recursive: true, force: true });
+    await removeRuntime();
     vi.restoreAllMocks();
   });
+
+  /**
+   * Hosts spawned for calls that another host answered can still be starting, and one can win the
+   * election the moment the hosts above are killed. So a single pass may leave a file behind: end
+   * whoever has won since, and start the removal over. A host that starts after this finds no
+   * directory and exits.
+   */
+  async function removeRuntime(): Promise<void> {
+    for (let attempt = 1; ; attempt += 1) {
+      for (const name of existsSync(runtimeDir) ? readdirSync(runtimeDir) : []) {
+        if (!name.endsWith(".winners")) continue;
+        for (const pid of readFileSync(join(runtimeDir, name), "utf8").trim().split("\n").map(Number)) {
+          if (pid > 0 && alive(pid)) process.kill(pid, "SIGKILL");
+        }
+      }
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if (attempt === 50) throw error;
+        await new Promise((settle) => setTimeout(settle, 100));
+      }
+    }
+  }
 
   function client(
     overrides: Partial<Parameters<typeof createSharedModelHost>[0]> = {},
@@ -728,6 +752,15 @@ describe("the provider's seam", () => {
       countTokens: async () => 0,
       inputWindow: async () => null,
     };
+
+    // CI runs this suite with MONET_EMBEDDER=hashing, which skips the selection under test entirely.
+    beforeEach(() => {
+      vi.stubEnv("MONET_EMBEDDER", "");
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
 
     it("leaves an empty pinned store's pin alone, where a load failure would re-pin it for good", async () => {
       const dir = mkdtempSync(join(realpathSync(tmpdir()), "msm-pin-"));
